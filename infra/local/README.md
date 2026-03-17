@@ -98,6 +98,20 @@ python greenference-api/infra/local/smoke_test.py --check-ops
 
 Ops mode verifies Prometheus-style `/_metrics` output from the API-side services and checks `/platform/v1/debug/workers` plus `/platform/v1/debug/event-deliveries` on the control plane.
 
+To validate failure-mode handling against the running compose stack:
+
+```bash
+python greenference-api/infra/local/smoke_test.py --check-failures
+```
+
+Failure mode validation covers:
+
+- transient builder failure followed by cleanup and retry
+- build attempts and failed-build operator visibility
+- deployment retry exhaustion when no compatible capacity exists
+- lease history and miner-drift debug visibility
+- consolidated operator status output
+
 ## Local Runbook
 
 When debugging a local stack issue, the highest-signal checks are:
@@ -106,7 +120,10 @@ When debugging a local stack issue, the highest-signal checks are:
 - `GET /platform/v1/debug/workers` on `control-plane`
 - `GET /platform/v1/debug/event-deliveries` on `control-plane`
 - `GET /platform/v1/debug/routing-decisions` on `gateway`
+- `GET /platform/v1/debug/build-failures` on `gateway`
+- `GET /platform/v1/debug/invocation-failures` on `gateway`
 - `GET /platform/v1/debug/servers`, `/nodes`, and `/placements` on `control-plane`
+- `GET /platform/v1/debug/lease-history`, `/deployment-retries`, `/miner-drift`, and `/status` on `control-plane`
 - `GET /platform/v1/invocations/exports/recent` on `gateway`
 - `GET /_metrics` on each API-side service
 

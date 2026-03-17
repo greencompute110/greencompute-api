@@ -15,6 +15,7 @@ from greenference_protocol import (
     InvocationRecord,
     LeaseAssignment,
     MinerRegistration,
+    NodeCapability,
     UsageRecord,
     WorkloadSpec,
 )
@@ -70,6 +71,9 @@ class ControlPlaneService:
     def list_placements(self, limit: int | None = None):
         return self.repository.list_placements(limit=limit)
 
+    def list_lease_history(self, limit: int | None = None):
+        return self.repository.list_lease_history(limit=limit)
+
     def upsert_workload(self, workload: WorkloadSpec) -> WorkloadSpec:
         return self.repository.upsert_workload(workload)
 
@@ -112,6 +116,8 @@ class ControlPlaneService:
             heartbeat = self.repository.get_heartbeat(node.hotkey)
             if heartbeat and not heartbeat.healthy:
                 continue
+            if self._is_node_stale(node):
+                continue
             nodes.append(node)
         assignment = self.placement_policy.assign_lease(workload, deployment_id, nodes)
         if assignment is None:
@@ -138,8 +144,10 @@ class ControlPlaneService:
         deployment.ready_instances = update.ready_instances if update.state == DeploymentState.READY else 0
         deployment.endpoint = update.endpoint or deployment.endpoint
         deployment.last_error = update.error
+        deployment.failure_class = self._classify_deployment_failure(update.error, update.state, deployment.failure_class)
         if update.state == DeploymentState.READY:
             deployment.health_check_failures = 0
+            deployment.retry_exhausted = False
         deployment.updated_at = update.observed_at
         self.repository.add_deployment_event(update)
         assignment_status = {
@@ -171,11 +179,18 @@ class ControlPlaneService:
         return saved
 
     def list_ready_deployments(self, workload_id: str) -> list[DeploymentRecord]:
-        return sorted(
-            self.repository.list_ready_deployments(workload_id),
-            key=lambda item: item.updated_at,
-            reverse=True,
-        )
+        routable: list[DeploymentRecord] = []
+        for deployment in self.repository.list_ready_deployments(workload_id):
+            if deployment.node_id is None:
+                continue
+            node = self._find_node(deployment.node_id)
+            if node is None or self._is_node_stale(node):
+                continue
+            heartbeat = self.repository.get_heartbeat(deployment.hotkey or "")
+            if heartbeat is not None and not heartbeat.healthy:
+                continue
+            routable.append(deployment)
+        return sorted(routable, key=lambda item: item.updated_at, reverse=True)
 
     def resolve_ready_deployment(self, workload_id: str) -> DeploymentRecord | None:
         ready = self.list_ready_deployments(workload_id)
@@ -187,6 +202,7 @@ class ControlPlaneService:
             raise KeyError(f"deployment not found: {deployment_id}")
         deployment.health_check_failures += 1
         deployment.last_error = error
+        deployment.failure_class = "health_check_failure"
         deployment.updated_at = datetime.now(UTC)
         if deployment.health_check_failures >= settings.deployment_health_failure_threshold:
             self.repository.update_deployment(deployment)
@@ -270,6 +286,83 @@ class ControlPlaneService:
             event.model_dump(mode="json")
             for event in self.workflow_repository.list_events(subjects=["deployment.reassigned"])
         ]
+
+    def miner_drift_report(self, now: datetime | None = None) -> dict[str, list[dict[str, Any]]]:
+        observed_at = now or datetime.now(UTC)
+        miners = self.miner_health_report(now=observed_at)
+        stale_nodes: list[dict[str, Any]] = []
+        stale_servers: list[dict[str, Any]] = []
+        for node in self.repository.list_nodes():
+            if self._is_node_stale(node, now=observed_at):
+                stale_nodes.append(
+                    {
+                        "hotkey": node.hotkey,
+                        "node_id": node.node_id,
+                        "server_id": node.server_id,
+                        "reason": "node inventory stale",
+                    }
+                )
+        for server in self.repository.list_servers():
+            if self._is_server_stale(server.observed_at, now=observed_at):
+                stale_servers.append(
+                    {
+                        "server_id": server.server_id,
+                        "hotkey": server.hotkey,
+                        "hostname": server.hostname,
+                        "reason": "server inventory stale",
+                    }
+                )
+        return {
+            "miners": [item for item in miners if item["status"] != "healthy"],
+            "nodes": stale_nodes,
+            "servers": stale_servers,
+        }
+
+    def deployment_retry_report(self) -> list[dict[str, Any]]:
+        reports: list[dict[str, Any]] = []
+        for deployment in self.repository.list_deployments():
+            if deployment.retry_count == 0 and not deployment.retry_exhausted:
+                continue
+            reports.append(
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "workload_id": deployment.workload_id,
+                    "state": deployment.state.value,
+                    "retry_count": deployment.retry_count,
+                    "retry_exhausted": deployment.retry_exhausted,
+                    "last_retry_reason": deployment.last_retry_reason,
+                    "failure_class": deployment.failure_class,
+                    "last_error": deployment.last_error,
+                }
+            )
+        return reports
+
+    def invocation_failure_report(self, limit: int = 100) -> list[dict[str, Any]]:
+        return [
+            record.model_dump(mode="json")
+            for record in self.repository.list_invocation_records(limit=limit)
+            if record.status != "succeeded"
+        ]
+
+    def operator_status(self) -> dict[str, Any]:
+        unhealthy_miners = [item for item in self.miner_health_report() if item["status"] != "healthy"]
+        stuck_deployments = self.stuck_deployments_report()
+        failed_builds = []
+        build_events = self.workflow_repository.list_events(subjects=["build.failed"], statuses=None)
+        for event in build_events:
+            failed_builds.append(event.model_dump(mode="json"))
+        delivery_status_counts: dict[str, int] = {}
+        for status in ["pending", "processing", "completed", "failed"]:
+            delivery_status_counts[status] = len(self.bus.list_deliveries(statuses=[status]))
+        return {
+            "workers": {
+                "queue_depth": delivery_status_counts["pending"],
+                "delivery_status_counts": delivery_status_counts,
+            },
+            "unhealthy_miners": unhealthy_miners,
+            "stuck_deployments": stuck_deployments,
+            "failed_builds": failed_builds[-20:],
+        }
 
     def stuck_deployments_report(self, now: datetime | None = None) -> list[dict[str, Any]]:
         observed_at = now or datetime.now(UTC)
@@ -447,9 +540,14 @@ class ControlPlaneService:
         if assignment is None:
             deployment.retry_count = max(deployment.retry_count, event.attempts)
             deployment.last_error = "no compatible miner capacity available"
+            deployment.last_retry_reason = deployment.last_error
+            deployment.failure_class = "scheduler_failure"
             deployment.updated_at = datetime.now(UTC)
             self.repository.update_deployment(deployment)
             if event.attempts >= settings.deployment_request_retry_limit:
+                deployment.retry_exhausted = True
+                deployment.updated_at = datetime.now(UTC)
+                self.repository.update_deployment(deployment)
                 failed = self.update_deployment_status(
                     DeploymentStatusUpdate(
                         deployment_id=deployment.deployment_id,
@@ -477,6 +575,9 @@ class ControlPlaneService:
         deployment.retry_count = max(deployment.retry_count, max(0, event.attempts - 1))
         deployment.health_check_failures = 0
         deployment.last_error = None
+        deployment.last_retry_reason = None
+        deployment.failure_class = None
+        deployment.retry_exhausted = False
         deployment.updated_at = datetime.now(UTC)
         self.repository.save_assignment(assignment)
         saved = self.repository.update_deployment(deployment)
@@ -564,6 +665,9 @@ class ControlPlaneService:
         deployment.health_check_failures = 0
         deployment.retry_count += 1
         deployment.last_error = reason
+        deployment.last_retry_reason = reason
+        deployment.failure_class = "miner_failure"
+        deployment.retry_exhausted = False
         deployment.updated_at = observed_at
         saved = self.repository.update_deployment(deployment)
         self.bus.publish(
@@ -585,6 +689,49 @@ class ControlPlaneService:
         )
         self.metrics.increment("deployment.reassigned")
         return saved
+
+    def _find_node(self, node_id: str) -> NodeCapability | None:
+        for node in self.repository.list_nodes():
+            if node.node_id == node_id:
+                return node
+        return None
+
+    def _is_node_stale(self, node: NodeCapability, now: datetime | None = None) -> bool:
+        observed_at = now or datetime.now(UTC)
+        raw = node.observed_at
+        if raw is None:
+            return False
+        if isinstance(raw, str):
+            node_observed_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        else:
+            node_observed_at = raw
+        node_observed_at = self._ensure_utc(node_observed_at)
+        return (observed_at - node_observed_at).total_seconds() > settings.node_inventory_timeout_seconds
+
+    def _is_server_stale(self, observed_at: datetime, now: datetime | None = None) -> bool:
+        current = now or datetime.now(UTC)
+        return (current - self._ensure_utc(observed_at)).total_seconds() > settings.server_observed_timeout_seconds
+
+    @staticmethod
+    def _classify_deployment_failure(
+        error: str | None,
+        state: DeploymentState,
+        existing: str | None,
+    ) -> str | None:
+        if state == DeploymentState.READY:
+            return None
+        if state not in {DeploymentState.FAILED, DeploymentState.TERMINATED}:
+            return existing
+        message = (error or "").lower()
+        if "capacity" in message or "scheduler" in message:
+            return "scheduler_failure"
+        if "health" in message:
+            return "health_check_failure"
+        if "heartbeat" in message or "miner" in message:
+            return "miner_failure"
+        if "upstream" in message or "timeout" in message:
+            return "upstream_failure"
+        return existing or "deployment_failure"
 
 
 service = ControlPlaneService()

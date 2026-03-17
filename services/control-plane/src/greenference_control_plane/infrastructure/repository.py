@@ -14,6 +14,7 @@ from greenference_persistence.orm import (
     DeploymentORM,
     HeartbeatORM,
     InvocationRecordORM,
+    LeaseHistoryORM,
     LeaseAssignmentORM,
     MinerORM,
     NodeInventoryORM,
@@ -31,6 +32,7 @@ from greenference_protocol import (
     Heartbeat,
     InvocationRecord,
     LeaseAssignment,
+    LeaseHistoryRecord,
     MinerRegistration,
     NodeCapability,
     PlacementRecord,
@@ -86,7 +88,7 @@ class ControlPlaneRepository:
     def upsert_capacity(self, update: CapacityUpdate) -> CapacityUpdate:
         with session_scope(self.session_factory) as session:
             row = session.get(CapacityORM, update.hotkey) or CapacityORM(hotkey=update.hotkey)
-            normalized_nodes = [self._normalize_node(update.hotkey, node) for node in update.nodes]
+            normalized_nodes = [self._normalize_node(update.hotkey, node, update.observed_at) for node in update.nodes]
             row.nodes = [node.model_dump(mode="json") for node in normalized_nodes]
             row.observed_at = update.observed_at
             session.add(row)
@@ -201,7 +203,10 @@ class ControlPlaneRepository:
                 ready_instances=deployment.ready_instances,
                 endpoint=deployment.endpoint,
                 last_error=deployment.last_error,
+                failure_class=deployment.failure_class,
+                last_retry_reason=deployment.last_retry_reason,
                 retry_count=deployment.retry_count,
+                retry_exhausted=deployment.retry_exhausted,
                 health_check_failures=deployment.health_check_failures,
                 created_at=deployment.created_at,
                 updated_at=deployment.updated_at,
@@ -226,7 +231,10 @@ class ControlPlaneRepository:
             row.ready_instances = deployment.ready_instances
             row.endpoint = deployment.endpoint
             row.last_error = deployment.last_error
+            row.failure_class = deployment.failure_class
+            row.last_retry_reason = deployment.last_retry_reason
             row.retry_count = deployment.retry_count
+            row.retry_exhausted = deployment.retry_exhausted
             row.health_check_failures = deployment.health_check_failures
             row.created_at = deployment.created_at
             row.updated_at = deployment.updated_at
@@ -260,6 +268,25 @@ class ControlPlaneRepository:
             row.expires_at = assignment.expires_at
             row.status = assignment.status
             session.add(row)
+            session.add(
+                LeaseHistoryORM(
+                    event_id=LeaseHistoryRecord(
+                        deployment_id=assignment.deployment_id,
+                        workload_id=assignment.workload_id,
+                        hotkey=assignment.hotkey,
+                        node_id=assignment.node_id,
+                        status=assignment.status,
+                        observed_at=assignment.assigned_at,
+                    ).event_id,
+                    deployment_id=assignment.deployment_id,
+                    workload_id=assignment.workload_id,
+                    hotkey=assignment.hotkey,
+                    node_id=assignment.node_id,
+                    status=assignment.status,
+                    reason=None,
+                    observed_at=assignment.assigned_at,
+                )
+            )
             server_id = self._resolve_server_id(session, assignment.hotkey, assignment.node_id)
             session.add(
                 PlacementORM(
@@ -311,6 +338,27 @@ class ControlPlaneRepository:
                 placement.reason = reason
                 placement.updated_at = datetime.now(UTC)
                 session.add(placement)
+            observed_at = datetime.now(UTC)
+            session.add(
+                LeaseHistoryORM(
+                    event_id=LeaseHistoryRecord(
+                        deployment_id=row.deployment_id,
+                        workload_id=row.workload_id,
+                        hotkey=row.hotkey,
+                        node_id=row.node_id,
+                        status=status,
+                        reason=reason,
+                        observed_at=observed_at,
+                    ).event_id,
+                    deployment_id=row.deployment_id,
+                    workload_id=row.workload_id,
+                    hotkey=row.hotkey,
+                    node_id=row.node_id,
+                    status=status,
+                    reason=reason,
+                    observed_at=observed_at,
+                )
+            )
             session.flush()
             session.refresh(row)
             return self._to_assignment(row)
@@ -449,6 +497,26 @@ class ControlPlaneRepository:
                 for row in rows
             ]
 
+    def list_lease_history(self, limit: int | None = None) -> list[LeaseHistoryRecord]:
+        with session_scope(self.session_factory) as session:
+            stmt = select(LeaseHistoryORM).order_by(LeaseHistoryORM.observed_at.desc())
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            rows = session.scalars(stmt).all()
+            return [
+                LeaseHistoryRecord(
+                    event_id=row.event_id,
+                    deployment_id=row.deployment_id,
+                    workload_id=row.workload_id,
+                    hotkey=row.hotkey,
+                    node_id=row.node_id,
+                    status=row.status,
+                    reason=row.reason,
+                    observed_at=row.observed_at,
+                )
+                for row in rows
+            ]
+
     @staticmethod
     def _to_registration(row: MinerORM) -> MinerRegistration:
         return MinerRegistration(
@@ -502,7 +570,10 @@ class ControlPlaneRepository:
             ready_instances=row.ready_instances,
             endpoint=row.endpoint,
             last_error=row.last_error,
+            failure_class=row.failure_class,
+            last_retry_reason=row.last_retry_reason,
             retry_count=row.retry_count,
+            retry_exhausted=row.retry_exhausted,
             health_check_failures=row.health_check_failures,
             created_at=row.created_at,
             updated_at=row.updated_at,
@@ -555,10 +626,12 @@ class ControlPlaneRepository:
         )
 
     @staticmethod
-    def _normalize_node(hotkey: str, node: NodeCapability) -> NodeCapability:
+    def _normalize_node(hotkey: str, node: NodeCapability, observed_at: datetime) -> NodeCapability:
         server_id = node.server_id or f"{hotkey}-server"
         hostname = node.hostname or f"{server_id}.greenference.local"
-        return node.model_copy(update={"hotkey": hotkey, "server_id": server_id, "hostname": hostname})
+        return node.model_copy(
+            update={"hotkey": hotkey, "server_id": server_id, "hostname": hostname, "observed_at": observed_at}
+        )
 
     @staticmethod
     def _resolve_server_id(session: Session, hotkey: str, node_id: str) -> str | None:

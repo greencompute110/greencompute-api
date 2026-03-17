@@ -13,6 +13,14 @@ from greenference_persistence import RuntimeSettings
 from greenference_protocol import BuildContextRecord, BuildRecord
 
 
+class BuilderExecutionError(RuntimeError):
+    def __init__(self, message: str, *, operation: str, failure_class: str, retryable: bool) -> None:
+        super().__init__(message)
+        self.operation = operation
+        self.failure_class = failure_class
+        self.retryable = retryable
+
+
 @dataclass(slots=True)
 class StagedContext:
     context: BuildContextRecord
@@ -38,9 +46,15 @@ class ObjectStoreAdapter:
     def build_log_uri(self, build_id: str) -> str:
         raise NotImplementedError
 
+    def cleanup(self, build: BuildRecord, context: BuildContextRecord | None) -> str:
+        raise NotImplementedError
+
 
 class RegistryAdapter:
     def publish(self, build: BuildRecord, context: BuildContextRecord) -> PublishedImage:
+        raise NotImplementedError
+
+    def cleanup(self, build: BuildRecord) -> str:
         raise NotImplementedError
 
 
@@ -49,6 +63,7 @@ class SimulatedObjectStoreAdapter(ObjectStoreAdapter):
         self.settings = settings
 
     def stage_context(self, build: BuildRecord, context: BuildContextRecord) -> StagedContext:
+        _maybe_inject_transient_failure(build, "fail-once-object-store", "stage_context", "object_store_failure")
         bucket = self.settings.object_store_bucket
         staged_context_uri = f"s3://{bucket}/contexts/{build.build_id}/context.tar.gz"
         context_manifest_uri = f"s3://{bucket}/manifests/{build.build_id}.json"
@@ -67,6 +82,9 @@ class SimulatedObjectStoreAdapter(ObjectStoreAdapter):
     def build_log_uri(self, build_id: str) -> str:
         return f"s3://{self.settings.object_store_bucket}/build-logs/{build_id}.log"
 
+    def cleanup(self, build: BuildRecord, context: BuildContextRecord | None) -> str:
+        return "simulated object store cleanup completed"
+
 
 class S3CompatibleObjectStoreAdapter(ObjectStoreAdapter):
     def __init__(self, settings: RuntimeSettings) -> None:
@@ -74,6 +92,7 @@ class S3CompatibleObjectStoreAdapter(ObjectStoreAdapter):
         self._bucket_ready = False
 
     def stage_context(self, build: BuildRecord, context: BuildContextRecord) -> StagedContext:
+        _maybe_inject_transient_failure(build, "fail-once-object-store", "stage_context", "object_store_failure")
         self._ensure_bucket()
         context_key = f"contexts/{build.build_id}/context.json"
         manifest_key = f"manifests/{build.build_id}.json"
@@ -129,6 +148,17 @@ class S3CompatibleObjectStoreAdapter(ObjectStoreAdapter):
 
     def build_log_uri(self, build_id: str) -> str:
         return self._object_uri(f"build-logs/{build_id}.log")
+
+    def cleanup(self, build: BuildRecord, context: BuildContextRecord | None) -> str:
+        self._ensure_bucket()
+        keys = [
+            f"contexts/{build.build_id}/context.json",
+            f"manifests/{build.build_id}.json",
+            f"build-logs/{build.build_id}.log",
+        ]
+        for key in keys:
+            self._delete_object(key)
+        return f"removed {len(keys)} object-store artifacts"
 
     def _object_uri(self, key: str) -> str:
         return f"s3://{self.settings.object_store_bucket}/{key}"
@@ -213,9 +243,27 @@ class S3CompatibleObjectStoreAdapter(ObjectStoreAdapter):
         try:
             return request.urlopen(req)  # noqa: S310
         except HTTPError as exc:
-            raise ValueError(f"object store request failed status={exc.code} target={target}") from exc
+            raise BuilderExecutionError(
+                f"object store request failed status={exc.code} target={target}",
+                operation=f"object_store:{method.lower()}",
+                failure_class="object_store_failure",
+                retryable=exc.code >= 500,
+            ) from exc
         except URLError as exc:
-            raise ValueError(f"object store request failed target={target}: {exc.reason}") from exc
+            raise BuilderExecutionError(
+                f"object store request failed target={target}: {exc.reason}",
+                operation=f"object_store:{method.lower()}",
+                failure_class="object_store_failure",
+                retryable=True,
+            ) from exc
+
+    def _delete_object(self, key: str) -> None:
+        try:
+            self._request("DELETE", key)
+        except BuilderExecutionError as exc:
+            if "status=404" in str(exc):
+                return
+            raise
 
 
 class SimulatedRegistryAdapter(RegistryAdapter):
@@ -223,6 +271,7 @@ class SimulatedRegistryAdapter(RegistryAdapter):
         self.settings = settings
 
     def publish(self, build: BuildRecord, context: BuildContextRecord) -> PublishedImage:
+        _maybe_inject_transient_failure(build, "fail-once-registry", "publish_registry", "registry_failure")
         registry_ref = _registry_ref(self.settings.registry_url)
         repository, image_tag = split_image_ref(build.image)
         digest = hashlib.sha256(
@@ -243,6 +292,9 @@ class SimulatedRegistryAdapter(RegistryAdapter):
             message=f"published registry manifest {manifest_uri}",
         )
 
+    def cleanup(self, build: BuildRecord) -> str:
+        return "simulated registry cleanup completed"
+
 
 class OCIRegistryAdapter(RegistryAdapter):
     def __init__(self, settings: RuntimeSettings) -> None:
@@ -250,6 +302,7 @@ class OCIRegistryAdapter(RegistryAdapter):
         self.base_url = settings.registry_url.rstrip("/")
 
     def publish(self, build: BuildRecord, context: BuildContextRecord) -> PublishedImage:
+        _maybe_inject_transient_failure(build, "fail-once-registry", "publish_registry", "registry_failure")
         repository, image_tag = split_image_ref(build.image)
         config_bytes = json.dumps(
             {
@@ -311,6 +364,17 @@ class OCIRegistryAdapter(RegistryAdapter):
             message=f"pushed OCI manifest {manifest_uri}",
         )
 
+    def cleanup(self, build: BuildRecord) -> str:
+        if not build.registry_repository or not build.artifact_digest:
+            return "registry cleanup skipped"
+        url = f"{self.base_url}/v2/{build.registry_repository}/manifests/{quote(build.artifact_digest, safe=':')}"
+        try:
+            self._request("DELETE", url)
+        except BuilderExecutionError as exc:
+            if "status=404" not in str(exc):
+                raise
+        return "registry manifest cleanup completed"
+
     def _push_blob(self, repository: str, body: bytes) -> str:
         digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
         start_url = f"{self.base_url}/v2/{repository}/blobs/uploads/"
@@ -347,9 +411,19 @@ class OCIRegistryAdapter(RegistryAdapter):
         try:
             return request.urlopen(req)  # noqa: S310
         except HTTPError as exc:
-            raise ValueError(f"registry request failed status={exc.code} target={url}") from exc
+            raise BuilderExecutionError(
+                f"registry request failed status={exc.code} target={url}",
+                operation=f"registry:{method.lower()}",
+                failure_class="registry_failure",
+                retryable=exc.code >= 500,
+            ) from exc
         except URLError as exc:
-            raise ValueError(f"registry request failed target={url}: {exc.reason}") from exc
+            raise BuilderExecutionError(
+                f"registry request failed target={url}: {exc.reason}",
+                operation=f"registry:{method.lower()}",
+                failure_class="registry_failure",
+                retryable=True,
+            ) from exc
 
 
 def create_execution_adapters(settings: RuntimeSettings) -> tuple[ObjectStoreAdapter, RegistryAdapter]:
@@ -386,3 +460,21 @@ def _registry_ref(registry_url: str) -> str:
 
 def _utcnow_isoformat() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _maybe_inject_transient_failure(
+    build: BuildRecord,
+    token: str,
+    operation: str,
+    failure_class: str,
+) -> None:
+    if token not in build.context_uri:
+        return
+    if build.retry_count > 0:
+        return
+    raise BuilderExecutionError(
+        f"injected transient failure for {operation}",
+        operation=operation,
+        failure_class=failure_class,
+        retryable=True,
+    )

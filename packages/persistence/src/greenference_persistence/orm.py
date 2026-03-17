@@ -126,7 +126,10 @@ class DeploymentORM(Base):
     ready_instances: Mapped[int] = mapped_column(Integer, default=0)
     endpoint: Mapped[str | None] = mapped_column(String(512), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_retry_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_exhausted: Mapped[bool] = mapped_column(Boolean, default=False)
     health_check_failures: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -158,6 +161,19 @@ class PlacementORM(Base):
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class LeaseHistoryORM(Base):
+    __tablename__ = "lease_history"
+
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    deployment_id: Mapped[str] = mapped_column(String(64), index=True)
+    workload_id: Mapped[str] = mapped_column(String(64), index=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class UsageRecordORM(Base):
@@ -221,6 +237,10 @@ class BuildORM(Base):
     executor_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     build_duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_operation: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    cleanup_status: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

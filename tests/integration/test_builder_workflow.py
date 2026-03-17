@@ -122,6 +122,42 @@ def test_builder_persists_context_and_build_events(monkeypatch) -> None:
     assert [event.stage for event in events] == ["accepted", "building", "staged", "published"]
 
 
+def test_builder_retry_and_cleanup_recover_transient_failure(monkeypatch) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    repository = BuilderRepository(database_url=shared_db, bootstrap=True)
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+    builder = BuilderService(repository, workflow_repository=workflow_repository)
+
+    build = builder.start_build(
+        BuildRequest(
+            image="greenference/retry:latest",
+            context_uri="s3://greenference/fail-once-object-store/retry.zip",
+        )
+    )
+    first_pass = builder.process_pending_events(limit=5)
+    failed = builder.get_build(build.build_id)
+
+    assert first_pass == []
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.failure_class == "object_store_failure"
+
+    cleaned = builder.cleanup_build(build.build_id)
+    retried = builder.retry_build(build.build_id)
+    second_pass = builder.process_pending_events(limit=5)
+    attempts = builder.build_attempts(build.build_id)
+    saved = builder.get_build(build.build_id)
+
+    assert cleaned.cleanup_status == "completed"
+    assert retried.retry_count == 1
+    assert len(second_pass) == 1
+    assert saved is not None
+    assert saved.status == "published"
+    assert len(attempts) >= 2
+    assert attempts[-1]["status"] == "published"
+
+
 def test_control_plane_fails_expired_leases_and_emits_event() -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
     repository = ControlPlaneRepository(database_url=shared_db, bootstrap=True)
@@ -182,6 +218,34 @@ def test_control_plane_fails_expired_leases_and_emits_event() -> None:
     assert saved.state.value == "failed"
     assert saved.last_error == "lease expired before deployment became ready"
     assert len(failed_events) == 1
+
+
+def test_control_plane_exhausts_scheduler_retries_without_capacity(monkeypatch) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    repository = ControlPlaneRepository(database_url=shared_db, bootstrap=True)
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+    control_plane = ControlPlaneService(repository, workflow_repository=workflow_repository)
+    monkeypatch.setattr(settings, "deployment_request_retry_limit", 1)
+
+    workload = repository.upsert_workload(
+        WorkloadSpec(
+            **WorkloadCreateRequest(
+                name="no-capacity-model",
+                image="greenference/echo:latest",
+                requirements={"gpu_count": 4},
+            ).model_dump()
+        )
+    )
+    deployment = control_plane.create_deployment(DeploymentCreateRequest(workload_id=workload.workload_id))
+
+    processed = control_plane.process_pending_events()
+    saved = repository.get_deployment(deployment.deployment_id)
+
+    assert processed["deployments"] == []
+    assert saved is not None
+    assert saved.state.value == "failed"
+    assert saved.retry_exhausted is True
+    assert saved.failure_class == "scheduler_failure"
 
 
 def test_duplicate_deployment_request_events_do_not_duplicate_assignments() -> None:

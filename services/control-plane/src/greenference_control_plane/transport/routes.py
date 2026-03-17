@@ -238,6 +238,43 @@ def debug_placements(
     return [record.model_dump(mode="json") for record in service.list_placements(limit=limit)]
 
 
+@router.get("/platform/v1/debug/lease-history")
+def debug_lease_history(
+    limit: int = 100,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_admin_api_key(authorization, x_api_key)
+    return [record.model_dump(mode="json") for record in service.list_lease_history(limit=limit)]
+
+
+@router.get("/platform/v1/debug/deployment-retries")
+def debug_deployment_retries(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_admin_api_key(authorization, x_api_key)
+    return service.deployment_retry_report()
+
+
+@router.get("/platform/v1/debug/miner-drift")
+def debug_miner_drift(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_admin_api_key(authorization, x_api_key)
+    return service.miner_drift_report()
+
+
+@router.get("/platform/v1/debug/status")
+def debug_status(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_admin_api_key(authorization, x_api_key)
+    return service.operator_status()
+
+
 @router.get("/platform/v1/debug/workers")
 def debug_workers(
     authorization: str | None = Header(default=None),

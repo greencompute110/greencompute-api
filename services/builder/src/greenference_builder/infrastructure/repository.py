@@ -32,6 +32,10 @@ class BuilderRepository:
             row.executor_name = build.executor_name
             row.build_duration_seconds = build.build_duration_seconds
             row.failure_reason = build.failure_reason
+            row.failure_class = build.failure_class
+            row.last_operation = build.last_operation
+            row.cleanup_status = build.cleanup_status
+            row.retry_count = build.retry_count
             row.created_at = build.created_at
             row.updated_at = build.updated_at
             session.add(row)
@@ -118,6 +122,10 @@ class BuilderRepository:
                 executor_name=row.executor_name,
                 build_duration_seconds=row.build_duration_seconds,
                 failure_reason=row.failure_reason,
+                failure_class=row.failure_class,
+                last_operation=row.last_operation,
+                cleanup_status=row.cleanup_status,
+                retry_count=row.retry_count,
                 created_at=row.created_at,
                 updated_at=row.updated_at,
             )
@@ -145,6 +153,10 @@ class BuilderRepository:
                     executor_name=row.executor_name,
                     build_duration_seconds=row.build_duration_seconds,
                     failure_reason=row.failure_reason,
+                    failure_class=row.failure_class,
+                    last_operation=row.last_operation,
+                    cleanup_status=row.cleanup_status,
+                    retry_count=row.retry_count,
                     created_at=row.created_at,
                     updated_at=row.updated_at,
                 )

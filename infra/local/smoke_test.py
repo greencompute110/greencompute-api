@@ -383,6 +383,79 @@ def _assert_operational_surfaces(headers: dict[str, str]) -> None:
     if not deliveries:
         raise RuntimeError("event deliveries debug endpoint returned no deliveries")
 
+    status = _request_json("GET", f"{CONTROL_PLANE_URL}/platform/v1/debug/status", headers=headers)
+    if "workers" not in status or "unhealthy_miners" not in status:
+        raise RuntimeError("operator status endpoint missing expected sections")
+
+
+def verify_failures(headers: dict[str, str]) -> None:
+    failing_build = _request_json(
+        "POST",
+        f"{GATEWAY_URL}/platform/images",
+        {
+            "image": "greenference/failing:stack",
+            "context_uri": "s3://greenference/fail-once-object-store/builds/failing.zip",
+            "dockerfile_path": "Dockerfile",
+            "public": False,
+        },
+        headers=headers,
+    )
+    failed_build = _wait_json(
+        f"{GATEWAY_URL}/platform/builds/{failing_build['build_id']}",
+        lambda body: body["status"] == "failed",
+        headers=headers,
+    )
+    if failed_build.get("failure_class") != "object_store_failure":
+        raise RuntimeError("transient build failure did not surface object_store_failure")
+    _request_json("POST", f"{GATEWAY_URL}/platform/builds/{failing_build['build_id']}/cleanup", headers=headers)
+    retried = _request_json("POST", f"{GATEWAY_URL}/platform/builds/{failing_build['build_id']}/retry", headers=headers)
+    if retried["retry_count"] < 1:
+        raise RuntimeError("build retry count did not increment")
+    published = _wait_json(
+        f"{GATEWAY_URL}/platform/builds/{failing_build['build_id']}",
+        lambda body: body["status"] == "published",
+        headers=headers,
+    )
+    attempts = _request_json("GET", f"{GATEWAY_URL}/platform/builds/{failing_build['build_id']}/attempts", headers=headers)
+    if len(attempts) < 2:
+        raise RuntimeError("build attempts endpoint did not record multiple attempts")
+    print(f"failed build recovered: {published['artifact_uri']}")
+
+    exhausting_workload = _request_json(
+        "POST",
+        f"{GATEWAY_URL}/platform/workloads",
+        {
+            "name": "stack-unplaceable-model",
+            "image": published["image"],
+            "requirements": {"gpu_count": 2, "min_vram_gb_per_gpu": 80},
+        },
+        headers=headers,
+    )
+    deployment = _request_json(
+        "POST",
+        f"{GATEWAY_URL}/platform/deployments",
+        {"workload_id": exhausting_workload["workload_id"], "requested_instances": 1},
+        headers=headers,
+    )
+    retries = _wait_json(
+        f"{CONTROL_PLANE_URL}/platform/v1/debug/deployment-retries",
+        lambda body: any(item["deployment_id"] == deployment["deployment_id"] and item["retry_exhausted"] for item in body),
+        headers=headers,
+        timeout=TIMEOUT_SECONDS,
+    )
+    lease_history = _request_json("GET", f"{CONTROL_PLANE_URL}/platform/v1/debug/lease-history", headers=headers)
+    drift = _request_json("GET", f"{CONTROL_PLANE_URL}/platform/v1/debug/miner-drift", headers=headers)
+    build_failures = _request_json("GET", f"{GATEWAY_URL}/platform/v1/debug/build-failures", headers=headers)
+    if not any(item["deployment_id"] == deployment["deployment_id"] for item in retries):
+        raise RuntimeError("deployment retry exhaustion not visible")
+    if drift.get("miners") is None or drift.get("nodes") is None:
+        raise RuntimeError("miner drift endpoint missing expected sections")
+    if not any(item["build_id"] == failing_build["build_id"] for item in build_failures):
+        raise RuntimeError("build failures endpoint missing failed build")
+    if not isinstance(lease_history, list):
+        raise RuntimeError("lease history endpoint did not return a list")
+    print(f"deployment retry exhaustion observed: {deployment['deployment_id']}")
+
 
 def verify_recovery(context: dict[str, Any], restart_services: tuple[str, ...] = RESTART_SERVICES) -> None:
     _restart_services(restart_services)
@@ -484,12 +557,15 @@ def main(argv: list[str] | None = None) -> int:
     check_recovery = "--check-recovery" in args
     check_failover = "--check-failover" in args
     check_ops = "--check-ops" in args
+    check_failures = "--check-failures" in args
 
     wait_for_stack_readiness()
     context = run_happy_path()
     _assert_metrics(context["headers"], context["deployment"]["deployment_id"])
     if check_ops:
         _assert_operational_surfaces(context["headers"])
+    if check_failures:
+        verify_failures(context["headers"])
     if check_failover:
         verify_failover(context)
     if check_recovery:

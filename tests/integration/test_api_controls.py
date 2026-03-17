@@ -157,6 +157,10 @@ def test_gateway_admin_routes_expose_build_and_invocation_history(
         build["build_id"],
         authorization=f"Bearer {admin_secret}",
     )
+    build_attempts = gateway_routes.get_build_attempts(
+        build["build_id"],
+        authorization=f"Bearer {admin_secret}",
+    )
     invocation_records = gateway_routes.list_invocations(authorization=f"Bearer {admin_secret}")
     invocation_export = gateway_routes.export_recent_invocations(authorization=f"Bearer {admin_secret}")
 
@@ -169,6 +173,7 @@ def test_gateway_admin_routes_expose_build_and_invocation_history(
     )
     assert build_record["registry_manifest_uri"] == f"{build_record['artifact_uri']}@{build_record['artifact_digest']}"
     assert build_record["executor_name"] == "simulated-buildkit"
+    assert build_attempts[0]["attempt"] == 1
     assert [event["stage"] for event in build_events] == ["accepted", "building", "staged", "published"]
     assert len(invocation_records) == 1
     assert invocation_records[0]["latency_ms"] == 12.5
@@ -302,12 +307,14 @@ def test_control_plane_routes_require_miner_header_and_expose_debug_state(
     workers = control_plane_routes.debug_workers(authorization=f"Bearer {admin_secret}")
     deliveries = control_plane_routes.debug_event_deliveries(authorization=f"Bearer {admin_secret}")
     metrics = control_plane_routes.platform_metrics(authorization=f"Bearer {admin_secret}")
+    status = control_plane_routes.debug_status(authorization=f"Bearer {admin_secret}")
 
     assert deployment.deployment_id in {event["payload"]["deployment_id"] for event in workflows if "deployment_id" in event["payload"]}
     assert len(leases) == 1
     assert any(item["consumer"] == "control-plane-worker" for item in workers)
     assert any(item["subject"] == "deployment.requested" for item in deliveries)
     assert metrics["gauges"]["deployments.total"] >= 1.0
+    assert "workers" in status
 
 
 def test_control_plane_debug_views_expose_unhealthy_miners_and_reassignments(
@@ -400,16 +407,61 @@ def test_control_plane_debug_views_expose_unhealthy_miners_and_reassignments(
     miners = control_plane_routes.debug_miners(authorization=f"Bearer {admin_secret}")
     reassignments = control_plane_routes.debug_reassignments(authorization=f"Bearer {admin_secret}")
     stuck = control_plane_routes.debug_stuck_deployments(authorization=f"Bearer {admin_secret}")
+    lease_history = control_plane_routes.debug_lease_history(authorization=f"Bearer {admin_secret}")
+    drift = control_plane_routes.debug_miner_drift(authorization=f"Bearer {admin_secret}")
     metrics = control_plane_routes.platform_metrics(authorization=f"Bearer {admin_secret}")
 
     miner_a_report = next(item for item in miners if item["hotkey"] == "miner-a")
     assert miner_a_report["status"] == "unhealthy"
     assert "unhealthy" in miner_a_report["reason"]
     assert any(item["payload"]["deployment_id"] == deployment.deployment_id for item in reassignments)
+    assert any(item["deployment_id"] == deployment.deployment_id for item in lease_history)
+    assert any(item["hotkey"] == "miner-a" for item in drift["miners"])
     stuck_deployment = next(item for item in stuck if item["deployment_id"] == deployment.deployment_id)
     assert stuck_deployment["state"] == "scheduled"
     assert "stalled" in stuck_deployment["reason"]
     assert metrics["gauges"]["miners.unhealthy"] >= 1.0
+
+
+def test_gateway_debug_routes_expose_failed_builds_and_retry_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    gateway_repository = GatewayRepository(database_url=shared_db, bootstrap=True)
+    builder_repository = BuilderRepository(database_url=shared_db, bootstrap=True)
+    control_repository = ControlPlaneRepository(database_url=shared_db, bootstrap=True)
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+
+    gateway_service = GatewayService(
+        repository=gateway_repository,
+        builder=BuilderService(builder_repository, workflow_repository=workflow_repository),
+        control_plane=ControlPlaneService(control_repository, workflow_repository=workflow_repository),
+    )
+    user_secret, admin_secret = _seed_keys(gateway_repository)
+
+    monkeypatch.setattr(gateway_routes, "service", gateway_service)
+    monkeypatch.setattr(
+        gateway_security,
+        "credential_store",
+        CredentialStore(engine=gateway_repository.engine, session_factory=gateway_repository.session_factory),
+    )
+    monkeypatch.setattr(gateway_security, "rate_limiter", FixedWindowRateLimiter())
+
+    build = gateway_routes.build_image(
+        BuildRequest(image="greenference/retry:latest", context_uri="s3://greenference/fail-once-object-store/retry.zip"),
+        authorization=f"Bearer {user_secret}",
+    )
+    gateway_service.builder.process_pending_events()
+    failed_builds = gateway_routes.debug_build_failures(authorization=f"Bearer {admin_secret}")
+    cleaned = gateway_routes.cleanup_build(build["build_id"], authorization=f"Bearer {admin_secret}")
+    retried = gateway_routes.retry_build(build["build_id"], authorization=f"Bearer {admin_secret}")
+    gateway_service.builder.process_pending_events()
+    final_build = gateway_routes.get_build(build["build_id"], authorization=f"Bearer {admin_secret}")
+
+    assert any(item["build_id"] == build["build_id"] for item in failed_builds)
+    assert cleaned["cleanup_status"] == "completed"
+    assert retried["retry_count"] == 1
+    assert final_build["status"] == "published"
 
 
 def test_control_plane_debug_views_expose_servers_nodes_capacity_and_placements(

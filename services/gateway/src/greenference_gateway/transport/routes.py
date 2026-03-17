@@ -102,6 +102,42 @@ def get_build_events(
     return [event.model_dump(mode="json") for event in service.list_build_events(build_id)]
 
 
+@router.get("/platform/builds/{build_id}/attempts")
+def get_build_attempts(
+    build_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return service.build_attempts(build_id)
+
+
+@router.post("/platform/builds/{build_id}/retry")
+def retry_build(
+    build_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    try:
+        return service.retry_build(build_id).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/platform/builds/{build_id}/cleanup")
+def cleanup_build(
+    build_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    try:
+        return service.cleanup_build(build_id).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/platform/workloads")
 def create_workload(
     payload: WorkloadCreateRequest,
@@ -285,3 +321,22 @@ def get_invocation(
     if record is None:
         raise HTTPException(status_code=404, detail="invocation not found")
     return record.model_dump(mode="json")
+
+
+@router.get("/platform/v1/debug/invocation-failures")
+def debug_invocation_failures(
+    limit: int = 100,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return service.control_plane.invocation_failure_report(limit=limit)
+
+
+@router.get("/platform/v1/debug/build-failures")
+def debug_build_failures(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return [build.model_dump(mode="json") for build in service.list_failed_builds()]

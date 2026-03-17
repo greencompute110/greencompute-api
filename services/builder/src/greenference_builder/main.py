@@ -14,15 +14,28 @@ from greenference_persistence import (
 from greenference_builder.transport.routes import router
 
 settings = load_runtime_settings("greenference-builder")
-_worker_state: dict[str, object | None] = {"running": False, "last_iteration": None}
+_worker_state: dict[str, object | None] = {
+    "running": False,
+    "last_iteration": None,
+    "last_successful_iteration": None,
+    "last_failed_iteration": None,
+    "last_error": None,
+}
 metrics = get_metrics_store("greenference-builder")
 
 
 async def _builder_worker_loop() -> None:
     _worker_state["running"] = True
     while True:
-        service.process_pending_events()
-        _worker_state["last_iteration"] = asyncio.get_running_loop().time()
+        try:
+            service.process_pending_events()
+            _worker_state["last_successful_iteration"] = asyncio.get_running_loop().time()
+            _worker_state["last_error"] = None
+        except Exception as exc:
+            _worker_state["last_failed_iteration"] = asyncio.get_running_loop().time()
+            _worker_state["last_error"] = str(exc)
+        finally:
+            _worker_state["last_iteration"] = asyncio.get_running_loop().time()
         await asyncio.sleep(settings.worker_poll_interval_seconds)
 
 
@@ -70,6 +83,9 @@ def readiness() -> dict[str, str | bool | float | None]:
         payload["workers_enabled"] = True
         payload["worker_running"] = bool(_worker_state["running"])
         payload["worker_last_iteration"] = _worker_state["last_iteration"]
+        payload["worker_last_successful_iteration"] = _worker_state["last_successful_iteration"]
+        payload["worker_last_failed_iteration"] = _worker_state["last_failed_iteration"]
+        payload["worker_last_error"] = _worker_state["last_error"]
     return payload
 
 

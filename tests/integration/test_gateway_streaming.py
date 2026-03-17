@@ -14,6 +14,7 @@ from greenference_builder.application.services import BuilderService
 from greenference_builder.infrastructure.repository import BuilderRepository
 from greenference_control_plane.application.services import ControlPlaneService
 from greenference_control_plane.infrastructure.repository import ControlPlaneRepository
+from greenference_gateway.domain.routing import NoReadyDeploymentError
 from greenference_gateway.application.services import GatewayService
 from greenference_gateway.infrastructure import inference_client as inference_client_module
 from greenference_gateway.infrastructure.repository import GatewayRepository
@@ -294,3 +295,38 @@ def test_gateway_routes_by_ingress_host(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert response.content == "greenference-upstream: route by host"
     assert gateway.list_routing_decisions(limit=1)[0]["matched_by"] == "ingress_host"
+
+
+def test_gateway_skips_stale_node_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    gateway, miner, control_plane, workload_id = _ready_gateway(shared_db)
+    _patch_upstream(monkeypatch, miner)
+
+    miner.publish_capacity(
+        CapacityUpdate(
+            hotkey="miner-a",
+            observed_at="2020-01-01T00:00:00+00:00",
+            nodes=[
+                NodeCapability(
+                    hotkey="miner-a",
+                    node_id="node-a",
+                    gpu_model="a100",
+                    gpu_count=1,
+                    available_gpus=1,
+                    vram_gb_per_gpu=80,
+                    cpu_cores=32,
+                    memory_gb=128,
+                    performance_score=1.3,
+                )
+            ],
+        )
+    )
+
+    with pytest.raises(NoReadyDeploymentError):
+        gateway.invoke_chat_completion(
+            ChatCompletionRequest(
+                model=workload_id,
+                messages=[{"role": "user", "content": "should not route"}],
+            ),
+            api_key_id="key-1",
+        )

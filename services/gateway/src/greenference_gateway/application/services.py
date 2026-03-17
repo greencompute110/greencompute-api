@@ -79,8 +79,20 @@ class GatewayService:
     def list_build_events(self, build_id: str) -> list[BuildEventRecord]:
         return self.builder.list_build_events(build_id)
 
+    def build_attempts(self, build_id: str) -> list[dict]:
+        return self.builder.build_attempts(build_id)
+
+    def retry_build(self, build_id: str) -> BuildRecord:
+        return self.builder.retry_build(build_id)
+
+    def cleanup_build(self, build_id: str) -> BuildRecord:
+        return self.builder.cleanup_build(build_id)
+
     def list_image_history(self, image: str) -> list[BuildRecord]:
         return self.builder.list_image_history(image)
+
+    def list_failed_builds(self) -> list[BuildRecord]:
+        return [build for build in self.builder.list_builds() if build.status == "failed"]
 
     def create_workload(self, request: WorkloadCreateRequest) -> WorkloadSpec:
         workload = WorkloadSpec(**request.model_dump())

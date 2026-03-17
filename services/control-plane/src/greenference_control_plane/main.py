@@ -9,17 +9,30 @@ from greenference_persistence import database_ready, get_metrics_store, load_run
 from greenference_control_plane.transport.routes import router
 
 settings = load_runtime_settings("greenference-control-plane")
-_worker_state: dict[str, object | None] = {"running": False, "last_iteration": None}
+_worker_state: dict[str, object | None] = {
+    "running": False,
+    "last_iteration": None,
+    "last_successful_iteration": None,
+    "last_failed_iteration": None,
+    "last_error": None,
+}
 metrics = get_metrics_store("greenference-control-plane")
 
 
 async def _control_plane_worker_loop() -> None:
     _worker_state["running"] = True
     while True:
-        service.process_pending_events()
-        service.process_timeouts()
-        service.process_unhealthy_miners()
-        _worker_state["last_iteration"] = asyncio.get_running_loop().time()
+        try:
+            service.process_pending_events()
+            service.process_timeouts()
+            service.process_unhealthy_miners()
+            _worker_state["last_successful_iteration"] = asyncio.get_running_loop().time()
+            _worker_state["last_error"] = None
+        except Exception as exc:
+            _worker_state["last_failed_iteration"] = asyncio.get_running_loop().time()
+            _worker_state["last_error"] = str(exc)
+        finally:
+            _worker_state["last_iteration"] = asyncio.get_running_loop().time()
         await asyncio.sleep(settings.worker_poll_interval_seconds)
 
 
@@ -65,6 +78,9 @@ def readiness() -> dict[str, str]:
         payload["workers_enabled"] = True
         payload["worker_running"] = bool(_worker_state["running"])
         payload["worker_last_iteration"] = _worker_state["last_iteration"]
+        payload["worker_last_successful_iteration"] = _worker_state["last_successful_iteration"]
+        payload["worker_last_failed_iteration"] = _worker_state["last_failed_iteration"]
+        payload["worker_last_error"] = _worker_state["last_error"]
     return payload
 
 
@@ -85,6 +101,14 @@ def prometheus_metrics() -> PlainTextResponse:
     metrics.set_gauge(
         "event_deliveries.failed",
         float(len(service.bus.list_deliveries(statuses=["failed"]))),
+    )
+    metrics.set_gauge(
+        "miners.unhealthy",
+        float(len([item for item in service.miner_health_report() if item["status"] != "healthy"])),
+    )
+    metrics.set_gauge(
+        "deployments.stuck",
+        float(len(service.stuck_deployments_report())),
     )
     return PlainTextResponse(
         render_prometheus_text(settings.service_name, metrics),
