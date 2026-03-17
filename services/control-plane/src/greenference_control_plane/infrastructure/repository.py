@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from greenference_persistence import create_db_engine, create_session_factory, init_database, session_scope
 from greenference_persistence.db import needs_bootstrap
 from greenference_persistence.orm import (
+    CapacityHistoryORM,
     CapacityORM,
     DeploymentEventORM,
     DeploymentORM,
@@ -13,10 +16,14 @@ from greenference_persistence.orm import (
     InvocationRecordORM,
     LeaseAssignmentORM,
     MinerORM,
+    NodeInventoryORM,
+    PlacementORM,
+    ServerORM,
     UsageRecordORM,
     WorkloadORM,
 )
 from greenference_protocol import (
+    CapacityHistoryRecord,
     CapacityUpdate,
     DeploymentRecord,
     DeploymentState,
@@ -25,6 +32,9 @@ from greenference_protocol import (
     InvocationRecord,
     LeaseAssignment,
     MinerRegistration,
+    NodeCapability,
+    PlacementRecord,
+    ServerRecord,
     UsageRecord,
     WorkloadSpec,
 )
@@ -76,9 +86,46 @@ class ControlPlaneRepository:
     def upsert_capacity(self, update: CapacityUpdate) -> CapacityUpdate:
         with session_scope(self.session_factory) as session:
             row = session.get(CapacityORM, update.hotkey) or CapacityORM(hotkey=update.hotkey)
-            row.nodes = [node.model_dump(mode="json") for node in update.nodes]
+            normalized_nodes = [self._normalize_node(update.hotkey, node) for node in update.nodes]
+            row.nodes = [node.model_dump(mode="json") for node in normalized_nodes]
             row.observed_at = update.observed_at
             session.add(row)
+            miner = session.get(MinerORM, update.hotkey)
+            for node in normalized_nodes:
+                server_id = node.server_id or f"{update.hotkey}-server"
+                server = session.get(ServerORM, server_id) or ServerORM(server_id=server_id)
+                server.hotkey = update.hotkey
+                server.hostname = node.hostname
+                server.api_base_url = miner.api_base_url if miner is not None else None
+                server.validator_url = miner.validator_url if miner is not None else None
+                server.observed_at = update.observed_at
+                session.add(server)
+
+                inventory = session.get(NodeInventoryORM, node.node_id) or NodeInventoryORM(node_id=node.node_id)
+                inventory.hotkey = update.hotkey
+                inventory.server_id = server_id
+                inventory.payload = node.model_dump(mode="json")
+                inventory.observed_at = update.observed_at
+                session.add(inventory)
+
+                session.add(
+                    CapacityHistoryORM(
+                        history_id=CapacityHistoryRecord(
+                            hotkey=update.hotkey,
+                            server_id=server_id,
+                            node_id=node.node_id,
+                            available_gpus=node.available_gpus,
+                            total_gpus=node.gpu_count,
+                            observed_at=update.observed_at,
+                        ).history_id,
+                        hotkey=update.hotkey,
+                        server_id=server_id,
+                        node_id=node.node_id,
+                        available_gpus=node.available_gpus,
+                        total_gpus=node.gpu_count,
+                        observed_at=update.observed_at,
+                    )
+                )
         return update
 
     def get_capacity(self, hotkey: str) -> CapacityUpdate | None:
@@ -201,6 +248,28 @@ class ControlPlaneRepository:
             row.expires_at = assignment.expires_at
             row.status = assignment.status
             session.add(row)
+            server_id = self._resolve_server_id(session, assignment.hotkey, assignment.node_id)
+            session.add(
+                PlacementORM(
+                    placement_id=PlacementRecord(
+                        deployment_id=assignment.deployment_id,
+                        workload_id=assignment.workload_id,
+                        hotkey=assignment.hotkey,
+                        server_id=server_id,
+                        node_id=assignment.node_id,
+                        status=assignment.status,
+                    ).placement_id,
+                    deployment_id=assignment.deployment_id,
+                    workload_id=assignment.workload_id,
+                    hotkey=assignment.hotkey,
+                    server_id=server_id,
+                    node_id=assignment.node_id,
+                    status=assignment.status,
+                    reason=None,
+                    created_at=assignment.assigned_at,
+                    updated_at=assignment.assigned_at,
+                )
+            )
         return assignment
 
     def list_assignments(self, hotkey: str | None = None, statuses: list[str] | None = None) -> list[LeaseAssignment]:
@@ -213,13 +282,23 @@ class ControlPlaneRepository:
             rows = session.scalars(stmt).all()
             return [self._to_assignment(row) for row in rows]
 
-    def update_assignment_status(self, deployment_id: str, status: str) -> LeaseAssignment | None:
+    def update_assignment_status(self, deployment_id: str, status: str, reason: str | None = None) -> LeaseAssignment | None:
         with session_scope(self.session_factory) as session:
             row = session.scalar(select(LeaseAssignmentORM).where(LeaseAssignmentORM.deployment_id == deployment_id))
             if row is None:
                 return None
             row.status = status
             session.add(row)
+            placement = session.scalar(
+                select(PlacementORM)
+                .where(PlacementORM.deployment_id == deployment_id)
+                .order_by(PlacementORM.created_at.desc())
+            )
+            if placement is not None:
+                placement.status = status
+                placement.reason = reason
+                placement.updated_at = datetime.now(UTC)
+                session.add(placement)
             session.flush()
             session.refresh(row)
             return self._to_assignment(row)
@@ -296,6 +375,67 @@ class ControlPlaneRepository:
                 stmt = stmt.where(DeploymentEventORM.deployment_id == deployment_id)
             rows = session.scalars(stmt.order_by(DeploymentEventORM.observed_at.asc())).all()
             return [row.payload for row in rows]
+
+    def list_servers(self) -> list[ServerRecord]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(select(ServerORM).order_by(ServerORM.observed_at.desc(), ServerORM.server_id.asc())).all()
+            return [
+                ServerRecord(
+                    server_id=row.server_id,
+                    hotkey=row.hotkey,
+                    hostname=row.hostname,
+                    api_base_url=row.api_base_url,
+                    validator_url=row.validator_url,
+                    observed_at=row.observed_at,
+                )
+                for row in rows
+            ]
+
+    def list_nodes(self) -> list[NodeCapability]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(select(NodeInventoryORM).order_by(NodeInventoryORM.observed_at.desc())).all()
+            return [NodeCapability(**row.payload) for row in rows]
+
+    def list_capacity_history(self, limit: int | None = None) -> list[CapacityHistoryRecord]:
+        with session_scope(self.session_factory) as session:
+            stmt = select(CapacityHistoryORM).order_by(CapacityHistoryORM.observed_at.desc())
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            rows = session.scalars(stmt).all()
+            return [
+                CapacityHistoryRecord(
+                    history_id=row.history_id,
+                    hotkey=row.hotkey,
+                    server_id=row.server_id,
+                    node_id=row.node_id,
+                    available_gpus=row.available_gpus,
+                    total_gpus=row.total_gpus,
+                    observed_at=row.observed_at,
+                )
+                for row in rows
+            ]
+
+    def list_placements(self, limit: int | None = None) -> list[PlacementRecord]:
+        with session_scope(self.session_factory) as session:
+            stmt = select(PlacementORM).order_by(PlacementORM.updated_at.desc(), PlacementORM.created_at.desc())
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            rows = session.scalars(stmt).all()
+            return [
+                PlacementRecord(
+                    placement_id=row.placement_id,
+                    deployment_id=row.deployment_id,
+                    workload_id=row.workload_id,
+                    hotkey=row.hotkey,
+                    server_id=row.server_id,
+                    node_id=row.node_id,
+                    status=row.status,
+                    reason=row.reason,
+                    created_at=row.created_at,
+                    updated_at=row.updated_at,
+                )
+                for row in rows
+            ]
 
     @staticmethod
     def _to_registration(row: MinerORM) -> MinerRegistration:
@@ -399,3 +539,17 @@ class ControlPlaneRepository:
             message_count=row.message_count,
             created_at=row.created_at,
         )
+
+    @staticmethod
+    def _normalize_node(hotkey: str, node: NodeCapability) -> NodeCapability:
+        server_id = node.server_id or f"{hotkey}-server"
+        hostname = node.hostname or f"{server_id}.greenference.local"
+        return node.model_copy(update={"hotkey": hotkey, "server_id": server_id, "hostname": hostname})
+
+    @staticmethod
+    def _resolve_server_id(session: Session, hotkey: str, node_id: str) -> str | None:
+        inventory = session.get(NodeInventoryORM, node_id)
+        if inventory is not None:
+            return inventory.server_id
+        server = session.scalar(select(ServerORM).where(ServerORM.hotkey == hotkey))
+        return server.server_id if server is not None else None

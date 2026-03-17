@@ -65,6 +65,39 @@ class CapacityORM(Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class ServerORM(Base):
+    __tablename__ = "servers"
+
+    server_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    api_base_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    validator_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class NodeInventoryORM(Base):
+    __tablename__ = "node_inventory"
+
+    node_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    server_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CapacityHistoryORM(Base):
+    __tablename__ = "capacity_history"
+
+    history_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    server_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    available_gpus: Mapped[int] = mapped_column(Integer)
+    total_gpus: Mapped[int] = mapped_column(Integer)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class WorkloadORM(Base):
     __tablename__ = "workloads"
 
@@ -108,6 +141,21 @@ class LeaseAssignmentORM(Base):
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="assigned")
+
+
+class PlacementORM(Base):
+    __tablename__ = "placements"
+
+    placement_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    deployment_id: Mapped[str] = mapped_column(String(64), index=True)
+    workload_id: Mapped[str] = mapped_column(String(64), index=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    server_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="assigned")
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class UsageRecordORM(Base):

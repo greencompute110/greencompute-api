@@ -200,6 +200,44 @@ def debug_stuck_deployments(
     return service.stuck_deployments_report()
 
 
+@router.get("/platform/v1/debug/servers")
+def debug_servers(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_admin_api_key(authorization, x_api_key)
+    return [server.model_dump(mode="json") for server in service.list_servers()]
+
+
+@router.get("/platform/v1/debug/nodes")
+def debug_nodes(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_admin_api_key(authorization, x_api_key)
+    return [node.model_dump(mode="json") for node in service.list_nodes()]
+
+
+@router.get("/platform/v1/debug/capacity-history")
+def debug_capacity_history(
+    limit: int = 100,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_admin_api_key(authorization, x_api_key)
+    return [record.model_dump(mode="json") for record in service.list_capacity_history(limit=limit)]
+
+
+@router.get("/platform/v1/debug/placements")
+def debug_placements(
+    limit: int = 100,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_admin_api_key(authorization, x_api_key)
+    return [record.model_dump(mode="json") for record in service.list_placements(limit=limit)]
+
+
 @router.get("/platform/v1/metrics")
 def platform_metrics(
     authorization: str | None = Header(default=None),
@@ -218,6 +256,9 @@ def platform_metrics(
         "miners.unhealthy",
         float(len([miner for miner in service.miner_health_report() if miner["status"] != "healthy"])),
     )
+    metrics.set_gauge("servers.total", float(len(service.list_servers())))
+    metrics.set_gauge("nodes.total", float(len(service.list_nodes())))
+    metrics.set_gauge("placements.total", float(len(service.list_placements(limit=1000))))
     metrics.set_gauge(
         "deployments.stuck",
         float(len(service.stuck_deployments_report())),

@@ -346,6 +346,81 @@ def test_control_plane_debug_views_expose_unhealthy_miners_and_reassignments(
     assert metrics["gauges"]["miners.unhealthy"] >= 1.0
 
 
+def test_control_plane_debug_views_expose_servers_nodes_capacity_and_placements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    control_repository = ControlPlaneRepository(database_url=shared_db, bootstrap=True)
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+    gateway_repository = GatewayRepository(database_url=shared_db, bootstrap=True)
+    service = ControlPlaneService(control_repository, workflow_repository=workflow_repository)
+    _, admin_secret = _seed_keys(gateway_repository)
+
+    monkeypatch.setattr(control_plane_routes, "service", service)
+    monkeypatch.setattr(control_plane_security, "service", service)
+    monkeypatch.setattr(
+        control_plane_security,
+        "credential_store",
+        CredentialStore(engine=gateway_repository.engine, session_factory=gateway_repository.session_factory),
+    )
+
+    service.register_miner(
+        MinerRegistration(
+            hotkey="miner-a",
+            payout_address="5FminerA",
+            auth_secret="miner-a-secret",
+            api_base_url="http://miner-a.local",
+            validator_url="http://validator.local",
+        )
+    )
+    service.record_heartbeat(Heartbeat(hotkey="miner-a", healthy=True))
+    service.update_capacity(
+        CapacityUpdate(
+            hotkey="miner-a",
+            nodes=[
+                NodeCapability(
+                    hotkey="miner-a",
+                    node_id="node-a",
+                    server_id="server-a",
+                    hostname="gpu-a.internal",
+                    gpu_model="a100",
+                    gpu_count=2,
+                    available_gpus=2,
+                    vram_gb_per_gpu=80,
+                    cpu_cores=32,
+                    memory_gb=128,
+                )
+            ],
+        )
+    )
+    workload = service.upsert_workload(
+        WorkloadSpec(
+            **WorkloadCreateRequest(
+                name="inventory-model",
+                image="greenference/echo:latest",
+                requirements={"gpu_count": 1},
+            ).model_dump()
+        )
+    )
+    deployment = service.create_deployment(DeploymentCreateRequest(workload_id=workload.workload_id))
+    service.process_pending_events()
+
+    servers = control_plane_routes.debug_servers(authorization=f"Bearer {admin_secret}")
+    nodes = control_plane_routes.debug_nodes(authorization=f"Bearer {admin_secret}")
+    history = control_plane_routes.debug_capacity_history(authorization=f"Bearer {admin_secret}")
+    placements = control_plane_routes.debug_placements(authorization=f"Bearer {admin_secret}")
+
+    assert servers[0]["server_id"] == "server-a"
+    assert servers[0]["api_base_url"] == "http://miner-a.local"
+    assert nodes[0]["node_id"] == "node-a"
+    assert nodes[0]["server_id"] == "server-a"
+    assert history[0]["node_id"] == "node-a"
+    assert history[0]["total_gpus"] == 2
+    assert placements[0]["deployment_id"] == deployment.deployment_id
+    assert placements[0]["server_id"] == "server-a"
+    assert placements[0]["status"] == "assigned"
+
+
 def test_validator_routes_require_headers_and_expose_probe_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

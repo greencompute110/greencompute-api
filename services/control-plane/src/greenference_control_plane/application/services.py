@@ -58,6 +58,18 @@ class ControlPlaneService:
     def update_capacity(self, update: CapacityUpdate) -> CapacityUpdate:
         return self.repository.upsert_capacity(update)
 
+    def list_servers(self):
+        return self.repository.list_servers()
+
+    def list_nodes(self):
+        return self.repository.list_nodes()
+
+    def list_capacity_history(self, limit: int | None = None):
+        return self.repository.list_capacity_history(limit=limit)
+
+    def list_placements(self, limit: int | None = None):
+        return self.repository.list_placements(limit=limit)
+
     def upsert_workload(self, workload: WorkloadSpec) -> WorkloadSpec:
         return self.repository.upsert_workload(workload)
 
@@ -90,11 +102,11 @@ class ControlPlaneService:
 
     def _assign_lease(self, workload: WorkloadSpec, deployment_id: str) -> LeaseAssignment | None:
         nodes = []
-        for update in self.repository.list_capacities():
-            heartbeat = self.repository.get_heartbeat(update.hotkey)
+        for node in self.repository.list_nodes():
+            heartbeat = self.repository.get_heartbeat(node.hotkey)
             if heartbeat and not heartbeat.healthy:
                 continue
-            nodes.extend(update.nodes)
+            nodes.append(node)
         assignment = self.placement_policy.assign_lease(workload, deployment_id, nodes)
         if assignment is None:
             return None
@@ -132,7 +144,7 @@ class ControlPlaneService:
             DeploymentState.TERMINATED: "terminated",
         }.get(update.state)
         if assignment_status is not None:
-            self.repository.update_assignment_status(update.deployment_id, assignment_status)
+            self.repository.update_assignment_status(update.deployment_id, assignment_status, reason=update.error)
         saved = self.repository.update_deployment(deployment)
         subject = {
             DeploymentState.READY: "deployment.ready",
@@ -537,7 +549,7 @@ class ControlPlaneService:
             assignment.node_id,
             workload.requirements.gpu_count,
         )
-        self.repository.update_assignment_status(assignment.deployment_id, "reassigned")
+        self.repository.update_assignment_status(assignment.deployment_id, "reassigned", reason=reason)
         deployment.state = DeploymentState.PENDING
         deployment.hotkey = None
         deployment.node_id = None
