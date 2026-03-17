@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from greenference_persistence import WorkflowEventRepository
 from greenference_protocol import NodeCapability, ProbeChallenge, ProbeResult, ScoreCard, WeightSnapshot
 from greenference_validator.domain.scoring import ScoreEngine
 from greenference_validator.infrastructure.repository import ValidatorRepository
@@ -18,8 +19,16 @@ class InvalidProbeResultError(ValueError):
 
 
 class ValidatorService:
-    def __init__(self, repository: ValidatorRepository | None = None) -> None:
+    def __init__(
+        self,
+        repository: ValidatorRepository | None = None,
+        workflow_repository: WorkflowEventRepository | None = None,
+    ) -> None:
         self.repository = repository or ValidatorRepository()
+        self.workflow_repository = workflow_repository or WorkflowEventRepository(
+            engine=self.repository.engine,
+            session_factory=self.repository.session_factory,
+        )
         self.scoring = ScoreEngine()
 
     def register_capability(self, capability: NodeCapability) -> NodeCapability:
@@ -49,7 +58,17 @@ class ValidatorService:
 
         self.repository.add_result(result)
         scorecard = self.scoring.compute_scorecard(capability, self.repository.list_results(result.hotkey))
-        return self.repository.save_scorecard(scorecard)
+        saved = self.repository.save_scorecard(scorecard)
+        self.workflow_repository.publish(
+            "probe.result.recorded",
+            {
+                "challenge_id": result.challenge_id,
+                "hotkey": result.hotkey,
+                "node_id": result.node_id,
+                "final_score": saved.final_score,
+            },
+        )
+        return saved
 
     def publish_weight_snapshot(self, netuid: int = 64) -> WeightSnapshot:
         scorecards: dict[str, ScoreCard] = {}
@@ -64,7 +83,16 @@ class ValidatorService:
             for hotkey, scorecard in sorted(scorecards.items())
         }
         snapshot = WeightSnapshot(netuid=netuid, weights=weights)
-        return self.repository.save_snapshot(snapshot)
+        saved = self.repository.save_snapshot(snapshot)
+        self.workflow_repository.publish(
+            "validator.weights.published",
+            {
+                "snapshot_id": saved.snapshot_id,
+                "netuid": saved.netuid,
+                "weights": saved.weights,
+            },
+        )
+        return saved
 
 
 service = ValidatorService()

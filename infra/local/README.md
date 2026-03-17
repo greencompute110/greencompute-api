@@ -20,12 +20,16 @@ Run:
 docker compose -f greenference-api/infra/local/docker-compose.yml up -d
 ```
 
-
-Each service package can then be started with its own FastAPI entrypoint.
-
 The local stack uses Postgres as the default development path through:
 
 `GREENFERENCE_DATABASE_URL=postgresql+psycopg://greenference:greenference@postgres:5432/greenference`
+
+Runtime dependency URLs are also injected for Redis, NATS, MinIO, and the local OCI registry. The builder and control-plane containers run with background workers enabled so accepted builds and lease timeout checks progress without direct in-process test calls.
+
+Service health endpoints:
+
+- `/healthz` for liveness
+- `/readyz` for database-backed readiness
 
 Service ports:
 

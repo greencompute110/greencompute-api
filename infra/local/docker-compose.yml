@@ -42,6 +42,13 @@ services:
       - ../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENFERENCE_DB_BOOTSTRAP: "false"
+      GREENFERENCE_REDIS_URL: redis://redis:6379/0
+      GREENFERENCE_NATS_URL: nats://nats:4222
+      GREENFERENCE_OBJECT_STORE_ENDPOINT: http://minio:9000
+      GREENFERENCE_OBJECT_STORE_ACCESS_KEY: greenference
+      GREENFERENCE_OBJECT_STORE_SECRET_KEY: greenference
+      GREENFERENCE_REGISTRY_URL: http://registry:5000
       PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/gateway/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/validator/src:/workspace/greenference-api/services/builder/src:/workspace/greenference-miner/services/miner-agent/src
     depends_on:
       postgres:
@@ -56,6 +63,13 @@ services:
       - ../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENFERENCE_DB_BOOTSTRAP: "false"
+      GREENFERENCE_REDIS_URL: redis://redis:6379/0
+      GREENFERENCE_NATS_URL: nats://nats:4222
+      GREENFERENCE_OBJECT_STORE_ENDPOINT: http://minio:9000
+      GREENFERENCE_OBJECT_STORE_ACCESS_KEY: greenference
+      GREENFERENCE_OBJECT_STORE_SECRET_KEY: greenference
+      GREENFERENCE_REGISTRY_URL: http://registry:5000
       PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/gateway/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/validator/src:/workspace/greenference-api/services/builder/src:/workspace/greenference-miner/services/miner-agent/src
     depends_on:
       migrate:
@@ -72,6 +86,14 @@ services:
       - ../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENFERENCE_DB_BOOTSTRAP: "false"
+      GREENFERENCE_REDIS_URL: redis://redis:6379/0
+      GREENFERENCE_NATS_URL: nats://nats:4222
+      GREENFERENCE_OBJECT_STORE_ENDPOINT: http://minio:9000
+      GREENFERENCE_OBJECT_STORE_ACCESS_KEY: greenference
+      GREENFERENCE_OBJECT_STORE_SECRET_KEY: greenference
+      GREENFERENCE_REGISTRY_URL: http://registry:5000
+      GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src
     depends_on:
       migrate:
@@ -88,6 +110,13 @@ services:
       - ../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENFERENCE_DB_BOOTSTRAP: "false"
+      GREENFERENCE_REDIS_URL: redis://redis:6379/0
+      GREENFERENCE_NATS_URL: nats://nats:4222
+      GREENFERENCE_OBJECT_STORE_ENDPOINT: http://minio:9000
+      GREENFERENCE_OBJECT_STORE_ACCESS_KEY: greenference
+      GREENFERENCE_OBJECT_STORE_SECRET_KEY: greenference
+      GREENFERENCE_REGISTRY_URL: http://registry:5000
       PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/validator/src
     depends_on:
       migrate:
@@ -104,6 +133,14 @@ services:
       - ../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENFERENCE_DB_BOOTSTRAP: "false"
+      GREENFERENCE_REDIS_URL: redis://redis:6379/0
+      GREENFERENCE_NATS_URL: nats://nats:4222
+      GREENFERENCE_OBJECT_STORE_ENDPOINT: http://minio:9000
+      GREENFERENCE_OBJECT_STORE_ACCESS_KEY: greenference
+      GREENFERENCE_OBJECT_STORE_SECRET_KEY: greenference
+      GREENFERENCE_REGISTRY_URL: http://registry:5000
+      GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/builder/src
     depends_on:
       migrate:
@@ -120,6 +157,7 @@ services:
       - ../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENFERENCE_DB_BOOTSTRAP: "false"
       PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-miner/services/miner-agent/src
     depends_on:
       migrate:

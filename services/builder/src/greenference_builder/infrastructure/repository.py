@@ -29,6 +29,23 @@ class BuilderRepository:
             session.add(row)
         return build
 
+    def get_build(self, build_id: str) -> BuildRecord | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(BuildORM, build_id)
+            if row is None:
+                return None
+            return BuildRecord(
+                build_id=row.build_id,
+                image=row.image,
+                context_uri=row.context_uri,
+                dockerfile_path=row.dockerfile_path,
+                public=row.public,
+                status=row.status,
+                artifact_uri=row.artifact_uri,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+            )
+
     def list_builds(self) -> list[BuildRecord]:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(select(BuildORM)).all()

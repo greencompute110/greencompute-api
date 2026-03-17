@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from greenference_persistence import WorkflowEventRepository
 from greenference_protocol import (
     CapacityUpdate,
     DeploymentCreateRequest,
@@ -22,8 +23,16 @@ from greenference_control_plane.infrastructure.repository import ControlPlaneRep
 
 
 class ControlPlaneService:
-    def __init__(self, repository: ControlPlaneRepository | None = None) -> None:
+    def __init__(
+        self,
+        repository: ControlPlaneRepository | None = None,
+        workflow_repository: WorkflowEventRepository | None = None,
+    ) -> None:
         self.repository = repository or ControlPlaneRepository()
+        self.workflow_repository = workflow_repository or WorkflowEventRepository(
+            engine=self.repository.engine,
+            session_factory=self.repository.session_factory,
+        )
         self.placement_policy = PlacementPolicy()
         self.usage_aggregator = UsageAggregator()
 
@@ -62,6 +71,15 @@ class ControlPlaneService:
             deployment.updated_at = datetime.now(UTC)
             self.repository.save_assignment(assignment)
             self.repository.update_deployment(deployment)
+            self.workflow_repository.publish(
+                "deployment.scheduled",
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "workload_id": deployment.workload_id,
+                    "hotkey": deployment.hotkey,
+                    "node_id": deployment.node_id,
+                },
+            )
         return deployment
 
     def _assign_lease(self, workload: WorkloadSpec, deployment_id: str) -> LeaseAssignment | None:
@@ -107,17 +125,73 @@ class ControlPlaneService:
         }.get(update.state)
         if assignment_status is not None:
             self.repository.update_assignment_status(update.deployment_id, assignment_status)
-        return self.repository.update_deployment(deployment)
+        saved = self.repository.update_deployment(deployment)
+        subject = {
+            DeploymentState.READY: "deployment.ready",
+            DeploymentState.FAILED: "deployment.failed",
+            DeploymentState.TERMINATED: "deployment.terminated",
+        }.get(update.state, "deployment.status.updated")
+        self.workflow_repository.publish(
+            subject,
+            {
+                "deployment_id": saved.deployment_id,
+                "state": saved.state.value,
+                "hotkey": saved.hotkey,
+                "endpoint": saved.endpoint,
+                "error": saved.last_error,
+            },
+        )
+        return saved
 
     def resolve_ready_deployment(self, workload_id: str) -> DeploymentRecord | None:
         ready = self.repository.list_ready_deployments(workload_id)
         return sorted(ready, key=lambda item: item.updated_at, reverse=True)[0] if ready else None
 
     def record_usage(self, record: UsageRecord) -> UsageRecord:
-        return self.repository.add_usage_record(record)
+        saved = self.repository.add_usage_record(record)
+        self.workflow_repository.publish(
+            "usage.recorded",
+            {
+                "deployment_id": saved.deployment_id,
+                "workload_id": saved.workload_id,
+                "hotkey": saved.hotkey,
+                "request_count": saved.request_count,
+            },
+        )
+        return saved
 
     def usage_summary(self) -> dict[str, dict[str, float]]:
         return self.usage_aggregator.aggregate(self.repository.list_usage_records())
+
+    def process_timeouts(self, now: datetime | None = None) -> list[DeploymentRecord]:
+        observed_at = now or datetime.now(UTC)
+        expired: list[DeploymentRecord] = []
+        for assignment in self.repository.list_assignments(statuses=["assigned", "activating"]):
+            expires_at = assignment.expires_at
+            if expires_at is None:
+                continue
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at > observed_at:
+                continue
+            deployment = self.repository.get_deployment(assignment.deployment_id)
+            if deployment is None or deployment.state in {
+                DeploymentState.READY,
+                DeploymentState.FAILED,
+                DeploymentState.TERMINATED,
+            }:
+                continue
+            expired.append(
+                self.update_deployment_status(
+                    DeploymentStatusUpdate(
+                        deployment_id=deployment.deployment_id,
+                        state=DeploymentState.FAILED,
+                        error="lease expired before deployment became ready",
+                        observed_at=observed_at,
+                    )
+                )
+            )
+        return expired
 
 
 service = ControlPlaneService()

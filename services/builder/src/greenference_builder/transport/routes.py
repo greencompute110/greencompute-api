@@ -15,3 +15,7 @@ def start_build(payload: BuildRequest) -> dict:
 def list_builds() -> list[dict]:
     return [build.model_dump(mode="json") for build in service.list_builds()]
 
+
+@router.post("/builder/v1/events/process")
+def process_events(limit: int = 10) -> list[dict]:
+    return [build.model_dump(mode="json") for build in service.process_pending_events(limit=limit)]
