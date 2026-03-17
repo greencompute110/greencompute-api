@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+from collections.abc import Iterator
 from urllib import request
 from urllib.error import HTTPError, URLError
 
@@ -73,3 +74,37 @@ class HttpInferenceClient:
                 f"upstream invocation failed for deployment={deployment.deployment_id}"
             ) from exc
         return ChatCompletionResponse(**body)
+
+    def stream_chat_completion(
+        self,
+        deployment: DeploymentRecord,
+        payload: ChatCompletionRequest,
+    ) -> Iterator[str]:
+        if not deployment.endpoint:
+            raise InferenceUpstreamError(f"deployment endpoint missing: {deployment.deployment_id}")
+
+        upstream = request.Request(
+            url=f"{deployment.endpoint.rstrip('/')}/v1/chat/completions",
+            data=payload.model_copy(update={"stream": True}).model_dump_json().encode(),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(upstream, timeout=self.upstream_timeout_seconds) as response:  # noqa: S310
+                while True:
+                    line = response.readline()
+                    if not line:
+                        break
+                    yield line.decode()
+        except (TimeoutError, socket.timeout) as exc:
+            raise InferenceTimeoutError(
+                f"upstream timed out for deployment={deployment.deployment_id}"
+            ) from exc
+        except (HTTPError, URLError) as exc:
+            if isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError | socket.timeout):
+                raise InferenceTimeoutError(
+                    f"upstream timed out for deployment={deployment.deployment_id}"
+                ) from exc
+            raise InferenceUpstreamError(
+                f"upstream invocation failed for deployment={deployment.deployment_id}"
+            ) from exc

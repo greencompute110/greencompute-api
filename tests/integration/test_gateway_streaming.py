@@ -32,12 +32,25 @@ from greenference_protocol import (
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict | str) -> None:
         self.payload = payload
         self.status = 200
+        self._lines = None if not isinstance(payload, str) else [f"{line}\n".encode() for line in payload.splitlines()]
+        self._line_index = 0
 
     def read(self) -> bytes:
+        if isinstance(self.payload, str):
+            return self.payload.encode()
         return json.dumps(self.payload).encode()
+
+    def readline(self) -> bytes:
+        if self._lines is None:
+            return b""
+        if self._line_index >= len(self._lines):
+            return b""
+        line = self._lines[self._line_index]
+        self._line_index += 1
+        return line
 
     def __enter__(self) -> "_FakeResponse":
         return self
@@ -67,6 +80,9 @@ def _patch_upstream(
                 raise socket.timeout("timed out")
             deployment_id = path.split("/")[2]
             payload = ChatCompletionRequest(**json.loads(target.data.decode()))
+            if payload.stream:
+                stream = "".join(miner.stream_chat_completion(deployment_id, payload))
+                return _FakeResponse(stream)
             response = miner.serve_chat_completion(deployment_id, payload)
             return _FakeResponse(response.model_dump(mode="json"))
         raise HTTPError(target.full_url, 404, "not found", hdrs=None, fp=None)
@@ -74,7 +90,7 @@ def _patch_upstream(
     monkeypatch.setattr(inference_client_module.request, "urlopen", fake_urlopen)
 
 
-def _ready_gateway(shared_db: str) -> tuple[GatewayService, MinerAgentService, str]:
+def _ready_gateway(shared_db: str) -> tuple[GatewayService, MinerAgentService, ControlPlaneService, str]:
     control_plane = ControlPlaneService(ControlPlaneRepository(database_url=shared_db, bootstrap=True))
     builder = BuilderService(BuilderRepository(database_url=shared_db, bootstrap=True))
     gateway = GatewayService(
@@ -123,12 +139,12 @@ def _ready_gateway(shared_db: str) -> tuple[GatewayService, MinerAgentService, s
     deployment = gateway.create_deployment({"workload_id": workload.workload_id})
     control_plane.process_pending_events()
     miner.reconcile_once("miner-a")
-    return gateway, miner, workload.workload_id
+    return gateway, miner, control_plane, workload.workload_id
 
 
 def test_gateway_streaming_route_returns_sse(monkeypatch: pytest.MonkeyPatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    gateway, miner, workload_id = _ready_gateway(shared_db)
+    gateway, miner, control_plane, workload_id = _ready_gateway(shared_db)
     _patch_auth(monkeypatch)
     _patch_upstream(monkeypatch, miner)
     monkeypatch.setattr(routes_module, "service", gateway)
@@ -156,11 +172,18 @@ def test_gateway_streaming_route_returns_sse(monkeypatch: pytest.MonkeyPatch) ->
     assert "stream" in body
     assert "this" in body
     assert "response" in body
+    persisted_usage = control_plane.process_pending_events()
+    summary = control_plane.usage_summary()
+    assert len(persisted_usage["usage_records"]) == 1
+    deployment_id = next(iter(summary))
+    assert summary[deployment_id]["requests"] == 0.0
+    assert summary[deployment_id]["streamed_requests"] == 1.0
+    assert summary[deployment_id]["stream_chunks"] > 0.0
 
 
 def test_gateway_returns_504_on_upstream_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    gateway, miner, workload_id = _ready_gateway(shared_db)
+    gateway, miner, _control_plane, workload_id = _ready_gateway(shared_db)
     _patch_auth(monkeypatch)
     _patch_upstream(monkeypatch, miner, timeout_on_invoke=True)
     monkeypatch.setattr(routes_module, "service", gateway)

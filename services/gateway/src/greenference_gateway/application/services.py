@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Iterator
-from json import dumps
+from json import loads
 
 from greenference_builder.application.services import BuilderService, service as default_builder_service
 from greenference_control_plane.application.services import (
@@ -76,6 +76,35 @@ class GatewayService:
         return self.control_plane.list_deployments()
 
     def invoke_chat_completion(self, request: ChatCompletionRequest):
+        deployment = self._resolve_deployment_for_request(request)
+        try:
+            response = self.inference_client.invoke_chat_completion(deployment, request)
+        except RuntimeError as exc:
+            self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
+            raise
+        self.control_plane.clear_deployment_health_failures(deployment.deployment_id)
+        self._record_usage(deployment, stream=False, stream_chunk_count=0)
+        return response
+
+    def stream_chat_completion(self, request: ChatCompletionRequest) -> Iterator[str]:
+        deployment = self._resolve_deployment_for_request(request)
+        chunk_count = 0
+        try:
+            for line in self.inference_client.stream_chat_completion(deployment, request):
+                stripped = line.strip()
+                if stripped.startswith("data: ") and stripped != "data: [DONE]":
+                    payload = loads(stripped[6:])
+                    choices = payload.get("choices", [])
+                    if choices and choices[0].get("delta", {}).get("content"):
+                        chunk_count += 1
+                yield line
+        except RuntimeError as exc:
+            self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
+            raise
+        self.control_plane.clear_deployment_health_failures(deployment.deployment_id)
+        self._record_usage(deployment, stream=True, stream_chunk_count=chunk_count)
+
+    def _resolve_deployment_for_request(self, request: ChatCompletionRequest) -> DeploymentRecord:
         workload_id = self._resolve_workload_id(request.model)
         candidates = [
             deployment
@@ -85,7 +114,6 @@ class GatewayService:
         if not candidates:
             raise NoReadyDeploymentError(f"no ready deployment for model={request.model}")
 
-        last_upstream_error: RuntimeError | None = None
         for deployment in candidates:
             if not self.inference_client.check_deployment_health(deployment):
                 self.control_plane.record_deployment_health_failure(
@@ -93,53 +121,24 @@ class GatewayService:
                     f"deployment endpoint unhealthy: {deployment.endpoint}",
                 )
                 continue
-            try:
-                response = self.inference_client.invoke_chat_completion(deployment, request)
-            except RuntimeError as exc:
-                self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
-                last_upstream_error = exc
-                continue
-            self.control_plane.clear_deployment_health_failures(deployment.deployment_id)
-            self.control_plane.record_usage(
-                UsageRecord(
-                    deployment_id=deployment.deployment_id,
-                    workload_id=deployment.workload_id,
-                    hotkey=deployment.hotkey or "unknown",
-                    request_count=1,
-                    compute_seconds=0.25,
-                    latency_ms_p95=42.0,
-                    occupancy_seconds=0.25,
-                )
-            )
-            return response
+            return deployment
 
-        if last_upstream_error is not None:
-            raise last_upstream_error
         raise NoReadyDeploymentError(f"no healthy deployment available for model={request.model}")
 
-    def stream_chat_completion(self, request: ChatCompletionRequest) -> Iterator[str]:
-        response = self.invoke_chat_completion(request.model_copy(update={"stream": False}))
-        words = response.content.split()
-        for index, word in enumerate(words):
-            event = {
-                "id": response.id,
-                "object": "chat.completion.chunk",
-                "model": response.model,
-                "deployment_id": response.deployment_id,
-                "routed_hotkey": response.routed_hotkey,
-                "choices": [{"index": 0, "delta": {"content": word if index == 0 else f" {word}"}}],
-            }
-            yield f"data: {dumps(event)}\n\n"
-        done_event = {
-            "id": response.id,
-            "object": "chat.completion.chunk",
-            "model": response.model,
-            "deployment_id": response.deployment_id,
-            "routed_hotkey": response.routed_hotkey,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        }
-        yield f"data: {dumps(done_event)}\n\n"
-        yield "data: [DONE]\n\n"
+    def _record_usage(self, deployment: DeploymentRecord, *, stream: bool, stream_chunk_count: int) -> None:
+        self.control_plane.record_usage(
+            UsageRecord(
+                deployment_id=deployment.deployment_id,
+                workload_id=deployment.workload_id,
+                hotkey=deployment.hotkey or "unknown",
+                request_count=0 if stream else 1,
+                streamed_request_count=1 if stream else 0,
+                stream_chunk_count=stream_chunk_count,
+                compute_seconds=0.25,
+                latency_ms_p95=42.0,
+                occupancy_seconds=0.25,
+            )
+        )
 
     def _resolve_workload_id(self, model: str) -> str:
         workload = self.control_plane.repository.get_workload(model)

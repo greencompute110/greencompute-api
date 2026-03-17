@@ -117,6 +117,8 @@ class UsageRecordORM(Base):
     workload_id: Mapped[str] = mapped_column(String(64), index=True)
     hotkey: Mapped[str] = mapped_column(String(128), index=True)
     request_count: Mapped[int] = mapped_column(Integer, default=1)
+    streamed_request_count: Mapped[int] = mapped_column(Integer, default=0)
+    stream_chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     compute_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     latency_ms_p95: Mapped[float] = mapped_column(Float, default=0.0)
     occupancy_seconds: Mapped[float] = mapped_column(Float, default=0.0)
