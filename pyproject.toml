@@ -1,0 +1,26 @@
+[project]
+name = "greenference-api-repo"
+version = "0.1.0"
+description = "Greenference API-side services"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv.workspace]
+members = [
+  "packages/persistence",
+  "services/gateway",
+  "services/control-plane",
+  "services/validator",
+  "services/builder",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "N"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

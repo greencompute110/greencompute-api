@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: greenference-control-plane
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: greenference-control-plane
+  template:
+    metadata:
+      labels:
+        app: greenference-control-plane
+    spec:
+      containers:
+        - name: control-plane
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: 8000
+

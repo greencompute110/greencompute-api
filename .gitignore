@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+dist/
+build/
+.coverage
+htmlcov/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+

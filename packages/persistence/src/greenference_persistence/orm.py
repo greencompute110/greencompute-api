@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+def utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class MinerORM(Base):
+    __tablename__ = "miners"
+
+    hotkey: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payout_address: Mapped[str] = mapped_column(String(256))
+    api_base_url: Mapped[str] = mapped_column(String(512))
+    validator_url: Mapped[str] = mapped_column(String(512))
+    supported_workload_kinds: Mapped[list[str]] = mapped_column(JSON)
+
+
+class HeartbeatORM(Base):
+    __tablename__ = "heartbeats"
+
+    hotkey: Mapped[str] = mapped_column(String(128), primary_key=True)
+    healthy: Mapped[bool] = mapped_column(Boolean, default=True)
+    active_deployments: Mapped[int] = mapped_column(Integer, default=0)
+    active_leases: Mapped[int] = mapped_column(Integer, default=0)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class CapacityORM(Base):
+    __tablename__ = "capacities"
+
+    hotkey: Mapped[str] = mapped_column(String(128), primary_key=True)
+    nodes: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WorkloadORM(Base):
+    __tablename__ = "workloads"
+
+    workload_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    image: Mapped[str] = mapped_column(String(512))
+    kind: Mapped[str] = mapped_column(String(32))
+    security_tier: Mapped[str] = mapped_column(String(32))
+    pricing_class: Mapped[str] = mapped_column(String(32))
+    requirements: Mapped[dict[str, Any]] = mapped_column(JSON)
+    public: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DeploymentORM(Base):
+    __tablename__ = "deployments"
+
+    deployment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workload_id: Mapped[str] = mapped_column(String(64), index=True)
+    hotkey: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    node_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    state: Mapped[str] = mapped_column(String(32), index=True)
+    requested_instances: Mapped[int] = mapped_column(Integer)
+    ready_instances: Mapped[int] = mapped_column(Integer, default=0)
+    endpoint: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class LeaseAssignmentORM(Base):
+    __tablename__ = "lease_assignments"
+
+    assignment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    deployment_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    workload_id: Mapped[str] = mapped_column(String(64), index=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    node_id: Mapped[str] = mapped_column(String(128))
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="assigned")
+
+
+class UsageRecordORM(Base):
+    __tablename__ = "usage_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    deployment_id: Mapped[str] = mapped_column(String(64), index=True)
+    workload_id: Mapped[str] = mapped_column(String(64), index=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    request_count: Mapped[int] = mapped_column(Integer, default=1)
+    compute_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    latency_ms_p95: Mapped[float] = mapped_column(Float, default=0.0)
+    occupancy_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    measured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DeploymentEventORM(Base):
+    __tablename__ = "deployment_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    deployment_id: Mapped[str] = mapped_column(String(64), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class BuildORM(Base):
+    __tablename__ = "builds"
+
+    build_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    image: Mapped[str] = mapped_column(String(512), index=True)
+    context_uri: Mapped[str] = mapped_column(String(1024))
+    dockerfile_path: Mapped[str] = mapped_column(String(256))
+    public: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    artifact_uri: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ValidatorCapabilityORM(Base):
+    __tablename__ = "validator_capabilities"
+
+    hotkey: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class ProbeChallengeORM(Base):
+    __tablename__ = "probe_challenges"
+
+    challenge_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    node_id: Mapped[str] = mapped_column(String(128))
+    kind: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ProbeResultORM(Base):
+    __tablename__ = "probe_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    challenge_id: Mapped[str] = mapped_column(String(64), index=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    node_id: Mapped[str] = mapped_column(String(128))
+    latency_ms: Mapped[float] = mapped_column(Float)
+    throughput: Mapped[float] = mapped_column(Float)
+    success: Mapped[bool] = mapped_column(Boolean, default=True)
+    benchmark_signature: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    proxy_suspected: Mapped[bool] = mapped_column(Boolean, default=False)
+    readiness_failures: Mapped[int] = mapped_column(Integer, default=0)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ScoreCardORM(Base):
+    __tablename__ = "scorecards"
+
+    hotkey: Mapped[str] = mapped_column(String(128), primary_key=True)
+    capacity_weight: Mapped[float] = mapped_column(Float)
+    reliability_score: Mapped[float] = mapped_column(Float)
+    performance_score: Mapped[float] = mapped_column(Float)
+    security_score: Mapped[float] = mapped_column(Float)
+    fraud_penalty: Mapped[float] = mapped_column(Float)
+    final_score: Mapped[float] = mapped_column(Float, index=True)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WeightSnapshotORM(Base):
+    __tablename__ = "weight_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    netuid: Mapped[int] = mapped_column(Integer, index=True)
+    weights: Mapped[dict[str, float]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+

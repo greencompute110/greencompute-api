@@ -1,0 +1,6 @@
+image:
+  repository: greenference/control-plane
+  tag: latest
+service:
+  port: 8001
+

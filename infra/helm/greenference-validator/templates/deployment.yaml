@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: greenference-validator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: greenference-validator
+  template:
+    metadata:
+      labels:
+        app: greenference-validator
+    spec:
+      containers:
+        - name: validator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: 8000
+
