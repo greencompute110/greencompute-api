@@ -40,7 +40,12 @@ app.include_router(router)
 
 @app.get("/healthz")
 def healthcheck() -> dict[str, str | bool]:
-    return {"status": "ok", "service": settings.service_name, "workers_enabled": settings.enable_background_workers}
+    return {
+        "status": "ok",
+        "service": settings.service_name,
+        "workers_enabled": settings.enable_background_workers,
+        "bus_transport": settings.bus_transport,
+    }
 
 
 @app.get("/readyz")
@@ -52,6 +57,7 @@ def readiness() -> dict[str, str]:
             detail={"status": "error", "service": settings.service_name, "database_error": error},
         )
     payload: dict[str, object] = {"status": "ok", "service": settings.service_name, "database": "ok"}
+    payload["bus_transport"] = settings.bus_transport
     if settings.enable_background_workers:
         payload["workers_enabled"] = True
         payload["worker_running"] = bool(_worker_state["running"])

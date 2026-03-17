@@ -57,11 +57,23 @@ After the stack is healthy, run:
 python greenference-api/infra/local/smoke_test.py
 ```
 
-The smoke test waits for service readiness, registers a user and admin API key, publishes a validator capability for the bootstrap miner, runs build -> workload -> deployment -> inference -> usage, then submits a validator probe result and publishes a weight snapshot.
+The smoke test waits for service readiness, verifies that `builder`, `control-plane`, and `validator` are running with `bus_transport=nats`, registers a user and admin API key, publishes a validator capability for the bootstrap miner, runs build -> workload -> deployment -> inference -> usage, then submits a validator probe result and publishes a weight snapshot.
+
+To validate restart and recovery behavior against the running compose stack:
+
+```bash
+python greenference-api/infra/local/smoke_test.py --check-recovery
+```
+
+By default, recovery mode restarts `control-plane`, `builder`, and `miner-agent`, waits for them to become ready again, then verifies the same deployment is still routable and usage continues to aggregate. You can override the restart set with:
+
+```bash
+GREENFERENCE_STACK_RESTART_SERVICES=control-plane,validator python greenference-api/infra/local/smoke_test.py --check-recovery
+```
 
 ## Recovery Expectations
 
-The stack is expected to recover these cases cleanly:
+The stack validator is expected to prove these cases cleanly:
 
 - pending workflow events survive service restarts because they are stored in Postgres
 - deployments remain queryable after `gateway` or `control-plane` restarts
