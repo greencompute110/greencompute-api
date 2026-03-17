@@ -83,7 +83,7 @@ class ControlPlaneService:
         return assignment
 
     def list_leases(self, hotkey: str) -> list[LeaseAssignment]:
-        return self.repository.list_assignments(hotkey)
+        return self.repository.list_assignments(hotkey, statuses=["assigned", "activating"])
 
     def list_deployments(self) -> list[DeploymentRecord]:
         return self.repository.list_deployments()
@@ -93,11 +93,20 @@ class ControlPlaneService:
         if deployment is None:
             raise KeyError(f"deployment not found: {update.deployment_id}")
         deployment.state = transition_state(deployment.state, update.state)
-        deployment.ready_instances = update.ready_instances
+        deployment.ready_instances = update.ready_instances if update.state == DeploymentState.READY else 0
         deployment.endpoint = update.endpoint or deployment.endpoint
         deployment.last_error = update.error
         deployment.updated_at = update.observed_at
         self.repository.add_deployment_event(update)
+        assignment_status = {
+            DeploymentState.PULLING: "activating",
+            DeploymentState.STARTING: "activating",
+            DeploymentState.READY: "active",
+            DeploymentState.FAILED: "failed",
+            DeploymentState.TERMINATED: "terminated",
+        }.get(update.state)
+        if assignment_status is not None:
+            self.repository.update_assignment_status(update.deployment_id, assignment_status)
         return self.repository.update_deployment(deployment)
 
     def resolve_ready_deployment(self, workload_id: str) -> DeploymentRecord | None:

@@ -191,13 +191,26 @@ class ControlPlaneRepository:
             session.add(row)
         return assignment
 
-    def list_assignments(self, hotkey: str | None = None) -> list[LeaseAssignment]:
+    def list_assignments(self, hotkey: str | None = None, statuses: list[str] | None = None) -> list[LeaseAssignment]:
         with session_scope(self.session_factory) as session:
             stmt = select(LeaseAssignmentORM)
             if hotkey:
                 stmt = stmt.where(LeaseAssignmentORM.hotkey == hotkey)
+            if statuses:
+                stmt = stmt.where(LeaseAssignmentORM.status.in_(statuses))
             rows = session.scalars(stmt).all()
             return [self._to_assignment(row) for row in rows]
+
+    def update_assignment_status(self, deployment_id: str, status: str) -> LeaseAssignment | None:
+        with session_scope(self.session_factory) as session:
+            row = session.scalar(select(LeaseAssignmentORM).where(LeaseAssignmentORM.deployment_id == deployment_id))
+            if row is None:
+                return None
+            row.status = status
+            session.add(row)
+            session.flush()
+            session.refresh(row)
+            return self._to_assignment(row)
 
     def add_usage_record(self, record: UsageRecord) -> UsageRecord:
         with session_scope(self.session_factory) as session:

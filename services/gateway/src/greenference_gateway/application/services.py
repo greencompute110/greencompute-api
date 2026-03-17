@@ -21,7 +21,8 @@ from greenference_protocol import (
     WorkloadCreateRequest,
     WorkloadSpec,
 )
-from greenference_gateway.domain.routing import InferenceRouter, NoReadyDeploymentError
+from greenference_gateway.domain.routing import NoReadyDeploymentError
+from greenference_gateway.infrastructure.inference_client import HttpInferenceClient
 from greenference_gateway.infrastructure.repository import GatewayRepository
 
 
@@ -31,11 +32,12 @@ class GatewayService:
         repository: GatewayRepository | None = None,
         control_plane: ControlPlaneService | None = None,
         builder: BuilderService | None = None,
+        inference_client: HttpInferenceClient | None = None,
     ) -> None:
         self.repository = repository or GatewayRepository()
         self.control_plane = control_plane or default_control_plane_service
         self.builder = builder or default_builder_service
-        self.router = InferenceRouter()
+        self.inference_client = inference_client or HttpInferenceClient()
 
     def register_user(self, request: UserRegistrationRequest) -> UserRecord:
         user = UserRecord(username=request.username, email=request.email)
@@ -74,9 +76,9 @@ class GatewayService:
     def invoke_chat_completion(self, request: ChatCompletionRequest):
         workload_id = self._resolve_workload_id(request.model)
         deployment = self.control_plane.resolve_ready_deployment(workload_id)
-        if deployment is None:
+        if deployment is None or deployment.endpoint is None:
             raise NoReadyDeploymentError(f"no ready deployment for model={request.model}")
-        response = self.router.render_chat_response(request, deployment)
+        response = self.inference_client.invoke_chat_completion(deployment, request)
         self.control_plane.record_usage(
             UsageRecord(
                 deployment_id=deployment.deployment_id,

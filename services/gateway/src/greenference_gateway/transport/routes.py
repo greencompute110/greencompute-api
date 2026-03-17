@@ -10,6 +10,7 @@ from greenference_protocol import (
 )
 from greenference_gateway.application.services import service
 from greenference_gateway.domain.routing import NoReadyDeploymentError
+from greenference_gateway.infrastructure.inference_client import InferenceUpstreamError
 
 router = APIRouter()
 
@@ -60,6 +61,8 @@ def chat_completions(payload: ChatCompletionRequest) -> dict:
         return service.invoke_chat_completion(payload).model_dump(mode="json")
     except NoReadyDeploymentError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except InferenceUpstreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.post("/v1/completions")
