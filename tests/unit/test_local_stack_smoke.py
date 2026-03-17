@@ -171,3 +171,30 @@ def test_main_runs_failure_checks_when_flag_present(monkeypatch) -> None:
 
     assert result == 0
     assert calls == ["wait", "happy", "metrics:dep-1", "failures"]
+
+
+def test_main_runs_operator_action_checks_when_flag_present(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_wait() -> None:
+        calls.append("wait")
+
+    def fake_run_happy_path() -> dict:
+        calls.append("happy")
+        return {"headers": {}, "deployment": {"deployment_id": "dep-1"}}
+
+    def fake_assert_metrics(headers: dict, deployment_id: str) -> None:
+        calls.append(f"metrics:{deployment_id}")
+
+    def fake_operator_actions(context: dict) -> None:
+        calls.append(f"operator:{context['deployment']['deployment_id']}")
+
+    monkeypatch.setattr(SMOKE_TEST, "wait_for_stack_readiness", fake_wait)
+    monkeypatch.setattr(SMOKE_TEST, "run_happy_path", fake_run_happy_path)
+    monkeypatch.setattr(SMOKE_TEST, "_assert_metrics", fake_assert_metrics)
+    monkeypatch.setattr(SMOKE_TEST, "verify_operator_actions", fake_operator_actions)
+
+    result = SMOKE_TEST.main(["--check-operator-actions"])
+
+    assert result == 0
+    assert calls == ["wait", "happy", "metrics:dep-1", "operator:dep-1"]

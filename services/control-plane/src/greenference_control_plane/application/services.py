@@ -53,6 +53,20 @@ class ControlPlaneService:
     def register_miner(self, registration: MinerRegistration) -> MinerRegistration:
         return self.repository.upsert_miner(registration)
 
+    def drain_miner(self, hotkey: str) -> MinerRegistration:
+        miner = self.repository.set_miner_drained(hotkey, True)
+        if miner is None:
+            raise KeyError(f"miner not found: {hotkey}")
+        self.metrics.increment("miner.drained")
+        return miner
+
+    def undrain_miner(self, hotkey: str) -> MinerRegistration:
+        miner = self.repository.set_miner_drained(hotkey, False)
+        if miner is None:
+            raise KeyError(f"miner not found: {hotkey}")
+        self.metrics.increment("miner.undrained")
+        return miner
+
     def record_heartbeat(self, heartbeat: Heartbeat) -> Heartbeat:
         return self.repository.upsert_heartbeat(heartbeat)
 
@@ -113,10 +127,17 @@ class ControlPlaneService:
     def _assign_lease(self, workload: WorkloadSpec, deployment_id: str) -> LeaseAssignment | None:
         nodes = []
         for node in self.repository.list_nodes():
+            miner = self.repository.get_miner(node.hotkey)
+            if miner is not None and miner.drained:
+                continue
             heartbeat = self.repository.get_heartbeat(node.hotkey)
             if heartbeat and not heartbeat.healthy:
                 continue
             if self._is_node_stale(node):
+                continue
+            if self._is_server_for_node_stale(node):
+                continue
+            if self._is_node_in_cooldown(node.node_id):
                 continue
             nodes.append(node)
         assignment = self.placement_policy.assign_lease(workload, deployment_id, nodes)
@@ -270,6 +291,7 @@ class ControlPlaneService:
             reports.append(
                 {
                     "hotkey": miner.hotkey,
+                    "drained": miner.drained,
                     "status": status,
                     "reason": reason,
                     "last_heartbeat_at": self._ensure_utc(heartbeat.observed_at) if heartbeat is not None else None,
@@ -337,6 +359,45 @@ class ControlPlaneService:
             )
         return reports
 
+    def placement_exclusion_report(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        observed_at = now or datetime.now(UTC)
+        servers = {server.server_id: server for server in self.repository.list_servers()}
+        exclusions: list[dict[str, Any]] = []
+        latest_by_node: dict[str, Any] = {}
+        for placement in self.repository.list_placements(limit=1000):
+            latest_by_node.setdefault(placement.node_id, placement)
+        for node in self.repository.list_nodes():
+            miner = self.repository.get_miner(node.hotkey)
+            latest = latest_by_node.get(node.node_id)
+            if miner is not None and miner.drained:
+                exclusions.append({"hotkey": node.hotkey, "node_id": node.node_id, "reason": "miner_drained"})
+                continue
+            if self._is_node_stale(node, now=observed_at):
+                exclusions.append({"hotkey": node.hotkey, "node_id": node.node_id, "reason": "node_stale"})
+                continue
+            server = servers.get(node.server_id or "")
+            if server is not None and self._is_server_stale(server.observed_at, now=observed_at):
+                exclusions.append({"hotkey": node.hotkey, "node_id": node.node_id, "reason": "server_stale"})
+                continue
+            if latest is not None and latest.cooldown_until is not None and self._ensure_utc(latest.cooldown_until) > observed_at:
+                exclusions.append(
+                    {
+                        "hotkey": node.hotkey,
+                        "node_id": node.node_id,
+                        "reason": "placement_cooldown",
+                        "cooldown_until": latest.cooldown_until,
+                        "failure_count": latest.failure_count,
+                    }
+                )
+        return exclusions
+
+    def deployment_failure_report(self) -> list[dict[str, Any]]:
+        return [
+            deployment.model_dump(mode="json")
+            for deployment in self.repository.list_deployments()
+            if deployment.state == DeploymentState.FAILED or deployment.retry_exhausted
+        ]
+
     def invocation_failure_report(self, limit: int = 100) -> list[dict[str, Any]]:
         return [
             record.model_dump(mode="json")
@@ -360,9 +421,66 @@ class ControlPlaneService:
                 "delivery_status_counts": delivery_status_counts,
             },
             "unhealthy_miners": unhealthy_miners,
+            "drained_miners": [item for item in self.miner_health_report() if item["drained"]],
             "stuck_deployments": stuck_deployments,
             "failed_builds": failed_builds[-20:],
         }
+
+    def requeue_deployment(self, deployment_id: str) -> DeploymentRecord:
+        deployment = self.repository.get_deployment(deployment_id)
+        if deployment is None:
+            raise KeyError(f"deployment not found: {deployment_id}")
+        assignment = next(
+            (item for item in self.repository.list_assignments(statuses=["assigned", "activating", "active"]) if item.deployment_id == deployment_id),
+            None,
+        )
+        if assignment is not None:
+            requeued = self._requeue_assignment(assignment, "operator requested requeue", datetime.now(UTC))
+            if requeued is not None:
+                return requeued
+        deployment.state = DeploymentState.PENDING
+        deployment.hotkey = None
+        deployment.node_id = None
+        deployment.endpoint = None
+        deployment.ready_instances = 0
+        deployment.last_error = "operator requested requeue"
+        deployment.last_retry_reason = deployment.last_error
+        deployment.updated_at = datetime.now(UTC)
+        saved = self.repository.update_deployment(deployment)
+        self.bus.publish(
+            "deployment.requested",
+            {"deployment_id": saved.deployment_id, "workload_id": saved.workload_id, "requested_instances": saved.requested_instances},
+        )
+        return saved
+
+    def fail_deployment(self, deployment_id: str) -> DeploymentRecord:
+        deployment = self.repository.get_deployment(deployment_id)
+        if deployment is None:
+            raise KeyError(f"deployment not found: {deployment_id}")
+        assignment = next(
+            (item for item in self.repository.list_assignments(statuses=["assigned", "activating", "active"]) if item.deployment_id == deployment_id),
+            None,
+        )
+        if assignment is not None:
+            workload = self.repository.get_workload(deployment.workload_id)
+            if workload is not None:
+                self.repository.adjust_node_capacity(assignment.hotkey, assignment.node_id, workload.requirements.gpu_count)
+            self.repository.update_assignment_status(deployment_id, "terminated", reason="operator forced failure")
+            self.repository.update_placement_status(
+                deployment_id,
+                "failed",
+                reason="operator forced failure",
+                increment_failure=True,
+                cooldown_until=datetime.now(UTC) + timedelta(seconds=settings.placement_failure_cooldown_seconds),
+            )
+        return self.update_deployment_status(
+            DeploymentStatusUpdate(
+                deployment_id=deployment_id,
+                state=DeploymentState.FAILED,
+                error="operator forced failure",
+                observed_at=datetime.now(UTC),
+            )
+        )
 
     def stuck_deployments_report(self, now: datetime | None = None) -> list[dict[str, Any]]:
         observed_at = now or datetime.now(UTC)
@@ -657,6 +775,13 @@ class ControlPlaneService:
             workload.requirements.gpu_count,
         )
         self.repository.update_assignment_status(assignment.deployment_id, "reassigned", reason=reason)
+        self.repository.update_placement_status(
+            assignment.deployment_id,
+            "failed",
+            reason=reason,
+            increment_failure=True,
+            cooldown_until=observed_at + timedelta(seconds=settings.placement_failure_cooldown_seconds),
+        )
         deployment.state = DeploymentState.PENDING
         deployment.hotkey = None
         deployment.node_id = None
@@ -695,6 +820,23 @@ class ControlPlaneService:
             if node.node_id == node_id:
                 return node
         return None
+
+    def _is_server_for_node_stale(self, node: NodeCapability, now: datetime | None = None) -> bool:
+        if not node.server_id:
+            return False
+        for server in self.repository.list_servers():
+            if server.server_id == node.server_id:
+                return self._is_server_stale(server.observed_at, now=now)
+        return False
+
+    def _is_node_in_cooldown(self, node_id: str, now: datetime | None = None) -> bool:
+        observed_at = now or datetime.now(UTC)
+        for placement in self.repository.list_placements(limit=1000):
+            if placement.node_id != node_id or placement.cooldown_until is None:
+                continue
+            if self._ensure_utc(placement.cooldown_until) > observed_at:
+                return True
+        return False
 
     def _is_node_stale(self, node: NodeCapability, now: datetime | None = None) -> bool:
         observed_at = now or datetime.now(UTC)

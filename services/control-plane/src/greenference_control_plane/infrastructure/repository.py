@@ -56,6 +56,7 @@ class ControlPlaneRepository:
             row.api_base_url = registration.api_base_url
             row.validator_url = registration.validator_url
             row.auth_secret = registration.auth_secret
+            row.drained = registration.drained
             row.supported_workload_kinds = [item.value for item in registration.supported_workload_kinds]
             session.add(row)
         return registration
@@ -69,6 +70,17 @@ class ControlPlaneRepository:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(select(MinerORM)).all()
             return [self._to_registration(row) for row in rows]
+
+    def set_miner_drained(self, hotkey: str, drained: bool) -> MinerRegistration | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(MinerORM, hotkey)
+            if row is None:
+                return None
+            row.drained = drained
+            session.add(row)
+            session.flush()
+            session.refresh(row)
+            return self._to_registration(row)
 
     def upsert_heartbeat(self, heartbeat: Heartbeat) -> Heartbeat:
         with session_scope(self.session_factory) as session:
@@ -363,6 +375,48 @@ class ControlPlaneRepository:
             session.refresh(row)
             return self._to_assignment(row)
 
+    def update_placement_status(
+        self,
+        deployment_id: str,
+        status: str,
+        *,
+        reason: str | None = None,
+        increment_failure: bool = False,
+        cooldown_until: datetime | None = None,
+    ) -> PlacementRecord | None:
+        with session_scope(self.session_factory) as session:
+            row = session.scalar(
+                select(PlacementORM)
+                .where(PlacementORM.deployment_id == deployment_id)
+                .order_by(PlacementORM.created_at.desc())
+            )
+            if row is None:
+                return None
+            row.status = status
+            row.reason = reason
+            if increment_failure:
+                row.failure_count += 1
+            if cooldown_until is not None:
+                row.cooldown_until = cooldown_until
+            row.updated_at = datetime.now(UTC)
+            session.add(row)
+            session.flush()
+            session.refresh(row)
+            return PlacementRecord(
+                placement_id=row.placement_id,
+                deployment_id=row.deployment_id,
+                workload_id=row.workload_id,
+                hotkey=row.hotkey,
+                server_id=row.server_id,
+                node_id=row.node_id,
+                status=row.status,
+                reason=row.reason,
+                failure_count=row.failure_count,
+                cooldown_until=row.cooldown_until,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+            )
+
     def add_usage_record(self, record: UsageRecord) -> UsageRecord:
         with session_scope(self.session_factory) as session:
             row = UsageRecordORM(
@@ -491,6 +545,8 @@ class ControlPlaneRepository:
                     node_id=row.node_id,
                     status=row.status,
                     reason=row.reason,
+                    failure_count=row.failure_count,
+                    cooldown_until=row.cooldown_until,
                     created_at=row.created_at,
                     updated_at=row.updated_at,
                 )
@@ -524,6 +580,7 @@ class ControlPlaneRepository:
             payout_address=row.payout_address,
             api_base_url=row.api_base_url,
             validator_url=row.validator_url,
+            drained=row.drained,
             auth_secret=row.auth_secret,
             supported_workload_kinds=row.supported_workload_kinds,
         )

@@ -4,8 +4,14 @@ from sqlalchemy import select
 
 from greenference_persistence import create_db_engine, create_session_factory, init_database, session_scope
 from greenference_persistence.db import needs_bootstrap
-from greenference_persistence.orm import BuildContextORM, BuildEventORM, BuildORM
-from greenference_protocol import BuildContextRecord, BuildEventRecord, BuildRecord
+from greenference_persistence.orm import BuildAttemptORM, BuildContextORM, BuildEventORM, BuildLogORM, BuildORM
+from greenference_protocol import (
+    BuildAttemptRecord,
+    BuildContextRecord,
+    BuildEventRecord,
+    BuildLogRecord,
+    BuildRecord,
+)
 
 
 class BuilderRepository:
@@ -36,6 +42,7 @@ class BuilderRepository:
             row.last_operation = build.last_operation
             row.cleanup_status = build.cleanup_status
             row.retry_count = build.retry_count
+            row.retry_exhausted = build.retry_exhausted
             row.created_at = build.created_at
             row.updated_at = build.updated_at
             session.add(row)
@@ -85,6 +92,69 @@ class BuilderRepository:
             )
         return event
 
+    def save_build_attempt(self, attempt: BuildAttemptRecord) -> BuildAttemptRecord:
+        with session_scope(self.session_factory) as session:
+            row = session.get(BuildAttemptORM, attempt.attempt_id) or BuildAttemptORM(attempt_id=attempt.attempt_id)
+            row.build_id = attempt.build_id
+            row.attempt = attempt.attempt
+            row.status = attempt.status
+            row.failure_class = attempt.failure_class
+            row.last_operation = attempt.last_operation
+            row.started_at = attempt.started_at
+            row.finished_at = attempt.finished_at
+            session.add(row)
+        return attempt
+
+    def get_build_attempt(self, build_id: str, attempt: int) -> BuildAttemptRecord | None:
+        with session_scope(self.session_factory) as session:
+            row = session.scalar(
+                select(BuildAttemptORM)
+                .where(BuildAttemptORM.build_id == build_id, BuildAttemptORM.attempt == attempt)
+                .order_by(BuildAttemptORM.started_at.desc())
+            )
+            return self._to_build_attempt(row) if row is not None else None
+
+    def list_build_attempts(self, build_id: str) -> list[BuildAttemptRecord]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(BuildAttemptORM)
+                .where(BuildAttemptORM.build_id == build_id)
+                .order_by(BuildAttemptORM.attempt.asc(), BuildAttemptORM.started_at.asc())
+            ).all()
+            return [self._to_build_attempt(row) for row in rows]
+
+    def add_build_log(self, log: BuildLogRecord) -> BuildLogRecord:
+        with session_scope(self.session_factory) as session:
+            session.add(
+                BuildLogORM(
+                    log_id=log.log_id,
+                    build_id=log.build_id,
+                    attempt=log.attempt,
+                    stage=log.stage,
+                    message=log.message,
+                    created_at=log.created_at,
+                )
+            )
+        return log
+
+    def list_build_logs(self, build_id: str, attempt: int | None = None) -> list[BuildLogRecord]:
+        with session_scope(self.session_factory) as session:
+            stmt = select(BuildLogORM).where(BuildLogORM.build_id == build_id)
+            if attempt is not None:
+                stmt = stmt.where(BuildLogORM.attempt == attempt)
+            rows = session.scalars(stmt.order_by(BuildLogORM.created_at.asc())).all()
+            return [
+                BuildLogRecord(
+                    log_id=row.log_id,
+                    build_id=row.build_id,
+                    attempt=row.attempt,
+                    stage=row.stage,
+                    message=row.message,
+                    created_at=row.created_at,
+                )
+                for row in rows
+            ]
+
     def list_build_events(self, build_id: str) -> list[BuildEventRecord]:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(
@@ -126,6 +196,7 @@ class BuilderRepository:
                 last_operation=row.last_operation,
                 cleanup_status=row.cleanup_status,
                 retry_count=row.retry_count,
+                retry_exhausted=row.retry_exhausted,
                 created_at=row.created_at,
                 updated_at=row.updated_at,
             )
@@ -157,8 +228,22 @@ class BuilderRepository:
                     last_operation=row.last_operation,
                     cleanup_status=row.cleanup_status,
                     retry_count=row.retry_count,
+                    retry_exhausted=row.retry_exhausted,
                     created_at=row.created_at,
                     updated_at=row.updated_at,
                 )
                 for row in rows
             ]
+
+    @staticmethod
+    def _to_build_attempt(row: BuildAttemptORM) -> BuildAttemptRecord:
+        return BuildAttemptRecord(
+            attempt_id=row.attempt_id,
+            build_id=row.build_id,
+            attempt=row.attempt,
+            status=row.status,
+            failure_class=row.failure_class,
+            last_operation=row.last_operation,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+        )

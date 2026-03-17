@@ -158,6 +158,30 @@ def test_builder_retry_and_cleanup_recover_transient_failure(monkeypatch) -> Non
     assert attempts[-1]["status"] == "published"
 
 
+def test_builder_persists_attempts_logs_and_cancellation(monkeypatch) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    repository = BuilderRepository(database_url=shared_db, bootstrap=True)
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+    builder = BuilderService(repository, workflow_repository=workflow_repository)
+
+    build = builder.start_build(
+        BuildRequest(
+            image="greenference/cancel:latest",
+            context_uri="s3://greenference/builds/cancel.zip",
+        )
+    )
+    cancelled = builder.cancel_build(build.build_id)
+    processed = builder.process_pending_events(limit=5)
+    attempt = builder.get_build_attempt(build.build_id, 1)
+    logs = builder.list_build_logs(build.build_id)
+
+    assert cancelled.status == "cancelled"
+    assert processed == []
+    assert attempt is None
+    assert any(item.stage == "cancelled" for item in logs)
+
+
 def test_control_plane_fails_expired_leases_and_emits_event() -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
     repository = ControlPlaneRepository(database_url=shared_db, bootstrap=True)

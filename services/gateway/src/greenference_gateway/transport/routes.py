@@ -112,6 +112,30 @@ def get_build_attempts(
     return service.build_attempts(build_id)
 
 
+@router.get("/platform/builds/{build_id}/attempts/{attempt}")
+def get_build_attempt(
+    build_id: str,
+    attempt: int,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    record = service.get_build_attempt(build_id, attempt)
+    if record is None:
+        raise HTTPException(status_code=404, detail="build attempt not found")
+    return record.model_dump(mode="json")
+
+
+@router.get("/platform/builds/{build_id}/logs")
+def get_build_logs(
+    build_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return [log.model_dump(mode="json") for log in service.list_build_logs(build_id)]
+
+
 @router.post("/platform/builds/{build_id}/retry")
 def retry_build(
     build_id: str,
@@ -136,6 +160,21 @@ def cleanup_build(
         return service.cleanup_build(build_id).model_dump(mode="json")
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/platform/builds/{build_id}/cancel")
+def cancel_build(
+    build_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    try:
+        return service.cancel_build(build_id).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("/platform/workloads")

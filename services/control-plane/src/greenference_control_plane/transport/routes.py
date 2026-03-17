@@ -257,6 +257,24 @@ def debug_deployment_retries(
     return service.deployment_retry_report()
 
 
+@router.get("/platform/v1/debug/placement-exclusions")
+def debug_placement_exclusions(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_admin_api_key(authorization, x_api_key)
+    return service.placement_exclusion_report()
+
+
+@router.get("/platform/v1/debug/deployment-failures")
+def debug_deployment_failures(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_admin_api_key(authorization, x_api_key)
+    return service.deployment_failure_report()
+
+
 @router.get("/platform/v1/debug/miner-drift")
 def debug_miner_drift(
     authorization: str | None = Header(default=None),
@@ -273,6 +291,58 @@ def debug_status(
 ) -> dict:
     require_admin_api_key(authorization, x_api_key)
     return service.operator_status()
+
+
+@router.post("/platform/v1/debug/deployments/{deployment_id}/requeue")
+def requeue_deployment(
+    deployment_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_admin_api_key(authorization, x_api_key)
+    try:
+        return service.requeue_deployment(deployment_id).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/platform/v1/debug/deployments/{deployment_id}/fail")
+def fail_deployment(
+    deployment_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_admin_api_key(authorization, x_api_key)
+    try:
+        return service.fail_deployment(deployment_id).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/platform/v1/debug/miners/{hotkey}/drain")
+def drain_miner(
+    hotkey: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_admin_api_key(authorization, x_api_key)
+    try:
+        return service.drain_miner(hotkey).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/platform/v1/debug/miners/{hotkey}/undrain")
+def undrain_miner(
+    hotkey: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_admin_api_key(authorization, x_api_key)
+    try:
+        return service.undrain_miner(hotkey).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/platform/v1/debug/workers")

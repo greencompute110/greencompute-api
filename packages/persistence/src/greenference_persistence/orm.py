@@ -23,6 +23,7 @@ class MinerORM(Base):
     api_base_url: Mapped[str] = mapped_column(String(512))
     validator_url: Mapped[str] = mapped_column(String(512))
     auth_secret: Mapped[str] = mapped_column(String(255))
+    drained: Mapped[bool] = mapped_column(Boolean, default=False)
     supported_workload_kinds: Mapped[list[str]] = mapped_column(JSON)
 
 
@@ -159,6 +160,8 @@ class PlacementORM(Base):
     node_id: Mapped[str] = mapped_column(String(128), index=True)
     status: Mapped[str] = mapped_column(String(32), index=True, default="assigned")
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -241,6 +244,7 @@ class BuildORM(Base):
     last_operation: Mapped[str | None] = mapped_column(String(128), nullable=True)
     cleanup_status: Mapped[str | None] = mapped_column(String(128), nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_exhausted: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -264,6 +268,30 @@ class BuildEventORM(Base):
 
     event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     build_id: Mapped[str] = mapped_column(String(64), index=True)
+    stage: Mapped[str] = mapped_column(String(64), index=True)
+    message: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class BuildAttemptORM(Base):
+    __tablename__ = "build_attempts"
+
+    attempt_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    build_id: Mapped[str] = mapped_column(String(64), index=True)
+    attempt: Mapped[int] = mapped_column(Integer, index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="accepted")
+    failure_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_operation: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BuildLogORM(Base):
+    __tablename__ = "build_logs"
+
+    log_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    build_id: Mapped[str] = mapped_column(String(64), index=True)
+    attempt: Mapped[int] = mapped_column(Integer, index=True)
     stage: Mapped[str] = mapped_column(String(64), index=True)
     message: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)

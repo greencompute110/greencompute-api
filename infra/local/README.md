@@ -112,6 +112,20 @@ Failure mode validation covers:
 - lease history and miner-drift debug visibility
 - consolidated operator status output
 
+To validate operator actions against the running compose stack:
+
+```bash
+python greenference-api/infra/local/smoke_test.py --check-operator-actions
+```
+
+Operator-action validation covers:
+
+- build cancellation plus persisted build logs
+- miner drain visibility through placement exclusions
+- manual deployment requeue
+- manual deployment failure
+- miner undrain recovery
+
 ## Local Runbook
 
 When debugging a local stack issue, the highest-signal checks are:
@@ -121,11 +135,22 @@ When debugging a local stack issue, the highest-signal checks are:
 - `GET /platform/v1/debug/event-deliveries` on `control-plane`
 - `GET /platform/v1/debug/routing-decisions` on `gateway`
 - `GET /platform/v1/debug/build-failures` on `gateway`
+- `GET /platform/builds/{id}/logs` and `/attempts/{attempt}` on `gateway`
 - `GET /platform/v1/debug/invocation-failures` on `gateway`
 - `GET /platform/v1/debug/servers`, `/nodes`, and `/placements` on `control-plane`
-- `GET /platform/v1/debug/lease-history`, `/deployment-retries`, `/miner-drift`, and `/status` on `control-plane`
+- `GET /platform/v1/debug/lease-history`, `/deployment-retries`, `/miner-drift`, `/placement-exclusions`, `/deployment-failures`, and `/status` on `control-plane`
+- `POST /platform/v1/debug/deployments/{id}/requeue` and `/fail` on `control-plane`
+- `POST /platform/v1/debug/miners/{hotkey}/drain` and `/undrain` on `control-plane`
 - `GET /platform/v1/invocations/exports/recent` on `gateway`
 - `GET /_metrics` on each API-side service
+
+## Config Matrix
+
+Use these runtime profiles as the working defaults:
+
+- Local: the compose stack in `infra/local` with Postgres, NATS, MinIO, registry, and two bootstrap miners
+- Single-node staging: one API stack with one miner, live builder execution, and admin/operator endpoints enabled behind a private network
+- Multi-miner staging: one API stack with at least two miners so reassignment, drain policy, and placement exclusions can be exercised before production
 
 The compose stack expects these runtime secrets and defaults:
 

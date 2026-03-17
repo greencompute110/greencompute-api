@@ -12,6 +12,7 @@ from greenference_persistence import (
     load_runtime_settings,
 )
 from greenference_protocol import BuildContextRecord, BuildEventRecord, BuildRecord, BuildRequest
+from greenference_protocol import BuildAttemptRecord, BuildLogRecord
 from greenference_builder.infrastructure.execution import (
     BuilderExecutionError,
     ObjectStoreAdapter,
@@ -98,34 +99,27 @@ class BuilderService:
     def list_build_events(self, build_id: str) -> list[BuildEventRecord]:
         return self.repository.list_build_events(build_id)
 
+    def list_build_logs(self, build_id: str) -> list[BuildLogRecord]:
+        return self.repository.list_build_logs(build_id)
+
+    def get_build_attempt(self, build_id: str, attempt: int) -> BuildAttemptRecord | None:
+        return self.repository.get_build_attempt(build_id, attempt)
+
     def list_image_history(self, image: str) -> list[BuildRecord]:
         return self.repository.list_builds(image=image)
 
     def build_attempts(self, build_id: str) -> list[dict]:
-        build = self.repository.get_build(build_id)
-        if build is None:
-            return []
-        events = self.repository.list_build_events(build_id)
-        attempts: list[dict] = []
-        current: dict | None = None
-        attempt_number = 0
-        for event in events:
-            if event.stage == "building" or current is None:
-                attempt_number += 1
-                current = {
-                    "attempt": attempt_number,
-                    "status": "in_progress",
-                    "events": [],
-                }
-                attempts.append(current)
-            current["events"].append(event.model_dump(mode="json"))
-            if event.stage in {"published", "failed"}:
-                current["status"] = event.stage
-        if attempts:
-            attempts[-1]["retry_count"] = build.retry_count
-            attempts[-1]["failure_class"] = build.failure_class
-            attempts[-1]["last_operation"] = build.last_operation
-        return attempts
+        attempts = self.repository.list_build_attempts(build_id)
+        return [
+            {
+                **attempt.model_dump(mode="json"),
+                "logs": [
+                    log.model_dump(mode="json")
+                    for log in self.repository.list_build_logs(build_id, attempt=attempt.attempt)
+                ],
+            }
+            for attempt in attempts
+        ]
 
     def retry_build(self, build_id: str) -> BuildRecord:
         build = self.repository.get_build(build_id)
@@ -133,6 +127,8 @@ class BuilderService:
             raise KeyError(f"build not found: {build_id}")
         if build.status == "published":
             return build
+        if build.status == "cancelled":
+            raise ValueError("cancelled build cannot be retried")
         context = self.repository.get_build_context(build_id)
         self.cleanup_build(build_id, persist=False)
         build.status = "accepted"
@@ -141,6 +137,7 @@ class BuilderService:
         build.failure_class = None
         build.last_operation = "retry_requested"
         build.cleanup_status = None
+        build.retry_exhausted = False
         build.registry_repository = None
         build.image_tag = None
         build.artifact_uri = None
@@ -159,6 +156,39 @@ class BuilderService:
         )
         self.bus.publish("build.accepted", {"build_id": build.build_id, "image": build.image})
         self.metrics.increment("build.retry_requested")
+        return build
+
+    def cancel_build(self, build_id: str) -> BuildRecord:
+        build = self.repository.get_build(build_id)
+        if build is None:
+            raise KeyError(f"build not found: {build_id}")
+        if build.status in {"published", "failed", "cancelled"}:
+            return build
+        build.status = "cancelled"
+        build.failure_reason = "build cancelled by operator"
+        build.failure_class = "cancelled"
+        build.last_operation = "cancel"
+        build.updated_at = datetime.now(UTC)
+        self.repository.save_build(build)
+        self.repository.add_build_event(
+            BuildEventRecord(build_id=build.build_id, stage="cancelled", message="build cancelled by operator")
+        )
+        latest_attempt = self.repository.get_build_attempt(build_id, build.retry_count + 1)
+        if latest_attempt is not None and latest_attempt.finished_at is None:
+            latest_attempt.status = "cancelled"
+            latest_attempt.failure_class = "cancelled"
+            latest_attempt.last_operation = "cancel"
+            latest_attempt.finished_at = build.updated_at
+            self.repository.save_build_attempt(latest_attempt)
+        self.repository.add_build_log(
+            BuildLogRecord(
+                build_id=build.build_id,
+                attempt=max(1, build.retry_count + 1),
+                stage="cancelled",
+                message="operator cancelled build",
+            )
+        )
+        self.metrics.increment("build.cancelled")
         return build
 
     def cleanup_build(self, build_id: str, *, persist: bool = True) -> BuildRecord:
@@ -195,9 +225,19 @@ class BuilderService:
                 continue
             started_at = datetime.now(UTC)
             try:
+                if build.status == "cancelled":
+                    self.bus.mark_completed(event.delivery_id)
+                    continue
                 if build.status == "published":
                     self.bus.mark_completed(event.delivery_id)
                     continue
+                attempt_number = max(1, event.attempts)
+                attempt = BuildAttemptRecord(
+                    build_id=build.build_id,
+                    attempt=attempt_number,
+                    status="staging",
+                )
+                self.repository.save_build_attempt(attempt)
                 build.status = "building"
                 build.failure_reason = None
                 build.failure_class = None
@@ -208,6 +248,14 @@ class BuilderService:
                 self.repository.add_build_event(
                     BuildEventRecord(
                         build_id=build.build_id,
+                        stage="building",
+                        message="validated build context and prepared registry target",
+                    )
+                )
+                self.repository.add_build_log(
+                    BuildLogRecord(
+                        build_id=build.build_id,
+                        attempt=attempt_number,
                         stage="building",
                         message="validated build context and prepared registry target",
                     )
@@ -226,6 +274,7 @@ class BuilderService:
                 if context is None:
                     raise ValueError("build context not found")
                 build.last_operation = "stage_context"
+                build.status = "staging"
                 self.repository.save_build(build)
                 staged = self.object_store.stage_context(build, context)
                 self.repository.save_build_context(staged.context)
@@ -236,7 +285,16 @@ class BuilderService:
                         message=staged.message,
                     )
                 )
+                self.repository.add_build_log(
+                    BuildLogRecord(
+                        build_id=build.build_id,
+                        attempt=attempt_number,
+                        stage="staged",
+                        message=staged.message,
+                    )
+                )
                 build.last_operation = "publish_registry"
+                build.status = "publishing"
                 self.repository.save_build(build)
                 published = self.registry.publish(build, staged.context)
                 build.status = "published"
@@ -264,6 +322,18 @@ class BuilderService:
                         message=published.message,
                     )
                 )
+                self.repository.add_build_log(
+                    BuildLogRecord(
+                        build_id=build.build_id,
+                        attempt=attempt_number,
+                        stage="published",
+                        message=published.message,
+                    )
+                )
+                attempt.status = "published"
+                attempt.last_operation = "published"
+                attempt.finished_at = datetime.now(UTC)
+                self.repository.save_build_attempt(attempt)
                 self.bus.publish(
                     "build.published",
                     {
@@ -292,6 +362,19 @@ class BuilderService:
                 self.repository.add_build_event(
                     BuildEventRecord(build_id=build.build_id, stage="failed", message=build.failure_reason)
                 )
+                self.repository.add_build_log(
+                    BuildLogRecord(
+                        build_id=build.build_id,
+                        attempt=attempt_number,
+                        stage="failed",
+                        message=build.failure_reason,
+                    )
+                )
+                attempt.status = "failed"
+                attempt.failure_class = build.failure_class
+                attempt.last_operation = exc.operation
+                attempt.finished_at = datetime.now(UTC)
+                self.repository.save_build_attempt(attempt)
                 self.bus.publish(
                     "build.failed",
                     {
@@ -305,6 +388,8 @@ class BuilderService:
                 if build.retry_count < 2 and exc.retryable:
                     self.bus.mark_failed(event.delivery_id, build.failure_reason, retryable=True, retry_after_seconds=1.0)
                 else:
+                    build.retry_exhausted = not exc.retryable or build.retry_count >= 2
+                    self.repository.save_build(build)
                     self.bus.mark_failed(event.delivery_id, build.failure_reason)
             except ValueError as exc:
                 build.status = "failed"
@@ -326,6 +411,19 @@ class BuilderService:
                         message=build.failure_reason,
                     )
                 )
+                self.repository.add_build_log(
+                    BuildLogRecord(
+                        build_id=build.build_id,
+                        attempt=attempt_number,
+                        stage="failed",
+                        message=build.failure_reason,
+                    )
+                )
+                attempt.status = "failed"
+                attempt.failure_class = build.failure_class
+                attempt.last_operation = "validate_context"
+                attempt.finished_at = datetime.now(UTC)
+                self.repository.save_build_attempt(attempt)
                 self.bus.publish(
                     "build.failed",
                     {
@@ -336,6 +434,8 @@ class BuilderService:
                     },
                 )
                 self.metrics.increment("build.failed")
+                build.retry_exhausted = True
+                self.repository.save_build(build)
                 self.bus.mark_failed(event.delivery_id, build.failure_reason)
         pending_count = len(
             self.bus.list_deliveries(

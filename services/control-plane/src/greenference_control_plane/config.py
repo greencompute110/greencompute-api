@@ -11,6 +11,8 @@ class Settings(BaseModel):
     deployment_request_retry_limit: int = Field(default=3, ge=1)
     deployment_request_retry_delay_seconds: int = Field(default=5, ge=1)
     deployment_health_failure_threshold: int = Field(default=2, ge=1)
+    placement_failure_cooldown_seconds: int = Field(default=300, ge=1)
+    placement_failure_threshold: int = Field(default=2, ge=1)
 
 
 settings = Settings()

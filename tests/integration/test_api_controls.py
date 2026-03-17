@@ -161,6 +161,15 @@ def test_gateway_admin_routes_expose_build_and_invocation_history(
         build["build_id"],
         authorization=f"Bearer {admin_secret}",
     )
+    build_attempt = gateway_routes.get_build_attempt(
+        build["build_id"],
+        1,
+        authorization=f"Bearer {admin_secret}",
+    )
+    build_logs = gateway_routes.get_build_logs(
+        build["build_id"],
+        authorization=f"Bearer {admin_secret}",
+    )
     invocation_records = gateway_routes.list_invocations(authorization=f"Bearer {admin_secret}")
     invocation_export = gateway_routes.export_recent_invocations(authorization=f"Bearer {admin_secret}")
 
@@ -174,6 +183,8 @@ def test_gateway_admin_routes_expose_build_and_invocation_history(
     assert build_record["registry_manifest_uri"] == f"{build_record['artifact_uri']}@{build_record['artifact_digest']}"
     assert build_record["executor_name"] == "simulated-buildkit"
     assert build_attempts[0]["attempt"] == 1
+    assert build_attempt["attempt"] == 1
+    assert any(log["stage"] == "published" for log in build_logs)
     assert [event["stage"] for event in build_events] == ["accepted", "building", "staged", "published"]
     assert len(invocation_records) == 1
     assert invocation_records[0]["latency_ms"] == 12.5
@@ -464,6 +475,40 @@ def test_gateway_debug_routes_expose_failed_builds_and_retry_controls(
     assert final_build["status"] == "published"
 
 
+def test_gateway_build_cancellation_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    gateway_repository = GatewayRepository(database_url=shared_db, bootstrap=True)
+    builder_repository = BuilderRepository(database_url=shared_db, bootstrap=True)
+    control_repository = ControlPlaneRepository(database_url=shared_db, bootstrap=True)
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+
+    gateway_service = GatewayService(
+        repository=gateway_repository,
+        builder=BuilderService(builder_repository, workflow_repository=workflow_repository),
+        control_plane=ControlPlaneService(control_repository, workflow_repository=workflow_repository),
+    )
+    user_secret, admin_secret = _seed_keys(gateway_repository)
+
+    monkeypatch.setattr(gateway_routes, "service", gateway_service)
+    monkeypatch.setattr(
+        gateway_security,
+        "credential_store",
+        CredentialStore(engine=gateway_repository.engine, session_factory=gateway_repository.session_factory),
+    )
+    monkeypatch.setattr(gateway_security, "rate_limiter", FixedWindowRateLimiter())
+
+    build = gateway_routes.build_image(
+        BuildRequest(image="greenference/cancel:latest", context_uri="s3://greenference/builds/cancel.zip"),
+        authorization=f"Bearer {user_secret}",
+    )
+    cancelled = gateway_routes.cancel_build(build["build_id"], authorization=f"Bearer {admin_secret}")
+    gateway_service.builder.process_pending_events()
+    logs = gateway_routes.get_build_logs(build["build_id"], authorization=f"Bearer {admin_secret}")
+
+    assert cancelled["status"] == "cancelled"
+    assert any(item["stage"] == "cancelled" for item in logs)
+
+
 def test_control_plane_debug_views_expose_servers_nodes_capacity_and_placements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -537,6 +582,78 @@ def test_control_plane_debug_views_expose_servers_nodes_capacity_and_placements(
     assert placements[0]["deployment_id"] == deployment.deployment_id
     assert placements[0]["server_id"] == "server-a"
     assert placements[0]["status"] == "assigned"
+
+
+def test_control_plane_operator_actions_and_exclusions(monkeypatch: pytest.MonkeyPatch) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    control_repository = ControlPlaneRepository(database_url=shared_db, bootstrap=True)
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+    gateway_repository = GatewayRepository(database_url=shared_db, bootstrap=True)
+    service = ControlPlaneService(control_repository, workflow_repository=workflow_repository)
+    _, admin_secret = _seed_keys(gateway_repository)
+
+    monkeypatch.setattr(control_plane_routes, "service", service)
+    monkeypatch.setattr(control_plane_security, "service", service)
+    monkeypatch.setattr(
+        control_plane_security,
+        "credential_store",
+        CredentialStore(engine=gateway_repository.engine, session_factory=gateway_repository.session_factory),
+    )
+
+    service.register_miner(
+        MinerRegistration(
+            hotkey="miner-a",
+            payout_address="5FminerA",
+            auth_secret="miner-a-secret",
+            api_base_url="http://miner-a.local",
+            validator_url="http://validator.local",
+        )
+    )
+    service.record_heartbeat(Heartbeat(hotkey="miner-a", healthy=True))
+    service.update_capacity(
+        CapacityUpdate(
+            hotkey="miner-a",
+            nodes=[
+                NodeCapability(
+                    hotkey="miner-a",
+                    node_id="node-a",
+                    server_id="server-a",
+                    hostname="gpu-a.internal",
+                    gpu_model="a100",
+                    gpu_count=1,
+                    available_gpus=1,
+                    vram_gb_per_gpu=80,
+                    cpu_cores=32,
+                    memory_gb=128,
+                )
+            ],
+        )
+    )
+    workload = service.upsert_workload(
+        WorkloadSpec(
+            **WorkloadCreateRequest(
+                name="operator-model",
+                image="greenference/echo:latest",
+                requirements={"gpu_count": 1},
+            ).model_dump()
+        )
+    )
+    deployment = service.create_deployment(DeploymentCreateRequest(workload_id=workload.workload_id))
+    service.process_pending_events()
+
+    drained = control_plane_routes.drain_miner("miner-a", authorization=f"Bearer {admin_secret}")
+    exclusions = control_plane_routes.debug_placement_exclusions(authorization=f"Bearer {admin_secret}")
+    requeued = control_plane_routes.requeue_deployment(deployment.deployment_id, authorization=f"Bearer {admin_secret}")
+    failed = control_plane_routes.fail_deployment(deployment.deployment_id, authorization=f"Bearer {admin_secret}")
+    failures = control_plane_routes.debug_deployment_failures(authorization=f"Bearer {admin_secret}")
+    undrained = control_plane_routes.undrain_miner("miner-a", authorization=f"Bearer {admin_secret}")
+
+    assert drained["drained"] is True
+    assert any(item["reason"] == "miner_drained" for item in exclusions)
+    assert requeued["state"] == "pending"
+    assert failed["state"] == "failed"
+    assert any(item["deployment_id"] == deployment.deployment_id for item in failures)
+    assert undrained["drained"] is False
 
 
 def test_validator_routes_require_headers_and_expose_probe_history(

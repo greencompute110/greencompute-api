@@ -552,12 +552,90 @@ def verify_failover(context: dict[str, Any]) -> None:
     print(f"post-failover inference response: {response['content']}")
 
 
+def verify_operator_actions(context: dict[str, Any]) -> None:
+    headers = context["headers"]
+    deployment = context["deployment"]
+
+    cancel_build = _request_json(
+        "POST",
+        f"{GATEWAY_URL}/platform/images",
+        {
+            "image": "greenference/operator-cancel:stack",
+            "context_uri": "s3://greenference/builds/operator-cancel.zip",
+            "dockerfile_path": "Dockerfile",
+            "public": False,
+        },
+        headers=headers,
+    )
+    cancelled = _request_json(
+        "POST",
+        f"{GATEWAY_URL}/platform/builds/{cancel_build['build_id']}/cancel",
+        headers=headers,
+    )
+    logs = _request_json(
+        "GET",
+        f"{GATEWAY_URL}/platform/builds/{cancel_build['build_id']}/logs",
+        headers=headers,
+    )
+    if cancelled["status"] != "cancelled" or not any(item["stage"] == "cancelled" for item in logs):
+        raise RuntimeError("build cancellation was not persisted through operator surfaces")
+
+    drained = _request_json(
+        "POST",
+        f"{CONTROL_PLANE_URL}/platform/v1/debug/miners/{MINER_HOTKEY}/drain",
+        headers=headers,
+    )
+    exclusions = _wait_json(
+        f"{CONTROL_PLANE_URL}/platform/v1/debug/placement-exclusions",
+        lambda body: any(item["reason"] == "miner_drained" and item["hotkey"] == MINER_HOTKEY for item in body),
+        headers=headers,
+    )
+    if drained["drained"] is not True:
+        raise RuntimeError("miner drain did not persist")
+
+    requeued = _request_json(
+        "POST",
+        f"{CONTROL_PLANE_URL}/platform/v1/debug/deployments/{deployment['deployment_id']}/requeue",
+        headers=headers,
+    )
+    if requeued["state"] != "pending":
+        raise RuntimeError("deployment requeue did not move deployment back to pending")
+
+    _wait_json(
+        f"{CONTROL_PLANE_URL}/platform/v1/debug/deployments",
+        lambda body: any(item["deployment_id"] == deployment["deployment_id"] and item["state"] == "ready" for item in body),
+        headers=headers,
+    )
+
+    failed = _request_json(
+        "POST",
+        f"{CONTROL_PLANE_URL}/platform/v1/debug/deployments/{deployment['deployment_id']}/fail",
+        headers=headers,
+    )
+    failure_report = _request_json(
+        "GET",
+        f"{CONTROL_PLANE_URL}/platform/v1/debug/deployment-failures",
+        headers=headers,
+    )
+    if failed["state"] != "failed" or not any(item["deployment_id"] == deployment["deployment_id"] for item in failure_report):
+        raise RuntimeError("deployment force-fail was not reflected in failure surfaces")
+
+    undrained = _request_json(
+        "POST",
+        f"{CONTROL_PLANE_URL}/platform/v1/debug/miners/{MINER_HOTKEY}/undrain",
+        headers=headers,
+    )
+    if undrained["drained"] is not False or not exclusions:
+        raise RuntimeError("miner undrain did not complete")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = argv or sys.argv[1:]
     check_recovery = "--check-recovery" in args
     check_failover = "--check-failover" in args
     check_ops = "--check-ops" in args
     check_failures = "--check-failures" in args
+    check_operator_actions = "--check-operator-actions" in args
 
     wait_for_stack_readiness()
     context = run_happy_path()
@@ -566,6 +644,8 @@ def main(argv: list[str] | None = None) -> int:
         _assert_operational_surfaces(context["headers"])
     if check_failures:
         verify_failures(context["headers"])
+    if check_operator_actions:
+        verify_operator_actions(context)
     if check_failover:
         verify_failover(context)
     if check_recovery:
