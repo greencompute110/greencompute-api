@@ -10,6 +10,7 @@ import time
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 
 GATEWAY_URL = os.getenv("GREENFERENCE_GATEWAY_URL", "http://127.0.0.1:8000")
 CONTROL_PLANE_URL = os.getenv("GREENFERENCE_CONTROL_PLANE_URL", "http://127.0.0.1:8001")
@@ -196,12 +197,24 @@ def run_happy_path() -> dict[str, Any]:
     )
     published = next(item for item in builds if item["build_id"] == build["build_id"])
     print(f"build published: {published['artifact_uri']}")
+    build_record = _request_json("GET", f"{GATEWAY_URL}/platform/builds/{build['build_id']}", headers=headers)
+    image_history = _request_json(
+        "GET",
+        f"{GATEWAY_URL}/platform/images/{quote(published['image'], safe='')}/history",
+        headers=headers,
+    )
+    if build_record["status"] != "published":
+        raise RuntimeError("published build was not queryable through build detail endpoint")
+    if not any(item["build_id"] == build["build_id"] for item in image_history):
+        raise RuntimeError("published build missing from image history endpoint")
 
     workload = _request_json(
         "POST",
         f"{GATEWAY_URL}/platform/workloads",
         {
             "name": "stack-echo-model",
+            "workload_alias": "stack-echo-alias",
+            "ingress_host": "stack-echo.greenference.local",
             "image": published["image"],
             "requirements": {"gpu_count": 1, "min_vram_gb_per_gpu": 40},
         },
@@ -229,10 +242,42 @@ def run_happy_path() -> dict[str, Any]:
     response = _request_json(
         "POST",
         f"{GATEWAY_URL}/v1/chat/completions",
-        {"model": workload["workload_id"], "messages": [{"role": "user", "content": "hello stack"}]},
-        headers=headers,
+        {"model": "ignored-by-host-routing", "messages": [{"role": "user", "content": "hello stack"}]},
+        headers={**headers, "Host": "stack-echo.greenference.local"},
     )
     print(f"inference response: {response['content']}")
+
+    invocations = _wait_json(
+        f"{GATEWAY_URL}/platform/v1/invocations",
+        lambda body: any(item["request_id"] == response["id"] for item in body),
+        timeout=TIMEOUT_SECONDS,
+        headers=headers,
+    )
+    invocation = next(item for item in invocations if item["request_id"] == response["id"])
+    invocation_export = _request_json(
+        "GET",
+        f"{GATEWAY_URL}/platform/v1/invocations/exports/recent",
+        headers=headers,
+    )
+    if invocation["status"] != "succeeded":
+        raise RuntimeError("successful invocation missing from invocation records")
+    if invocation_export["summary"]["count"] < 1:
+        raise RuntimeError("invocation export did not include the routed request")
+
+    routing = _request_json(
+        "GET",
+        f"{GATEWAY_URL}/platform/v1/debug/route/stack-echo-alias?host=stack-echo.greenference.local",
+        headers=headers,
+    )
+    decisions = _request_json(
+        "GET",
+        f"{GATEWAY_URL}/platform/v1/debug/routing-decisions",
+        headers=headers,
+    )
+    if routing.get("routing", {}).get("matched_by") != "ingress_host":
+        raise RuntimeError("debug route did not resolve through ingress host")
+    if not any(item.get("decision") == "selected" and item.get("matched_by") == "ingress_host" for item in decisions):
+        raise RuntimeError("routing decision history did not capture ingress-host selection")
 
     usage = _wait_json(
         f"{CONTROL_PLANE_URL}/platform/v1/usage",
@@ -241,6 +286,14 @@ def run_happy_path() -> dict[str, Any]:
         headers=headers,
     )
     print(f"usage summary: {usage[deployment['deployment_id']]}")
+
+    servers = _request_json("GET", f"{CONTROL_PLANE_URL}/platform/v1/debug/servers", headers=headers)
+    nodes = _request_json("GET", f"{CONTROL_PLANE_URL}/platform/v1/debug/nodes", headers=headers)
+    placements = _request_json("GET", f"{CONTROL_PLANE_URL}/platform/v1/debug/placements", headers=headers)
+    if not servers or not nodes:
+        raise RuntimeError("server or node inventory debug endpoints returned no data")
+    if not any(item["deployment_id"] == deployment["deployment_id"] for item in placements):
+        raise RuntimeError("placement history missing deployment assignment")
 
     challenge = _request_json(
         "POST",
@@ -272,6 +325,7 @@ def run_happy_path() -> dict[str, Any]:
         "headers": headers,
         "workload": workload,
         "deployment": deployment,
+        "build": build,
         "response": response,
         "snapshot": snapshot,
         "usage": usage,

@@ -59,7 +59,16 @@ After the stack is healthy, run:
 python greenference-api/infra/local/smoke_test.py
 ```
 
-The smoke test waits for service readiness, verifies that `builder`, `control-plane`, and `validator` are running with `bus_transport=nats`, registers a user and admin API key, publishes a validator capability for the bootstrap miner, runs build -> workload -> deployment -> inference -> usage, then submits a validator probe result and publishes a weight snapshot.
+The smoke test waits for service readiness, verifies that `builder`, `control-plane`, and `validator` are running with `bus_transport=nats`, registers a user and admin API key, publishes a validator capability for the bootstrap miner, then validates:
+
+- build publish plus `/platform/builds/{id}` and `/platform/images/{image}/history`
+- workload creation with alias and ingress host
+- deployment scheduling and ready-state routing
+- host-based inference routing plus routing decision debug output
+- invocation persistence and recent invocation export
+- usage aggregation
+- server, node, and placement debug views
+- validator probe scoring and weight snapshot publication
 
 To validate failover behavior against the running compose stack:
 
@@ -88,6 +97,27 @@ python greenference-api/infra/local/smoke_test.py --check-ops
 ```
 
 Ops mode verifies Prometheus-style `/_metrics` output from the API-side services and checks `/platform/v1/debug/workers` plus `/platform/v1/debug/event-deliveries` on the control plane.
+
+## Local Runbook
+
+When debugging a local stack issue, the highest-signal checks are:
+
+- `GET /readyz` on `gateway`, `control-plane`, `builder`, `validator`, and both miners
+- `GET /platform/v1/debug/workers` on `control-plane`
+- `GET /platform/v1/debug/event-deliveries` on `control-plane`
+- `GET /platform/v1/debug/routing-decisions` on `gateway`
+- `GET /platform/v1/debug/servers`, `/nodes`, and `/placements` on `control-plane`
+- `GET /platform/v1/invocations/exports/recent` on `gateway`
+- `GET /_metrics` on each API-side service
+
+The compose stack expects these runtime secrets and defaults:
+
+- Postgres: `greenference` / `greenference`
+- MinIO: `greenference` / `greenference`
+- Registry: local unauthenticated `registry:5000`
+- Miner auth secrets:
+  - `greenference-miner-local-secret`
+  - `greenference-miner-failover-secret`
 
 ## Recovery Expectations
 
