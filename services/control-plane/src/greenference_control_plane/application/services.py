@@ -54,32 +54,24 @@ class ControlPlaneService:
     def find_workload_by_name(self, name: str) -> WorkloadSpec | None:
         return self.repository.find_workload_by_name(name)
 
-    def create_deployment(self, request: DeploymentCreateRequest) -> DeploymentRecord:
-        workload = self.repository.get_workload(request.workload_id)
+    def create_deployment(self, request: DeploymentCreateRequest | dict) -> DeploymentRecord:
+        payload = request if isinstance(request, DeploymentCreateRequest) else DeploymentCreateRequest(**request)
+        workload = self.repository.get_workload(payload.workload_id)
         if workload is None:
-            raise KeyError(f"workload not found: {request.workload_id}")
+            raise KeyError(f"workload not found: {payload.workload_id}")
         deployment = DeploymentRecord(
-            workload_id=request.workload_id,
-            requested_instances=request.requested_instances,
+            workload_id=payload.workload_id,
+            requested_instances=payload.requested_instances,
         )
         self.repository.create_deployment(deployment)
-        assignment = self._assign_lease(workload, deployment.deployment_id)
-        if assignment:
-            deployment.hotkey = assignment.hotkey
-            deployment.node_id = assignment.node_id
-            deployment.state = DeploymentState.SCHEDULED
-            deployment.updated_at = datetime.now(UTC)
-            self.repository.save_assignment(assignment)
-            self.repository.update_deployment(deployment)
-            self.workflow_repository.publish(
-                "deployment.scheduled",
-                {
-                    "deployment_id": deployment.deployment_id,
-                    "workload_id": deployment.workload_id,
-                    "hotkey": deployment.hotkey,
-                    "node_id": deployment.node_id,
-                },
-            )
+        self.workflow_repository.publish(
+            "deployment.requested",
+            {
+                "deployment_id": deployment.deployment_id,
+                "workload_id": deployment.workload_id,
+                "requested_instances": deployment.requested_instances,
+            },
+        )
         return deployment
 
     def _assign_lease(self, workload: WorkloadSpec, deployment_id: str) -> LeaseAssignment | None:
@@ -148,17 +140,11 @@ class ControlPlaneService:
         return sorted(ready, key=lambda item: item.updated_at, reverse=True)[0] if ready else None
 
     def record_usage(self, record: UsageRecord) -> UsageRecord:
-        saved = self.repository.add_usage_record(record)
         self.workflow_repository.publish(
             "usage.recorded",
-            {
-                "deployment_id": saved.deployment_id,
-                "workload_id": saved.workload_id,
-                "hotkey": saved.hotkey,
-                "request_count": saved.request_count,
-            },
+            record.model_dump(mode="json"),
         )
-        return saved
+        return record
 
     def usage_summary(self) -> dict[str, dict[str, float]]:
         return self.usage_aggregator.aggregate(self.repository.list_usage_records())
@@ -192,6 +178,77 @@ class ControlPlaneService:
                 )
             )
         return expired
+
+    def process_pending_events(self, limit: int = 10) -> dict[str, list]:
+        events = self.workflow_repository.claim_pending(["deployment.requested", "usage.recorded"], limit=limit)
+        scheduled: list[DeploymentRecord] = []
+        usage_records: list[UsageRecord] = []
+
+        for event in events:
+            if event.subject == "deployment.requested":
+                processed = self._process_deployment_request(event)
+                if processed is not None:
+                    scheduled.append(processed)
+                continue
+            if event.subject == "usage.recorded":
+                usage_record = self._process_usage_record(event)
+                if usage_record is not None:
+                    usage_records.append(usage_record)
+                continue
+            self.workflow_repository.mark_failed(event.event_id, f"unsupported workflow subject={event.subject}")
+
+        return {
+            "deployments": [item.model_dump(mode="json") for item in scheduled],
+            "usage_records": [item.model_dump(mode="json") for item in usage_records],
+        }
+
+    def _process_deployment_request(self, event) -> DeploymentRecord | None:
+        deployment = self.repository.get_deployment(str(event.payload["deployment_id"]))
+        if deployment is None:
+            self.workflow_repository.mark_failed(event.event_id, "deployment not found")
+            return None
+        if deployment.state != DeploymentState.PENDING:
+            self.workflow_repository.mark_completed(event.event_id)
+            return None
+
+        workload = self.repository.get_workload(deployment.workload_id)
+        if workload is None:
+            self.workflow_repository.mark_failed(event.event_id, "workload not found")
+            return None
+
+        assignment = self._assign_lease(workload, deployment.deployment_id)
+        if assignment is None:
+            self.workflow_repository.mark_failed(
+                event.event_id,
+                "no compatible miner capacity available",
+                retryable=True,
+                retry_after_seconds=5.0,
+            )
+            return None
+
+        deployment.hotkey = assignment.hotkey
+        deployment.node_id = assignment.node_id
+        deployment.state = DeploymentState.SCHEDULED
+        deployment.updated_at = datetime.now(UTC)
+        self.repository.save_assignment(assignment)
+        saved = self.repository.update_deployment(deployment)
+        self.workflow_repository.publish(
+            "deployment.scheduled",
+            {
+                "deployment_id": saved.deployment_id,
+                "workload_id": saved.workload_id,
+                "hotkey": saved.hotkey,
+                "node_id": saved.node_id,
+            },
+        )
+        self.workflow_repository.mark_completed(event.event_id)
+        return saved
+
+    def _process_usage_record(self, event) -> UsageRecord | None:
+        record = UsageRecord(**event.payload)
+        saved = self.repository.add_usage_record(record)
+        self.workflow_repository.mark_completed(event.event_id)
+        return saved
 
 
 service = ControlPlaneService()

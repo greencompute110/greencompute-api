@@ -88,6 +88,10 @@ def test_control_plane_fails_expired_leases_and_emits_event() -> None:
         )
     )
     deployment = control_plane.create_deployment(DeploymentCreateRequest(workload_id=workload.workload_id))
+    assert deployment.state.value == "pending"
+
+    scheduled = control_plane.process_pending_events()
+    assert len(scheduled["deployments"]) == 1
     assignment = repository.list_assignments("miner-a")[0]
     assignment.expires_at = datetime.now(UTC) - timedelta(seconds=1)
     repository.save_assignment(assignment)
@@ -101,3 +105,62 @@ def test_control_plane_fails_expired_leases_and_emits_event() -> None:
     assert saved.state.value == "failed"
     assert saved.last_error == "lease expired before deployment became ready"
     assert len(failed_events) == 1
+
+
+def test_duplicate_deployment_request_events_do_not_duplicate_assignments() -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    repository = ControlPlaneRepository(database_url=shared_db, bootstrap=True)
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+    control_plane = ControlPlaneService(repository, workflow_repository=workflow_repository)
+
+    repository.upsert_miner(
+        MinerRegistration(
+            hotkey="miner-a",
+            payout_address="5Fminer",
+            api_base_url="http://miner-a.local",
+            validator_url="http://validator.local",
+        )
+    )
+    repository.upsert_heartbeat(Heartbeat(hotkey="miner-a", healthy=True))
+    repository.upsert_capacity(
+        CapacityUpdate(
+            hotkey="miner-a",
+            nodes=[
+                NodeCapability(
+                    hotkey="miner-a",
+                    node_id="node-a",
+                    gpu_model="a100",
+                    gpu_count=1,
+                    available_gpus=1,
+                    vram_gb_per_gpu=80,
+                    cpu_cores=32,
+                    memory_gb=128,
+                )
+            ],
+        )
+    )
+    workload = repository.upsert_workload(
+        WorkloadSpec(
+            **WorkloadCreateRequest(
+                name="dedupe-model",
+                image="greenference/echo:latest",
+                requirements={"gpu_count": 1},
+            ).model_dump()
+        )
+    )
+    deployment = control_plane.create_deployment(DeploymentCreateRequest(workload_id=workload.workload_id))
+    workflow_repository.publish(
+        "deployment.requested",
+        {
+            "deployment_id": deployment.deployment_id,
+            "workload_id": deployment.workload_id,
+            "requested_instances": deployment.requested_instances,
+        },
+    )
+
+    processed = control_plane.process_pending_events(limit=10)
+    assignments = repository.list_assignments("miner-a")
+
+    assert len(processed["deployments"]) == 1
+    assert len(assignments) == 1
+    assert assignments[0].deployment_id == deployment.deployment_id

@@ -12,6 +12,7 @@ settings = load_runtime_settings("greenference-control-plane")
 
 async def _control_plane_worker_loop() -> None:
     while True:
+        service.process_pending_events()
         service.process_timeouts()
         await asyncio.sleep(settings.worker_poll_interval_seconds)
 

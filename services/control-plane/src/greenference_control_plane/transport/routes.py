@@ -38,3 +38,7 @@ def deployment_status(deployment_id: str, payload: DeploymentStatusUpdate) -> di
 def usage_summary() -> dict[str, dict[str, float]]:
     return service.usage_summary()
 
+
+@router.post("/platform/v1/events/process")
+def process_events(limit: int = 10) -> dict[str, list]:
+    return service.process_pending_events(limit=limit)

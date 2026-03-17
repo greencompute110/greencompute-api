@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -85,9 +85,20 @@ class WorkflowEventRepository:
     def mark_completed(self, event_id: str) -> WorkflowEvent | None:
         return self._update_status(event_id, status="completed")
 
-    def mark_failed(self, event_id: str, error: str, retryable: bool = False) -> WorkflowEvent | None:
+    def mark_failed(
+        self,
+        event_id: str,
+        error: str,
+        retryable: bool = False,
+        retry_after_seconds: float | None = None,
+    ) -> WorkflowEvent | None:
         status = "pending" if retryable else "failed"
-        return self._update_status(event_id, status=status, error=error)
+        return self._update_status(
+            event_id,
+            status=status,
+            error=error,
+            retry_after_seconds=retry_after_seconds,
+        )
 
     def list_events(
         self,
@@ -103,13 +114,21 @@ class WorkflowEventRepository:
             rows = session.scalars(stmt.order_by(WorkflowEventORM.created_at.asc())).all()
             return [self._to_event(row) for row in rows]
 
-    def _update_status(self, event_id: str, status: str, error: str | None = None) -> WorkflowEvent | None:
+    def _update_status(
+        self,
+        event_id: str,
+        status: str,
+        error: str | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> WorkflowEvent | None:
         with session_scope(self.session_factory) as session:
             row = session.get(WorkflowEventORM, event_id)
             if row is None:
                 return None
             row.status = status
             row.last_error = error
+            if retry_after_seconds is not None:
+                row.available_at = utcnow() + timedelta(seconds=retry_after_seconds)
             row.updated_at = utcnow()
             session.add(row)
             session.flush()
