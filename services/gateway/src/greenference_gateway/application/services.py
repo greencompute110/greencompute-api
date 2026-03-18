@@ -103,6 +103,12 @@ class GatewayService:
     def restart_latest_build_job(self, build_id: str) -> BuildRecord:
         return self.builder.restart_latest_job(build_id)
 
+    def recover_build_jobs(self) -> dict[str, object | None]:
+        return self.builder.recover_inflight_jobs()
+
+    def build_recovery_status(self) -> dict[str, object | None]:
+        return self.builder.recovery_status()
+
     def build_attempts(self, build_id: str) -> list[dict]:
         return self.builder.build_attempts(build_id)
 

@@ -30,3 +30,13 @@ def image_history(image: str) -> list[dict]:
 @router.post("/builder/v1/events/process")
 def process_events(limit: int = 10) -> list[dict]:
     return [build.model_dump(mode="json") for build in service.process_pending_events(limit=limit)]
+
+
+@router.post("/builder/v1/recovery")
+def recover_jobs() -> dict:
+    return service.recover_inflight_jobs()
+
+
+@router.get("/builder/v1/recovery")
+def recovery_status() -> dict:
+    return service.recovery_status()

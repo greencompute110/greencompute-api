@@ -163,6 +163,7 @@ When debugging a local stack issue, the highest-signal checks are:
 - `GET /platform/v1/debug/build-failures` on `gateway`
 - `GET /platform/builds/{id}/jobs`, `/jobs/latest`, `/logs`, `/logs/stream`, and `/attempts/{attempt}` on `gateway`
 - `POST /platform/builds/{id}/jobs/latest/cancel` and `/restart` on `gateway`
+- `GET /platform/builds/recovery/status` and `POST /platform/builds/recovery` on `gateway`
 - `GET /platform/v1/debug/invocation-failures` on `gateway`
 - `GET /platform/v1/debug/servers`, `/nodes`, and `/placements` on `control-plane`
 - `GET /platform/v1/debug/lease-history`, `/deployment-retries`, `/miner-drift`, `/placement-exclusions`, `/deployment-failures`, and `/status` on `control-plane`
@@ -193,6 +194,7 @@ The compose stack expects these runtime secrets and defaults:
 The stack validator is expected to prove these cases cleanly:
 
 - pending workflow events survive service restarts because they are stored in Postgres
+- builder restarts requeue stale job deliveries and republish in-flight build stages
 - deployments remain queryable after `gateway` or `control-plane` restarts
 - usage aggregation continues after a worker restart
 - the bootstrap miners reconnect and resume reconcile loops on restart

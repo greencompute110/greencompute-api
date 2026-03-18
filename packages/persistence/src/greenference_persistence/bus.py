@@ -159,6 +159,41 @@ class SubjectBus:
                 messages.append(self._to_message(row, event_row))
             return messages
 
+    def requeue_stale_processing(
+        self,
+        consumer: str,
+        subjects: list[str],
+        *,
+        stale_after_seconds: float,
+    ) -> list[BusMessage]:
+        threshold = utcnow() - timedelta(seconds=stale_after_seconds)
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(BusDeliveryORM).where(
+                    BusDeliveryORM.consumer == consumer,
+                    BusDeliveryORM.subject.in_(subjects),
+                    BusDeliveryORM.status == "processing",
+                    BusDeliveryORM.updated_at <= threshold,
+                )
+            ).all()
+            messages: list[BusMessage] = []
+            for row in rows:
+                row.status = "pending"
+                row.last_error = "requeued after stale processing delivery"
+                row.available_at = utcnow()
+                row.updated_at = utcnow()
+                session.add(row)
+                event_row = session.scalar(select(WorkflowEventORM).where(WorkflowEventORM.event_id == row.event_id))
+                if event_row is None:
+                    continue
+                event_row.status = "pending"
+                event_row.last_error = row.last_error
+                event_row.available_at = row.available_at
+                event_row.updated_at = row.updated_at
+                session.add(event_row)
+                messages.append(self._to_message(row, event_row))
+            return messages
+
     def _update_status(
         self,
         delivery_id: int,
@@ -269,6 +304,19 @@ class NatsJetStreamBus:
         statuses: list[str] | None = None,
     ) -> list[BusMessage]:
         return self.durable_bus.list_deliveries(consumer=consumer, subjects=subjects, statuses=statuses)
+
+    def requeue_stale_processing(
+        self,
+        consumer: str,
+        subjects: list[str],
+        *,
+        stale_after_seconds: float,
+    ) -> list[BusMessage]:
+        return self.durable_bus.requeue_stale_processing(
+            consumer,
+            subjects,
+            stale_after_seconds=stale_after_seconds,
+        )
 
     def _publish_to_nats(self, subject: str, event: WorkflowEvent) -> None:
         self._run_async(self._publish_to_nats_async(subject, event))

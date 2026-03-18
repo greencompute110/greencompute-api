@@ -163,6 +163,24 @@ def restart_latest_build_job(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.get("/platform/builds/recovery/status")
+def build_recovery_status(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return service.build_recovery_status()
+
+
+@router.post("/platform/builds/recovery")
+def recover_build_jobs(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return service.recover_build_jobs()
+
+
 @router.get("/platform/builds/{build_id}/attempts/{attempt}")
 def get_build_attempt(
     build_id: str,

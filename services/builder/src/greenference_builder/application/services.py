@@ -55,6 +55,13 @@ class BuilderService:
         self.registry = registry or default_registry
         self.runner = runner or AdapterBackedBuildRunner(self.object_store, self.registry)
         self.metrics = get_metrics_store("greenference-builder")
+        self._recovery_state: dict[str, object | None] = {
+            "last_recovery_at": None,
+            "last_recovery_error": None,
+            "requeued_deliveries": 0,
+            "republished_jobs": 0,
+            "recovered_build_ids": [],
+        }
 
     def start_build(self, request: BuildRequest) -> BuildRecord:
         build = BuildRecord(
@@ -137,6 +144,9 @@ class BuilderService:
     def list_build_jobs(self, build_id: str) -> list[BuildJobRecord]:
         return self.repository.list_build_jobs(build_id)
 
+    def recovery_status(self) -> dict[str, object | None]:
+        return dict(self._recovery_state)
+
     def restart_latest_job(self, build_id: str) -> BuildRecord:
         latest_job = self.repository.get_build_job(build_id)
         if latest_job is None:
@@ -150,6 +160,71 @@ class BuilderService:
         if latest_job is None:
             raise KeyError(f"build job not found: {build_id}")
         return self.cancel_build(build_id)
+
+    def recover_inflight_jobs(self) -> dict[str, object | None]:
+        stale_after_seconds = max(self.settings.worker_poll_interval_seconds * 4, 2.0)
+        requeued = self.bus.requeue_stale_processing(
+            "builder-worker",
+            ["build.accepted", "build.job.progress"],
+            stale_after_seconds=stale_after_seconds,
+        )
+        republished_build_ids: list[str] = []
+        for build in self.repository.list_builds():
+            if build.status not in {"accepted", "staging", "building", "publishing"}:
+                continue
+            latest_job = self.repository.get_build_job(build.build_id)
+            if latest_job is None:
+                if build.status == "accepted" and not self._has_active_delivery(build.build_id, None, "build.accepted"):
+                    self.bus.publish(
+                        "build.accepted",
+                        {"build_id": build.build_id, "image": build.image, "attempt": build.retry_count + 1},
+                    )
+                    republished_build_ids.append(build.build_id)
+                continue
+            if latest_job.finished_at is not None or latest_job.status not in {"queued", "running"}:
+                continue
+            if self._has_active_delivery(build.build_id, latest_job.attempt, "build.job.progress"):
+                continue
+            latest_job.status = "queued"
+            latest_job.progress_message = (
+                f"recovered build job at stage {latest_job.current_stage}"
+            )
+            latest_job.updated_at = datetime.now(UTC)
+            self.repository.save_build_job(latest_job)
+            self.repository.add_build_event(
+                BuildEventRecord(
+                    build_id=build.build_id,
+                    stage="recovered",
+                    message=latest_job.progress_message,
+                )
+            )
+            self.repository.add_build_log(
+                BuildLogRecord(
+                    build_id=build.build_id,
+                    attempt=latest_job.attempt,
+                    stage="recovered",
+                    message=latest_job.progress_message,
+                )
+            )
+            self.bus.publish(
+                "build.job.progress",
+                {
+                    "build_id": build.build_id,
+                    "attempt": latest_job.attempt,
+                    "stage": latest_job.current_stage,
+                    "recovered": True,
+                },
+            )
+            republished_build_ids.append(build.build_id)
+
+        self._recovery_state = {
+            "last_recovery_at": datetime.now(UTC),
+            "last_recovery_error": None,
+            "requeued_deliveries": len(requeued),
+            "republished_jobs": len(republished_build_ids),
+            "recovered_build_ids": republished_build_ids,
+        }
+        return self.recovery_status()
 
     def list_image_history(self, image: str) -> list[BuildRecord]:
         return self.repository.list_builds(image=image)
@@ -339,6 +414,20 @@ class BuilderService:
             ),
         )
         return processed
+
+    def _has_active_delivery(self, build_id: str, attempt: int | None, subject: str) -> bool:
+        deliveries = self.bus.list_deliveries(
+            consumer="builder-worker",
+            subjects=[subject],
+            statuses=["pending", "processing"],
+        )
+        for delivery in deliveries:
+            if str(delivery.payload.get("build_id")) != build_id:
+                continue
+            if attempt is not None and int(delivery.payload.get("attempt", -1)) != attempt:
+                continue
+            return True
+        return False
 
     def _initialize_or_resume_job(self, build: BuildRecord, event) -> None:
         self._validate_context_uri(build.context_uri)
