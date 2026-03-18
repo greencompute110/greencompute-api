@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 from greenference_protocol import (
     APIKeyCreateRequest,
     APIKeySummary,
+    BuildContextUploadRequest,
     BuildRequest,
     ChatCompletionRequest,
     DeploymentCreateRequest,
@@ -157,6 +158,17 @@ def build_image(
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("build_image", api_key.key_id, limit=30, window_seconds=60)
     return service.start_build(payload, owner_user_id=api_key.user_id).model_dump(mode="json")
+
+
+@router.post("/platform/images/contexts")
+def upload_build_context(
+    payload: BuildContextUploadRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    enforce_rate_limit("upload_build_context", api_key.key_id, limit=30, window_seconds=60)
+    return service.upload_build_context(payload).model_dump(mode="json")
 
 
 @router.get("/platform/images")

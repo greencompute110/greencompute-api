@@ -18,6 +18,8 @@ from greenference_protocol import (
     BuildAttemptRecord,
     APIKeyRecord,
     BuildContextRecord,
+    BuildContextUploadRecord,
+    BuildContextUploadRequest,
     BuildEventRecord,
     BuildJobCheckpointRecord,
     BuildJobRecord,
@@ -125,6 +127,9 @@ class GatewayService:
 
     def start_build(self, request: BuildRequest, owner_user_id: str | None = None) -> BuildRecord:
         return self.builder.start_build(request, owner_user_id=owner_user_id)
+
+    def upload_build_context(self, request: BuildContextUploadRequest) -> BuildContextUploadRecord:
+        return self.builder.upload_build_context(request)
 
     def list_builds(self, user_id: str | None = None, *, admin: bool = False) -> list[BuildRecord]:
         builds = self.builder.list_builds()

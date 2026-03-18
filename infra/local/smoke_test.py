@@ -691,8 +691,8 @@ def verify_miner_runtime(context: dict[str, Any]) -> None:
     if runtime_detail.get("runtime_mode") not in {"process", "fallback"}:
         raise RuntimeError("runtime detail missing runtime mode")
     runtime_manifest = runtime_detail.get("metadata", {}).get("runtime_manifest", {})
-    if runtime_manifest.get("runtime_kind") not in {"local-cpu-textgen", "hf-causal-lm"}:
-        raise RuntimeError("runtime detail missing supported runtime kind")
+    if runtime_manifest.get("runtime_kind") != "hf-causal-lm":
+        raise RuntimeError("runtime detail did not use the default GPU-serving runtime kind")
     if runtime_summary.get("by_mode", {}).get(runtime_detail["runtime_mode"], 0) < 1:
         raise RuntimeError("runtime summary missing runtime mode breakdown")
     if runtime_summary.get("by_backend", {}).get(runtime_detail["backend_name"], 0) < 1:

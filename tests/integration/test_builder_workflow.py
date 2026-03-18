@@ -13,6 +13,7 @@ from greenference_persistence import RuntimeSettings, SubjectBus, WorkflowEventR
 from greenference_persistence.orm import BusDeliveryORM, WorkflowEventORM
 from greenference_protocol import (
     BuildContextRecord,
+    BuildContextUploadRequest,
     BuildRequest,
     BuildRecord,
     CapacityUpdate,
@@ -150,6 +151,25 @@ def test_builder_accepts_inline_context_archive(monkeypatch) -> None:
     assert saved.status == "published"
     assert context is not None
     assert context.source_uri.startswith("file://")
+
+
+def test_builder_uploads_context_archive_without_starting_build(monkeypatch) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    repository = BuilderRepository(database_url=shared_db, bootstrap=True)
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+    builder = BuilderService(repository, workflow_repository=workflow_repository)
+
+    uploaded = builder.upload_build_context(
+        BuildContextUploadRequest(
+            context_archive_b64=base64.b64encode(b"context-bytes").decode(),
+            context_archive_name="sdk-context.zip",
+        )
+    )
+
+    assert uploaded.context_uri.startswith("file://")
+    assert uploaded.archive_name == "sdk-context.zip"
+    assert uploaded.size_bytes == len(b"context-bytes")
 
 
 def test_builder_retry_and_cleanup_recover_transient_failure(monkeypatch) -> None:

@@ -21,6 +21,8 @@ from greenference_persistence import (
 from greenference_protocol import (
     BuildAttemptRecord,
     BuildContextRecord,
+    BuildContextUploadRecord,
+    BuildContextUploadRequest,
     BuildEventRecord,
     BuildJobCheckpointRecord,
     BuildJobRecord,
@@ -120,6 +122,17 @@ class BuilderService:
         )
         self.metrics.increment("build.accepted")
         return saved
+
+    def upload_build_context(self, request: BuildContextUploadRequest) -> BuildContextUploadRecord:
+        context_uri, size_bytes = self._write_context_archive(
+            request.context_archive_b64,
+            request.context_archive_name,
+        )
+        return BuildContextUploadRecord(
+            context_uri=context_uri,
+            archive_name=request.context_archive_name,
+            size_bytes=size_bytes,
+        )
 
     def list_builds(self) -> list[BuildRecord]:
         return self.repository.list_builds()
@@ -924,20 +937,26 @@ class BuilderService:
     def _materialize_context_source(self, request: BuildRequest) -> str:
         if request.context_archive_b64:
             archive_name = request.context_archive_name or "build-context.zip"
-            suffix = Path(archive_name).suffix or ".zip"
-            context_dir = Path(tempfile.gettempdir()) / "greenference-builder-contexts"
-            context_dir.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                prefix="greenference-build-",
-                suffix=suffix,
-                dir=context_dir,
-                delete=False,
-            ) as outfile:
-                outfile.write(base64.b64decode(request.context_archive_b64.encode()))
-            return Path(outfile.name).resolve().as_uri()
+            context_uri, _ = self._write_context_archive(request.context_archive_b64, archive_name)
+            return context_uri
         if request.context_uri is None:
             raise ValueError("build request requires context_uri or context_archive_b64")
         return request.context_uri
+
+    @staticmethod
+    def _write_context_archive(context_archive_b64: str, archive_name: str) -> tuple[str, int]:
+        suffix = Path(archive_name).suffix or ".zip"
+        context_dir = Path(tempfile.gettempdir()) / "greenference-builder-contexts"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        payload = base64.b64decode(context_archive_b64.encode())
+        with tempfile.NamedTemporaryFile(
+            prefix="greenference-build-",
+            suffix=suffix,
+            dir=context_dir,
+            delete=False,
+        ) as outfile:
+            outfile.write(payload)
+        return Path(outfile.name).resolve().as_uri(), len(payload)
 
     @staticmethod
     def _ensure_utc(timestamp: datetime) -> datetime:

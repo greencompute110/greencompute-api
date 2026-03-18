@@ -40,6 +40,11 @@ class _FakeResponse:
         return None
 
 
+@pytest.fixture(autouse=True)
+def _enable_runtime_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GREENFERENCE_ALLOW_RUNTIME_FALLBACK", "true")
+
+
 def _patch_upstream(monkeypatch: pytest.MonkeyPatch, miner: MinerAgentService) -> None:
     def fake_urlopen(target, timeout=None):  # type: ignore[no-untyped-def]
         path = urlparse(target.full_url).path

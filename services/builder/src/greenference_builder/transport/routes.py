@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from greenference_protocol import BuildRequest
+from greenference_protocol import BuildContextUploadRequest, BuildRequest
 from greenference_builder.application.services import service
 
 router = APIRouter()
@@ -9,6 +9,11 @@ router = APIRouter()
 @router.post("/builder/v1/builds")
 def start_build(payload: BuildRequest) -> dict:
     return service.start_build(payload).model_dump(mode="json")
+
+
+@router.post("/builder/v1/build-contexts")
+def upload_build_context(payload: BuildContextUploadRequest) -> dict:
+    return service.upload_build_context(payload).model_dump(mode="json")
 
 
 @router.get("/builder/v1/builds")
