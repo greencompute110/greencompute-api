@@ -6,11 +6,13 @@ from greenference_protocol import (
     BuildRequest,
     ChatCompletionRequest,
     DeploymentCreateRequest,
+    DeploymentUpdateRequest,
     UserProfileUpdateRequest,
     UserSecretCreateRequest,
     UserRegistrationRequest,
     WorkloadCreateRequest,
     WorkloadShareCreateRequest,
+    WorkloadUpdateRequest,
 )
 from greenference_gateway.application.services import service
 from greenference_gateway.domain.routing import NoReadyDeploymentError
@@ -359,6 +361,40 @@ def list_workloads(
     ]
 
 
+@router.get("/platform/workloads/{workload_id}")
+def get_workload(
+    workload_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    workload = service.get_workload(workload_id, user_id=api_key.user_id, admin=api_key.admin)
+    if workload is None:
+        raise HTTPException(status_code=404, detail="workload not found")
+    return workload.model_dump(mode="json")
+
+
+@router.patch("/platform/workloads/{workload_id}")
+def update_workload(
+    workload_id: str,
+    payload: WorkloadUpdateRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    try:
+        return service.update_workload(
+            workload_id,
+            payload,
+            actor_user_id=api_key.user_id,
+            admin=api_key.admin,
+        ).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
 @router.post("/platform/workloads/{workload_id}/shares")
 def share_workload(
     workload_id: str,
@@ -432,6 +468,40 @@ def list_deployments(
         deployment.model_dump(mode="json")
         for deployment in service.list_deployments(user_id=api_key.user_id, admin=api_key.admin)
     ]
+
+
+@router.get("/platform/deployments/{deployment_id}")
+def get_deployment(
+    deployment_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=api_key.admin)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="deployment not found")
+    return deployment.model_dump(mode="json")
+
+
+@router.patch("/platform/deployments/{deployment_id}")
+def update_deployment(
+    deployment_id: str,
+    payload: DeploymentUpdateRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    try:
+        return service.update_deployment(
+            deployment_id,
+            payload,
+            actor_user_id=api_key.user_id,
+            admin=api_key.admin,
+        ).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @router.post("/platform/secrets")

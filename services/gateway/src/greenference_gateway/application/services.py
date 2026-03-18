@@ -27,6 +27,7 @@ from greenference_protocol import (
     ChatCompletionRequest,
     DeploymentCreateRequest,
     DeploymentRecord,
+    DeploymentUpdateRequest,
     InvocationRecord,
     UserRecord,
     UserProfileUpdateRequest,
@@ -38,6 +39,7 @@ from greenference_protocol import (
     WorkloadShareCreateRequest,
     WorkloadShareRecord,
     WorkloadSpec,
+    WorkloadUpdateRequest,
 )
 from greenference_gateway.domain.routing import NoReadyDeploymentError
 from greenference_gateway.infrastructure.inference_client import (
@@ -180,6 +182,47 @@ class GatewayService:
         workload = WorkloadSpec(**request.model_dump(), owner_user_id=owner_user_id)
         return self.control_plane.upsert_workload(workload)
 
+    def get_workload(self, workload_id: str, user_id: str | None = None, *, admin: bool = False) -> WorkloadSpec | None:
+        workload = self.control_plane.repository.get_workload(workload_id)
+        if workload is None:
+            return None
+        if admin or self._user_can_access_workload(workload, user_id):
+            return workload
+        return None
+
+    def update_workload(
+        self,
+        workload_id: str,
+        request: WorkloadUpdateRequest,
+        *,
+        actor_user_id: str | None,
+        admin: bool = False,
+    ) -> WorkloadSpec:
+        workload = self.control_plane.repository.get_workload(workload_id)
+        if workload is None:
+            raise KeyError(f"workload not found: {workload_id}")
+        if not admin and workload.owner_user_id != actor_user_id:
+            raise PermissionError(f"workload update denied: {workload_id}")
+        if request.display_name is not None:
+            workload.display_name = request.display_name
+        if request.readme is not None:
+            workload.readme = request.readme
+        if request.logo_uri is not None:
+            workload.logo_uri = request.logo_uri
+        if request.tags is not None:
+            workload.tags = request.tags
+        if request.workload_alias is not None:
+            workload.workload_alias = request.workload_alias
+        if request.ingress_host is not None:
+            workload.ingress_host = request.ingress_host
+        if request.pricing_class is not None:
+            workload.pricing_class = request.pricing_class
+        if request.public is not None:
+            workload.public = request.public
+        if request.lifecycle is not None:
+            workload.lifecycle = request.lifecycle
+        return self.control_plane.upsert_workload(workload)
+
     def list_workloads(self, user_id: str | None = None, *, admin: bool = False) -> list[WorkloadSpec]:
         workloads = self.control_plane.list_workloads()
         if admin:
@@ -210,6 +253,7 @@ class GatewayService:
             {
                 "workload_id": payload.workload_id,
                 "requested_instances": payload.requested_instances,
+                "accept_fee": payload.accept_fee,
                 "owner_user_id": user_id,
             }
         )
@@ -223,6 +267,29 @@ class GatewayService:
             for deployment in deployments
             if deployment.owner_user_id == user_id or (deployment.owner_user_id is None and user_id is None)
         ]
+
+    def get_deployment(self, deployment_id: str, user_id: str | None = None, *, admin: bool = False) -> DeploymentRecord | None:
+        deployment = self.control_plane.repository.get_deployment(deployment_id)
+        if deployment is None:
+            return None
+        if admin or deployment.owner_user_id == user_id or (deployment.owner_user_id is None and user_id is None):
+            return deployment
+        return None
+
+    def update_deployment(
+        self,
+        deployment_id: str,
+        request: DeploymentUpdateRequest,
+        *,
+        actor_user_id: str | None,
+        admin: bool = False,
+    ) -> DeploymentRecord:
+        deployment = self.control_plane.repository.get_deployment(deployment_id)
+        if deployment is None:
+            raise KeyError(f"deployment not found: {deployment_id}")
+        if not admin and deployment.owner_user_id != actor_user_id:
+            raise PermissionError(f"deployment update denied: {deployment_id}")
+        return self.control_plane.update_deployment(deployment_id, request)
 
     def create_secret(self, user_id: str, request: UserSecretCreateRequest) -> UserSecretRecord:
         secret = UserSecretRecord(user_id=user_id, name=request.name, value=request.value)

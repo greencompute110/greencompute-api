@@ -7,11 +7,13 @@ from greenference_builder.infrastructure.repository import BuilderRepository
 from greenference_protocol import (
     APIKeyCreateRequest,
     BuildRequest,
+    DeploymentUpdateRequest,
     UserProfileUpdateRequest,
     UserRegistrationRequest,
     UserSecretCreateRequest,
     WorkloadCreateRequest,
     WorkloadShareCreateRequest,
+    WorkloadUpdateRequest,
 )
 
 
@@ -131,3 +133,97 @@ def test_gateway_build_visibility_and_workload_metadata():
     saved = gateway.control_plane.repository.get_workload(workload.workload_id)
     assert saved is not None
     assert saved.tags == ["chat", "public"]
+
+
+def test_gateway_workload_and_deployment_product_policy():
+    shared_db = "sqlite+pysqlite:///:memory:"
+    gateway = GatewayService(repository=GatewayRepository(database_url=shared_db, bootstrap=True))
+    gateway.control_plane = ControlPlaneService(ControlPlaneRepository(database_url=shared_db, bootstrap=True))
+
+    owner = gateway.register_user(UserRegistrationRequest(username="owner2", email="owner2@example.com"))
+    peer = gateway.register_user(UserRegistrationRequest(username="peer2", email="peer2@example.com"))
+
+    workload = gateway.create_workload(
+        WorkloadCreateRequest(
+            name="policy-model",
+            image="greenference/policy:latest",
+            requirements={"gpu_count": 2},
+            public=False,
+            lifecycle={
+                "warmup_enabled": True,
+                "warmup_path": "/ready",
+                "shutdown_after_seconds": 900,
+                "scaling_threshold": 0.85,
+            },
+        ),
+        owner.user_id,
+    )
+    assert workload.lifecycle.warmup_enabled is True
+    assert workload.lifecycle.shutdown_after_seconds == 900
+
+    updated = gateway.update_workload(
+        workload.workload_id,
+        WorkloadUpdateRequest(
+            display_name="Policy Model",
+            public=True,
+            lifecycle={
+                "warmup_enabled": True,
+                "warmup_path": "/healthz",
+                "shutdown_after_seconds": 1200,
+                "scaling_threshold": 0.9,
+            },
+        ),
+        actor_user_id=owner.user_id,
+    )
+    assert updated.display_name == "Policy Model"
+    assert updated.public is True
+    assert updated.lifecycle.warmup_path == "/healthz"
+    assert updated.lifecycle.scaling_threshold == 0.9
+    assert gateway.get_workload(workload.workload_id, user_id=peer.user_id) is not None
+
+    try:
+        gateway.update_workload(
+            workload.workload_id,
+            WorkloadUpdateRequest(display_name="nope"),
+            actor_user_id=peer.user_id,
+        )
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("expected workload update permission error")
+
+    deployment = gateway.create_deployment(
+        {
+            "workload_id": workload.workload_id,
+            "requested_instances": 2,
+            "accept_fee": False,
+        },
+        user_id=owner.user_id,
+    )
+    assert deployment.deployment_fee_usd == 1.2
+    assert deployment.fee_acknowledged is False
+    assert deployment.warmup_state == "pending"
+
+    saved_deployment = gateway.get_deployment(deployment.deployment_id, user_id=owner.user_id)
+    assert saved_deployment is not None
+    assert saved_deployment.deployment_fee_usd == deployment.deployment_fee_usd
+
+    updated_deployment = gateway.update_deployment(
+        deployment.deployment_id,
+        DeploymentUpdateRequest(requested_instances=3, fee_acknowledged=True),
+        actor_user_id=owner.user_id,
+    )
+    assert updated_deployment.requested_instances == 3
+    assert updated_deployment.deployment_fee_usd == 1.8
+    assert updated_deployment.fee_acknowledged is True
+
+    try:
+        gateway.update_deployment(
+            deployment.deployment_id,
+            DeploymentUpdateRequest(requested_instances=4),
+            actor_user_id=peer.user_id,
+        )
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("expected deployment update permission error")

@@ -11,6 +11,7 @@ from greenference_protocol import (
     DeploymentRecord,
     DeploymentState,
     DeploymentStatusUpdate,
+    DeploymentUpdateRequest,
     Heartbeat,
     InvocationRecord,
     LeaseAssignment,
@@ -120,6 +121,8 @@ class ControlPlaneService:
             workload_id=payload.workload_id,
             owner_user_id=owner_user_id,
             requested_instances=payload.requested_instances,
+            deployment_fee_usd=self._estimate_deployment_fee(workload, payload.requested_instances),
+            fee_acknowledged=payload.accept_fee,
         )
         self.repository.create_deployment(deployment)
         self.bus.publish(
@@ -166,6 +169,21 @@ class ControlPlaneService:
     def list_deployments(self) -> list[DeploymentRecord]:
         return self.repository.list_deployments()
 
+    def update_deployment(self, deployment_id: str, request: DeploymentUpdateRequest) -> DeploymentRecord:
+        deployment = self.repository.get_deployment(deployment_id)
+        if deployment is None:
+            raise KeyError(f"deployment not found: {deployment_id}")
+        workload = self.repository.get_workload(deployment.workload_id)
+        if workload is None:
+            raise KeyError(f"workload not found: {deployment.workload_id}")
+        if request.requested_instances is not None:
+            deployment.requested_instances = request.requested_instances
+            deployment.deployment_fee_usd = self._estimate_deployment_fee(workload, deployment.requested_instances)
+        if request.fee_acknowledged is not None:
+            deployment.fee_acknowledged = request.fee_acknowledged
+        deployment.updated_at = datetime.now(UTC)
+        return self.repository.update_deployment(deployment)
+
     def update_deployment_status(self, update: DeploymentStatusUpdate) -> DeploymentRecord:
         deployment = self.repository.get_deployment(update.deployment_id)
         if deployment is None:
@@ -178,6 +196,11 @@ class ControlPlaneService:
         if update.state == DeploymentState.READY:
             deployment.health_check_failures = 0
             deployment.retry_exhausted = False
+            deployment.warmup_state = "ready"
+        elif update.state in {DeploymentState.PULLING, DeploymentState.STARTING}:
+            deployment.warmup_state = "warming"
+        elif update.state in {DeploymentState.FAILED, DeploymentState.TERMINATED}:
+            deployment.warmup_state = "stopped"
         deployment.updated_at = update.observed_at
         self.repository.add_deployment_event(update)
         assignment_status = {
@@ -207,6 +230,12 @@ class ControlPlaneService:
         )
         self.metrics.increment(f"deployment.state.{saved.state.value}")
         return saved
+
+    @staticmethod
+    def _estimate_deployment_fee(workload: WorkloadSpec, requested_instances: int) -> float:
+        gpu_count = workload.requirements.gpu_count
+        base_hourly = 0.1 * gpu_count
+        return round(base_hourly * 3 * requested_instances, 4)
 
     def list_ready_deployments(self, workload_id: str) -> list[DeploymentRecord]:
         routable: list[DeploymentRecord] = []

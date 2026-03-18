@@ -179,6 +179,7 @@ class ControlPlaneRepository:
             row.pricing_class = workload.pricing_class
             row.requirements = workload.requirements.model_dump(mode="json")
             row.runtime = workload.runtime.model_dump(mode="json")
+            row.lifecycle = workload.lifecycle.model_dump(mode="json")
             row.public = workload.public
             row.created_at = workload.created_at
             session.add(row)
@@ -221,6 +222,9 @@ class ControlPlaneRepository:
                 requested_instances=deployment.requested_instances,
                 ready_instances=deployment.ready_instances,
                 endpoint=deployment.endpoint,
+                deployment_fee_usd=deployment.deployment_fee_usd,
+                fee_acknowledged=deployment.fee_acknowledged,
+                warmup_state=deployment.warmup_state,
                 last_error=deployment.last_error,
                 failure_class=deployment.failure_class,
                 last_retry_reason=deployment.last_retry_reason,
@@ -250,6 +254,9 @@ class ControlPlaneRepository:
             row.requested_instances = deployment.requested_instances
             row.ready_instances = deployment.ready_instances
             row.endpoint = deployment.endpoint
+            row.deployment_fee_usd = deployment.deployment_fee_usd
+            row.fee_acknowledged = deployment.fee_acknowledged
+            row.warmup_state = deployment.warmup_state
             row.last_error = deployment.last_error
             row.failure_class = deployment.failure_class
             row.last_retry_reason = deployment.last_retry_reason
@@ -628,6 +635,7 @@ class ControlPlaneRepository:
             pricing_class=row.pricing_class,
             requirements=row.requirements,
             runtime=row.runtime,
+            lifecycle=row.lifecycle or {},
             public=row.public,
             created_at=row.created_at,
         )
@@ -644,6 +652,9 @@ class ControlPlaneRepository:
             requested_instances=row.requested_instances,
             ready_instances=row.ready_instances,
             endpoint=row.endpoint,
+            deployment_fee_usd=row.deployment_fee_usd,
+            fee_acknowledged=row.fee_acknowledged,
+            warmup_state=row.warmup_state,
             last_error=row.last_error,
             failure_class=row.failure_class,
             last_retry_reason=row.last_retry_reason,
