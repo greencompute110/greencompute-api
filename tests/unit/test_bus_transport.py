@@ -58,6 +58,28 @@ def test_nats_publish_uses_transport_when_available(monkeypatch) -> None:
     assert published == [("build.accepted", event.event_id)]
 
 
+def test_nats_publish_falls_back_to_durable_when_transport_publish_fails(monkeypatch) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+    durable_bus = SubjectBus(
+        database_url=shared_db,
+        bootstrap=True,
+        workflow_repository=workflow_repository,
+    )
+    bus = NatsJetStreamBus(durable_bus=durable_bus, nats_url="nats://nats:4222", enabled=True)
+    bus.client_available = True
+
+    def fail_publish(subject: str, event) -> None:
+        raise RuntimeError("nats unavailable")
+
+    monkeypatch.setattr(bus, "_publish_to_nats", fail_publish)
+
+    event = bus.publish("build.accepted", {"build_id": "build-1"})
+    persisted = workflow_repository.list_events(subjects=["build.accepted"], statuses=["pending"])
+
+    assert event.event_id == persisted[0].event_id
+
+
 def test_nats_claim_pending_uses_fetched_messages(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)

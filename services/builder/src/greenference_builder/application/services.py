@@ -437,6 +437,50 @@ class BuilderService:
                 build.retry_exhausted = True
                 self.repository.save_build(build)
                 self.bus.mark_failed(event.delivery_id, build.failure_reason)
+            except Exception as exc:  # noqa: BLE001
+                build.status = "failed"
+                build.failure_reason = str(exc)
+                build.failure_class = "builder_runtime_error"
+                build.last_operation = build.last_operation or "unexpected"
+                build.build_log_uri = self.object_store.build_log_uri(build.build_id)
+                build.build_duration_seconds = max(
+                    (datetime.now(UTC) - started_at).total_seconds(),
+                    0.001,
+                )
+                build.retry_exhausted = True
+                build.updated_at = datetime.now(UTC)
+                self.repository.save_build(build)
+                self.repository.add_build_event(
+                    BuildEventRecord(
+                        build_id=build.build_id,
+                        stage="failed",
+                        message=build.failure_reason,
+                    )
+                )
+                self.repository.add_build_log(
+                    BuildLogRecord(
+                        build_id=build.build_id,
+                        attempt=attempt_number,
+                        stage="failed",
+                        message=build.failure_reason,
+                    )
+                )
+                attempt.status = "failed"
+                attempt.failure_class = build.failure_class
+                attempt.last_operation = build.last_operation
+                attempt.finished_at = datetime.now(UTC)
+                self.repository.save_build_attempt(attempt)
+                self.bus.publish(
+                    "build.failed",
+                    {
+                        "build_id": build.build_id,
+                        "image": build.image,
+                        "reason": build.failure_reason,
+                        "failure_class": build.failure_class,
+                    },
+                )
+                self.metrics.increment("build.failed")
+                self.bus.mark_failed(event.delivery_id, build.failure_reason)
         pending_count = len(
             self.bus.list_deliveries(
                 consumer="builder-worker",

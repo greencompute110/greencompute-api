@@ -168,7 +168,7 @@ class S3CompatibleObjectStoreAdapter(ObjectStoreAdapter):
             return
         try:
             self._request("HEAD", "")
-        except ValueError as exc:
+        except BuilderExecutionError as exc:
             if "status=404" not in str(exc):
                 raise
             self._request("PUT", "", body=b"", content_type="application/octet-stream")

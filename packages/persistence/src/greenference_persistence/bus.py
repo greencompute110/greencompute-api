@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import importlib.util
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -221,16 +222,22 @@ class NatsJetStreamBus:
     def publish(self, subject: str, payload: dict[str, Any]) -> WorkflowEvent:
         event = self.durable_bus.publish(subject, payload)
         if self.active_transport == "nats":
-            self._publish_to_nats(subject, event)
+            try:
+                self._publish_to_nats(subject, event)
+            except Exception:
+                pass
         return event
 
     def claim_pending(self, consumer: str, subjects: list[str], limit: int = 10) -> list[BusMessage]:
         if self.active_transport != "nats":
             return self.durable_bus.claim_pending(consumer, subjects, limit=limit)
         try:
-            return self._claim_pending_from_nats(consumer, subjects, limit=limit)
+            messages = self._claim_pending_from_nats(consumer, subjects, limit=limit)
         except Exception:
             return self.durable_bus.claim_pending(consumer, subjects, limit=limit)
+        if messages:
+            return messages
+        return self.durable_bus.claim_pending(consumer, subjects, limit=limit)
 
     def mark_completed(self, delivery_id: int) -> BusMessage | None:
         message = self._pending_messages.pop(delivery_id, None)
@@ -380,7 +387,26 @@ class NatsJetStreamBus:
 
     @staticmethod
     def _run_async(coro):
-        return asyncio.run(coro)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+        result: dict[str, Any] = {}
+        error: dict[str, BaseException] = {}
+
+        def _runner() -> None:
+            try:
+                result["value"] = asyncio.run(coro)
+            except BaseException as exc:  # noqa: BLE001
+                error["value"] = exc
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join()
+        if "value" in error:
+            raise error["value"]
+        return result.get("value")
 
     def _ack_message(self, raw_message: Any) -> None:
         if hasattr(raw_message, "ack"):

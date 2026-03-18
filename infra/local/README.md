@@ -33,6 +33,32 @@ The local stack uses Postgres as the default development path through:
 
 Runtime dependency URLs are injected for Redis, NATS, MinIO, and the local OCI registry. The `builder` container also runs with `GREENFERENCE_BUILD_EXECUTION_MODE=live`, so build workers stage context metadata and logs into MinIO and push OCI manifests to the local registry instead of using the simulated publish path. The `builder`, `control-plane`, and both miner containers run with background workers enabled. The miner containers bootstrap two default nodes and continuously reconcile assigned leases, so both the inference happy path and the reassignment path can complete without manual reconcile calls.
 
+Host-exposed dependency ports are configurable so the stack can coexist with other local services. Defaults:
+
+- Gateway: `28000`
+- Control plane: `28001`
+- Validator: `28002`
+- Builder: `28003`
+- Miner agent: `28004`
+- Failover miner agent: `28005`
+- Postgres: `15432`
+- Redis: `16379`
+- NATS client: `14222`
+- NATS monitor: `18222`
+- MinIO API: `19000`
+- MinIO console: `19001`
+- Registry: `15000`
+
+Override them with:
+
+```bash
+GREENFERENCE_LOCAL_GATEWAY_PORT=38000 \
+GREENFERENCE_LOCAL_CONTROL_PLANE_PORT=38001 \
+GREENFERENCE_LOCAL_POSTGRES_PORT=25432 \
+GREENFERENCE_LOCAL_REDIS_PORT=26379 \
+docker compose -f greenference-api/infra/local/docker-compose.yml up -d
+```
+
 ## Health Checks
 
 Every service exposes:
@@ -44,12 +70,12 @@ For `builder`, `control-plane`, and `miner-agent`, `/readyz` also includes worke
 
 Service ports:
 
-- `8000` gateway
-- `8001` control-plane
-- `8002` validator
-- `8003` builder
-- `8004` miner-agent
-- `8005` miner-agent-b
+- `28000` gateway
+- `28001` control-plane
+- `28002` validator
+- `28003` builder
+- `28004` miner-agent
+- `28005` miner-agent-b
 
 ## Smoke Test
 

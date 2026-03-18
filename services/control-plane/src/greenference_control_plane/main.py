@@ -55,7 +55,7 @@ app.include_router(router)
 
 
 @app.get("/healthz")
-def healthcheck() -> dict[str, str | bool]:
+def healthcheck() -> dict[str, object]:
     return {
         "status": "ok",
         "service": settings.service_name,
@@ -65,7 +65,7 @@ def healthcheck() -> dict[str, str | bool]:
 
 
 @app.get("/readyz")
-def readiness() -> dict[str, str]:
+def readiness() -> dict[str, object]:
     ready, error = database_ready(settings.database_url)
     if not ready:
         raise HTTPException(

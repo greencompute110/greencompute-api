@@ -3,14 +3,17 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 
 from greenference_builder.application.services import BuilderService
+from greenference_builder.infrastructure.execution import BuilderExecutionError, S3CompatibleObjectStoreAdapter
 from greenference_builder.infrastructure.repository import BuilderRepository
 from greenference_control_plane.application.services import ControlPlaneService
 from greenference_control_plane.config import settings
 from greenference_control_plane.infrastructure.repository import ControlPlaneRepository
-from greenference_persistence import SubjectBus, WorkflowEventRepository, session_scope
+from greenference_persistence import RuntimeSettings, SubjectBus, WorkflowEventRepository, session_scope
 from greenference_persistence.orm import BusDeliveryORM, WorkflowEventORM
 from greenference_protocol import (
+    BuildContextRecord,
     BuildRequest,
+    BuildRecord,
     CapacityUpdate,
     DeploymentCreateRequest,
     Heartbeat,
@@ -180,6 +183,82 @@ def test_builder_persists_attempts_logs_and_cancellation(monkeypatch) -> None:
     assert processed == []
     assert attempt is None
     assert any(item.stage == "cancelled" for item in logs)
+
+
+def test_live_object_store_creates_bucket_on_missing_head() -> None:
+    settings = RuntimeSettings(
+        service_name="greenference-builder",
+        database_url="sqlite+pysqlite:///:memory:",
+        build_execution_mode="live",
+        object_store_endpoint="http://minio:9000",
+        object_store_bucket="greenference-build-artifacts",
+    )
+    adapter = S3CompatibleObjectStoreAdapter(settings)
+    calls: list[tuple[str, str]] = []
+
+    def fake_request(method: str, key: str, body: bytes | None = None, content_type: str | None = None):
+        calls.append((method, key))
+        if method == "HEAD":
+            raise BuilderExecutionError(
+                "object store request failed status=404 target=http://minio:9000/greenference-build-artifacts",
+                operation="object_store:head",
+                failure_class="object_store_failure",
+                retryable=False,
+            )
+        return None
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+    context = BuildContextRecord(
+        build_id="build-live",
+        source_uri="s3://greenference/builds/live.zip",
+        normalized_context_uri="s3://greenference/builds/live.zip",
+        dockerfile_path="Dockerfile",
+        dockerfile_object_uri="s3://greenference/builds/live.zip.Dockerfile",
+        context_digest="sha256:test",
+    )
+    build = BuildRecord(
+        build_id="build-live",
+        image="greenference/live:latest",
+        context_uri=context.source_uri,
+        dockerfile_path="Dockerfile",
+    )
+
+    staged = adapter.stage_context(build, context)
+
+    assert staged.context.staged_context_uri is not None
+    assert calls[:2] == [("HEAD", ""), ("PUT", "")]
+    assert ("PUT", f"contexts/{build.build_id}/context.json") in calls
+
+
+def test_builder_marks_unexpected_runtime_errors_failed(monkeypatch) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    repository = BuilderRepository(database_url=shared_db, bootstrap=True)
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+    builder = BuilderService(repository, workflow_repository=workflow_repository)
+
+    build = builder.start_build(
+        BuildRequest(
+            image="greenference/runtime-error:latest",
+            context_uri="s3://greenference/builds/runtime.zip",
+        )
+    )
+
+    def explode(build_record: BuildRecord, context_record: BuildContextRecord):
+        raise RuntimeError("unexpected stage failure")
+
+    monkeypatch.setattr(builder.object_store, "stage_context", explode)
+
+    processed = builder.process_pending_events(limit=5)
+    saved = builder.get_build(build.build_id)
+    failed_events = workflow_repository.list_events(subjects=["build.accepted"], statuses=["failed"])
+
+    assert processed == []
+    assert saved is not None
+    assert saved.status == "failed"
+    assert saved.failure_class == "builder_runtime_error"
+    assert saved.retry_exhausted is True
+    assert len(failed_events) == 1
 
 
 def test_control_plane_fails_expired_leases_and_emits_event() -> None:

@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: greenference
       POSTGRES_PASSWORD: greenference
     ports:
-      - "5432:5432"
+      - "${GREENFERENCE_LOCAL_POSTGRES_PORT:-15432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U greenference -d greenference"]
       interval: 5s
@@ -15,13 +15,13 @@ services:
   redis:
     image: redis:7
     ports:
-      - "6379:6379"
+      - "${GREENFERENCE_LOCAL_REDIS_PORT:-16379}:6379"
   nats:
     image: nats:2.10
-    command: ["-js"]
+    command: ["-js", "-m", "8222"]
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - "${GREENFERENCE_LOCAL_NATS_PORT:-14222}:4222"
+      - "${GREENFERENCE_LOCAL_NATS_MONITOR_PORT:-18222}:8222"
   minio:
     image: minio/minio:latest
     command: ["server", "/data", "--console-address", ":9001"]
@@ -29,17 +29,17 @@ services:
       MINIO_ROOT_USER: greenference
       MINIO_ROOT_PASSWORD: greenference
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${GREENFERENCE_LOCAL_MINIO_PORT:-19000}:9000"
+      - "${GREENFERENCE_LOCAL_MINIO_CONSOLE_PORT:-19001}:9001"
   registry:
     image: registry:2
     ports:
-      - "5000:5000"
+      - "${GREENFERENCE_LOCAL_REGISTRY_PORT:-15000}:5000"
   migrate:
     image: python:3.12-slim
     working_dir: /workspace/greenference-api
     volumes:
-      - ../../:/workspace
+      - ../../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
@@ -55,12 +55,12 @@ services:
         condition: service_healthy
     command: >
       sh -lc "pip install alembic nats-py psycopg[binary] sqlalchemy fastapi uvicorn pydantic &&
-      alembic upgrade head"
+      alembic -c /workspace/greenference-api/alembic.ini upgrade head"
   gateway:
     image: python:3.12-slim
     working_dir: /workspace/greenference-api
     volumes:
-      - ../../:/workspace
+      - ../../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
@@ -80,10 +80,10 @@ services:
       builder:
         condition: service_started
     command: >
-      sh -lc "pip install nats-py psycopg[binary] sqlalchemy fastapi uvicorn pydantic &&
+      sh -lc "pip install psycopg[binary] sqlalchemy fastapi uvicorn pydantic &&
       uvicorn greenference_gateway.main:app --host 0.0.0.0 --port 8000"
     ports:
-      - "8000:8000"
+      - "${GREENFERENCE_LOCAL_GATEWAY_PORT:-28000}:8000"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/readyz')\""]
       interval: 5s
@@ -93,7 +93,7 @@ services:
     image: python:3.12-slim
     working_dir: /workspace/greenference-api
     volumes:
-      - ../../:/workspace
+      - ../../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
@@ -114,7 +114,7 @@ services:
       sh -lc "pip install nats-py psycopg[binary] sqlalchemy fastapi uvicorn pydantic &&
       uvicorn greenference_control_plane.main:app --host 0.0.0.0 --port 8001"
     ports:
-      - "8001:8001"
+      - "${GREENFERENCE_LOCAL_CONTROL_PLANE_PORT:-28001}:8001"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8001/readyz')\""]
       interval: 5s
@@ -124,7 +124,7 @@ services:
     image: python:3.12-slim
     working_dir: /workspace/greenference-api
     volumes:
-      - ../../:/workspace
+      - ../../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
@@ -137,7 +137,7 @@ services:
       GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS: "0.5"
       GREENFERENCE_BUS_TRANSPORT: nats
-      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/validator/src
+      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/validator/src
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -145,7 +145,7 @@ services:
       sh -lc "pip install nats-py psycopg[binary] sqlalchemy fastapi uvicorn pydantic &&
       uvicorn greenference_validator.main:app --host 0.0.0.0 --port 8002"
     ports:
-      - "8002:8002"
+      - "${GREENFERENCE_LOCAL_VALIDATOR_PORT:-28002}:8002"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8002/readyz')\""]
       interval: 5s
@@ -155,7 +155,7 @@ services:
     image: python:3.12-slim
     working_dir: /workspace/greenference-api
     volumes:
-      - ../../:/workspace
+      - ../../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
@@ -178,7 +178,7 @@ services:
       sh -lc "pip install nats-py psycopg[binary] sqlalchemy fastapi uvicorn pydantic &&
       uvicorn greenference_builder.main:app --host 0.0.0.0 --port 8003"
     ports:
-      - "8003:8003"
+      - "${GREENFERENCE_LOCAL_BUILDER_PORT:-28003}:8003"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8003/readyz')\""]
       interval: 5s
@@ -188,7 +188,7 @@ services:
     image: python:3.12-slim
     working_dir: /workspace/greenference-miner
     volumes:
-      - ../../:/workspace
+      - ../../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
@@ -218,7 +218,7 @@ services:
       sh -lc "pip install psycopg[binary] sqlalchemy fastapi uvicorn pydantic &&
       uvicorn greenference_miner_agent.main:app --host 0.0.0.0 --port 8004"
     ports:
-      - "8004:8004"
+      - "${GREENFERENCE_LOCAL_MINER_PORT:-28004}:8004"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8004/readyz')\""]
       interval: 5s
@@ -228,7 +228,7 @@ services:
     image: python:3.12-slim
     working_dir: /workspace/greenference-miner
     volumes:
-      - ../../:/workspace
+      - ../../../:/workspace
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
@@ -258,7 +258,7 @@ services:
       sh -lc "pip install psycopg[binary] sqlalchemy fastapi uvicorn pydantic &&
       uvicorn greenference_miner_agent.main:app --host 0.0.0.0 --port 8005"
     ports:
-      - "8005:8005"
+      - "${GREENFERENCE_LOCAL_FAILOVER_MINER_PORT:-28005}:8005"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8005/readyz')\""]
       interval: 5s

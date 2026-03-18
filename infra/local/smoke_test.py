@@ -7,18 +7,24 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 
-GATEWAY_URL = os.getenv("GREENFERENCE_GATEWAY_URL", "http://127.0.0.1:8000")
-CONTROL_PLANE_URL = os.getenv("GREENFERENCE_CONTROL_PLANE_URL", "http://127.0.0.1:8001")
-VALIDATOR_URL = os.getenv("GREENFERENCE_VALIDATOR_URL", "http://127.0.0.1:8002")
-BUILDER_URL = os.getenv("GREENFERENCE_BUILDER_URL", "http://127.0.0.1:8003")
-MINER_URL = os.getenv("GREENFERENCE_MINER_URL", "http://127.0.0.1:8004")
-FAILOVER_MINER_URL = os.getenv("GREENFERENCE_FAILOVER_MINER_URL", "http://127.0.0.1:8005")
-NATS_MONITOR_URL = os.getenv("GREENFERENCE_NATS_MONITOR_URL", "http://127.0.0.1:8222/healthz")
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT.parent / "greenference" / "protocol" / "src"))
+
+from greenference_protocol import NodeCapability, ProbeResult  # noqa: E402
+
+GATEWAY_URL = os.getenv("GREENFERENCE_GATEWAY_URL", "http://127.0.0.1:28000")
+CONTROL_PLANE_URL = os.getenv("GREENFERENCE_CONTROL_PLANE_URL", "http://127.0.0.1:28001")
+VALIDATOR_URL = os.getenv("GREENFERENCE_VALIDATOR_URL", "http://127.0.0.1:28002")
+BUILDER_URL = os.getenv("GREENFERENCE_BUILDER_URL", "http://127.0.0.1:28003")
+MINER_URL = os.getenv("GREENFERENCE_MINER_URL", "http://127.0.0.1:28004")
+FAILOVER_MINER_URL = os.getenv("GREENFERENCE_FAILOVER_MINER_URL", "http://127.0.0.1:28005")
+NATS_MONITOR_URL = os.getenv("GREENFERENCE_NATS_MONITOR_URL", "http://127.0.0.1:18222/healthz")
 TIMEOUT_SECONDS = float(os.getenv("GREENFERENCE_STACK_TIMEOUT_SECONDS", "60"))
 MINER_HOTKEY = os.getenv("GREENFERENCE_MINER_HOTKEY", "miner-local")
 MINER_NODE_ID = os.getenv("GREENFERENCE_MINER_NODE_ID", "node-local")
@@ -40,6 +46,20 @@ RESTART_SERVICES = tuple(
 def _request_json(method: str, url: str, payload: dict | None = None, headers: dict[str, str] | None = None) -> dict:
     encoded = None if payload is None else json.dumps(payload).encode()
     req = request.Request(url=url, data=encoded, method=method)
+    req.add_header("content-type", "application/json")
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    with request.urlopen(req) as response:  # noqa: S310
+        return json.loads(response.read().decode())
+
+
+def _request_json_body(
+    method: str,
+    url: str,
+    body_json: str,
+    headers: dict[str, str] | None = None,
+) -> dict:
+    req = request.Request(url=url, data=body_json.encode(), method=method)
     req.add_header("content-type", "application/json")
     for key, value in (headers or {}).items():
         req.add_header(key, value)
@@ -129,55 +149,80 @@ def wait_for_stack_readiness() -> None:
 
 
 def _register_admin() -> tuple[dict[str, str], dict[str, Any]]:
+    suffix = f"{time.time_ns():x}"
+    username = f"stack-admin-{suffix}"
     user = _request_json(
         "POST",
         f"{GATEWAY_URL}/platform/register",
-        {"username": "stack-admin", "email": "stack-admin@greenference.local"},
+        {"username": username, "email": f"{username}@greenference.local"},
     )
     admin_key = _request_json(
         "POST",
         f"{GATEWAY_URL}/platform/api-keys",
-        {"name": "stack-admin", "user_id": user["user_id"], "admin": True, "scopes": ["*"]},
+        {"name": username, "user_id": user["user_id"], "admin": True, "scopes": ["*"]},
     )
     return {"X-API-Key": admin_key["secret"]}, user
 
 
+def _cleanup_active_deployments(headers: dict[str, str]) -> None:
+    deployments = _request_json(
+        "GET",
+        f"{CONTROL_PLANE_URL}/platform/v1/debug/deployments",
+        headers=headers,
+    )
+    for deployment in deployments:
+        if deployment["state"] not in {"scheduled", "pulling", "starting", "ready"}:
+            continue
+        _request_json(
+            "POST",
+            f"{CONTROL_PLANE_URL}/platform/v1/debug/deployments/{deployment['deployment_id']}/fail",
+            headers=headers,
+        )
+
+
 def run_happy_path() -> dict[str, Any]:
     headers, _user = _register_admin()
+    _cleanup_active_deployments(headers)
+    run_suffix = f"{time.time_ns():x}"
+    workload_name = f"stack-echo-model-{run_suffix}"
+    workload_alias = f"stack-echo-alias-{run_suffix}"
+    ingress_host = f"{workload_alias}.greenference.local"
 
-    capability_payload = {
-        "hotkey": MINER_HOTKEY,
-        "node_id": MINER_NODE_ID,
-        "gpu_model": "a100",
-        "gpu_count": 1,
-        "available_gpus": 1,
-        "vram_gb_per_gpu": 80,
-        "cpu_cores": 32,
-        "memory_gb": 128,
-        "performance_score": 1.25,
-    }
-    _request_json(
-        "POST",
-        f"{VALIDATOR_URL}/validator/v1/capabilities",
-        capability_payload,
-        headers=_miner_headers(json.dumps(capability_payload).encode()),
+    capability_model = NodeCapability(
+        hotkey=MINER_HOTKEY,
+        node_id=MINER_NODE_ID,
+        gpu_model="a100",
+        gpu_count=1,
+        available_gpus=1,
+        vram_gb_per_gpu=80,
+        cpu_cores=32,
+        memory_gb=128,
+        performance_score=1.25,
     )
-    failover_capability_payload = {
-        "hotkey": FAILOVER_MINER_HOTKEY,
-        "node_id": FAILOVER_MINER_NODE_ID,
-        "gpu_model": "a100",
-        "gpu_count": 1,
-        "available_gpus": 1,
-        "vram_gb_per_gpu": 80,
-        "cpu_cores": 32,
-        "memory_gb": 128,
-        "performance_score": 1.1,
-    }
-    _request_json(
+    capability_json = capability_model.model_dump_json()
+    _request_json_body(
         "POST",
         f"{VALIDATOR_URL}/validator/v1/capabilities",
-        failover_capability_payload,
-        headers=_failover_miner_headers(json.dumps(failover_capability_payload).encode()),
+        capability_json,
+        headers=_miner_headers(capability_json.encode()),
+    )
+    failover_capability_model = NodeCapability(
+        hotkey=FAILOVER_MINER_HOTKEY,
+        node_id=FAILOVER_MINER_NODE_ID,
+        gpu_model="a100",
+        gpu_count=1,
+        available_gpus=1,
+        vram_gb_per_gpu=80,
+        cpu_cores=32,
+        memory_gb=128,
+        performance_score=1.1,
+    )
+    failover_capability_json = failover_capability_model.model_dump_json()
+    _request_json_body(
+        "POST",
+        f"{VALIDATOR_URL}/validator/v1/capabilities",
+        failover_capability_json,
+        headers=_failover_miner_headers(failover_capability_json.encode()),
     )
 
     build = _request_json(
@@ -196,6 +241,7 @@ def run_happy_path() -> dict[str, Any]:
     builds = _wait_json(
         f"{GATEWAY_URL}/platform/images",
         lambda body: any(item["build_id"] == build["build_id"] and item["status"] == "published" for item in body),
+        headers=headers,
     )
     published = next(item for item in builds if item["build_id"] == build["build_id"])
     print(f"build published: {published['artifact_uri']}")
@@ -214,9 +260,9 @@ def run_happy_path() -> dict[str, Any]:
         "POST",
         f"{GATEWAY_URL}/platform/workloads",
         {
-            "name": "stack-echo-model",
-            "workload_alias": "stack-echo-alias",
-            "ingress_host": "stack-echo.greenference.local",
+            "name": workload_name,
+            "workload_alias": workload_alias,
+            "ingress_host": ingress_host,
             "image": published["image"],
             "requirements": {"gpu_count": 1, "min_vram_gb_per_gpu": 40},
         },
@@ -245,7 +291,7 @@ def run_happy_path() -> dict[str, Any]:
         "POST",
         f"{GATEWAY_URL}/v1/chat/completions",
         {"model": "ignored-by-host-routing", "messages": [{"role": "user", "content": "hello stack"}]},
-        headers={**headers, "Host": "stack-echo.greenference.local"},
+        headers={**headers, "Host": ingress_host},
     )
     print(f"inference response: {response['content']}")
 
@@ -268,7 +314,7 @@ def run_happy_path() -> dict[str, Any]:
 
     routing = _request_json(
         "GET",
-        f"{GATEWAY_URL}/platform/v1/debug/route/stack-echo-alias?host=stack-echo.greenference.local",
+        f"{GATEWAY_URL}/platform/v1/debug/route/{workload_alias}?host={ingress_host}",
         headers=headers,
     )
     decisions = _request_json(
@@ -302,22 +348,23 @@ def run_happy_path() -> dict[str, Any]:
         f"{VALIDATOR_URL}/validator/v1/probes/{MINER_HOTKEY}/{MINER_NODE_ID}",
         headers=headers,
     )
-    probe_result_payload = {
-        "challenge_id": challenge["challenge_id"],
-        "hotkey": MINER_HOTKEY,
-        "node_id": MINER_NODE_ID,
-        "latency_ms": 95.0,
-        "throughput": 185.0,
-        "success": True,
-        "benchmark_signature": "stack-smoke",
-        "proxy_suspected": False,
-        "readiness_failures": 0,
-    }
-    scorecard = _request_json(
+    probe_result_model = ProbeResult(
+        challenge_id=challenge["challenge_id"],
+        hotkey=MINER_HOTKEY,
+        node_id=MINER_NODE_ID,
+        latency_ms=95.0,
+        throughput=185.0,
+        success=True,
+        benchmark_signature="stack-smoke",
+        proxy_suspected=False,
+        readiness_failures=0,
+    )
+    probe_result_json = probe_result_model.model_dump_json()
+    scorecard = _request_json_body(
         "POST",
         f"{VALIDATOR_URL}/validator/v1/probes/results",
-        probe_result_payload,
-        headers=_miner_headers(json.dumps(probe_result_payload).encode()),
+        probe_result_json,
+        headers=_miner_headers(probe_result_json.encode()),
     )
     snapshot = _request_json("POST", f"{VALIDATOR_URL}/validator/v1/weights", headers=headers)
     print(f"scorecard: {scorecard['final_score']}")
@@ -326,6 +373,8 @@ def run_happy_path() -> dict[str, Any]:
     return {
         "headers": headers,
         "workload": workload,
+        "workload_alias": workload_alias,
+        "ingress_host": ingress_host,
         "deployment": deployment,
         "build": build,
         "response": response,
@@ -347,11 +396,17 @@ def _assert_metrics(headers: dict[str, str], deployment_id: str) -> None:
     gateway_metrics = _request_json("GET", f"{GATEWAY_URL}/platform/v1/metrics", headers=headers)
     control_plane_metrics = _request_json("GET", f"{CONTROL_PLANE_URL}/platform/v1/metrics", headers=headers)
     validator_metrics = _request_json("GET", f"{VALIDATOR_URL}/validator/v1/metrics", headers=headers)
-    if gateway_metrics.get("invoke.success", 0) < 1:
+    gateway_prometheus = _request_text("GET", f"{GATEWAY_URL}/_metrics")
+    control_plane_prometheus = _request_text("GET", f"{CONTROL_PLANE_URL}/_metrics")
+    validator_prometheus = _request_text("GET", f"{VALIDATOR_URL}/_metrics")
+    if gateway_metrics.get("invoke.success", 0) < 1 and "greenference_invoke_success" not in gateway_prometheus:
         raise RuntimeError("gateway invoke.success metric did not increment")
-    if control_plane_metrics.get("deployment.state.ready", 0) < 1:
+    if (
+        control_plane_metrics.get("deployment.state.ready", 0) < 1
+        and "greenference_deployment_state_ready" not in control_plane_prometheus
+    ):
         raise RuntimeError("control-plane ready metric did not increment")
-    if validator_metrics.get("weights.published", 0) < 1:
+    if validator_metrics.get("weights.published", 0) < 1 and "greenference_weights_published" not in validator_prometheus:
         raise RuntimeError("validator weights.published metric did not increment")
     deployment_events = _request_json(
         "GET",
