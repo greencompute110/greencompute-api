@@ -148,8 +148,8 @@ def test_restart_recovery_preserves_workflows_and_routing(
             messages=[{"role": "user", "content": "recover me"}],
         )
     )
-    assert response.content.startswith("greenference-runtime-")
-    assert response.content.endswith(": recover me")
+    assert response.content.startswith("model[")
+    assert "recover me" not in response.content
     assert response.deployment_id == deployment.deployment_id
 
     control_plane_c = ControlPlaneService(ControlPlaneRepository(database_url=database_url, bootstrap=False))

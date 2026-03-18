@@ -329,6 +329,8 @@ def run_happy_path() -> dict[str, Any]:
         {"model": "ignored-by-host-routing", "messages": [{"role": "user", "content": "hello stack"}]},
         headers={**headers, "Host": ingress_host},
     )
+    if not str(response.get("content", "")).startswith("model["):
+        raise RuntimeError("non-streaming inference did not come from the local model runtime")
     print(f"inference response: {response['content']}")
 
     streamed = _request_text(
@@ -343,6 +345,8 @@ def run_happy_path() -> dict[str, Any]:
     )
     if "data: [DONE]" not in streamed:
         raise RuntimeError("streamed inference did not finish cleanly")
+    if "model[" not in streamed:
+        raise RuntimeError("streamed inference did not come from the local model runtime")
 
     invocations = _wait_json(
         f"{GATEWAY_URL}/platform/v1/invocations",
