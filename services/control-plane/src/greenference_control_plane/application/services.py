@@ -482,6 +482,51 @@ class ControlPlaneService:
             )
         )
 
+    def cleanup_deployment(self, deployment_id: str, reason: str = "operator cleanup") -> DeploymentRecord:
+        deployment = self.repository.get_deployment(deployment_id)
+        if deployment is None:
+            raise KeyError(f"deployment not found: {deployment_id}")
+        active_assignment = next(
+            (
+                item
+                for item in self.repository.list_assignments(statuses=["assigned", "activating", "active"])
+                if item.deployment_id == deployment_id
+            ),
+            None,
+        )
+        if active_assignment is not None:
+            workload = self.repository.get_workload(deployment.workload_id)
+            if workload is not None:
+                self.repository.adjust_node_capacity(
+                    active_assignment.hotkey,
+                    active_assignment.node_id,
+                    workload.requirements.gpu_count,
+                )
+            self.repository.update_assignment_status(deployment_id, "terminated", reason=reason)
+            self.repository.update_placement_status(
+                deployment_id,
+                "terminated",
+                reason=reason,
+            )
+
+        deployment.state = DeploymentState.TERMINATED
+        deployment.ready_instances = 0
+        deployment.endpoint = None
+        deployment.last_error = reason
+        deployment.failure_class = "operator_cleanup"
+        deployment.updated_at = datetime.now(UTC)
+        saved = self.repository.update_deployment(deployment)
+        self.repository.add_deployment_event(
+            DeploymentStatusUpdate(
+                deployment_id=deployment_id,
+                state=DeploymentState.TERMINATED,
+                error=reason,
+                observed_at=saved.updated_at,
+            )
+        )
+        self.metrics.increment("deployment.cleanup")
+        return saved
+
     def stuck_deployments_report(self, now: datetime | None = None) -> list[dict[str, Any]]:
         observed_at = now or datetime.now(UTC)
         reports: list[dict[str, Any]] = []

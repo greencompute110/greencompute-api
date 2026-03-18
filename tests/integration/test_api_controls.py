@@ -17,6 +17,8 @@ from greenference_protocol import (
     BuildRequest,
     CapacityUpdate,
     DeploymentCreateRequest,
+    DeploymentState,
+    DeploymentStatusUpdate,
     Heartbeat,
     InvocationRecord,
     MinerRegistration,
@@ -654,6 +656,92 @@ def test_control_plane_operator_actions_and_exclusions(monkeypatch: pytest.Monke
     assert failed["state"] == "failed"
     assert any(item["deployment_id"] == deployment.deployment_id for item in failures)
     assert undrained["drained"] is False
+
+
+def test_cleanup_deployment_releases_capacity_for_next_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
+    shared_db = "sqlite+pysqlite:///:memory:"
+    control_repository = ControlPlaneRepository(database_url=shared_db, bootstrap=True)
+    workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
+    gateway_repository = GatewayRepository(database_url=shared_db, bootstrap=True)
+    service = ControlPlaneService(control_repository, workflow_repository=workflow_repository)
+    _, admin_secret = _seed_keys(gateway_repository)
+
+    monkeypatch.setattr(control_plane_routes, "service", service)
+    monkeypatch.setattr(control_plane_security, "service", service)
+    monkeypatch.setattr(
+        control_plane_security,
+        "credential_store",
+        CredentialStore(engine=gateway_repository.engine, session_factory=gateway_repository.session_factory),
+    )
+
+    service.register_miner(
+        MinerRegistration(
+            hotkey="miner-a",
+            payout_address="5FminerA",
+            auth_secret="miner-a-secret",
+            api_base_url="http://miner-a.local",
+            validator_url="http://validator.local",
+        )
+    )
+    service.record_heartbeat(Heartbeat(hotkey="miner-a", healthy=True))
+    service.update_capacity(
+        CapacityUpdate(
+            hotkey="miner-a",
+            nodes=[
+                NodeCapability(
+                    hotkey="miner-a",
+                    node_id="node-a",
+                    server_id="server-a",
+                    hostname="gpu-a.internal",
+                    gpu_model="a100",
+                    gpu_count=1,
+                    available_gpus=1,
+                    vram_gb_per_gpu=80,
+                    cpu_cores=32,
+                    memory_gb=128,
+                )
+            ],
+        )
+    )
+    workload = service.upsert_workload(
+        WorkloadSpec(
+            **WorkloadCreateRequest(
+                name="cleanup-model",
+                image="greenference/echo:latest",
+                requirements={"gpu_count": 1},
+            ).model_dump()
+        )
+    )
+
+    first = service.create_deployment(DeploymentCreateRequest(workload_id=workload.workload_id))
+    service.process_pending_events()
+    service.update_deployment_status(
+        DeploymentStatusUpdate(deployment_id=first.deployment_id, state=DeploymentState.PULLING)
+    )
+    service.update_deployment_status(
+        DeploymentStatusUpdate(deployment_id=first.deployment_id, state=DeploymentState.STARTING)
+    )
+    service.update_deployment_status(
+        DeploymentStatusUpdate(
+            deployment_id=first.deployment_id,
+            state=DeploymentState.READY,
+            endpoint="http://miner-a.local/deployments/first",
+            ready_instances=1,
+        )
+    )
+
+    cleaned = control_plane_routes.cleanup_deployment(first.deployment_id, authorization=f"Bearer {admin_secret}")
+
+    second = service.create_deployment(DeploymentCreateRequest(workload_id=workload.workload_id))
+    service.process_pending_events()
+    scheduled = service.repository.get_deployment(second.deployment_id)
+
+    assert cleaned["state"] == "terminated"
+    assert cleaned["endpoint"] is None
+    assert cleaned["failure_class"] == "operator_cleanup"
+    assert scheduled is not None
+    assert scheduled.state == DeploymentState.SCHEDULED
+    assert scheduled.hotkey == "miner-a"
 
 
 def test_validator_routes_require_headers_and_expose_probe_history(

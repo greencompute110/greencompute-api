@@ -319,6 +319,19 @@ def fail_deployment(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/platform/v1/debug/deployments/{deployment_id}/cleanup")
+def cleanup_deployment(
+    deployment_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_admin_api_key(authorization, x_api_key)
+    try:
+        return service.cleanup_deployment(deployment_id).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/platform/v1/debug/miners/{hotkey}/drain")
 def drain_miner(
     hotkey: str,

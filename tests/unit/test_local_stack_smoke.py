@@ -198,3 +198,34 @@ def test_main_runs_operator_action_checks_when_flag_present(monkeypatch) -> None
 
     assert result == 0
     assert calls == ["wait", "happy", "metrics:dep-1", "operator:dep-1"]
+
+
+def test_cleanup_active_deployments_terminates_miner_before_control_plane(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_request_json(method: str, url: str, payload=None, headers=None):  # noqa: ANN001
+        calls.append((method, url))
+        if url.endswith("/platform/v1/debug/deployments"):
+            return [
+                {
+                    "deployment_id": "dep-1",
+                    "state": "ready",
+                    "hotkey": SMOKE_TEST.MINER_HOTKEY,
+                },
+                {
+                    "deployment_id": "dep-2",
+                    "state": "failed",
+                    "hotkey": SMOKE_TEST.FAILOVER_MINER_HOTKEY,
+                },
+            ]
+        return {"status": "ok"}
+
+    monkeypatch.setattr(SMOKE_TEST, "_request_json", fake_request_json)
+
+    SMOKE_TEST._cleanup_active_deployments({"X-API-Key": "secret"})
+
+    assert calls == [
+        ("GET", f"{SMOKE_TEST.CONTROL_PLANE_URL}/platform/v1/debug/deployments"),
+        ("POST", f"{SMOKE_TEST.MINER_URL}/agent/v1/deployments/dep-1/terminate"),
+        ("POST", f"{SMOKE_TEST.CONTROL_PLANE_URL}/platform/v1/debug/deployments/dep-1/cleanup"),
+    ]

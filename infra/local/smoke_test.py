@@ -173,9 +173,22 @@ def _cleanup_active_deployments(headers: dict[str, str]) -> None:
     for deployment in deployments:
         if deployment["state"] not in {"scheduled", "pulling", "starting", "ready"}:
             continue
+        miner_url = None
+        if deployment.get("hotkey") == MINER_HOTKEY:
+            miner_url = MINER_URL
+        elif deployment.get("hotkey") == FAILOVER_MINER_HOTKEY:
+            miner_url = FAILOVER_MINER_URL
+        if miner_url is not None:
+            try:
+                _request_json(
+                    "POST",
+                    f"{miner_url}/agent/v1/deployments/{deployment['deployment_id']}/terminate",
+                )
+            except HTTPError:
+                pass
         _request_json(
             "POST",
-            f"{CONTROL_PLANE_URL}/platform/v1/debug/deployments/{deployment['deployment_id']}/fail",
+            f"{CONTROL_PLANE_URL}/platform/v1/debug/deployments/{deployment['deployment_id']}/cleanup",
             headers=headers,
         )
 
@@ -402,15 +415,15 @@ def _assert_metrics(headers: dict[str, str], deployment_id: str) -> None:
     if gateway_metrics.get("invoke.success", 0) < 1 and "greenference_invoke_success" not in gateway_prometheus:
         raise RuntimeError("gateway invoke.success metric did not increment")
     if (
-        control_plane_metrics.get("deployment.state.ready", 0) < 1
-        and "greenference_deployment_state_ready" not in control_plane_prometheus
+        control_plane_metrics.get("deployment.scheduled", 0) < 1
+        and "greenference_deployment_scheduled" not in control_plane_prometheus
     ):
-        raise RuntimeError("control-plane ready metric did not increment")
+        raise RuntimeError("control-plane deployment.scheduled metric did not increment")
     if validator_metrics.get("weights.published", 0) < 1 and "greenference_weights_published" not in validator_prometheus:
         raise RuntimeError("validator weights.published metric did not increment")
     deployment_events = _request_json(
         "GET",
-        f"{CONTROL_PLANE_URL}/platform/v1/debug/deployment-events/{deployment_id}",
+        f"{CONTROL_PLANE_URL}/platform/v1/debug/deployment-events?deployment_id={deployment_id}",
         headers=headers,
     )
     if not any(item["state"] == "ready" for item in deployment_events):
