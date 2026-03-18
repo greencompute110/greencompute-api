@@ -37,6 +37,8 @@ class UserORM(Base):
     bio: Mapped[str | None] = mapped_column(Text, nullable=True)
     website: Mapped[str | None] = mapped_column(String(255), nullable=True)
     profile_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    balance_tao: Mapped[float] = mapped_column(Float, default=0.0)
+    balance_usd: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

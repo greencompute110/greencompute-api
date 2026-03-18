@@ -31,6 +31,7 @@ class HttpInferenceClient:
         self,
         upstream_timeout_seconds: float | None = None,
         health_timeout_seconds: float | None = None,
+        miner_auth_secret: str | None = None,
     ) -> None:
         self.upstream_timeout_seconds = upstream_timeout_seconds or float(
             os.getenv("GREENFERENCE_UPSTREAM_TIMEOUT_SECONDS", "10.0")
@@ -38,12 +39,25 @@ class HttpInferenceClient:
         self.health_timeout_seconds = health_timeout_seconds or float(
             os.getenv("GREENFERENCE_HEALTH_TIMEOUT_SECONDS", "2.0")
         )
+        self.miner_auth_secret = miner_auth_secret or os.getenv("GREENFERENCE_INFERENCE_AUTH_SECRET") or None
+
+    def _base_headers(self, request_id: str | None) -> dict[str, str]:
+        h: dict[str, str] = {"content-type": "application/json"}
+        if request_id is not None:
+            h["x-request-id"] = request_id
+        if self.miner_auth_secret:
+            h["X-Gateway-Auth"] = self.miner_auth_secret
+        return h
 
     def check_deployment_health(self, deployment: DeploymentRecord) -> bool:
         if not deployment.endpoint:
             return False
+        headers: dict[str, str] = {}
+        if self.miner_auth_secret:
+            headers["X-Gateway-Auth"] = self.miner_auth_secret
         upstream = request.Request(
             url=f"{deployment.endpoint.rstrip('/')}/healthz",
+            headers=headers,
             method="GET",
         )
         try:
@@ -65,10 +79,7 @@ class HttpInferenceClient:
         upstream = request.Request(
             url=f"{deployment.endpoint.rstrip('/')}/v1/chat/completions",
             data=payload.model_dump_json().encode(),
-            headers={
-                "content-type": "application/json",
-                **({"x-request-id": request_id} if request_id is not None else {}),
-            },
+            headers=self._base_headers(request_id),
             method="POST",
         )
         try:
@@ -110,10 +121,7 @@ class HttpInferenceClient:
         upstream = request.Request(
             url=f"{deployment.endpoint.rstrip('/')}/v1/chat/completions",
             data=payload.model_copy(update={"stream": True}).model_dump_json().encode(),
-            headers={
-                "content-type": "application/json",
-                **({"x-request-id": request_id} if request_id is not None else {}),
-            },
+            headers=self._base_headers(request_id),
             method="POST",
         )
         try:

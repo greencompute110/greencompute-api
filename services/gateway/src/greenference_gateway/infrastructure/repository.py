@@ -28,6 +28,8 @@ class GatewayRepository:
             row.bio = user.bio
             row.website = user.website
             row.profile_metadata = user.metadata
+            row.balance_tao = getattr(user, "balance_tao", 0.0)
+            row.balance_usd = getattr(user, "balance_usd", 0.0)
             row.created_at = user.created_at
             session.add(row)
         return user
@@ -56,6 +58,20 @@ class GatewayRepository:
                 stmt = stmt.where(APIKeyORM.user_id == user_id)
             rows = session.scalars(stmt).all()
             return [self._to_api_key(row) for row in rows]
+
+    def get_api_key(self, key_id: str) -> APIKeyRecord | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(APIKeyORM, key_id)
+            return self._to_api_key(row) if row else None
+
+    def delete_api_key(self, key_id: str) -> APIKeyRecord | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(APIKeyORM, key_id)
+            if row is None:
+                return None
+            record = self._to_api_key(row)
+            session.delete(row)
+            return record
 
     def save_secret(self, secret: UserSecretRecord) -> UserSecretRecord:
         with session_scope(self.session_factory) as session:
@@ -126,6 +142,8 @@ class GatewayRepository:
             bio=row.bio,
             website=row.website,
             metadata=row.profile_metadata or {},
+            balance_tao=getattr(row, "balance_tao", 0.0),
+            balance_usd=getattr(row, "balance_usd", 0.0),
             created_at=row.created_at,
         )
 

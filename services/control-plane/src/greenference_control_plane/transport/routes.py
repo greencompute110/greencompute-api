@@ -1,4 +1,6 @@
+import json
 from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import StreamingResponse
 
 from greenference_persistence import get_metrics_store
 from greenference_protocol import CapacityUpdate, DeploymentStatusUpdate, Heartbeat, MinerRegistration
@@ -111,6 +113,174 @@ def deployment_status(
     )
     saved = service.update_deployment_status(payload)
     return saved.model_dump(mode="json")
+
+
+def _sse_stream(items: list):
+    for item in items:
+        payload = item if isinstance(item, dict) else item.model_dump(mode="json")
+        yield f"data: {json.dumps(payload)}\n\n"
+    yield "data: NO_ITEMS\n\n"
+
+
+@router.get("/miner/v1/workloads")
+def miner_stream_workloads(
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> StreamingResponse:
+    hotkey = x_miner_hotkey or ""
+    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    workloads = service.list_workloads()
+    items = [{"workload_id": w.workload_id, "name": w.name, "image": w.image, "kind": w.kind.value} for w in workloads]
+    return StreamingResponse(
+        _sse_stream(items),
+        media_type="text/event-stream",
+        headers={"cache-control": "no-cache"},
+    )
+
+
+@router.get("/miner/v1/images")
+def miner_stream_images(
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> StreamingResponse:
+    hotkey = x_miner_hotkey or ""
+    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    builds = service.repository.list_builds()
+    items = [{"build_id": b["build_id"], "image": b["image"], "status": b["status"]} for b in builds]
+    return StreamingResponse(
+        _sse_stream(items),
+        media_type="text/event-stream",
+        headers={"cache-control": "no-cache"},
+    )
+
+
+@router.get("/miner/v1/nodes")
+def miner_stream_nodes(
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> StreamingResponse:
+    hotkey = x_miner_hotkey or ""
+    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    nodes = service.list_nodes()
+    items = [
+        {"node_id": n.node_id, "hotkey": n.hotkey, "payload": n.model_dump(mode="json")}
+        for n in nodes
+    ]
+    return StreamingResponse(
+        _sse_stream(items),
+        media_type="text/event-stream",
+        headers={"cache-control": "no-cache"},
+    )
+
+
+@router.get("/miner/v1/instances")
+def miner_stream_instances(
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> StreamingResponse:
+    hotkey = x_miner_hotkey or ""
+    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    deployments = service.list_deployments()
+    items = [d.model_dump(mode="json") for d in deployments]
+    return StreamingResponse(
+        _sse_stream(items),
+        media_type="text/event-stream",
+        headers={"cache-control": "no-cache"},
+    )
+
+
+@router.get("/miner/v1/jobs")
+def miner_list_jobs(
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> list[dict]:
+    hotkey = x_miner_hotkey or ""
+    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    return []
+
+
+@router.get("/miner/v1/inventory")
+def miner_inventory(
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> dict:
+    hk = x_miner_hotkey or ""
+    require_miner_request(hk, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    workloads = service.list_workloads()
+    deployments = service.list_deployments()
+    nodes = service.list_nodes()
+    return {
+        "workloads": [w.model_dump(mode="json") for w in workloads],
+        "deployments": [d.model_dump(mode="json") for d in deployments],
+        "nodes": [n.model_dump(mode="json") for n in nodes],
+    }
+
+
+@router.get("/miner/v1/metrics")
+def miner_stream_metrics(
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> StreamingResponse:
+    hotkey = x_miner_hotkey or ""
+    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    usage = service.usage_summary()
+    items = [{"deployment_id": k, **v} for k, v in usage.items()]
+    return StreamingResponse(
+        _sse_stream(items),
+        media_type="text/event-stream",
+        headers={"cache-control": "no-cache"},
+    )
+
+
+@router.get("/miner/v1/active_instances")
+def miner_active_instances(
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> list[dict]:
+    hotkey = x_miner_hotkey or ""
+    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    deployments = [d for d in service.list_deployments() if d.state.value == "ready"]
+    return [d.model_dump(mode="json") for d in deployments]
+
+
+@router.get("/miner/v1/stats")
+def miner_stats(
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> dict:
+    hotkey = x_miner_hotkey or ""
+    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    return {"deployments": len(service.list_deployments()), "leases": len(service.repository.list_assignments())}
+
+
+@router.get("/miner/v1/scores")
+def miner_scores(
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> dict:
+    hotkey = x_miner_hotkey or ""
+    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    return {}
 
 
 @router.get("/platform/v1/usage")

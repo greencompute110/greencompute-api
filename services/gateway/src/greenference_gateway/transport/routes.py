@@ -1,8 +1,10 @@
-from fastapi import APIRouter, Header, HTTPException
+import json
+from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from greenference_protocol import (
     APIKeyCreateRequest,
+    APIKeySummary,
     BuildRequest,
     ChatCompletionRequest,
     DeploymentCreateRequest,
@@ -32,6 +34,69 @@ def create_api_key(payload: APIKeyCreateRequest) -> dict:
     return service.create_api_key(payload).model_dump(mode="json")
 
 
+@router.get("/platform/api-keys")
+def list_api_keys(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    api_key = require_api_key(authorization, x_api_key)
+    keys = service.list_api_keys(user_id=api_key.user_id, admin=api_key.admin)
+    return [
+        APIKeySummary(
+            key_id=k.key_id,
+            name=k.name,
+            user_id=k.user_id,
+            admin=k.admin,
+            scopes=k.scopes,
+            created_at=k.created_at,
+        ).model_dump(mode="json")
+        for k in keys
+    ]
+
+
+@router.get("/platform/api-keys/{key_id}")
+def get_api_key(
+    key_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    key = service.get_api_key(key_id, user_id=api_key.user_id, admin=api_key.admin)
+    if key is None:
+        raise HTTPException(status_code=404, detail="api key not found")
+    return APIKeySummary(
+        key_id=key.key_id,
+        name=key.name,
+        user_id=key.user_id,
+        admin=key.admin,
+        scopes=key.scopes,
+        created_at=key.created_at,
+    ).model_dump(mode="json")
+
+
+@router.delete("/platform/api-keys/{key_id}")
+def delete_api_key(
+    key_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    try:
+        deleted = service.delete_api_key(key_id, user_id=api_key.user_id, admin=api_key.admin)
+        return APIKeySummary(
+            key_id=deleted.key_id,
+            name=deleted.name,
+            user_id=deleted.user_id,
+            admin=deleted.admin,
+            scopes=deleted.scopes,
+            created_at=deleted.created_at,
+        ).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
 @router.post("/platform/register")
 def register_user(payload: UserRegistrationRequest) -> dict:
     return service.register_user(payload).model_dump(mode="json")
@@ -50,6 +115,21 @@ def get_user(
     if user is None:
         raise HTTPException(status_code=404, detail="user not found")
     return user.model_dump(mode="json")
+
+
+@router.get("/platform/users/{user_id}/balance")
+def get_user_balance(
+    user_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    if not api_key.admin and api_key.user_id != user_id:
+        raise HTTPException(status_code=403, detail="user access denied")
+    user = service.get_user(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    return {"user_id": user_id, "balance_tao": user.balance_tao, "balance_usd": user.balance_usd}
 
 
 @router.patch("/platform/users/{user_id}")
@@ -338,7 +418,7 @@ def cancel_build(
 
 @router.post("/platform/workloads")
 def create_workload(
-    payload: WorkloadCreateRequest,
+    payload: dict,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
@@ -346,7 +426,23 @@ def create_workload(
     enforce_rate_limit("create_workload", api_key.key_id, limit=30, window_seconds=60)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
-    return service.create_workload(payload, api_key.user_id).model_dump(mode="json")
+    template = payload.get("template")
+    if template == "vllm":
+        from greenference_gateway.domain.templates import build_vllm_workload
+        model = payload.get("model")
+        if not model:
+            raise HTTPException(status_code=400, detail="model required for vllm template")
+        request = build_vllm_workload(model, **{k: v for k, v in payload.items() if k not in ("template", "model")})
+    elif template == "diffusion":
+        from greenference_gateway.domain.templates import build_diffusion_workload
+        model = payload.get("model")
+        name = payload.get("name", model or "diffusion")
+        if not model:
+            raise HTTPException(status_code=400, detail="model required for diffusion template")
+        request = build_diffusion_workload(model, name, **{k: v for k, v in payload.items() if k not in ("template", "model", "name")})
+    else:
+        request = WorkloadCreateRequest(**payload)
+    return service.create_workload(request, api_key.user_id).model_dump(mode="json")
 
 
 @router.get("/platform/workloads")
@@ -414,6 +510,60 @@ def share_workload(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.delete("/platform/workloads/{workload_id}")
+def delete_workload(
+    workload_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    try:
+        return service.delete_workload(
+            workload_id,
+            actor_user_id=api_key.user_id,
+            admin=api_key.admin,
+        ).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.get("/platform/workloads/{workload_id}/utilization")
+def get_workload_utilization(
+    workload_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    workload = service.get_workload(workload_id, user_id=api_key.user_id, admin=api_key.admin)
+    if workload is None:
+        raise HTTPException(status_code=404, detail="workload not found")
+    return service.workload_utilization(workload_id)
+
+
+@router.get("/platform/workloads/{workload_id}/warmup")
+def workload_warmup(
+    workload_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> StreamingResponse:
+    api_key = require_api_key(authorization, x_api_key)
+    workload = service.get_workload(workload_id, user_id=api_key.user_id, admin=api_key.admin)
+    if workload is None:
+        raise HTTPException(status_code=404, detail="workload not found")
+
+    def _warmup_stream():
+        yield f"data: {json.dumps({'workload_id': workload_id, 'status': 'warmup_started'})}\n\n"
+        yield f"data: {json.dumps({'workload_id': workload_id, 'status': 'warmup_complete'})}\n\n"
+
+    return StreamingResponse(
+        _warmup_stream(),
+        media_type="text/event-stream",
+        headers={"cache-control": "no-cache"},
+    )
 
 
 @router.get("/platform/workloads/{workload_id}/shares")
@@ -617,6 +767,37 @@ def embeddings(
     }
 
 
+SUPPORTED_GPU_MODELS = [
+    "a100",
+    "a100-80gb",
+    "h100",
+    "h100-80gb",
+    "a10",
+    "a10g",
+    "l40",
+    "l40s",
+    "rtx-4090",
+    "rtx-4080",
+    "rtx-3090",
+    "rtx-3080",
+    "v100",
+    "v100-32gb",
+    "t4",
+    "t4g",
+    "m60",
+    "k80",
+]
+
+
+@router.get("/platform/nodes/supported")
+def list_supported_gpus(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[str]:
+    require_api_key(authorization, x_api_key)
+    return SUPPORTED_GPU_MODELS
+
+
 @router.get("/platform/v1/debug/route/{model}")
 def debug_route(
     model: str,
@@ -660,6 +841,15 @@ def platform_metrics(
     return metrics.snapshot()
 
 
+@router.get("/platform/v1/payment/summary")
+def payment_summary(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return service.payment_summary()
+
+
 @router.get("/platform/v1/invocations")
 def list_invocations(
     limit: int = 100,
@@ -678,6 +868,72 @@ def export_recent_invocations(
 ) -> dict:
     require_api_key(authorization, x_api_key, admin_required=True)
     return service.export_recent_invocations(limit=limit)
+
+
+@router.get("/platform/model-aliases")
+def list_model_aliases(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    api_key = require_api_key(authorization, x_api_key)
+    workloads = service.list_workloads(user_id=api_key.user_id, admin=api_key.admin)
+    return [
+        {"alias": w.workload_alias, "workload_id": w.workload_id}
+        for w in workloads
+        if w.workload_alias
+    ]
+
+
+@router.post("/platform/model-aliases")
+def create_or_update_model_alias(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    alias = payload.get("alias")
+    workload_id = payload.get("workload_id")
+    if not alias or not workload_id:
+        raise HTTPException(status_code=400, detail="alias and workload_id required")
+    try:
+        from greenference_protocol import WorkloadUpdateRequest
+
+        return service.update_workload(
+            workload_id,
+            WorkloadUpdateRequest(workload_alias=alias),
+            actor_user_id=api_key.user_id,
+            admin=api_key.admin,
+        ).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.delete("/platform/model-aliases/{alias}")
+def delete_model_alias(
+    alias: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    workloads = service.list_workloads(user_id=api_key.user_id, admin=api_key.admin)
+    target = next((w for w in workloads if w.workload_alias == alias), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="model alias not found")
+    try:
+        from greenference_protocol import WorkloadUpdateRequest
+
+        return service.update_workload(
+            target.workload_id,
+            WorkloadUpdateRequest(clear_workload_alias=True),
+            actor_user_id=api_key.user_id,
+            admin=api_key.admin,
+        ).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @router.get("/platform/v1/invocations/{invocation_id}")
@@ -701,6 +957,158 @@ def debug_invocation_failures(
 ) -> list[dict]:
     require_api_key(authorization, x_api_key, admin_required=True)
     return service.control_plane.invocation_failure_report(limit=limit)
+
+
+@router.get("/registry/auth")
+def registry_auth(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key)
+    import base64
+    from greenference_persistence.runtime import load_runtime_settings
+    settings = load_runtime_settings("greenference-gateway")
+    registry_password = getattr(settings, "registry_password", "greenference-registry")
+    auth_string = base64.b64encode(f":{registry_password}".encode()).decode()
+    return {"authenticated": True, "auth_header": f"Basic {auth_string}"}
+
+
+@router.get("/guess/vllm_config")
+def guess_vllm_config(
+    model: str = Query(..., description="HuggingFace model id (org/model)"),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key)
+    from greenference_gateway.infrastructure.guesser import analyze_model
+    try:
+        req = analyze_model(model)
+        return req.to_dict()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/logos")
+def upload_logo(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key)
+    from uuid import uuid4
+    logo_id = str(uuid4())
+    return {"logo_id": logo_id, "uri": f"/logos/{logo_id}.png"}
+
+
+@router.get("/logos/{logo_id}.{ext}")
+def get_logo(
+    logo_id: str,
+    ext: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key)
+    raise HTTPException(status_code=404, detail="logo not found")
+
+
+@router.get("/bounties")
+def list_bounties(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_api_key(authorization, x_api_key)
+    return []
+
+
+@router.post("/audit/miner_data")
+def audit_miner_data(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return {"status": "accepted", "path": f"audit/{payload.get('miner_id', 'unknown')}"}
+
+
+@router.get("/audit/")
+def list_audit(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return []
+
+
+@router.get("/audit/download")
+def audit_download(
+    path: str = Query(""),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    raise HTTPException(status_code=404, detail="audit data not found")
+
+
+@router.get("/misc/proxy")
+def misc_proxy(
+    url: str = Query(""),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key)
+    if not url or "scoredata.me" not in url:
+        raise HTTPException(status_code=400, detail="whitelisted proxy only")
+    return {"url": url, "proxied": False}
+
+
+@router.get("/misc/hf_repo_info")
+def misc_hf_repo_info(
+    repo: str = Query(""),
+    path: str = Query(""),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key)
+    return {"repo": repo, "path": path, "files": []}
+
+
+@router.get("/e2e/instances/{workload_id}")
+def e2e_instances(
+    workload_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_api_key(authorization, x_api_key)
+    return []
+
+
+@router.get("/idp/scopes")
+def idp_scopes() -> list[str]:
+    return ["openid", "profile", "email"]
+
+
+@router.get("/idp/authorize")
+def idp_authorize(
+    client_id: str = Query(""),
+    redirect_uri: str = Query(""),
+    response_type: str = Query(""),
+    scope: str = Query(""),
+) -> dict:
+    raise HTTPException(status_code=501, detail="OAuth2 not implemented")
+
+
+@router.post("/idp/token")
+def idp_token(payload: dict) -> dict:
+    raise HTTPException(status_code=501, detail="OAuth2 not implemented")
+
+
+@router.post("/e2e/invoke")
+def e2e_invoke(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_api_key(authorization, x_api_key)
+    raise HTTPException(status_code=501, detail="E2E encryption not implemented")
 
 
 @router.get("/platform/v1/debug/build-failures")

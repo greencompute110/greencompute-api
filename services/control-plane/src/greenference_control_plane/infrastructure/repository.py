@@ -8,20 +8,22 @@ from sqlalchemy.orm import Session
 from greenference_persistence import create_db_engine, create_session_factory, init_database, session_scope
 from greenference_persistence.db import needs_bootstrap
 from greenference_persistence.orm import (
+    BuildORM,
     CapacityHistoryORM,
     CapacityORM,
     DeploymentEventORM,
     DeploymentORM,
     HeartbeatORM,
     InvocationRecordORM,
-    LeaseHistoryORM,
     LeaseAssignmentORM,
+    LeaseHistoryORM,
     MinerORM,
     NodeInventoryORM,
     PlacementORM,
     ServerORM,
     UsageRecordORM,
     WorkloadORM,
+    WorkloadShareORM,
 )
 from greenference_protocol import (
     CapacityHistoryRecord,
@@ -209,6 +211,36 @@ class ControlPlaneRepository:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(select(WorkloadORM)).all()
             return [self._to_workload(row) for row in rows]
+
+    def delete_workload(self, workload_id: str) -> WorkloadSpec | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(WorkloadORM, workload_id)
+            if row is None:
+                return None
+            workload = self._to_workload(row)
+            deployment_ids = [
+                r.deployment_id
+                for r in session.scalars(select(DeploymentORM).where(DeploymentORM.workload_id == workload_id)).all()
+            ]
+            for dep_id in deployment_ids:
+                for la in session.scalars(select(LeaseAssignmentORM).where(LeaseAssignmentORM.deployment_id == dep_id)).all():
+                    session.delete(la)
+                for p in session.scalars(select(PlacementORM).where(PlacementORM.deployment_id == dep_id)).all():
+                    session.delete(p)
+                for lh in session.scalars(select(LeaseHistoryORM).where(LeaseHistoryORM.deployment_id == dep_id)).all():
+                    session.delete(lh)
+                for de in session.scalars(select(DeploymentEventORM).where(DeploymentEventORM.deployment_id == dep_id)).all():
+                    session.delete(de)
+                for ur in session.scalars(select(UsageRecordORM).where(UsageRecordORM.deployment_id == dep_id)).all():
+                    session.delete(ur)
+                for inv in session.scalars(select(InvocationRecordORM).where(InvocationRecordORM.deployment_id == dep_id)).all():
+                    session.delete(inv)
+            for share in session.scalars(select(WorkloadShareORM).where(WorkloadShareORM.workload_id == workload_id)).all():
+                session.delete(share)
+            for dep in session.scalars(select(DeploymentORM).where(DeploymentORM.workload_id == workload_id)).all():
+                session.delete(dep)
+            session.delete(row)
+            return workload
 
     def create_deployment(self, deployment: DeploymentRecord) -> DeploymentRecord:
         with session_scope(self.session_factory) as session:
@@ -527,6 +559,20 @@ class ControlPlaneRepository:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(select(NodeInventoryORM).order_by(NodeInventoryORM.observed_at.desc())).all()
             return [NodeCapability(**row.payload) for row in rows]
+
+    def list_builds(self) -> list[dict]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(select(BuildORM).order_by(BuildORM.created_at.desc())).all()
+            return [
+                {
+                    "build_id": row.build_id,
+                    "image": row.image,
+                    "status": row.status,
+                    "artifact_uri": row.artifact_uri,
+                    "artifact_digest": row.artifact_digest,
+                }
+                for row in rows
+            ]
 
     def list_capacity_history(self, limit: int | None = None) -> list[CapacityHistoryRecord]:
         with session_scope(self.session_factory) as session:

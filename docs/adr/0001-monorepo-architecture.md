@@ -6,14 +6,14 @@ Accepted
 
 ## Context
 
-The reference Chutes repositories separate SDK, validator, and miner concerns, but they also mix
+Reference upstream repositories separate SDK, validator, and miner concerns, but they also mix
 transport, orchestration, and policy logic heavily inside large modules. Greenference needs a
 cleaner substrate for an inference-first subnet that later expands into pods and VMs without a
 full rewrite.
 
 ## Decision
 
-Greenference uses a Python-first split that mirrors the Chutes references:
+Greenference uses a Python-first split that mirrors the upstream references:
 
 - `greenference` for shared protocol and SDK
 - `greenference-api` for gateway, control-plane, validator, and builder

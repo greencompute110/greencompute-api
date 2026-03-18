@@ -98,6 +98,31 @@ class GatewayService:
         )
         return self.repository.save_api_key(api_key)
 
+    def list_api_keys(self, user_id: str | None = None, *, admin: bool = False) -> list[APIKeyRecord]:
+        keys = self.repository.list_api_keys(user_id=None if admin else user_id)
+        if admin:
+            return keys
+        return [k for k in keys if k.user_id == user_id]
+
+    def get_api_key(self, key_id: str, user_id: str | None = None, *, admin: bool = False) -> APIKeyRecord | None:
+        key = self.repository.get_api_key(key_id)
+        if key is None:
+            return None
+        if admin or key.user_id == user_id:
+            return key
+        return None
+
+    def delete_api_key(self, key_id: str, *, user_id: str | None, admin: bool = False) -> APIKeyRecord:
+        key = self.repository.get_api_key(key_id)
+        if key is None:
+            raise KeyError(f"api key not found: {key_id}")
+        if not admin and key.user_id != user_id:
+            raise PermissionError(f"api key delete denied: {key_id}")
+        deleted = self.repository.delete_api_key(key_id)
+        if deleted is None:
+            raise KeyError(f"api key not found: {key_id}")
+        return deleted
+
     def start_build(self, request: BuildRequest, owner_user_id: str | None = None) -> BuildRecord:
         return self.builder.start_build(request, owner_user_id=owner_user_id)
 
@@ -211,7 +236,9 @@ class GatewayService:
             workload.logo_uri = request.logo_uri
         if request.tags is not None:
             workload.tags = request.tags
-        if request.workload_alias is not None:
+        if request.clear_workload_alias:
+            workload.workload_alias = None
+        elif request.workload_alias is not None:
             workload.workload_alias = request.workload_alias
         if request.ingress_host is not None:
             workload.ingress_host = request.ingress_host
@@ -346,6 +373,23 @@ class GatewayService:
             raise PermissionError(f"workload share denied: {workload_id}")
         return self.repository.list_workload_shares(workload_id)
 
+    def delete_workload(
+        self,
+        workload_id: str,
+        *,
+        actor_user_id: str | None,
+        admin: bool = False,
+    ) -> WorkloadSpec:
+        workload = self.control_plane.repository.get_workload(workload_id)
+        if workload is None:
+            raise KeyError(f"workload not found: {workload_id}")
+        if not admin and workload.owner_user_id != actor_user_id:
+            raise PermissionError(f"workload delete denied: {workload_id}")
+        deleted = self.control_plane.repository.delete_workload(workload_id)
+        if deleted is None:
+            raise KeyError(f"workload not found: {workload_id}")
+        return deleted
+
     def list_invocations(self, limit: int | None = None) -> list[InvocationRecord]:
         return self.control_plane.list_invocations(limit=limit)
 
@@ -354,6 +398,35 @@ class GatewayService:
 
     def export_recent_invocations(self, limit: int = 50) -> dict:
         return self.control_plane.export_recent_invocations(limit=limit)
+
+    def payment_summary(self) -> dict:
+        usage = self.control_plane.usage_summary()
+        return {
+            "usage": usage,
+            "revenue_usd": 0.0,
+            "tao_total": 0.0,
+            "fmv_usd_per_tao": 0.0,
+            "pricing": {"compute_unit_usd": 0.0001, "inference_per_token_usd": 0.000001},
+        }
+
+    def workload_utilization(self, workload_id: str) -> dict:
+        usage = self.control_plane.usage_summary()
+        deployments = self.control_plane.list_deployments()
+        workload_deployment_ids = {d.deployment_id for d in deployments if d.workload_id == workload_id}
+        request_count = 0.0
+        compute_seconds = 0.0
+        occupancy_seconds = 0.0
+        for dep_id in workload_deployment_ids:
+            dep_usage = usage.get(dep_id, {})
+            request_count += dep_usage.get("requests", 0) + dep_usage.get("streamed_requests", 0)
+            compute_seconds += dep_usage.get("compute_seconds", 0.0)
+            occupancy_seconds += dep_usage.get("occupancy_seconds", 0.0)
+        return {
+            "workload_id": workload_id,
+            "request_count": int(request_count),
+            "compute_seconds": compute_seconds,
+            "occupancy_seconds": occupancy_seconds,
+        }
 
     def list_routing_decisions(self, limit: int = 50) -> list[dict]:
         return self.repository.list_routing_decisions(limit=limit)

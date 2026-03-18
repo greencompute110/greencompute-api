@@ -29,6 +29,7 @@ class RuntimeSettings(BaseModel):
     object_store_secret_key: str = "greenference"
     object_store_bucket: str = "greenference-build-artifacts"
     registry_url: str = "http://127.0.0.1:5000"
+    registry_password: str = "greenference-registry"
     enable_background_workers: bool = False
     worker_poll_interval_seconds: float = Field(default=1.0, ge=0.1)
     bootstrap_schema: bool = False
@@ -47,6 +48,7 @@ def load_runtime_settings(service_name: str) -> RuntimeSettings:
         object_store_secret_key=os.getenv("GREENFERENCE_OBJECT_STORE_SECRET_KEY", "greenference"),
         object_store_bucket=os.getenv("GREENFERENCE_OBJECT_STORE_BUCKET", "greenference-build-artifacts"),
         registry_url=os.getenv("GREENFERENCE_REGISTRY_URL", "http://127.0.0.1:5000"),
+        registry_password=os.getenv("GREENFERENCE_REGISTRY_PASSWORD", "greenference-registry"),
         enable_background_workers=_env_bool("GREENFERENCE_ENABLE_BACKGROUND_WORKERS", False),
         worker_poll_interval_seconds=float(os.getenv("GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS", "1.0")),
         bootstrap_schema=should_bootstrap_schema(),
