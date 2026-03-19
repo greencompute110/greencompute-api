@@ -25,7 +25,7 @@ def upgrade() -> None:
             sa.JSON(),
             nullable=False,
             server_default=sa.text(
-                '\'{"runtime_kind":"hf-causal-lm","model_identifier":"sshleifer/tiny-gpt2","model_revision":null,"tokenizer_identifier":null}\''
+                """'{"runtime_kind":"hf-causal-lm","model_identifier":"sshleifer/tiny-gpt2"}'::json"""
             ),
         ),
     )

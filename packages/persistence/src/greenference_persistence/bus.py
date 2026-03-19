@@ -249,7 +249,10 @@ class NatsJetStreamBus:
         self.nats_url = nats_url
         self.enabled = enabled
         self.client_available = importlib.util.find_spec("nats") is not None
-        self._pending_messages: dict[int, Any] = {}
+        self._pending_messages: dict[int, tuple[Any, Any]] = {}
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._loop_thread.start()
 
     @property
     def active_transport(self) -> str:
@@ -276,9 +279,13 @@ class NatsJetStreamBus:
         return self.durable_bus.claim_pending(consumer, subjects, limit=limit)
 
     def mark_completed(self, delivery_id: int) -> BusMessage | None:
-        message = self._pending_messages.pop(delivery_id, None)
-        if message is not None:
-            self._ack_message(message)
+        pending = self._pending_messages.pop(delivery_id, None)
+        if pending is not None:
+            client, message = pending
+            try:
+                self._ack_message(message)
+            finally:
+                self._close_client_if_unused(client)
         return self.durable_bus.mark_completed(delivery_id)
 
     def mark_failed(
@@ -288,9 +295,13 @@ class NatsJetStreamBus:
         retryable: bool = False,
         retry_after_seconds: float | None = None,
     ) -> BusMessage | None:
-        message = self._pending_messages.pop(delivery_id, None)
-        if message is not None:
-            self._fail_message(message, retryable=retryable)
+        pending = self._pending_messages.pop(delivery_id, None)
+        if pending is not None:
+            client, message = pending
+            try:
+                self._fail_message(message, retryable=retryable)
+            finally:
+                self._close_client_if_unused(client)
         return self.durable_bus.mark_failed(
             delivery_id,
             error,
@@ -346,6 +357,7 @@ class NatsJetStreamBus:
     ) -> list[BusMessage]:
         client = await self._connect()
         messages: list[BusMessage] = []
+        keep_client_open = False
         try:
             jetstream = client.jetstream()
             await self._ensure_stream(jetstream)
@@ -368,12 +380,14 @@ class NatsJetStreamBus:
                         self._ack_message(raw_message)
                         continue
                     messages.append(claimed)
-                    self._pending_messages[claimed.delivery_id] = raw_message
+                    self._pending_messages[claimed.delivery_id] = (client, raw_message)
+                    keep_client_open = True
                     if len(messages) >= limit:
                         break
             return messages
         finally:
-            await client.close()
+            if not keep_client_open:
+                await client.close()
 
     def _claim_delivery_for_message(self, consumer: str, subject: str, raw_message: Any) -> BusMessage | None:
         event_id = self._message_event_id(raw_message)
@@ -434,28 +448,13 @@ class NatsJetStreamBus:
         except Exception:
             return
 
-    @staticmethod
-    def _run_async(coro):
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(coro)
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
 
-        result: dict[str, Any] = {}
-        error: dict[str, BaseException] = {}
-
-        def _runner() -> None:
-            try:
-                result["value"] = asyncio.run(coro)
-            except BaseException as exc:  # noqa: BLE001
-                error["value"] = exc
-
-        thread = threading.Thread(target=_runner, daemon=True)
-        thread.start()
-        thread.join()
-        if "value" in error:
-            raise error["value"]
-        return result.get("value")
+    def _run_async(self, coro):
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
 
     def _ack_message(self, raw_message: Any) -> None:
         if hasattr(raw_message, "ack"):
@@ -469,6 +468,13 @@ class NatsJetStreamBus:
             self._run_async(raw_message.term())
             return
         self._ack_message(raw_message)
+
+    def _close_client_if_unused(self, client: Any) -> None:
+        if any(pending_client is client for pending_client, _ in self._pending_messages.values()):
+            return
+        close = getattr(client, "close", None)
+        if close is not None:
+            self._run_async(close())
 
 
 def create_subject_bus(

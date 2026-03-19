@@ -12,10 +12,10 @@ SMOKE_TEST = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SMOKE_TEST)
 
 
-def test_service_ready_payload_requires_nats_for_api_workers() -> None:
+def test_service_ready_payload_accepts_supported_bus_transports_for_api_workers() -> None:
     payload = {
         "status": "ok",
-        "bus_transport": "nats",
+        "bus_transport": "durable",
         "build_execution_mode": "live",
         "worker_running": True,
         "worker_last_iteration": 1.0,
@@ -32,7 +32,7 @@ def test_service_ready_payload_rejects_missing_worker_state() -> None:
             SMOKE_TEST.CONTROL_PLANE_URL,
             {
                 "status": "ok",
-                "bus_transport": "nats",
+                "bus_transport": "durable",
                 "build_execution_mode": "live",
                 "worker_running": False,
                 "worker_last_iteration": None,
@@ -55,7 +55,7 @@ def test_service_ready_payload_rejects_builder_without_live_execution() -> None:
             SMOKE_TEST.BUILDER_URL,
             {
                 "status": "ok",
-                "bus_transport": "nats",
+                "bus_transport": "durable",
                 "build_execution_mode": "simulated",
                 "worker_running": True,
                 "worker_last_iteration": 1.0,
@@ -71,7 +71,7 @@ def test_service_ready_payload_accepts_builder_with_execution_details() -> None:
             SMOKE_TEST.BUILDER_URL,
             {
                 "status": "ok",
-                "bus_transport": "nats",
+                "bus_transport": "durable",
                 "build_execution_mode": "live",
                 "builder_runner": "AdapterBackedBuildRunner",
                 "builder_object_store_adapter": "S3CompatibleObjectStoreAdapter",
@@ -138,6 +138,23 @@ def test_main_runs_failover_when_flag_present(monkeypatch) -> None:
 
     assert result == 0
     assert calls == ["wait", "happy", "metrics:dep-1", "failover:dep-1"]
+
+
+def test_wait_json_retries_transient_oserror(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    def fake_request_json(method: str, url: str, payload=None, headers=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise ConnectionResetError(104, "Connection reset by peer")
+        return {"status": "ok"}
+
+    monkeypatch.setattr(SMOKE_TEST, "_request_json", fake_request_json)
+
+    payload = SMOKE_TEST._wait_json("http://example.test/readyz", lambda body: body.get("status") == "ok", timeout=2)
+
+    assert payload == {"status": "ok"}
+    assert calls["count"] == 2
 
 
 def test_main_runs_operational_checks_when_flag_present(monkeypatch) -> None:

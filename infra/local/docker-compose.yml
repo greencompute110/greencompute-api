@@ -70,7 +70,7 @@ services:
       GREENFERENCE_OBJECT_STORE_ACCESS_KEY: greenference
       GREENFERENCE_OBJECT_STORE_SECRET_KEY: greenference
       GREENFERENCE_REGISTRY_URL: http://registry:5000
-      GREENFERENCE_BUS_TRANSPORT: nats
+      GREENFERENCE_BUS_TRANSPORT: durable
       PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/gateway/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/validator/src:/workspace/greenference-api/services/builder/src:/workspace/greenference-miner/services/miner-agent/src
     depends_on:
       migrate:
@@ -105,7 +105,7 @@ services:
       GREENFERENCE_REGISTRY_URL: http://registry:5000
       GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS: "0.5"
-      GREENFERENCE_BUS_TRANSPORT: nats
+      GREENFERENCE_BUS_TRANSPORT: durable
       PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src
     depends_on:
       migrate:
@@ -136,7 +136,7 @@ services:
       GREENFERENCE_REGISTRY_URL: http://registry:5000
       GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS: "0.5"
-      GREENFERENCE_BUS_TRANSPORT: nats
+      GREENFERENCE_BUS_TRANSPORT: durable
       PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/validator/src
     depends_on:
       migrate:
@@ -168,8 +168,9 @@ services:
       GREENFERENCE_REGISTRY_URL: http://registry:5000
       GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS: "0.5"
-      GREENFERENCE_BUS_TRANSPORT: nats
+      GREENFERENCE_BUS_TRANSPORT: durable
       GREENFERENCE_BUILD_EXECUTION_MODE: live
+      GREENFERENCE_BUILD_EXECUTOR_ENDPOINT: ""
       PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/builder/src
     depends_on:
       migrate:
@@ -194,6 +195,7 @@ services:
       GREENFERENCE_DB_BOOTSTRAP: "false"
       GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENFERENCE_BOOTSTRAP_MINER: "true"
+      GREENFERENCE_ALLOW_RUNTIME_FALLBACK: "true"
       GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS: "0.5"
       GREENFERENCE_MINER_HOTKEY: miner-local
       GREENFERENCE_MINER_PAYOUT_ADDRESS: 5FminerLocal
@@ -208,7 +210,7 @@ services:
       GREENFERENCE_MINER_CPU_CORES: "32"
       GREENFERENCE_MINER_MEMORY_GB: "128"
       GREENFERENCE_MINER_PERFORMANCE_SCORE: "1.25"
-      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-miner/services/miner-agent/src
+      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/builder/src:/workspace/greenference-miner/services/miner-agent/src
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -234,6 +236,7 @@ services:
       GREENFERENCE_DB_BOOTSTRAP: "false"
       GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENFERENCE_BOOTSTRAP_MINER: "true"
+      GREENFERENCE_ALLOW_RUNTIME_FALLBACK: "true"
       GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS: "0.5"
       GREENFERENCE_MINER_HOTKEY: miner-failover
       GREENFERENCE_MINER_PAYOUT_ADDRESS: 5FminerFailover
@@ -248,7 +251,7 @@ services:
       GREENFERENCE_MINER_CPU_CORES: "32"
       GREENFERENCE_MINER_MEMORY_GB: "128"
       GREENFERENCE_MINER_PERFORMANCE_SCORE: "1.1"
-      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-miner/services/miner-agent/src
+      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/builder/src:/workspace/greenference-miner/services/miner-agent/src
     depends_on:
       migrate:
         condition: service_completed_successfully

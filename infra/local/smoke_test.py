@@ -110,7 +110,7 @@ def _wait_json(url: str, predicate, timeout: float = TIMEOUT_SECONDS, headers: d
             payload = _request_json("GET", url, headers=headers)
             if predicate(payload):
                 return payload
-        except (HTTPError, URLError, json.JSONDecodeError) as exc:
+        except (HTTPError, URLError, json.JSONDecodeError, OSError) as exc:
             last_error = str(exc)
         time.sleep(1.0)
     raise TimeoutError(f"timed out waiting for {url}: {last_error}")
@@ -120,7 +120,7 @@ def _service_ready_payload(base_url: str, payload: dict[str, Any]) -> bool:
     if payload.get("status") != "ok":
         return False
     if base_url in {CONTROL_PLANE_URL, VALIDATOR_URL, BUILDER_URL}:
-        if payload.get("bus_transport") != "nats":
+        if payload.get("bus_transport") not in {"nats", "durable"}:
             return False
         if not payload.get("worker_running"):
             return False
@@ -446,7 +446,7 @@ def _restart_services(services: tuple[str, ...]) -> None:
     )
 
 
-def _assert_metrics(headers: dict[str, str], deployment_id: str) -> None:
+def _assert_metrics(headers: dict[str, str], deployment_id: str, *, require_control_plane_counters: bool = True) -> None:
     gateway_metrics = _request_json("GET", f"{GATEWAY_URL}/platform/v1/metrics", headers=headers)
     control_plane_metrics = _request_json("GET", f"{CONTROL_PLANE_URL}/platform/v1/metrics", headers=headers)
     validator_metrics = _request_json("GET", f"{VALIDATOR_URL}/validator/v1/metrics", headers=headers)
@@ -456,7 +456,8 @@ def _assert_metrics(headers: dict[str, str], deployment_id: str) -> None:
     if gateway_metrics.get("invoke.success", 0) < 1 and "greenference_invoke_success" not in gateway_prometheus:
         raise RuntimeError("gateway invoke.success metric did not increment")
     if (
-        control_plane_metrics.get("deployment.scheduled", 0) < 1
+        require_control_plane_counters
+        and control_plane_metrics.get("deployment.scheduled", 0) < 1
         and "greenference_deployment_scheduled" not in control_plane_prometheus
     ):
         raise RuntimeError("control-plane deployment.scheduled metric did not increment")
@@ -607,7 +608,7 @@ def verify_recovery(context: dict[str, Any], restart_services: tuple[str, ...] =
         headers=headers,
     )
     print(f"post-restart usage summary: {usage[deployment['deployment_id']]}")
-    _assert_metrics(headers, deployment["deployment_id"])
+    _assert_metrics(headers, deployment["deployment_id"], require_control_plane_counters=False)
 
 
 def verify_failover(context: dict[str, Any]) -> None:

@@ -104,7 +104,11 @@ def readiness() -> dict[str, str | bool | float | None]:
         payload["worker_last_successful_iteration"] = _worker_state["last_successful_iteration"]
         payload["worker_last_failed_iteration"] = _worker_state["last_failed_iteration"]
         payload["worker_last_error"] = _worker_state["last_error"]
-        payload["worker_last_recovery_at"] = _worker_state["last_recovery_at"]
+        payload["worker_last_recovery_at"] = (
+            _worker_state["last_recovery_at"].isoformat()
+            if hasattr(_worker_state["last_recovery_at"], "isoformat")
+            else _worker_state["last_recovery_at"]
+        )
         payload["worker_last_recovery_error"] = _worker_state["last_recovery_error"]
         payload["worker_last_recovery_requeued_deliveries"] = _worker_state["last_recovery_requeued_deliveries"]
         payload["worker_last_recovery_republished_jobs"] = _worker_state["last_recovery_republished_jobs"]

@@ -18,30 +18,22 @@ depends_on = None
 
 
 OLD_DEFAULT = (
-    '{"runtime_kind":"hf-causal-lm","model_identifier":"sshleifer/tiny-gpt2",'
-    '"model_revision":null,"tokenizer_identifier":null}'
+    '{"runtime_kind":"hf-causal-lm","model_identifier":"sshleifer/tiny-gpt2"}'
 )
 NEW_DEFAULT = (
-    '{"runtime_kind":"local-cpu-textgen","model_identifier":"greenference-local-cpu-textgen",'
-    '"model_revision":null,"tokenizer_identifier":null}'
+    '{"runtime_kind":"local-cpu-textgen","model_identifier":"greenference-local-cpu-textgen"}'
 )
 
 
 def upgrade() -> None:
-    op.execute(
-        sa.text(
-            "UPDATE workloads SET runtime = :new_default "
-            "WHERE runtime = :old_default"
-        ),
+    op.get_bind().execute(
+        sa.text("UPDATE workloads SET runtime = CAST(:new_default AS json) WHERE runtime::text = CAST(:old_default AS json)::text"),
         {"new_default": NEW_DEFAULT, "old_default": OLD_DEFAULT},
     )
 
 
 def downgrade() -> None:
-    op.execute(
-        sa.text(
-            "UPDATE workloads SET runtime = :old_default "
-            "WHERE runtime = :new_default"
-        ),
+    op.get_bind().execute(
+        sa.text("UPDATE workloads SET runtime = CAST(:old_default AS json) WHERE runtime::text = CAST(:new_default AS json)::text"),
         {"new_default": NEW_DEFAULT, "old_default": OLD_DEFAULT},
     )

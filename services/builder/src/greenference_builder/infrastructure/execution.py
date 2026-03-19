@@ -701,10 +701,13 @@ def create_execution_adapters(
     settings: RuntimeSettings,
 ) -> tuple[ObjectStoreAdapter, RegistryAdapter, BuildExecutorAdapter | None]:
     if settings.build_execution_mode == "live":
+        executor: BuildExecutorAdapter | None = None
+        if settings.build_executor_endpoint:
+            executor = RemoteBuildExecutorAdapter(settings)
         return (
             S3CompatibleObjectStoreAdapter(settings),
             OCIRegistryAdapter(settings),
-            RemoteBuildExecutorAdapter(settings),
+            executor,
         )
     return SimulatedObjectStoreAdapter(settings), SimulatedRegistryAdapter(settings), None
 

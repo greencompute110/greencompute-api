@@ -30,7 +30,7 @@ def upgrade() -> None:
     )
     op.add_column(
         "deployments",
-        sa.Column("fee_acknowledged", sa.Boolean(), nullable=False, server_default=sa.text("1")),
+        sa.Column("fee_acknowledged", sa.Boolean(), nullable=False, server_default=sa.true()),
     )
     op.add_column(
         "deployments",

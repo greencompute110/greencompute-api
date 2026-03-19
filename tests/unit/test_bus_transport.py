@@ -130,16 +130,23 @@ def test_nats_mark_completed_acks_pending_message(monkeypatch) -> None:
     assert len(claimed) == 1
     delivery_id = claimed[0].delivery_id
     raw_message = object()
-    bus._pending_messages[delivery_id] = raw_message
+    client = object()
+    bus._pending_messages[delivery_id] = (client, raw_message)
     acked: list[object] = []
+    closed: list[object] = []
 
     def fake_ack(message: object) -> None:
         acked.append(message)
 
+    def fake_close(message_client: object) -> None:
+        closed.append(message_client)
+
     monkeypatch.setattr(bus, "_ack_message", fake_ack)
+    monkeypatch.setattr(bus, "_close_client_if_unused", fake_close)
 
     result = bus.mark_completed(delivery_id)
 
     assert result is not None
     assert result.event_id == event.event_id
     assert acked == [raw_message]
+    assert closed == [client]
