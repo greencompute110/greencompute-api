@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+import logging
+
 from greenference_persistence import SubjectBus, WorkflowEventRepository, create_subject_bus, get_metrics_store
 from greenference_persistence.runtime import load_runtime_settings
-from greenference_protocol import NodeCapability, ProbeChallenge, ProbeResult, ScoreCard, WeightSnapshot
+from greenference_protocol import (
+    FluxRebalanceEvent,
+    FluxState,
+    NodeCapability,
+    ProbeChallenge,
+    ProbeResult,
+    RentalWaitEstimate,
+    ScoreCard,
+    WeightSnapshot,
+)
+from greenference_validator.config import settings as validator_settings
+from greenference_validator.domain.demand import DemandCollector
+from greenference_validator.domain.flux import FluxOrchestrator
 from greenference_validator.domain.scoring import ScoreEngine
+from greenference_validator.domain.wait_estimator import WaitEstimator
 from greenference_validator.infrastructure.repository import ValidatorRepository
+
+logger = logging.getLogger(__name__)
 
 
 class UnknownCapabilityError(KeyError):
@@ -41,6 +58,13 @@ class ValidatorService:
         )
         self.scoring = ScoreEngine()
         self.metrics = get_metrics_store("greenference-validator")
+        self.flux = FluxOrchestrator(
+            inference_floor_pct=validator_settings.flux_inference_floor_pct,
+            rental_floor_pct=validator_settings.flux_rental_floor_pct,
+        )
+        self.demand = DemandCollector()
+        self.wait_estimator = WaitEstimator()
+        self._flux_states: dict[str, FluxState] = {}
 
     def register_capability(self, capability: NodeCapability) -> NodeCapability:
         return self.repository.upsert_capability(capability)
@@ -139,6 +163,63 @@ class ValidatorService:
             ),
         )
         return processed
+
+
+    # --- Flux orchestrator ---
+
+    def get_flux_state(self, hotkey: str) -> FluxState | None:
+        return self._flux_states.get(hotkey)
+
+    def init_flux_state(self, hotkey: str, node_id: str, total_gpus: int) -> FluxState:
+        """Initialize or update a miner's Flux state when capacity is registered."""
+        existing = self._flux_states.get(hotkey)
+        if existing and existing.total_gpus == total_gpus:
+            return existing
+        state = FluxState(
+            hotkey=hotkey,
+            node_id=node_id,
+            total_gpus=total_gpus,
+            idle_gpus=total_gpus,
+            inference_floor_pct=validator_settings.flux_inference_floor_pct,
+            rental_floor_pct=validator_settings.flux_rental_floor_pct,
+        )
+        self._flux_states[hotkey] = state
+        return state
+
+    def rebalance_miner(self, hotkey: str) -> tuple[FluxState, list[FluxRebalanceEvent]]:
+        """Run Flux rebalance for a single miner."""
+        state = self._flux_states.get(hotkey)
+        if state is None:
+            return FluxState(hotkey=hotkey, node_id="", total_gpus=0), []
+        # Inject latest demand scores
+        state = state.model_copy(update={
+            "inference_demand_score": self.demand.inference_score(hotkey),
+            "rental_demand_score": self.demand.rental_score(hotkey),
+        })
+        new_state, events = self.flux.rebalance(state)
+        self._flux_states[hotkey] = new_state
+        self.metrics.increment("flux.rebalance", len(events))
+        return new_state, events
+
+    def rebalance_all_miners(self) -> dict[str, FluxState]:
+        """Rebalance all tracked miners. Called from the worker loop."""
+        results: dict[str, FluxState] = {}
+        for hotkey in list(self._flux_states):
+            new_state, _ = self.rebalance_miner(hotkey)
+            results[hotkey] = new_state
+        return results
+
+    def estimate_rental_wait(self, deployment_id: str, hotkey: str) -> RentalWaitEstimate:
+        """Estimate wait time for a rental deployment on a specific miner."""
+        state = self._flux_states.get(hotkey)
+        if state is None:
+            return RentalWaitEstimate(
+                deployment_id=deployment_id,
+                estimated_wait_seconds=0.0,
+                position_in_queue=0,
+            )
+        self.wait_estimator.enqueue(deployment_id)
+        return self.wait_estimator.estimate(deployment_id, state)
 
 
 service = ValidatorService()

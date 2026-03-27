@@ -11,6 +11,7 @@ from greenference_persistence import (
     render_prometheus_text,
 )
 from greenference_validator.application.services import service
+from greenference_validator.config import settings as service_settings
 from greenference_validator.transport.routes import router
 
 settings = load_runtime_settings("greenference-validator")
@@ -26,9 +27,17 @@ metrics = get_metrics_store("greenference-validator")
 
 async def _validator_worker_loop() -> None:
     _worker_state["running"] = True
+    _flux_counter = 0
+    flux_every = max(1, int(
+        service_settings.flux_rebalance_interval_seconds / settings.worker_poll_interval_seconds
+    ))
     while True:
         try:
             service.process_pending_events()
+            _flux_counter += 1
+            if _flux_counter >= flux_every:
+                service.rebalance_all_miners()
+                _flux_counter = 0
             _worker_state["last_successful_iteration"] = asyncio.get_running_loop().time()
             _worker_state["last_error"] = None
         except Exception as exc:

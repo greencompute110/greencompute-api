@@ -273,6 +273,50 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+  node-agent:
+    image: python:3.12-slim
+    working_dir: /workspace/greenference-node
+    volumes:
+      - ../../../:/workspace
+    environment:
+      GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
+      GREENFERENCE_BOOTSTRAP_MINER: "true"
+      GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS: "0.5"
+      GREENFERENCE_CONTROL_PLANE_URL: http://control-plane:8001
+      GREENFERENCE_MINER_HOTKEY: node-unified
+      GREENFERENCE_MINER_PAYOUT_ADDRESS: 5FnodeUnified
+      GREENFERENCE_MINER_AUTH_SECRET: greenference-node-local-secret
+      GREENFERENCE_MINER_API_BASE_URL: http://node-agent:8007
+      GREENFERENCE_MINER_VALIDATOR_URL: http://validator:8002
+      GREENFERENCE_MINER_NODE_ID: node-unified
+      GREENFERENCE_GPU_MODEL: a100
+      GREENFERENCE_GPU_COUNT: "2"
+      GREENFERENCE_VRAM_GB_PER_GPU: "80"
+      GREENFERENCE_CPU_CORES: "32"
+      GREENFERENCE_MEMORY_GB: "128"
+      GREENFERENCE_PERFORMANCE_SCORE: "1.5"
+      GREENFERENCE_GPU_SPLIT_UNITS: "100"
+      GREENFERENCE_SUPPORTED_WORKLOAD_KINDS: inference,pod,vm
+      GREENFERENCE_POD_BACKEND: stub
+      GREENFERENCE_VM_BACKEND: stub
+      GREENFERENCE_INFERENCE_BACKEND: process
+      GREENFERENCE_SSH_HOST: "0.0.0.0"
+      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-node/services/node-agent/src
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      control-plane:
+        condition: service_healthy
+    command: >
+      sh -lc "pip install httpx fastapi uvicorn pydantic &&
+      uvicorn greenference_node_agent.main:app --host 0.0.0.0 --port 8007"
+    ports:
+      - "${GREENFERENCE_LOCAL_NODE_AGENT_PORT:-28007}:8007"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8007/readyz')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
   miner-agent-b:
     image: python:3.12-slim
     working_dir: /workspace/greenference-miner

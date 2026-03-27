@@ -467,3 +467,47 @@ class BusDeliveryORM(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# --- Flux orchestrator ---
+
+
+class FluxStateORM(Base):
+    __tablename__ = "flux_states"
+
+    hotkey: Mapped[str] = mapped_column(String(128), primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    total_gpus: Mapped[int] = mapped_column(Integer)
+    inference_gpus: Mapped[int] = mapped_column(Integer, default=0)
+    rental_gpus: Mapped[int] = mapped_column(Integer, default=0)
+    idle_gpus: Mapped[int] = mapped_column(Integer, default=0)
+    inference_floor_pct: Mapped[float] = mapped_column(Float, default=0.20)
+    rental_floor_pct: Mapped[float] = mapped_column(Float, default=0.10)
+    inference_demand_score: Mapped[float] = mapped_column(Float, default=0.0)
+    rental_demand_score: Mapped[float] = mapped_column(Float, default=0.0)
+    last_rebalanced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class FluxRebalanceEventORM(Base):
+    __tablename__ = "flux_rebalance_events"
+
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    node_id: Mapped[str] = mapped_column(String(128))
+    gpu_index: Mapped[int] = mapped_column(Integer)
+    from_mode: Mapped[str] = mapped_column(String(32))
+    to_mode: Mapped[str] = mapped_column(String(32))
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RentalWaitQueueORM(Base):
+    __tablename__ = "rental_wait_queue"
+
+    deployment_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    position: Mapped[int] = mapped_column(Integer)
+    estimated_wait_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

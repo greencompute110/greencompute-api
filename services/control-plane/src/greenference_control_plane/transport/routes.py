@@ -81,6 +81,38 @@ def capacity(
     return service.update_capacity(payload)
 
 
+@router.get("/miner/v1/deployments/{deployment_id}")
+def get_deployment(
+    deployment_id: str,
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> dict:
+    deployment = service.repository.get_deployment(deployment_id)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="deployment not found")
+    hotkey = deployment.hotkey or (x_miner_hotkey or "")
+    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    return deployment.model_dump(mode="json")
+
+
+@router.get("/miner/v1/workloads/{workload_id}")
+def get_workload(
+    workload_id: str,
+    x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
+    x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
+    x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
+    x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
+) -> dict:
+    hotkey = x_miner_hotkey or ""
+    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp)
+    workload = service.repository.get_workload(workload_id)
+    if workload is None:
+        raise HTTPException(status_code=404, detail="workload not found")
+    return workload.model_dump(mode="json")
+
+
 @router.get("/miner/v1/leases/{hotkey}")
 def list_leases(
     hotkey: str,

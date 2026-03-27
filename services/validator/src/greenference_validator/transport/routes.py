@@ -117,3 +117,51 @@ def validator_metrics(
     metrics.set_gauge("probe.results.total", float(len(service.repository.list_results())))
     metrics.set_gauge("scorecards.total", float(len(service.repository.list_scorecards())))
     return metrics.snapshot()
+
+
+# --- Flux orchestrator endpoints ---
+
+
+@router.get("/validator/v1/flux/{hotkey}")
+def get_flux_state(
+    hotkey: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_admin_api_key(authorization, x_api_key)
+    state = service.get_flux_state(hotkey)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"no flux state for hotkey={hotkey}")
+    return state.model_dump(mode="json")
+
+
+@router.post("/validator/v1/flux/rebalance")
+def flux_rebalance(
+    hotkey: str | None = None,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_admin_api_key(authorization, x_api_key)
+    if hotkey:
+        state, events = service.rebalance_miner(hotkey)
+        return {
+            "state": state.model_dump(mode="json"),
+            "events": [e.model_dump(mode="json") for e in events],
+        }
+    results = service.rebalance_all_miners()
+    return {
+        hotkey: state.model_dump(mode="json")
+        for hotkey, state in results.items()
+    }
+
+
+@router.get("/validator/v1/flux/wait-estimate/{deployment_id}")
+def flux_wait_estimate(
+    deployment_id: str,
+    hotkey: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    require_admin_api_key(authorization, x_api_key)
+    estimate = service.estimate_rental_wait(deployment_id, hotkey)
+    return estimate.model_dump(mode="json")
