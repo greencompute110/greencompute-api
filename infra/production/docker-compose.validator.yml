@@ -40,12 +40,12 @@ services:
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
-      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/gateway/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/validator/src
+      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/gateway/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/validator/src:/workspace/greenference-api/services/builder/src
     depends_on:
       migrate:
         condition: service_completed_successfully
     command: >
-      sh -lc "pip install -q psycopg[binary] sqlalchemy fastapi uvicorn pydantic &&
+      sh -lc "pip install -q psycopg[binary] sqlalchemy fastapi uvicorn pydantic nats-py &&
       uvicorn greenference_gateway.main:app --host 0.0.0.0 --port 8000"
     ports:
       - "28000:8000"
