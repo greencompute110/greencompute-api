@@ -8,9 +8,18 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE = ROOT.parent
+
+# Persistence package (always relative to this repo)
 sys.path.insert(0, str(ROOT / "packages/persistence/src"))
-sys.path.insert(0, str(WORKSPACE / "greenference/protocol/src"))
+
+# Protocol: try local dev layout then container layout
+for _candidate in [
+    ROOT.parent / "greenference" / "protocol" / "src",  # local dev
+    ROOT.parent / "protocol" / "src",                     # docker container
+]:
+    if _candidate.is_dir():
+        sys.path.insert(0, str(_candidate))
+        break
 
 from greenference_persistence.config import get_database_url  # noqa: E402
 from greenference_persistence.orm import Base  # noqa: E402

@@ -18,29 +18,32 @@ services:
 
   migrate:
     image: python:3.12-slim
-    working_dir: /workspace/greenference-api
+    working_dir: /app/api
     volumes:
-      - /workspace:/workspace
+      - ../../:/app/api
+      - ${PROTOCOL_DIR:-../../../greenference/protocol}:/app/protocol
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
-      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/validator/src
+      PYTHONPATH: /app/protocol/src:/app/api/packages/persistence/src:/app/api/services/control-plane/src:/app/api/services/validator/src
     depends_on:
       postgres:
         condition: service_healthy
     command: >
       sh -lc "pip install -q alembic psycopg[binary] sqlalchemy fastapi pydantic &&
-      alembic -c /workspace/greenference-api/alembic.ini upgrade head"
+      alembic -c /app/api/alembic.ini upgrade head"
 
   gateway:
     image: python:3.12-slim
-    working_dir: /workspace/greenference-api
+    working_dir: /app/api
     volumes:
-      - /workspace:/workspace
+      - ../../:/app/api
+      - ${PROTOCOL_DIR:-../../../greenference/protocol}:/app/protocol
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
-      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/gateway/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/validator/src:/workspace/greenference-api/services/builder/src
+      GREENFERENCE_ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      PYTHONPATH: /app/protocol/src:/app/api/packages/persistence/src:/app/api/services/gateway/src:/app/api/services/control-plane/src:/app/api/services/validator/src:/app/api/services/builder/src
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -58,16 +61,17 @@ services:
 
   control-plane:
     image: python:3.12-slim
-    working_dir: /workspace/greenference-api
+    working_dir: /app/api
     volumes:
-      - /workspace:/workspace
+      - ../../:/app/api
+      - ${PROTOCOL_DIR:-../../../greenference/protocol}:/app/protocol
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
       GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS: "1.0"
       GREENFERENCE_NETUID: "16"
-      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src
+      PYTHONPATH: /app/protocol/src:/app/api/packages/persistence/src:/app/api/services/control-plane/src
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -85,15 +89,17 @@ services:
 
   validator:
     image: python:3.12-slim
-    working_dir: /workspace/greenference-api
+    working_dir: /app/api
     volumes:
-      - /workspace:/workspace
+      - ../../:/app/api
+      - ${PROTOCOL_DIR:-../../../greenference/protocol}:/app/protocol
       - ${BITTENSOR_WALLET_DIR:-/root/.bittensor}:/root/.bittensor:ro
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
       GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS: "1.0"
+      GREENFERENCE_WHITELIST_ENABLED: ${WHITELIST_ENABLED:-true}
       # Bittensor
       GREENFERENCE_BITTENSOR_ENABLED: ${BITTENSOR_ENABLED:-false}
       GREENFERENCE_BITTENSOR_NETWORK: ${BITTENSOR_NETWORK:-test}
@@ -106,7 +112,7 @@ services:
       # Scoring
       GREENFERENCE_SCORE_DELTA: ${SCORE_DELTA:-0.8}
       GREENFERENCE_RENTAL_REVENUE_BONUS_CAP: ${RENTAL_REVENUE_BONUS_CAP:-0.1}
-      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/validator/src
+      PYTHONPATH: /app/protocol/src:/app/api/packages/persistence/src:/app/api/services/control-plane/src:/app/api/services/validator/src
     depends_on:
       migrate:
         condition: service_completed_successfully
