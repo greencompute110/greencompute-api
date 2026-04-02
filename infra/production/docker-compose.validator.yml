@@ -21,7 +21,7 @@ services:
     working_dir: /app/api
     volumes:
       - ../../:/app/api
-      - ${PROTOCOL_DIR:-../../../protocol}:/app/protocol
+      - ${PROTOCOL_DIR:-../../../greenference/protocol}:/app/protocol
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
@@ -38,7 +38,7 @@ services:
     working_dir: /app/api
     volumes:
       - ../../:/app/api
-      - ${PROTOCOL_DIR:-../../../protocol}:/app/protocol
+      - ${PROTOCOL_DIR:-../../../greenference/protocol}:/app/protocol
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
@@ -64,7 +64,7 @@ services:
     working_dir: /app/api
     volumes:
       - ../../:/app/api
-      - ${PROTOCOL_DIR:-../../../protocol}:/app/protocol
+      - ${PROTOCOL_DIR:-../../../greenference/protocol}:/app/protocol
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
       GREENFERENCE_DB_BOOTSTRAP: "false"
@@ -92,7 +92,7 @@ services:
     working_dir: /app/api
     volumes:
       - ../../:/app/api
-      - ${PROTOCOL_DIR:-../../../protocol}:/app/protocol
+      - ${PROTOCOL_DIR:-../../../greenference/protocol}:/app/protocol
       - ${BITTENSOR_WALLET_DIR:-~/.bittensor}:/root/.bittensor:ro
     environment:
       GREENFERENCE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
