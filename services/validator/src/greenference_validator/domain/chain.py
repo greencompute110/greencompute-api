@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 import logging
+import sys
 from datetime import UTC, datetime
 
 from greenference_protocol import ChainWeightCommit, MetagraphEntry
 from substrateinterface import SubstrateInterface, Keypair
 
-
 logger = logging.getLogger(__name__)
+
+
+def _restore_logging() -> None:
+    """Re-attach our handler after bittensor wipes the root logger."""
+    for noisy in ("bittensor", "urllib3", "websocket", "substrateinterface"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    root = logging.getLogger("greenference_validator")
+    if not root.handlers:
+        h = logging.StreamHandler(sys.stderr)
+        h.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        root.addHandler(h)
+        root.propagate = False
 
 
 class BittensorChainClient:
@@ -24,20 +39,26 @@ class BittensorChainClient:
         self.network = network
         self.netuid = netuid
         self.wallet_path = wallet_path
-        self.subtensor = None
+        self._subtensor = None
+        self._bt = None
+
+    def _get_bt(self):
+        """Lazy-import bittensor so its logging init runs after uvicorn sets up logging."""
+        if self._bt is not None:
+            return self._bt
+        import bittensor as bt  # noqa: PLC0415
+        bt.logging.off()
+        _restore_logging()
+        self._bt = bt
+        return self._bt
 
     def _get_subtensor(self):
-        if self.subtensor is not None:
-            return self.subtensor
-        try:
-            import bittensor as bt
-
-        except ImportError:
-            logger.error("substrate-interface not installed — chain calls will fail")
-            raise
-
+        if self._subtensor is not None:
+            return self._subtensor
+        bt = self._get_bt()
         endpoint = self._resolve_endpoint()
-        self._subtensor = bt.subtensor(network=endpoint)
+        logger.info("connecting to subtensor: %s", endpoint)
+        self._subtensor = bt.Subtensor(network=endpoint)
         logger.info("connected to %s subtensor", endpoint)
         return self._subtensor
 
@@ -60,23 +81,14 @@ class BittensorChainClient:
 
         entries: list[MetagraphEntry] = []
         for neuron in result:
-            uid = neuron.uid
-            hotkey = neuron.hotkey
-            coldkey = neuron.coldkey
-            stake = neuron.stake
-            trust = neuron.trust
-            incentive = neuron.incentive
-            emission = neuron.emission
-
             entries.append(MetagraphEntry(
                 netuid=self.netuid,
-                uid=uid,
-                hotkey=str(hotkey),
-                coldkey=str(coldkey),
-                stake=stake,
-                trust=trust,
-                incentive=incentive,
-                emission=emission,
+                uid=neuron.uid,
+                hotkey=str(neuron.hotkey),
+                coldkey=str(neuron.coldkey),
+                stake=neuron.stake,
+                incentive=neuron.incentive,
+                emission=neuron.emission,
                 synced_at=datetime.now(UTC),
             ))
 
@@ -101,8 +113,6 @@ class BittensorChainClient:
         hotkey_name: str = "default",
     ) -> ChainWeightCommit:
         """Push weight vector to chain via set_weights extrinsic."""
-
-        # Normalize weights to u16 range
         total = sum(weights) or 1.0
         normalized = [int((w / total) * 65535) for w in weights]
 
@@ -110,8 +120,8 @@ class BittensorChainClient:
             substrate = SubstrateInterface(
                 url=self._resolve_endpoint(),
                 ss58_format=42,
-                type_registry_preset='substrate-node-template',
-                auto_reconnect=True
+                type_registry_preset="substrate-node-template",
+                auto_reconnect=True,
             )
 
             if self.wallet_path:

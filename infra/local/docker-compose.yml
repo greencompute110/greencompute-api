@@ -256,8 +256,8 @@ services:
       GREENFERENCE_POD_BACKEND: stub
       GREENFERENCE_VM_BACKEND: stub
       GREENFERENCE_SSH_HOST: "0.0.0.0"
-      GREENFERENCE_SSH_PORT_RANGE_START: "30000"
-      GREENFERENCE_SSH_PORT_RANGE_END: "31000"
+      GREENFERENCE_SSH_PORT_RANGE_START: "31000"
+      GREENFERENCE_SSH_PORT_RANGE_END: "32000"
       GREENFERENCE_VOLUME_BASE_DIR: /tmp/greenference-volumes
       GREENFERENCE_SUPPORTED_WORKLOAD_KINDS: pod,vm
       PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-api/packages/persistence/src:/workspace/greenference-api/services/control-plane/src:/workspace/greenference-api/services/builder/src:/workspace/greenference-compute/services/compute-agent/src

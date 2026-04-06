@@ -664,6 +664,33 @@ def get_deployment(
     return deployment.model_dump(mode="json")
 
 
+@router.get("/platform/deployments/{deployment_id}/ssh")
+def get_deployment_ssh(
+    deployment_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=api_key.admin)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="deployment not found")
+    if not deployment.endpoint or not deployment.endpoint.startswith("ssh://"):
+        raise HTTPException(status_code=404, detail="SSH not available for this deployment")
+    # Parse ssh://user@host:port
+    parts = deployment.endpoint.replace("ssh://", "").split("@", 1)
+    user = parts[0] if len(parts) == 2 else "root"
+    host_port = parts[-1].rsplit(":", 1)
+    host = host_port[0]
+    port = int(host_port[1]) if len(host_port) == 2 else 22
+    return {
+        "ssh_host": host,
+        "ssh_port": port,
+        "ssh_username": user,
+        "ssh_command": f"ssh {user}@{host} -p {port}",
+        "private_key": deployment.ssh_private_key,
+    }
+
+
 @router.patch("/platform/deployments/{deployment_id}")
 def update_deployment(
     deployment_id: str,

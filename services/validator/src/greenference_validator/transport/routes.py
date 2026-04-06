@@ -193,8 +193,11 @@ def sync_metagraph(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     require_admin_api_key(authorization, x_api_key)
-    entries = service.sync_metagraph()
-    return {"synced": len(entries)}
+    try:
+        entries = service.sync_metagraph()
+        return {"synced": len(entries)}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"chain sync failed: {exc}") from exc
 
 
 @router.get("/validator/v1/metagraph/{hotkey}")

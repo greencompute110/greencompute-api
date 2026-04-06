@@ -65,17 +65,18 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Greenference Control Plane", version="0.1.0", lifespan=lifespan)
 
 _cors_raw = os.getenv("GREENFERENCE_CORS_ALLOW_ORIGINS", "").strip()
-if _cors_raw:
-    _origins = [o.strip() for o in _cors_raw.split(",") if o.strip()]
-    _wildcard = len(_origins) == 1 and _origins[0] == "*"
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"] if _wildcard else _origins,
-        allow_credentials=not _wildcard,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["*"],
-    )
+_cors_fallback = "http://localhost:3000,http://127.0.0.1:3000"
+_origins_line = _cors_raw if _cors_raw else _cors_fallback
+_origins = [o.strip() for o in _origins_line.split(",") if o.strip()]
+_wildcard = len(_origins) == 1 and _origins[0] == "*"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if _wildcard else _origins,
+    allow_credentials=not _wildcard,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 
 app.include_router(router)
 

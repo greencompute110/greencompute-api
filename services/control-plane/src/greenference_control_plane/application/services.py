@@ -192,6 +192,8 @@ class ControlPlaneService:
         deployment.state = transition_state(deployment.state, update.state)
         deployment.ready_instances = update.ready_instances if update.state == DeploymentState.READY else 0
         deployment.endpoint = update.endpoint or deployment.endpoint
+        if update.ssh_private_key:
+            deployment.ssh_private_key = update.ssh_private_key
         deployment.last_error = update.error
         deployment.failure_class = self._classify_deployment_failure(update.error, update.state, deployment.failure_class)
         if update.state == DeploymentState.READY:
