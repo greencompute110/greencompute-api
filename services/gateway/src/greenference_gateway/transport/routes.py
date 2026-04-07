@@ -712,6 +712,25 @@ def update_deployment(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
+@router.delete("/platform/deployments/{deployment_id}")
+def terminate_deployment(
+    deployment_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    try:
+        return service.terminate_deployment(
+            deployment_id,
+            actor_user_id=api_key.user_id,
+            admin=api_key.admin,
+        ).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
 @router.post("/platform/secrets")
 def create_secret(
     payload: UserSecretCreateRequest,

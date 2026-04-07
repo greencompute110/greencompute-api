@@ -324,6 +324,20 @@ class GatewayService:
             raise PermissionError(f"deployment update denied: {deployment_id}")
         return self.control_plane.update_deployment(deployment_id, request)
 
+    def terminate_deployment(
+        self,
+        deployment_id: str,
+        *,
+        actor_user_id: str | None,
+        admin: bool = False,
+    ) -> DeploymentRecord:
+        deployment = self.control_plane.repository.get_deployment(deployment_id)
+        if deployment is None:
+            raise KeyError(f"deployment not found: {deployment_id}")
+        if not admin and deployment.owner_user_id != actor_user_id:
+            raise PermissionError(f"deployment terminate denied: {deployment_id}")
+        return self.control_plane.cleanup_deployment(deployment_id, reason="user terminated")
+
     def create_secret(self, user_id: str, request: UserSecretCreateRequest) -> UserSecretRecord:
         secret = UserSecretRecord(user_id=user_id, name=request.name, value=request.value)
         return self.repository.save_secret(secret)
