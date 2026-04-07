@@ -731,6 +731,7 @@ class ControlPlaneService:
                 deployment_id,
                 "terminated",
                 reason=reason,
+                cooldown_until=datetime.min.replace(tzinfo=UTC),
             )
 
         deployment.state = DeploymentState.TERMINATED
