@@ -7,8 +7,8 @@ class InvalidDeploymentTransition(ValueError):
 
 ALLOWED_TRANSITIONS: dict[DeploymentState, set[DeploymentState]] = {
     DeploymentState.PENDING: {DeploymentState.SCHEDULED, DeploymentState.FAILED, DeploymentState.TERMINATED},
-    DeploymentState.SCHEDULED: {DeploymentState.PULLING, DeploymentState.FAILED, DeploymentState.TERMINATED},
-    DeploymentState.PULLING: {DeploymentState.STARTING, DeploymentState.FAILED, DeploymentState.TERMINATED},
+    DeploymentState.SCHEDULED: {DeploymentState.PULLING, DeploymentState.STARTING, DeploymentState.READY, DeploymentState.FAILED, DeploymentState.TERMINATED},
+    DeploymentState.PULLING: {DeploymentState.STARTING, DeploymentState.READY, DeploymentState.FAILED, DeploymentState.TERMINATED},
     DeploymentState.STARTING: {DeploymentState.READY, DeploymentState.FAILED, DeploymentState.TERMINATED},
     DeploymentState.READY: {DeploymentState.DRAINING, DeploymentState.FAILED, DeploymentState.TERMINATED},
     DeploymentState.DRAINING: {DeploymentState.TERMINATED, DeploymentState.FAILED},
