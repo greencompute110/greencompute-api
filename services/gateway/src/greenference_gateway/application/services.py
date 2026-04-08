@@ -672,6 +672,16 @@ class GatewayService:
         candidates, routing = self._select_healthy_deployments(request, routed_host=routed_host)
         return candidates[0], routing
 
+    def _rewrite_model_for_upstream(
+        self,
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionRequest:
+        """Rewrite request.model from workload name to the actual HF model identifier."""
+        workload, _ = self.resolve_workload_reference(request.model)
+        if workload.runtime and workload.runtime.model_identifier:
+            return request.model_copy(update={"model": workload.runtime.model_identifier})
+        return request
+
     def _invoke_upstream_response(
         self,
         deployment: DeploymentRecord,
@@ -679,7 +689,8 @@ class GatewayService:
         *,
         request_id: str,
     ):
-        return self.inference_client.invoke_chat_completion(deployment, request, request_id=request_id)
+        upstream_request = self._rewrite_model_for_upstream(request)
+        return self.inference_client.invoke_chat_completion(deployment, upstream_request, request_id=request_id)
 
     def _invoke_upstream_stream(
         self,
@@ -688,7 +699,8 @@ class GatewayService:
         *,
         request_id: str,
     ) -> Iterator[str]:
-        return self.inference_client.stream_chat_completion(deployment, request, request_id=request_id)
+        upstream_request = self._rewrite_model_for_upstream(request)
+        return self.inference_client.stream_chat_completion(deployment, upstream_request, request_id=request_id)
 
     def _handle_upstream_success(self, deployment: DeploymentRecord, routing: dict) -> None:
         self.control_plane.clear_deployment_health_failures(deployment.deployment_id)
