@@ -114,6 +114,15 @@ def register_user(payload: UserRegistrationRequest) -> dict:
     return service.register_user(payload).model_dump(mode="json")
 
 
+@router.get("/platform/users")
+def list_users(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return [u.model_dump(mode="json") for u in service.list_users()]
+
+
 @router.get("/platform/users/{user_id}")
 def get_user(
     user_id: str,

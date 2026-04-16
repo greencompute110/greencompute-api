@@ -76,6 +76,9 @@ class GatewayService:
     def get_user(self, user_id: str) -> UserRecord | None:
         return self.repository.get_user(user_id)
 
+    def list_users(self) -> list[UserRecord]:
+        return self.repository.list_users()
+
     def update_user_profile(self, user_id: str, request: UserProfileUpdateRequest) -> UserRecord:
         user = self.repository.get_user(user_id)
         if user is None:

@@ -38,6 +38,11 @@ class GatewayRepository:
             row = session.get(UserORM, user_id)
             return self._to_user(row) if row else None
 
+    def list_users(self) -> list[UserRecord]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(select(UserORM)).all()
+            return [self._to_user(row) for row in rows]
+
     def save_api_key(self, api_key: APIKeyRecord) -> APIKeyRecord:
         with session_scope(self.session_factory) as session:
             row = session.get(APIKeyORM, api_key.key_id) or APIKeyORM(key_id=api_key.key_id)
