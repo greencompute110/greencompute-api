@@ -297,6 +297,24 @@ async def submit_application(
     return app.model_dump(mode="json")
 
 
+@router.get("/validator/v1/applications/status/{hotkey}")
+def application_status(hotkey: str) -> list[dict]:
+    """Public endpoint — check application status by hotkey."""
+    apps = service.repository.list_applications_by_hotkey(hotkey)
+    return [
+        {
+            "application_id": a.application_id,
+            "status": a.status,
+            "organization": a.organization,
+            "energy_source": a.energy_source,
+            "reviewer_notes": a.reviewer_notes,
+            "submitted_at": a.submitted_at.isoformat() if a.submitted_at else None,
+            "reviewed_at": a.reviewed_at.isoformat() if a.reviewed_at else None,
+        }
+        for a in apps
+    ]
+
+
 @router.get("/validator/v1/applications")
 def list_applications(
     status: str | None = None,

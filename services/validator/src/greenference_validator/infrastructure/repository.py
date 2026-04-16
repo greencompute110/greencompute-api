@@ -322,6 +322,15 @@ class ValidatorRepository:
             row = session.get(GreenEnergyApplicationORM, application_id)
             return self._app_from_orm(row) if row else None
 
+    def list_applications_by_hotkey(self, hotkey: str) -> list[GreenEnergyApplication]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(GreenEnergyApplicationORM)
+                .where(GreenEnergyApplicationORM.hotkey == hotkey)
+                .order_by(GreenEnergyApplicationORM.submitted_at.desc())
+            ).all()
+            return [self._app_from_orm(r) for r in rows]
+
     def list_attachments(self, application_id: str) -> list[GreenEnergyAttachment]:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(
