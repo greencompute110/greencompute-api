@@ -1239,7 +1239,11 @@ class ControlPlaneService:
             # remainder so hourly totals converge exactly to the advertised
             # rate instead of biasing +50% (small) or −25% (2×).
             hourly_cents = deployment.hourly_rate_cents or 10
-            add_mcents = int(
+            # Round-to-nearest (not truncate) so the per-minute increment
+                #   40 × 1000 × 1 / 60 = 666.67  → 667 (not 666)
+            # Over 60 minutes at 667 mcents/min = 40020 mcents → 40 full cents
+            # billed + 20 mcents carried over. Drift is < 1 cent/hour.
+            add_mcents = round(
                 hourly_cents * 1000 * gpu_count * deployment.requested_instances / 60
             )
             whole_cents, _remainder = self.repository.accrue_metering(
