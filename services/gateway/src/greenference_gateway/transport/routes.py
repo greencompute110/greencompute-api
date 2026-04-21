@@ -648,6 +648,8 @@ def create_deployment(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
+    from greenference_gateway.application.services import InsufficientBalanceForRentalError
+
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("create_deployment", api_key.key_id, limit=30, window_seconds=60)
     try:
@@ -660,6 +662,20 @@ def create_deployment(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except InsufficientBalanceForRentalError as exc:
+        # 402 Payment Required — UI reads the numeric fields to render a
+        # friendly "Add $X to start" prompt.
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "message": "insufficient balance to start this rental",
+                "required_cents": exc.required_cents,
+                "current_cents": exc.current_cents,
+                "rate_cents_per_hour": exc.rate_cents_per_hour,
+                "gpu_count": exc.gpu_count,
+                "requested_instances": exc.requested_instances,
+            },
+        ) from exc
 
 
 @router.get("/platform/deployments")
@@ -862,19 +878,44 @@ def chat_completions(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     host: str | None = Header(default=None, alias="Host"),
 ) -> dict:
+    from greenference_gateway.application.services import InsufficientBalanceForInferenceError
+    from greenference_gateway.infrastructure.billing_repository import BillingRepository
+
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("chat_completions", api_key.key_id, limit=60, window_seconds=60)
+
+    # Pre-flight balance gate: require any positive balance. Per-request cost
+    # is fractions of a cent for small prompts, so we don't need a large
+    # floor — just "not broke". Admin keys bypass. Anonymous (user_id=None)
+    # also bypasses so internal / system callers are not blocked.
+    if api_key.user_id is not None and not api_key.admin:
+        current = BillingRepository().get_balance(api_key.user_id)
+        if current <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "message": "insufficient balance for inference",
+                    "current_cents": current,
+                },
+            )
+
     try:
         if payload.stream:
             metrics.increment("invoke.stream")
             return StreamingResponse(
-                service.stream_chat_completion(payload, api_key_id=api_key.key_id, routed_host=host),
+                service.stream_chat_completion(
+                    payload,
+                    api_key_id=api_key.key_id,
+                    user_id=api_key.user_id,
+                    routed_host=host,
+                ),
                 media_type="text/event-stream",
                 headers={"cache-control": "no-cache"},
             )
         response = service.invoke_chat_completion(
             payload,
             api_key_id=api_key.key_id,
+            user_id=api_key.user_id,
             routed_host=host,
         ).model_dump(mode="json")
         metrics.increment("invoke.success")

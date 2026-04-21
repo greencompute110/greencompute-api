@@ -977,6 +977,18 @@ class ControlPlaneService:
 
         deployment.hotkey = assignment.hotkey
         deployment.node_id = assignment.node_id
+        # Lock the per-GPU-per-hour rate onto the deployment row at placement
+        # time based on the allocated node's GPU model. This way the metering
+        # loop has a stable rate to debit against, and any future edits to
+        # GPU_RATE_CENTS_PER_HOUR don't retroactively change active rentals.
+        from greenference_protocol import rate_for_gpu
+        assigned_node = next(
+            (n for n in self.repository.list_nodes() if n.node_id == assignment.node_id),
+            None,
+        )
+        deployment.hourly_rate_cents = rate_for_gpu(
+            assigned_node.gpu_model if assigned_node else None
+        )
         deployment.state = DeploymentState.SCHEDULED
         deployment.retry_count = max(deployment.retry_count, max(0, event.attempts - 1))
         deployment.health_check_failures = 0
@@ -1191,9 +1203,16 @@ class ControlPlaneService:
 
             workload = self.repository.get_workload(deployment.workload_id)
             gpu_count = workload.requirements.gpu_count if workload else 1
-            # Rate: $0.10/hr per GPU -> ~0.17 cents/min per GPU
-            rate_cents_per_min = max(1, int(round(10.0 * gpu_count / 60.0)))
-            amount = rate_cents_per_min * deployment.requested_instances
+            # Rate is locked on the deployment row at placement time. Metering
+            # is per-minute, so hourly → per-minute divided by 60. We enforce a
+            # 1-cent minimum per deployment per cycle (so sub-cent rates still
+            # generate a ledger entry instead of silently skipping).
+            hourly_cents = deployment.hourly_rate_cents or 10
+            per_gpu_per_min_cents = hourly_cents / 60.0
+            amount = max(
+                1,
+                int(round(per_gpu_per_min_cents * gpu_count * deployment.requested_instances)),
+            )
 
             try:
                 billing_repo.debit_user(
@@ -1201,7 +1220,7 @@ class ControlPlaneService:
                     amount_cents=amount,
                     kind="usage",
                     reference_id=deployment.deployment_id,
-                    description=f"GPU usage {gpu_count}x GPU @ ${rate_cents_per_min/100:.3f}/min",
+                    description=f"GPU usage {gpu_count}× GPU @ ${hourly_cents/100:.2f}/hr",
                 )
                 result[deployment.deployment_id] = amount
             except InsufficientBalanceError:

@@ -54,6 +54,44 @@ from greenference_gateway.infrastructure.repository import GatewayRepository
 from greenference_gateway.transport.security import metrics as gateway_metrics
 
 
+class InsufficientBalanceForRentalError(Exception):
+    """Raised by GatewayService.create_deployment when the caller doesn't
+    have enough credits to cover ≥ 1 hour of the requested workload at the
+    highest possible GPU rate. The route layer catches this and returns a
+    402 Payment Required with the details so the UI can prompt a top-up.
+    """
+
+    def __init__(
+        self,
+        *,
+        required_cents: int,
+        current_cents: int,
+        rate_cents_per_hour: int,
+        gpu_count: int,
+        requested_instances: int,
+    ) -> None:
+        self.required_cents = required_cents
+        self.current_cents = current_cents
+        self.rate_cents_per_hour = rate_cents_per_hour
+        self.gpu_count = gpu_count
+        self.requested_instances = requested_instances
+        super().__init__(
+            f"insufficient balance: need {required_cents}¢, have {current_cents}¢ "
+            f"(rate {rate_cents_per_hour}¢/GPU/hr × {gpu_count} GPU × {requested_instances} inst × 1 hr)"
+        )
+
+
+class InsufficientBalanceForInferenceError(Exception):
+    """Raised when a user attempts a chat completion with zero balance."""
+
+    def __init__(self, *, current_cents: int) -> None:
+        self.current_cents = current_cents
+        super().__init__(
+            f"insufficient balance: inference requires a positive credit balance "
+            f"(current: {current_cents}¢)"
+        )
+
+
 class GatewayService:
     def __init__(
         self,
@@ -293,6 +331,47 @@ class GatewayService:
             raise KeyError(f"workload not found: {payload.workload_id}")
         if not admin and not self._user_can_access_workload(workload, user_id):
             raise PermissionError(f"workload access denied: {payload.workload_id}")
+
+        # Pre-flight balance check: require enough credits for at least 1 hour
+        # of runtime at the highest possible rate among the user's requested
+        # GPU models. Using MAX (worst case) guarantees the user has enough
+        # balance regardless of which GPU they actually get scheduled on.
+        # Admin deployments bypass the check.
+        if not admin and user_id is not None:
+            from greenference_protocol import rate_for_gpu
+            from greenference_gateway.infrastructure.billing_repository import BillingRepository
+
+            supported = workload.requirements.supported_gpu_models or []
+            if supported:
+                max_rate_cents_per_hour = max(
+                    (rate_for_gpu(m) for m in supported), default=10
+                )
+            else:
+                # No GPU constraint set — be conservative and use the top rate
+                # in our table so users need balance for the priciest option.
+                from greenference_protocol import GPU_RATE_CENTS_PER_HOUR, LEGACY_FALLBACK_CENTS_PER_HOUR
+                max_rate_cents_per_hour = max(
+                    list(GPU_RATE_CENTS_PER_HOUR.values()) + [LEGACY_FALLBACK_CENTS_PER_HOUR]
+                )
+
+            gpu_count = workload.requirements.gpu_count or 1
+            required_cents = (
+                max_rate_cents_per_hour
+                * gpu_count
+                * payload.requested_instances
+            )
+            current_cents = BillingRepository().get_balance(user_id)
+            if current_cents < required_cents:
+                # Raised as ValueError so the route layer can catch and return
+                # 402 with the detail payload — see create_deployment route.
+                raise InsufficientBalanceForRentalError(
+                    required_cents=required_cents,
+                    current_cents=current_cents,
+                    rate_cents_per_hour=max_rate_cents_per_hour,
+                    gpu_count=gpu_count,
+                    requested_instances=payload.requested_instances,
+                )
+
         return self.control_plane.create_deployment(
             {
                 "workload_id": payload.workload_id,
@@ -466,6 +545,7 @@ class GatewayService:
         self,
         request: ChatCompletionRequest,
         api_key_id: str | None = None,
+        user_id: str | None = None,
         routed_host: str | None = None,
     ):
         request_id = str(uuid4())
@@ -495,6 +575,16 @@ class GatewayService:
             latency_ms = (perf_counter() - started) * 1000.0
             self.metrics.observe("invoke.latency_ms", latency_ms)
             response.id = request_id
+            # Per-token charge: only if miner returned a usage block AND the
+            # caller is a real user (admin / anonymous is free by policy).
+            if user_id and response.usage is not None:
+                self._charge_inference_tokens(
+                    user_id=user_id,
+                    reference_id=request_id,
+                    model=request.model,
+                    prompt_tokens=response.usage.prompt_tokens,
+                    completion_tokens=response.usage.completion_tokens,
+                )
             self._record_invocation(
                 deployment,
                 request,
@@ -512,6 +602,7 @@ class GatewayService:
         self,
         request: ChatCompletionRequest,
         api_key_id: str | None = None,
+        user_id: str | None = None,
         routed_host: str | None = None,
     ) -> Iterator[str]:
         request_id = str(uuid4())
@@ -520,6 +611,10 @@ class GatewayService:
         last_exc: RuntimeError | None = None
         for deployment in candidates:
             chunk_count = 0
+            # Accumulated usage from the final OpenAI streaming chunk (which
+            # only arrives when stream_options.include_usage is True —
+            # injected by the node-agent automatically).
+            stream_usage: dict | None = None
             try:
                 for line in self._invoke_upstream_stream(deployment, request, request_id=request_id):
                     stripped = line.strip()
@@ -528,6 +623,10 @@ class GatewayService:
                         choices = payload.get("choices", [])
                         if choices and choices[0].get("delta", {}).get("content"):
                             chunk_count += 1
+                        # OpenAI streams emit usage ONLY in the final chunk
+                        # (choices=[] at that point, usage populated).
+                        if isinstance(payload.get("usage"), dict):
+                            stream_usage = payload["usage"]
                     yield line
             except RuntimeError as exc:
                 last_exc = exc
@@ -549,6 +648,18 @@ class GatewayService:
                 continue
             self._handle_upstream_success(deployment, routing)
             self._record_usage(deployment, stream=True, stream_chunk_count=chunk_count)
+            # Per-token charge — requires usage from final chunk. If it's
+            # missing (older vLLM or user override of stream_options), skip
+            # the debit rather than guess at token counts. Acceptable for
+            # MVP; upgrade path is a tokenizer-based fallback count.
+            if user_id and stream_usage:
+                self._charge_inference_tokens(
+                    user_id=user_id,
+                    reference_id=request_id,
+                    model=request.model,
+                    prompt_tokens=int(stream_usage.get("prompt_tokens", 0) or 0),
+                    completion_tokens=int(stream_usage.get("completion_tokens", 0) or 0),
+                )
             self.metrics.observe("invoke.latency_ms", (perf_counter() - started) * 1000.0)
             self._record_invocation(
                 deployment,
@@ -762,6 +873,49 @@ class GatewayService:
                 occupancy_seconds=0.25,
             )
         )
+
+    def _charge_inference_tokens(
+        self,
+        *,
+        user_id: str,
+        reference_id: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> None:
+        """Debit a user's balance for one chat-completion call.
+
+        Uses the shared `inference_cost_cents` helper so the UI's estimate
+        matches the actual charge. Failures (insufficient balance, user
+        missing) log-and-swallow — by the time we get here the response has
+        already been yielded to the user, so raising would just confuse the
+        caller without saving any cost.
+        """
+        from greenference_protocol import inference_cost_cents
+        from greenference_gateway.infrastructure.billing_repository import (
+            BillingRepository,
+            InsufficientBalanceError,
+        )
+
+        cents = inference_cost_cents(prompt_tokens, completion_tokens)
+        try:
+            BillingRepository().debit_user(
+                user_id=user_id,
+                amount_cents=cents,
+                kind="inference",
+                reference_id=reference_id,
+                description=(
+                    f"Inference {model}: "
+                    f"{prompt_tokens} in + {completion_tokens} out tokens"
+                ),
+            )
+        except InsufficientBalanceError:
+            # User went negative on this request. We already delivered the
+            # response — record it to a metric and move on. Subsequent
+            # requests will be blocked by the pre-flight gate.
+            self.metrics.increment("inference.debit.insufficient_balance")
+        except Exception:
+            self.metrics.increment("inference.debit.failed")
 
     def _record_invocation(
         self,

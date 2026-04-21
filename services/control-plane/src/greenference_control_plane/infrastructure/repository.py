@@ -274,6 +274,7 @@ class ControlPlaneRepository:
                 endpoint=deployment.endpoint,
                 ssh_private_key=deployment.ssh_private_key,
                 port_mappings=_serialize_port_mappings(deployment.port_mappings),
+                hourly_rate_cents=deployment.hourly_rate_cents,
                 deployment_fee_usd=deployment.deployment_fee_usd,
                 fee_acknowledged=deployment.fee_acknowledged,
                 warmup_state=deployment.warmup_state,
@@ -308,6 +309,7 @@ class ControlPlaneRepository:
             row.endpoint = deployment.endpoint
             row.ssh_private_key = deployment.ssh_private_key
             row.port_mappings = _serialize_port_mappings(deployment.port_mappings)
+            row.hourly_rate_cents = deployment.hourly_rate_cents
             row.deployment_fee_usd = deployment.deployment_fee_usd
             row.fee_acknowledged = deployment.fee_acknowledged
             row.warmup_state = deployment.warmup_state
@@ -750,6 +752,7 @@ class ControlPlaneRepository:
             endpoint=row.endpoint,
             ssh_private_key=row.ssh_private_key,
             port_mappings=_deserialize_port_mappings(row.port_mappings),
+            hourly_rate_cents=row.hourly_rate_cents if row.hourly_rate_cents is not None else 10,
             deployment_fee_usd=row.deployment_fee_usd,
             fee_acknowledged=row.fee_acknowledged,
             warmup_state=row.warmup_state,
