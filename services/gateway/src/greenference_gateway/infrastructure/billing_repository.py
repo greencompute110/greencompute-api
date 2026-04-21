@@ -137,6 +137,29 @@ class BillingRepository:
             session.add(row)
             return self._to_crypto_invoice(row)
 
+    def report_invoice_tx_hash(
+        self,
+        invoice_id: str,
+        user_id: str,
+        tx_hash: str,
+    ) -> CryptoInvoice | None:
+        """User-side: attach the tx hash they sent. Does NOT credit the
+        user — admin still has to verify and confirm. The hash is stored on
+        the invoice so the admin UI can surface it as a starting point.
+        Ownership is enforced: only the invoice's own user can report a tx.
+        """
+        with session_scope(self.session_factory) as session:
+            row = session.get(CryptoInvoiceORM, invoice_id)
+            if row is None:
+                return None
+            if row.user_id != user_id:
+                return None  # caller doesn't own this invoice
+            if row.status == "confirmed":
+                return self._to_crypto_invoice(row)  # already settled, no-op
+            row.tx_hash = tx_hash
+            session.add(row)
+            return self._to_crypto_invoice(row)
+
     def list_crypto_invoices(self, user_id: str) -> list[CryptoInvoice]:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(

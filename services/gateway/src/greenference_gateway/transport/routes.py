@@ -1376,6 +1376,39 @@ async def billing_stripe_webhook(request: Request) -> dict:
     return {"received": True}
 
 
+@router.post("/platform/billing/crypto/{invoice_id}/report-tx")
+def billing_report_crypto_tx(
+    invoice_id: str,
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """User-side — attach a tx hash to an invoice after sending funds.
+    Does NOT credit the user; admin still has to verify and confirm. The
+    hash is stored on the invoice so the admin UI has a starting point.
+    """
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.user_id is None:
+        raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    tx_hash = (payload.get("tx_hash") or "").strip()
+    if not tx_hash:
+        raise HTTPException(status_code=400, detail="tx_hash required")
+    result = _get_billing().repo.report_invoice_tx_hash(
+        invoice_id=invoice_id,
+        user_id=api_key.user_id,
+        tx_hash=tx_hash,
+    )
+    if result is None:
+        # Either invoice doesn't exist or caller doesn't own it — same response
+        # either way so we don't leak invoice IDs.
+        raise HTTPException(status_code=404, detail="invoice not found")
+    return {
+        "invoice_id": result.invoice_id,
+        "status": result.status,
+        "tx_hash": result.tx_hash,
+    }
+
+
 @router.post("/platform/billing/crypto/{invoice_id}/confirm")
 def billing_confirm_crypto(
     invoice_id: str,
