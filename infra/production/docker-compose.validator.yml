@@ -45,12 +45,27 @@ services:
       GREENFERENCE_DB_BOOTSTRAP: "false"
       GREENFERENCE_ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       GREENFERENCE_BUS_TRANSPORT: durable
+      # Stripe
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_SUCCESS_URL: ${STRIPE_SUCCESS_URL:-https://green-compute.com/billing?status=success}
+      STRIPE_CANCEL_URL: ${STRIPE_CANCEL_URL:-https://green-compute.com/billing?status=cancelled}
+      # Crypto deposit addresses — chain-aware for stablecoins
+      BILLING_DEPOSIT_USDT_ETH: ${BILLING_DEPOSIT_USDT_ETH:-}
+      BILLING_DEPOSIT_USDT_BASE: ${BILLING_DEPOSIT_USDT_BASE:-}
+      BILLING_DEPOSIT_USDC_ETH: ${BILLING_DEPOSIT_USDC_ETH:-}
+      BILLING_DEPOSIT_USDC_BASE: ${BILLING_DEPOSIT_USDC_BASE:-}
+      # Legacy single-address fallbacks (used if the chain-specific vars above are empty)
+      BILLING_DEPOSIT_USDT: ${BILLING_DEPOSIT_USDT:-}
+      BILLING_DEPOSIT_USDC: ${BILLING_DEPOSIT_USDC:-}
+      BILLING_DEPOSIT_TAO: ${BILLING_DEPOSIT_TAO:-}
+      BILLING_DEPOSIT_ALPHA: ${BILLING_DEPOSIT_ALPHA:-}
       PYTHONPATH: /app/protocol/src:/app/api/packages/persistence/src:/app/api/services/gateway/src:/app/api/services/control-plane/src:/app/api/services/validator/src:/app/api/services/builder/src
     depends_on:
       migrate:
         condition: service_completed_successfully
     command: >
-      sh -lc "pip install -q psycopg[binary] sqlalchemy fastapi uvicorn pydantic nats-py &&
+      sh -lc "pip install -q psycopg[binary] sqlalchemy fastapi uvicorn pydantic nats-py stripe requests &&
       uvicorn greenference_gateway.main:app --host 0.0.0.0 --port 8000 --log-level info"
     ports:
       - "28000:8000"

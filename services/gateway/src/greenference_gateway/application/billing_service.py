@@ -9,7 +9,7 @@ from greenference_gateway.infrastructure.billing_repository import BillingReposi
 
 log = logging.getLogger(__name__)
 
-# Bonus rates (as fractions, not percentages)
+# Bonus rates keyed by the base currency (chain suffix stripped for lookup).
 BONUS_RATES: dict[str, float] = {
     "stripe": 0.00,
     "usdt": 0.05,
@@ -18,13 +18,42 @@ BONUS_RATES: dict[str, float] = {
     "alpha": 0.20,
 }
 
-# Deposit addresses per currency (from env vars)
-DEPOSIT_ADDRESSES: dict[str, str] = {
-    "usdt": os.environ.get("BILLING_DEPOSIT_USDT", ""),
-    "usdc": os.environ.get("BILLING_DEPOSIT_USDC", ""),
-    "tao": os.environ.get("BILLING_DEPOSIT_TAO", ""),
-    "alpha": os.environ.get("BILLING_DEPOSIT_ALPHA", ""),
-}
+
+def _deposit_address_for(currency: str) -> str:
+    """Resolve a deposit address for a currency identifier.
+
+    Accepts both chain-qualified codes (``usdt-eth``, ``usdt-base``,
+    ``usdc-eth``, ``usdc-base``) and plain base codes (``usdt``, ``usdc``,
+    ``tao``, ``alpha``). For stablecoins, the chain-specific env var is
+    preferred; if unset, falls back to the legacy single-address env var
+    so older deployments keep working.
+    """
+    c = currency.lower()
+    if c == "usdt-eth":
+        return os.environ.get("BILLING_DEPOSIT_USDT_ETH") or os.environ.get("BILLING_DEPOSIT_USDT", "")
+    if c == "usdt-base":
+        return os.environ.get("BILLING_DEPOSIT_USDT_BASE") or os.environ.get("BILLING_DEPOSIT_USDT", "")
+    if c == "usdc-eth":
+        return os.environ.get("BILLING_DEPOSIT_USDC_ETH") or os.environ.get("BILLING_DEPOSIT_USDC", "")
+    if c == "usdc-base":
+        return os.environ.get("BILLING_DEPOSIT_USDC_BASE") or os.environ.get("BILLING_DEPOSIT_USDC", "")
+    if c == "usdt":
+        return os.environ.get("BILLING_DEPOSIT_USDT", "")
+    if c == "usdc":
+        return os.environ.get("BILLING_DEPOSIT_USDC", "")
+    if c == "tao":
+        return os.environ.get("BILLING_DEPOSIT_TAO", "")
+    if c == "alpha":
+        return os.environ.get("BILLING_DEPOSIT_ALPHA", "")
+    return ""
+
+
+def _base_currency(currency: str) -> str:
+    """Strip chain suffix for bonus-rate lookups and display."""
+    c = currency.lower()
+    if "-" in c:
+        return c.split("-", 1)[0]
+    return c
 
 
 class BillingService:
@@ -95,22 +124,30 @@ class BillingService:
     # --- Crypto top-up ---
 
     def create_crypto_invoice(self, user_id: str, currency: str, amount_usd: float) -> dict:
-        """Create a crypto deposit invoice."""
+        """Create a crypto deposit invoice.
+
+        `currency` may be a bare code (``usdt``, ``usdc``, ``tao``, ``alpha``)
+        or a chain-qualified stablecoin code (``usdt-eth``, ``usdt-base``,
+        ``usdc-eth``, ``usdc-base``). The chain suffix is preserved on the
+        invoice so admins can tell which network the sender used; bonus
+        rates are resolved against the base currency.
+        """
         currency = currency.lower()
-        bonus_pct = BONUS_RATES.get(currency, 0.0)
+        base = _base_currency(currency)
+        bonus_pct = BONUS_RATES.get(base, 0.0)
         base_cents = int(round(amount_usd * 100))
         bonus_cents = int(round(base_cents * bonus_pct))
         total_credits = base_cents + bonus_cents
 
-        # Calculate crypto amount (for stablecoins it's 1:1, for TAO/Alpha use price feed)
-        if currency in ("usdt", "usdc"):
+        # Stablecoins settle 1:1 USD. TAO/Alpha use a live price feed.
+        if base in ("usdt", "usdc"):
             amount_crypto = amount_usd
         else:
             from greenference_gateway.infrastructure.price_feed import get_price
-            price = get_price(currency)
+            price = get_price(base)
             amount_crypto = round(amount_usd / price, 6) if price > 0 else 0.0
 
-        deposit_address = DEPOSIT_ADDRESSES.get(currency, "")
+        deposit_address = _deposit_address_for(currency)
         invoice = CryptoInvoice(
             user_id=user_id,
             currency=currency,

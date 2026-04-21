@@ -1343,8 +1343,17 @@ def billing_topup_crypto(
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
     currency = payload.get("currency", "").lower()
     amount_usd = payload.get("amount_usd")
-    if currency not in ("usdt", "usdc", "tao", "alpha"):
-        raise HTTPException(status_code=400, detail="currency must be one of: usdt, usdc, tao, alpha")
+    allowed = (
+        "usdt", "usdc",                           # legacy — single address for either chain
+        "usdt-eth", "usdt-base",                  # chain-qualified
+        "usdc-eth", "usdc-base",                  # chain-qualified
+        "tao", "alpha",
+    )
+    if currency not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"currency must be one of: {', '.join(allowed)}",
+        )
     if not amount_usd or amount_usd < 1:
         raise HTTPException(status_code=400, detail="amount_usd must be >= 1")
     return _get_billing().create_crypto_invoice(api_key.user_id, currency, float(amount_usd))
