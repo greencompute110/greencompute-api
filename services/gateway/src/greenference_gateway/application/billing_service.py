@@ -171,32 +171,36 @@ class BillingService:
         }
 
     def confirm_crypto_deposit(self, invoice_id: str, tx_hash: str) -> dict | None:
-        """Admin confirms a crypto deposit. Credits user with bonus."""
+        """Admin confirms a crypto deposit. Credits user with bonus.
+
+        Atomic — the repo runs the invoice flip and the ledger insert in a
+        single session, so we can't end up in a "confirmed-without-credit"
+        stuck state if anything in between fails. Also idempotent: a retry
+        once a ledger entry already exists is a no-op.
+        """
         invoice = self.repo.get_crypto_invoice(invoice_id)
         if invoice is None:
             return None
-        if invoice.status == "confirmed":
-            return {"already_confirmed": True, "invoice_id": invoice_id}
-
-        self.repo.confirm_crypto_invoice(invoice_id, tx_hash)
-        self.repo.credit_user(
-            user_id=invoice.user_id,
-            amount_cents=invoice.total_credits,
-            kind="topup",
-            reference_id=invoice_id,
-            description=f"Crypto deposit {invoice.currency.upper()} ${invoice.amount_usd:.2f} (+{int(invoice.bonus_pct*100)}% bonus)",
+        description = (
+            f"Crypto deposit {invoice.currency.upper()} "
+            f"${invoice.amount_usd:.2f} "
+            f"(+{int(invoice.bonus_pct * 100)}% bonus)"
         )
-        log.info(
-            "Crypto deposit confirmed: user=%s invoice=%s credits=%d",
-            invoice.user_id,
-            invoice_id,
-            invoice.total_credits,
+        result = self.repo.confirm_and_credit_invoice(
+            invoice_id=invoice_id,
+            tx_hash=tx_hash,
+            description=description,
         )
-        return {
-            "confirmed": True,
-            "invoice_id": invoice_id,
-            "total_credits": invoice.total_credits,
-        }
+        if result is None:
+            return None
+        if result.get("credited"):
+            log.info(
+                "Crypto deposit confirmed: user=%s invoice=%s credits=%d",
+                invoice.user_id,
+                invoice_id,
+                invoice.total_credits,
+            )
+        return result
 
     # --- Usage deduction ---
 

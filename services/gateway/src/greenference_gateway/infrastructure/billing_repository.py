@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -46,6 +47,9 @@ class BillingRepository:
             if row is None:
                 raise KeyError(f"user {user_id} not found")
             row.balance_credits += amount_cents
+            # Populate created_at explicitly — the ORM's default=utcnow fires
+            # at flush time, but we return the pydantic LedgerEntry before the
+            # session commits, so reading it before then would be None.
             entry = LedgerEntryORM(
                 entry_id=str(uuid4()),
                 user_id=user_id,
@@ -54,6 +58,7 @@ class BillingRepository:
                 kind=kind,
                 reference_id=reference_id,
                 description=description,
+                created_at=datetime.now(UTC),
             )
             session.add(entry)
             return self._to_ledger_entry(entry)
@@ -83,6 +88,7 @@ class BillingRepository:
                 kind=kind,
                 reference_id=reference_id,
                 description=description,
+                created_at=datetime.now(UTC),
             )
             session.add(entry)
             return self._to_ledger_entry(entry)
@@ -136,6 +142,79 @@ class BillingRepository:
             row.confirmed_at = datetime.now(UTC)
             session.add(row)
             return self._to_crypto_invoice(row)
+
+    def confirm_and_credit_invoice(
+        self,
+        invoice_id: str,
+        tx_hash: str,
+        description: str,
+    ) -> dict | None:
+        """Atomically confirm an invoice and credit the owning user.
+
+        Runs inside a single session so partial failures (e.g. a ledger
+        insert blowing up after we've flipped the invoice to `confirmed`)
+        roll back everything. Before crediting, checks for an existing
+        topup ledger entry referencing this invoice — if one is there,
+        treat the invoice as already credited and do not double-issue.
+        Returns:
+          - None if the invoice doesn't exist
+          - {"already_confirmed": True} if the invoice was already processed
+          - {"credited": True, ...} on a fresh confirm+credit
+        """
+        with session_scope(self.session_factory) as session:
+            inv = session.get(CryptoInvoiceORM, invoice_id, with_for_update=True)
+            if inv is None:
+                return None
+
+            # Idempotency: if we've already written a ledger entry for this
+            # invoice, short-circuit. Covers retries and also recovers the
+            # case where a stuck "confirmed-without-credit" gets retried
+            # manually and we want the second call to be a no-op.
+            existing = session.scalar(
+                select(LedgerEntryORM).where(
+                    LedgerEntryORM.reference_id == invoice_id,
+                    LedgerEntryORM.kind == "topup",
+                )
+            )
+            if existing is not None:
+                # Make sure the invoice is marked confirmed even if a prior
+                # partial run left it in a mismatched state.
+                if inv.status != "confirmed":
+                    inv.status = "confirmed"
+                    if tx_hash and not inv.tx_hash:
+                        inv.tx_hash = tx_hash
+                    if inv.confirmed_at is None:
+                        inv.confirmed_at = datetime.now(UTC)
+                return {"already_confirmed": True, "invoice_id": invoice_id}
+
+            user = session.get(UserORM, inv.user_id, with_for_update=True)
+            if user is None:
+                raise KeyError(f"user {inv.user_id} not found for invoice {invoice_id}")
+
+            # 1. flip invoice
+            inv.status = "confirmed"
+            inv.tx_hash = tx_hash
+            inv.confirmed_at = datetime.now(UTC)
+            # 2. credit user
+            user.balance_credits += inv.total_credits
+            # 3. ledger entry (explicit created_at — see credit_user comment)
+            session.add(
+                LedgerEntryORM(
+                    entry_id=str(uuid4()),
+                    user_id=inv.user_id,
+                    amount_cents=inv.total_credits,
+                    balance_after=user.balance_credits,
+                    kind="topup",
+                    reference_id=invoice_id,
+                    description=description,
+                    created_at=datetime.now(UTC),
+                )
+            )
+            return {
+                "credited": True,
+                "invoice_id": invoice_id,
+                "total_credits": inv.total_credits,
+            }
 
     def reject_crypto_invoice(self, invoice_id: str) -> CryptoInvoice | None:
         """Admin action: mark invoice as rejected and never credit it.
