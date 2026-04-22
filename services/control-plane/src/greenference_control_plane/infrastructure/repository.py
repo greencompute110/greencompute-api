@@ -580,6 +580,20 @@ class ControlPlaneRepository:
             rows = session.scalars(stmt).all()
             return [self._to_invocation_record(row) for row in rows]
 
+    def last_invocation_at(self, deployment_id: str) -> datetime | None:
+        """Return the timestamp of the most recent invocation for a deployment,
+        or None if the deployment has never been invoked. Used by the idle-kill
+        loop to decide whether a private-endpoint inference deployment should
+        be auto-suspended."""
+        with session_scope(self.session_factory) as session:
+            row = session.scalar(
+                select(InvocationRecordORM)
+                .where(InvocationRecordORM.deployment_id == deployment_id)
+                .order_by(InvocationRecordORM.created_at.desc())
+                .limit(1)
+            )
+            return row.created_at if row is not None else None
+
     def add_deployment_event(self, event: DeploymentStatusUpdate) -> DeploymentStatusUpdate:
         with session_scope(self.session_factory) as session:
             row = DeploymentEventORM(

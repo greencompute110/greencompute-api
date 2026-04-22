@@ -23,6 +23,10 @@ class Settings(BaseModel):
     deployment_health_failure_threshold: int = Field(default=3, ge=1)
     placement_failure_cooldown_seconds: int = Field(default=120, ge=1)
     placement_failure_threshold: int = Field(default=3, ge=1)
+    # Private-endpoint inference: auto-suspend if zero invocations within this
+    # window. Catalog (Flux-managed) replicas are not subject to this timer;
+    # they're rebalanced based on demand signals instead.
+    idle_private_endpoint_timeout_seconds: int = Field(default=1800, ge=60)
 
 
 settings = Settings(
@@ -36,4 +40,5 @@ settings = Settings(
     deployment_health_failure_threshold=_int("GREENFERENCE_DEPLOYMENT_HEALTH_FAILURE_THRESHOLD", 3),
     placement_failure_cooldown_seconds=_int("GREENFERENCE_PLACEMENT_FAILURE_COOLDOWN_SECONDS", 120),
     placement_failure_threshold=_int("GREENFERENCE_PLACEMENT_FAILURE_THRESHOLD", 3),
+    idle_private_endpoint_timeout_seconds=_int("GREENFERENCE_IDLE_PRIVATE_ENDPOINT_TIMEOUT_SECONDS", 1800),
 )

@@ -20,6 +20,7 @@ from greenference_protocol import (
     MinerRegistration,
     NodeCapability,
     UsageRecord,
+    WorkloadKind,
     WorkloadSpec,
 )
 from greenference_control_plane.config import settings
@@ -886,6 +887,64 @@ class ControlPlaneService:
                 reassigned.append(deployment)
         return reassigned
 
+    def process_idle_inference_deployments(self, now: datetime | None = None) -> list[str]:
+        """Auto-suspend private-endpoint inference deployments with no
+        recent invocations.
+
+        Scope: READY deployments whose workload.kind is INFERENCE **and**
+        that are NOT flux-managed (metadata['managed_by'] != 'flux').
+        Flux-managed catalog replicas churn via demand-reactive rebalance,
+        not a timer.
+
+        Threshold is `settings.idle_private_endpoint_timeout_seconds`
+        (default 1800s = 30 min) measured from the later of:
+          - the last invocation against this deployment, or
+          - the deployment's READY transition (if never invoked).
+
+        Returns the list of deployment IDs that were suspended this cycle.
+        """
+        observed_at = now or datetime.now(UTC)
+        timeout = settings.idle_private_endpoint_timeout_seconds
+        suspended: list[str] = []
+        for deployment in self.repository.list_deployments_by_state(DeploymentState.READY):
+            workload = self.repository.get_workload(deployment.workload_id)
+            if workload is None or workload.kind != WorkloadKind.INFERENCE:
+                continue
+            if (workload.metadata or {}).get("managed_by") == "flux":
+                continue  # catalog replica — Flux rebalance owns lifecycle
+
+            last_inv = self.repository.last_invocation_at(deployment.deployment_id)
+            ready_since = self._ensure_utc(deployment.updated_at) if deployment.updated_at else observed_at
+            last_activity = last_inv if last_inv is not None else ready_since
+            last_activity = self._ensure_utc(last_activity)
+            idle_seconds = (observed_at - last_activity).total_seconds()
+            if idle_seconds < timeout:
+                continue
+
+            logger.info(
+                "Auto-suspending idle private-endpoint inference deployment %s "
+                "(idle %ds, threshold %ds, last_invocation=%s)",
+                deployment.deployment_id,
+                int(idle_seconds),
+                timeout,
+                last_inv.isoformat() if last_inv else "never",
+            )
+            try:
+                self.update_deployment_status(
+                    DeploymentStatusUpdate(
+                        deployment_id=deployment.deployment_id,
+                        state=DeploymentState.SUSPENDED,
+                        error=f"idle — no invocations in {timeout // 60} min",
+                    )
+                )
+                self.metrics.increment("deployment.suspended.idle_inference")
+                suspended.append(deployment.deployment_id)
+            except Exception:
+                logger.exception(
+                    "failed to suspend idle deployment %s", deployment.deployment_id
+                )
+        return suspended
+
     def process_pending_events(self, limit: int = 10) -> dict[str, list]:
         events = self.bus.claim_pending(
             "control-plane-worker",
@@ -1230,6 +1289,11 @@ class ControlPlaneService:
                 continue
 
             workload = self.repository.get_workload(deployment.workload_id)
+            # Inference workloads are metered per-token at request time
+            # (see gateway's _charge_inference_tokens). Charging hourly here
+            # too would be double-billing. Only pod/vm rentals are hourly.
+            if workload is not None and workload.kind == WorkloadKind.INFERENCE:
+                continue
             gpu_count = workload.requirements.gpu_count if workload else 1
             # Per-minute cost in *millicents* — integer math, no float rounding.
             # Hourly-cents × 1000 / 60 = millicents per minute.

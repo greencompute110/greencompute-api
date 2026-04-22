@@ -33,6 +33,7 @@ async def _control_plane_worker_loop() -> None:
             service.process_pending_events()
             service.process_timeouts()
             service.process_unhealthy_miners()
+            service.process_idle_inference_deployments()
             # Usage metering — runs every ~60 seconds
             _metering_counter += 1
             if _metering_counter >= _metering_interval:
