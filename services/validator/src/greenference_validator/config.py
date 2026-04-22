@@ -53,6 +53,7 @@ class Settings(BaseModel):
     gateway_url: str = ""
     inference_canary_api_key: str = ""
     inference_canary_timeout_seconds: float = Field(default=30.0, ge=1.0)
+    inference_canary_interval_seconds: float = Field(default=300.0, ge=30.0)
 
 
 settings = Settings(
@@ -69,7 +70,9 @@ settings = Settings(
     metagraph_sync_interval_seconds=_float("GREENFERENCE_BITTENSOR_METAGRAPH_SYNC_INTERVAL", "BITTENSOR_METAGRAPH_SYNC_INTERVAL", 60.0),
     target_rpm_per_replica=_float("GREENFERENCE_FLUX_TARGET_RPM_PER_REPLICA", "FLUX_TARGET_RPM_PER_REPLICA", 30.0),
     flux_cooldown_seconds=_float("GREENFERENCE_FLUX_COOLDOWN_SECONDS", "FLUX_COOLDOWN_SECONDS", 300.0),
-    gateway_url=_env("GREENFERENCE_VALIDATOR_GATEWAY_URL", "VALIDATOR_GATEWAY_URL", ""),
-    inference_canary_api_key=_env("GREENFERENCE_INFERENCE_CANARY_API_KEY", "INFERENCE_CANARY_API_KEY", ""),
+    gateway_url=_env("GREENFERENCE_VALIDATOR_GATEWAY_URL", "VALIDATOR_GATEWAY_URL", "http://gateway:8000"),
+    inference_canary_api_key=_env("GREENFERENCE_INFERENCE_CANARY_API_KEY", "INFERENCE_CANARY_API_KEY")
+                              or _env("GREENFERENCE_ADMIN_API_KEY", "ADMIN_API_KEY", ""),
     inference_canary_timeout_seconds=_float("GREENFERENCE_INFERENCE_CANARY_TIMEOUT_SECONDS", "INFERENCE_CANARY_TIMEOUT_SECONDS", 30.0),
+    inference_canary_interval_seconds=_float("GREENFERENCE_INFERENCE_CANARY_INTERVAL_SECONDS", "INFERENCE_CANARY_INTERVAL_SECONDS", 300.0),
 )

@@ -32,6 +32,7 @@ async def _validator_worker_loop() -> None:
     _flux_counter = 0
     _metagraph_counter = 0
     _demand_prune_counter = 0
+    _canary_counter = 0
     flux_every = max(1, int(
         service_settings.flux_rebalance_interval_seconds / settings.worker_poll_interval_seconds
     ))
@@ -41,6 +42,9 @@ async def _validator_worker_loop() -> None:
     # Prune demand stats every hour. retention is 48h so we're well within
     # the safety window even if a tick gets skipped.
     demand_prune_every = max(1, int(3600.0 / settings.worker_poll_interval_seconds))
+    canary_every = max(1, int(
+        service_settings.inference_canary_interval_seconds / settings.worker_poll_interval_seconds
+    ))
     while True:
         try:
             service.process_pending_events()
@@ -56,6 +60,10 @@ async def _validator_worker_loop() -> None:
             if _demand_prune_counter >= demand_prune_every:
                 service.repository.prune_demand_stats(retention_hours=48)
                 _demand_prune_counter = 0
+            _canary_counter += 1
+            if _canary_counter >= canary_every:
+                service.run_attestation_tick()
+                _canary_counter = 0
             _worker_state["last_successful_iteration"] = asyncio.get_running_loop().time()
             _worker_state["last_error"] = None
         except Exception as exc:

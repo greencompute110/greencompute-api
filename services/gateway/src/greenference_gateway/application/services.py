@@ -107,6 +107,12 @@ class GatewayService:
         self.inference_client = inference_client or HttpInferenceClient()
         self.metrics = gateway_metrics
         self._round_robin_counter = 0
+        # Per-deployment EMA of recent chat-completion latency (ms). Populated
+        # on every successful invoke; `_select_healthy_deployments` sorts by
+        # it so consistently faster miners get preferred. Missing entries
+        # default to 0 → new deployments rank first, which we want (it lets
+        # the scheduler learn their latency quickly).
+        self._deployment_latency_ema: dict[str, float] = {}
 
     def register_user(self, request: UserRegistrationRequest) -> UserRecord:
         # Idempotent: if a user with this email already exists, return it.
@@ -632,6 +638,7 @@ class GatewayService:
             self._record_usage(deployment, stream=False, stream_chunk_count=0)
             latency_ms = (perf_counter() - started) * 1000.0
             self.metrics.observe("invoke.latency_ms", latency_ms)
+            self._track_latency_ema(deployment.deployment_id, latency_ms)
             response.id = request_id
             # Per-token charge: only if miner returned a usage block AND the
             # caller is a real user (admin / anonymous is free by policy).
@@ -720,7 +727,9 @@ class GatewayService:
                     completion_tokens=int(stream_usage.get("completion_tokens", 0) or 0),
                     deployment=deployment,
                 )
-            self.metrics.observe("invoke.latency_ms", (perf_counter() - started) * 1000.0)
+            stream_latency_ms = (perf_counter() - started) * 1000.0
+            self.metrics.observe("invoke.latency_ms", stream_latency_ms)
+            self._track_latency_ema(deployment.deployment_id, stream_latency_ms)
             self._record_invocation(
                 deployment,
                 request,
@@ -762,6 +771,15 @@ class GatewayService:
             if workload_item.name == model:
                 return workload_item, {"matched_by": "name_scan", "host": normalized_host, "model": model}
         raise NoReadyDeploymentError(f"unknown model={model}")
+
+    def _track_latency_ema(self, deployment_id: str, latency_ms: float, alpha: float = 0.3) -> None:
+        """EMA of recent chat-completion latencies. Alpha=0.3 means a single
+        slow sample shifts the score but transient spikes don't dominate."""
+        prev = self._deployment_latency_ema.get(deployment_id)
+        if prev is None:
+            self._deployment_latency_ema[deployment_id] = latency_ms
+        else:
+            self._deployment_latency_ema[deployment_id] = (alpha * latency_ms) + ((1 - alpha) * prev)
 
     def _select_healthy_deployments(
         self,
@@ -830,7 +848,14 @@ class GatewayService:
             )
             raise NoReadyDeploymentError(f"no healthy deployment available for model={request.model}")
 
-        # Round-robin: rotate the healthy list so each request starts at a different deployment
+        # Latency-aware: sort healthy deployments by EMA latency ascending
+        # (faster miners first). Deployments without a latency sample keep
+        # their index stable via 0.0 — they get probed first, we learn
+        # their latency, then the scheduler sorts them accordingly. After
+        # sorting, still rotate to balance load across the top-N.
+        healthy.sort(key=lambda d: self._deployment_latency_ema.get(d.deployment_id, 0.0))
+
+        # Round-robin: rotate the (latency-sorted) healthy list so each request starts at a different deployment
         offset = self._round_robin_counter % len(healthy)
         self._round_robin_counter += 1
         ordered = healthy[offset:] + healthy[:offset]

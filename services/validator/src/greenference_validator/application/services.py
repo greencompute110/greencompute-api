@@ -92,7 +92,11 @@ class ValidatorService:
         if validator_settings.bittensor_enabled and not self.metagraph.is_registered(capability.hotkey):
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail=f"hotkey {capability.hotkey} not registered on chain")
-        return self.repository.upsert_capability(capability)
+        saved = self.repository.upsert_capability(capability)
+        # Bootstrap Flux state so the first rebalance tick already considers
+        # this miner. Re-seeds total_gpus if the miner changed capacity.
+        self.init_flux_state(capability.hotkey, capability.node_id, capability.gpu_count)
+        return saved
 
     def create_probe(self, hotkey: str, node_id: str, kind: str = "latency") -> ProbeChallenge:
         capability = self.repository.get_capability(hotkey)
@@ -336,7 +340,24 @@ class ValidatorService:
     def rebalance_all_miners(self) -> dict[str, FluxState]:
         """Rebalance all tracked miners. Called from the worker loop.
         Computes the fleet-wide replica targets up-front so every per-miner
-        rebalance sees the same target map."""
+        rebalance sees the same target map. Lazily bootstraps Flux state
+        for any registered capability we haven't seen yet — previously
+        `_flux_states` only grew from the (unused) init_flux_state call
+        site, so rebalance was a no-op after every restart."""
+        # Bootstrap: ensure every registered miner has a Flux state so
+        # rebalance actually iterates them. Noop for miners already present.
+        for hotkey, cap in self.repository.list_capabilities().items():
+            if hotkey in self._flux_states:
+                continue
+            self._flux_states[hotkey] = FluxState(
+                hotkey=hotkey,
+                node_id=cap.node_id,
+                total_gpus=cap.gpu_count,
+                idle_gpus=cap.gpu_count,
+                inference_floor_pct=validator_settings.flux_inference_floor_pct,
+                rental_floor_pct=validator_settings.flux_rental_floor_pct,
+            )
+
         self._replica_targets = self.compute_replica_targets()
         results: dict[str, FluxState] = {}
         for hotkey in list(self._flux_states):
@@ -441,6 +462,29 @@ class ValidatorService:
         saved = self.repository.add_result(result)
         self.metrics.increment(f"probe.inference.{'success' if success else 'failure'}")
         return saved
+
+    def run_attestation_tick(self) -> ProbeResult | None:
+        """Periodic worker hook — fires a canary against one live
+        (miner, catalog model) pair per call. Round-robins across the
+        fleet so every replica gets probed eventually. Skips silently if
+        no catalog replicas are running."""
+        pairs: list[tuple[str, str]] = []
+        for hotkey, state in self._flux_states.items():
+            for model_id, idxs in state.inference_assignments.items():
+                if idxs:
+                    pairs.append((hotkey, model_id))
+        if not pairs:
+            return None
+        # Deterministic round-robin without storing a pointer: hash on
+        # the current minute so we spread probes without thrashing on
+        # restart.
+        idx = (int(datetime.now(UTC).timestamp()) // 60) % len(pairs)
+        hotkey, model_id = pairs[idx]
+        try:
+            return self.run_inference_canary(hotkey, model_id)
+        except Exception:
+            logger.exception("attestation tick failed for %s / %s", hotkey, model_id)
+            return None
 
     # --- Dashboard snapshot (Phase 2J) ---------------------------------
 
