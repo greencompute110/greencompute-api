@@ -994,8 +994,16 @@ class GatewayService:
         completion_tokens: int,
         deployment: DeploymentRecord | None = None,
     ) -> None:
-        """Debit a user's balance for one chat-completion call + accrue the
-        serving miner's payout.
+        """Debit a user's balance for one chat-completion call + record a
+        per-miner accrual row.
+
+        The accrual table is **reporting-only** — it does not create a
+        liability. Miners earn from TAO emissions via the subnet's weight
+        snapshot (publish_weight_snapshot). The `cents_earned` column is
+        kept so a future miner dashboard can show "you served N requests
+        worth ~$X equivalent this week." If you later want to run direct
+        fiat payouts, a separate batch job signs transactions with the
+        treasury wallet and reads these rows.
 
         Uses the shared `inference_cost_cents` helper so the UI's estimate
         matches the actual charge. Failures (insufficient balance, user

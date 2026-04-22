@@ -493,8 +493,10 @@ def _ensure_catalog_workload(entry: ModelCatalogEntry) -> None:
     # vLLM-compatible default image. Miners override via the catalog template
     # if they need diffusion / vision variants.
     default_images = {
-        "vllm": "vllm/vllm-openai:v0.8.5",
-        "vllm-vision": "vllm/vllm-openai:v0.8.5",
+        # v0.19.1 with CUDA 13.0 is needed for Blackwell (sm_120 / RTX 5090).
+        # Older tags like 0.8.5 crash at EngineCore init on RTX 5090.
+        "vllm": "vllm/vllm-openai:v0.19.1-cu130-ubuntu2404",
+        "vllm-vision": "vllm/vllm-openai:v0.19.1-cu130-ubuntu2404",
         "diffusion": "greenference/diffusion-server:latest",
     }
     image = default_images.get(entry.template, default_images["vllm"])
