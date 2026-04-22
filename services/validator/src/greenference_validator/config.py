@@ -48,6 +48,11 @@ class Settings(BaseModel):
     # for this long before Flux will actually drop a replica. Protects
     # against flapping when demand oscillates.
     flux_cooldown_seconds: float = Field(default=300.0, ge=0.0)
+    # Phase 2F — inference attestation probes
+    # Gateway URL for the canary chat completion. Empty disables the probe.
+    gateway_url: str = ""
+    inference_canary_api_key: str = ""
+    inference_canary_timeout_seconds: float = Field(default=30.0, ge=1.0)
 
 
 settings = Settings(
@@ -64,4 +69,7 @@ settings = Settings(
     metagraph_sync_interval_seconds=_float("GREENFERENCE_BITTENSOR_METAGRAPH_SYNC_INTERVAL", "BITTENSOR_METAGRAPH_SYNC_INTERVAL", 60.0),
     target_rpm_per_replica=_float("GREENFERENCE_FLUX_TARGET_RPM_PER_REPLICA", "FLUX_TARGET_RPM_PER_REPLICA", 30.0),
     flux_cooldown_seconds=_float("GREENFERENCE_FLUX_COOLDOWN_SECONDS", "FLUX_COOLDOWN_SECONDS", 300.0),
+    gateway_url=_env("GREENFERENCE_VALIDATOR_GATEWAY_URL", "VALIDATOR_GATEWAY_URL", ""),
+    inference_canary_api_key=_env("GREENFERENCE_INFERENCE_CANARY_API_KEY", "INFERENCE_CANARY_API_KEY", ""),
+    inference_canary_timeout_seconds=_float("GREENFERENCE_INFERENCE_CANARY_TIMEOUT_SECONDS", "INFERENCE_CANARY_TIMEOUT_SECONDS", 30.0),
 )

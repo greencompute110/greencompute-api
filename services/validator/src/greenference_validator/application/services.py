@@ -346,6 +346,102 @@ class ValidatorService:
 
     # --- Demand-reactive replica targets (Phase 2I) --------------------
 
+    # --- Inference attestation canary (Phase 2F) -----------------------
+
+    def run_inference_canary(self, hotkey: str, model_id: str) -> ProbeResult:
+        """Fire a canary chat-completion against the gateway and score the
+        response. Result gets persisted as a ProbeResult so existing
+        reliability / fraud-penalty scoring picks it up — no new scoring
+        math needed. Records latency, shape-compliance signature, and
+        whether the serving miner matched the expected hotkey."""
+        import hashlib
+        import json
+        import time as _time
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+
+        cap = self.repository.get_capability(hotkey)
+        if cap is None:
+            raise UnknownCapabilityError(f"capability not found for hotkey={hotkey}")
+
+        challenge = self.create_probe(hotkey, cap.node_id, kind="inference_verification")
+
+        gw = validator_settings.gateway_url
+        key = validator_settings.inference_canary_api_key
+        if not gw or not key:
+            # No gateway wired → record a no-op failure rather than raising,
+            # so admin triggering the endpoint sees a clear signal.
+            result = ProbeResult(
+                challenge_id=challenge.challenge_id,
+                hotkey=hotkey,
+                node_id=cap.node_id,
+                latency_ms=0.0,
+                throughput=0.0,
+                success=False,
+                readiness_failures=1,
+            )
+            return self.repository.add_result(result)
+
+        body = {
+            "model": model_id,
+            "messages": [
+                {"role": "user", "content": "Reply exactly: OK"},
+            ],
+            "max_tokens": 8,
+            "stream": False,
+        }
+        data = json.dumps(body).encode()
+        req = Request(
+            gw.rstrip("/") + "/v1/chat/completions",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": key,
+            },
+            method="POST",
+        )
+        started = _time.perf_counter()
+        latency_ms = 0.0
+        success = False
+        signature: str | None = None
+        tokens = 0
+        readiness_failures = 0
+        try:
+            with urlopen(req, timeout=validator_settings.inference_canary_timeout_seconds) as resp:
+                payload = json.loads(resp.read())
+            latency_ms = (_time.perf_counter() - started) * 1000.0
+            choices = payload.get("choices") or []
+            content = (choices[0].get("message") or {}).get("content") if choices else None
+            if content and isinstance(content, str):
+                success = True
+                norm = content.strip().upper()[:32]
+                signature = hashlib.sha256(f"{model_id}:{norm}".encode()).hexdigest()[:16]
+            usage = payload.get("usage") or {}
+            tokens = int(usage.get("completion_tokens", 0) or 0)
+        except HTTPError as exc:
+            latency_ms = (_time.perf_counter() - started) * 1000.0
+            readiness_failures = 1
+            logger.warning("inference canary http %s for %s: %s", exc.code, model_id, exc.reason)
+        except Exception as exc:  # noqa: BLE001 — broad is fine, we're scoring a probe
+            latency_ms = (_time.perf_counter() - started) * 1000.0
+            readiness_failures = 1
+            logger.warning("inference canary error for %s: %s", model_id, exc)
+
+        throughput = (tokens / max(latency_ms, 1.0)) * 1000.0 if success else 0.0
+        result = ProbeResult(
+            challenge_id=challenge.challenge_id,
+            hotkey=hotkey,
+            node_id=cap.node_id,
+            latency_ms=latency_ms,
+            throughput=throughput,
+            success=success,
+            benchmark_signature=signature,
+            readiness_failures=readiness_failures,
+        )
+        saved = self.repository.add_result(result)
+        self.metrics.increment(f"probe.inference.{'success' if success else 'failure'}")
+        return saved
+
     # --- Dashboard snapshot (Phase 2J) ---------------------------------
 
     def build_flux_dashboard(self) -> dict:

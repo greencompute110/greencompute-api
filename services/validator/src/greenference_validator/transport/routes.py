@@ -171,6 +171,24 @@ def flux_events(
     return {"events": service.flux_events(limit=limit)}
 
 
+@router.post("/validator/v1/probes/inference/{hotkey}/{model_id}")
+def run_inference_probe(
+    hotkey: str,
+    model_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — fire an inference-verification canary against a specific miner
+    hosting the catalog model. Records a ProbeResult that feeds
+    reliability / fraud-penalty scoring via the existing pipeline."""
+    require_admin_api_key(authorization, x_api_key)
+    try:
+        result = service.run_inference_canary(hotkey, model_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return result.model_dump(mode="json")
+
+
 @router.get("/validator/v1/flux/{hotkey}")
 def get_flux_state(
     hotkey: str,
