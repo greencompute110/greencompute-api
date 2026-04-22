@@ -833,6 +833,46 @@ def terminate_deployment(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
+@router.post("/platform/deployments/{deployment_id}/resume")
+def resume_deployment(
+    deployment_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Re-deploy a SUSPENDED deployment with the same workload + instance
+    count. Returns the *new* deployment record. Old one flips to TERMINATED.
+    """
+    from greenference_gateway.application.services import InsufficientBalanceForRentalError
+
+    api_key = require_api_key(authorization, x_api_key)
+    enforce_rate_limit("resume_deployment", api_key.key_id, limit=30, window_seconds=60)
+    try:
+        return service.resume_deployment(
+            deployment_id,
+            user_id=api_key.user_id,
+            admin=api_key.admin,
+        ).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        # Not in SUSPENDED state.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except InsufficientBalanceForRentalError as exc:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "message": "insufficient balance to resume this deployment",
+                "required_cents": exc.required_cents,
+                "current_cents": exc.current_cents,
+                "rate_cents_per_hour": exc.rate_cents_per_hour,
+                "gpu_count": exc.gpu_count,
+                "requested_instances": exc.requested_instances,
+            },
+        ) from exc
+
+
 @router.post("/platform/secrets")
 def create_secret(
     payload: UserSecretCreateRequest,

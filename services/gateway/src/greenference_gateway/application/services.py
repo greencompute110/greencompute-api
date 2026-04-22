@@ -17,6 +17,7 @@ from greenference_protocol import (
     APIKeyCreateRequest,
     BuildAttemptRecord,
     APIKeyRecord,
+    DeploymentState,
     BuildContextRecord,
     BuildContextUploadRecord,
     BuildContextUploadRequest,
@@ -380,6 +381,63 @@ class GatewayService:
                 "owner_user_id": user_id,
             }
         )
+
+    def resume_deployment(
+        self,
+        deployment_id: str,
+        *,
+        user_id: str | None = None,
+        admin: bool = False,
+    ) -> DeploymentRecord:
+        """Re-deploy a suspended deployment with the same workload + instance
+        count. Because a suspended container is already torn down, "resume"
+        is semantically a fresh deployment — but we hide that from the user
+        by looking up the prior config and reusing it in one click.
+
+        Flow:
+          1. Load the suspended deployment; ownership check.
+          2. Submit a fresh create_deployment (reuses the standard balance
+             gate + rate-lock-at-placement path).
+          3. Terminate the old row so it drops out of 'active' counts.
+          4. Return the new deployment.
+        """
+        old = self.control_plane.repository.get_deployment(deployment_id)
+        if old is None:
+            raise KeyError(f"deployment not found: {deployment_id}")
+        if not admin and old.owner_user_id != user_id:
+            raise PermissionError(f"deployment access denied: {deployment_id}")
+        if old.state != DeploymentState.SUSPENDED:
+            raise ValueError(
+                f"deployment {deployment_id} is not suspended "
+                f"(current state: {old.state.value})"
+            )
+
+        fresh = self.create_deployment(
+            {
+                "workload_id": old.workload_id,
+                "requested_instances": old.requested_instances,
+                "accept_fee": True,
+                "owner_user_id": user_id,
+            },
+            user_id=user_id,
+            admin=admin,
+        )
+
+        # Terminate the old row so it stops appearing as "suspended-pending-
+        # resume" in counts. Best-effort: if it fails, the fresh deployment
+        # still exists and the user can proceed.
+        try:
+            from greenference_protocol import DeploymentStatusUpdate
+            self.control_plane.update_deployment_status(
+                DeploymentStatusUpdate(
+                    deployment_id=deployment_id,
+                    state=DeploymentState.TERMINATED,
+                    error="resumed as new deployment",
+                )
+            )
+        except Exception:
+            pass
+        return fresh
 
     def list_deployments(self, user_id: str | None = None, *, admin: bool = False) -> list[DeploymentRecord]:
         deployments = self.control_plane.list_deployments()
