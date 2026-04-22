@@ -1,4 +1,10 @@
-from greenference_protocol import ChatCompletionRequest, ChatCompletionResponse, DeploymentRecord
+from greenference_protocol import (
+    ChatCompletionChoice,
+    ChatCompletionMessage,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    DeploymentRecord,
+)
 
 
 class NoReadyDeploymentError(RuntimeError):
@@ -12,8 +18,15 @@ class InferenceRouter:
         prompt = request.messages[-1].content if request.messages else ""
         return ChatCompletionResponse(
             model=request.model,
-            content=f"greenference-response: {prompt}",
             deployment_id=deployment.deployment_id,
             routed_hotkey=deployment.hotkey,
+            choices=[ChatCompletionChoice(
+                index=0,
+                message=ChatCompletionMessage(
+                    role="assistant",
+                    content=f"greenference-response: {prompt}",
+                ),
+                finish_reason="stop",
+            )],
         )
 
