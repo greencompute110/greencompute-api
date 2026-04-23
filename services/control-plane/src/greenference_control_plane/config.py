@@ -13,6 +13,8 @@ def _int(name: str, default: int) -> int:
 
 class Settings(BaseModel):
     service_name: str = "greenference-control-plane"
+    # Greenference netuid: 16 on testnet, 110 on mainnet. Override via
+    # GREENFERENCE_NETUID env var.
     netuid: int = Field(default=16, ge=0)
     default_lease_ttl_seconds: int = Field(default=3600, ge=1)
     miner_heartbeat_timeout_seconds: int = Field(default=120, ge=1)

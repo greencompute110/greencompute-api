@@ -58,9 +58,10 @@ def test_probe_results_produce_weights_and_reject_invalid_submissions():
             )
         )
 
+    # publish_weight_snapshot defaults to netuid 16 (testnet); mainnet is 110.
     snapshot_one = validator.publish_weight_snapshot()
     snapshot_two = validator.publish_weight_snapshot()
-    snapshots = repository.list_snapshots(netuid=64)
+    snapshots = repository.list_snapshots(netuid=16)
 
     assert scorecard.final_score > 0
     assert snapshot_one.weights["miner-a"] == scorecard.final_score

@@ -142,11 +142,20 @@ class ValidatorService:
         self.metrics.increment("probe.result.recorded")
         return saved
 
-    def publish_weight_snapshot(self, netuid: int = 16, epoch_id: str | None = None) -> WeightSnapshot:
+    def publish_weight_snapshot(
+        self,
+        netuid: int | None = None,
+        epoch_id: str | None = None,
+    ) -> WeightSnapshot:
         """Compute scorecards for every capable+whitelisted miner, persist them,
         publish a WeightSnapshot, optionally push to chain, and — if epoch_id is
         provided — append the scorecard vector to scorecard_history so audits
-        can replay exactly what drove this epoch's weights."""
+        can replay exactly what drove this epoch's weights.
+
+        `netuid` defaults to GREENFERENCE_BITTENSOR_NETUID (16 on testnet,
+        110 on mainnet) — pass explicitly only if you're cross-publishing."""
+        if netuid is None:
+            netuid = validator_settings.bittensor_netuid
         scorecards: dict[str, ScoreCard] = {}
         for hotkey, capability in sorted(self.repository.list_capabilities().items()):
             if validator_settings.whitelist_enabled and not self.repository.is_whitelisted(hotkey):
@@ -217,7 +226,10 @@ class ValidatorService:
 
     # --- Audit (Chutes-style per-epoch signed reports) ---
 
-    AUDIT_EPOCH_LENGTH = 360  # Bittensor tempo for most subnets, incl. netuid 16.
+    # Bittensor tempo — 360 blocks for most subnets including both of ours
+    # (netuid 16 on testnet + netuid 110 on mainnet). At ~12s block time
+    # this is one epoch / weight-setting window ≈ 72 min.
+    AUDIT_EPOCH_LENGTH = 360
 
     @classmethod
     def _compute_epoch_window(cls, current_block: int, netuid: int) -> tuple[str, int, int]:
@@ -242,7 +254,10 @@ class ValidatorService:
         import hashlib
         import json
 
-        netuid = netuid if netuid is not None else (self._chain.netuid if self._chain else 16)
+        # Resolve netuid: explicit arg > chain client's configured netuid
+        # > validator settings (16 on testnet, 110 on mainnet).
+        if netuid is None:
+            netuid = self._chain.netuid if self._chain else validator_settings.bittensor_netuid
 
         # Block-to-timestamp mapping is imperfect (chain block times drift) —
         # for MVP we bound the probe window by the audit tick's wall-clock

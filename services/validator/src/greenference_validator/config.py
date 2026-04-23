@@ -36,6 +36,10 @@ class Settings(BaseModel):
     flux_rental_floor_pct: float = Field(default=0.10, ge=0.0, le=1.0)
     flux_rebalance_interval_seconds: float = Field(default=30.0, ge=1.0)
     bittensor_enabled: bool = False
+    # Network + netuid:
+    #   testnet = ("test",  netuid 16)    — current production deployment
+    #   mainnet = ("finney", netuid 110)  — target production
+    # Override both via GREENFERENCE_BITTENSOR_NETWORK + _NETUID env vars.
     bittensor_network: str = "test"
     bittensor_netuid: int = 16
     bittensor_wallet_path: str | None = None

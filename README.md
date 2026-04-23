@@ -42,7 +42,7 @@ Full architecture + setup docs: [../README.md](../README.md).
 - `ScoreEngine`: multi-factor formula combining `capacity_weight × security^α × reliability^β × performance^γ × fraud_penalty × utilization^δ × (1 + rental_bonus)`.
 - **Flux orchestrator**: fleet brain that allocates per-miner GPU slots between inference/rental, picks catalog models to host based on demand, writes `DeploymentORM` rows that miners consume via existing sync_leases.
 - Demand-reactive scaling: per-minute `inference_demand_stats` table + blended 10-min/1-hour EMA → `target_replicas` per catalog model with 5-min scale-down hysteresis.
-- **Audit publishing**: every Bittensor epoch (~360 blocks on netuid 16), generates a signed audit report (probes + scorecards + weight snapshot + chain commit), SHA256-anchors the hash on-chain via `Commitments.set_commitment`, exposes publicly at `/validator/v1/audit/*`.
+- **Audit publishing**: every Bittensor epoch (~360 blocks / 72 min, same tempo on netuid 110 mainnet + netuid 16 testnet), generates a signed audit report (probes + scorecards + weight snapshot + chain commit), SHA256-anchors the hash on-chain via `Commitments.set_commitment`, exposes publicly at `/validator/v1/audit/*`.
 
 ## audit endpoints (public, no auth)
 
@@ -103,7 +103,7 @@ pytest tests/gateway -k chat   # focused: chat completion routing
 All services read env vars; defaults live in [`services/{name}/src/greenference_{name}/config.py`](services/validator/src/greenference_validator/config.py). Highlights:
 
 - `GREENFERENCE_ADMIN_API_KEY` — bootstraps the admin API key that gates admin routes (also falls back as the inference canary auth key).
-- `GREENFERENCE_BITTENSOR_ENABLED` / `_NETUID` / `_WALLET_PATH` — on-chain integration; when enabled, validator publishes weights + audit commitments.
+- `GREENFERENCE_BITTENSOR_ENABLED` / `_NETWORK` / `_NETUID` / `_WALLET_PATH` — on-chain integration. Network + netuid pairs: `("test", 16)` for testnet, `("finney", 110)` for mainnet. When enabled, validator publishes weights + audit commitments.
 - `GREENFERENCE_FLUX_TARGET_RPM_PER_REPLICA=30` — Flux demand threshold per replica.
 - `GREENFERENCE_FLUX_COOLDOWN_SECONDS=300` — scale-down hysteresis.
 - `GREENFERENCE_IDLE_PRIVATE_ENDPOINT_TIMEOUT_SECONDS=1800` — idle-kill window for private endpoints.

@@ -28,7 +28,15 @@ def _restore_logging() -> None:
 
 
 class BittensorChainClient:
-    """Wraps substrate-interface calls to the Bittensor chain."""
+    """Wraps substrate-interface calls to the Bittensor chain.
+
+    Greenference runs on two netuids depending on environment:
+      - testnet (`network="test"`, endpoint test.finney)   → netuid 16
+      - mainnet (`network="finney"`, endpoint finney)       → netuid 110
+
+    Defaults below target testnet since that's where current prod lives;
+    flip both `network` and `netuid` via the validator config env vars
+    (`GREENFERENCE_BITTENSOR_NETWORK`, `_NETUID`) to cut over to mainnet."""
 
     def __init__(
         self,

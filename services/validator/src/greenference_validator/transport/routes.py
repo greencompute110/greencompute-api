@@ -13,6 +13,7 @@ from greenference_protocol import (
     NodeCapability,
     ProbeResult,
 )
+from greenference_validator.config import settings as validator_settings
 from greenference_validator.application.services import (
     InvalidProbeResultError,
     UnknownCapabilityError,
@@ -105,12 +106,16 @@ def list_scores(
 
 @router.post("/validator/v1/weights")
 def publish_weights(
-    netuid: int = 64,
+    netuid: int | None = None,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
+    """Admin — publish weight snapshot. netuid defaults to the configured
+    GREENFERENCE_BITTENSOR_NETUID (16 on testnet, 110 on mainnet). Pass
+    `?netuid=110` to force mainnet publication in a mixed deployment."""
     require_admin_api_key(authorization, x_api_key)
-    return service.publish_weight_snapshot(netuid=netuid).model_dump(mode="json")
+    effective = netuid if netuid is not None else validator_settings.bittensor_netuid
+    return service.publish_weight_snapshot(netuid=effective).model_dump(mode="json")
 
 
 @router.get("/validator/v1/debug/results")
