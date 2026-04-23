@@ -56,7 +56,7 @@ def build_vllm_workload(
 def build_diffusion_workload(
     model: str,
     name: str | None = None,
-    image: str = "ghcr.io/greenference/diffusion:latest",
+    image: str = "ghcr.io/greencompute110/diffusion:latest",
     concurrency: int = 1,
     **kwargs: object,
 ) -> WorkloadCreateRequest:

@@ -502,7 +502,7 @@ def _ensure_catalog_workload(entry: ModelCatalogEntry) -> None:
         # Older tags like 0.8.5 crash at EngineCore init on RTX 5090.
         "vllm": "vllm/vllm-openai:v0.19.1-cu130-ubuntu2404",
         "vllm-vision": "vllm/vllm-openai:v0.19.1-cu130-ubuntu2404",
-        "diffusion": "greenference/diffusion-server:latest",
+        "diffusion": "greencompute110/diffusion-server:latest",
     }
     image = default_images.get(entry.template, default_images["vllm"])
 
