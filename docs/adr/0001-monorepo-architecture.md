@@ -1,4 +1,4 @@
-# ADR 0001: Greenference Project Split Architecture
+# ADR 0001: GreenCompute Project Split Architecture
 
 ## Status
 
@@ -7,15 +7,15 @@ Accepted
 ## Context
 
 Reference upstream repositories separate SDK, validator, and miner concerns, but they also mix
-transport, orchestration, and policy logic heavily inside large modules. Greenference needs a
+transport, orchestration, and policy logic heavily inside large modules. GreenCompute needs a
 cleaner substrate for an inference-first subnet that later expands into pods and VMs without a
 full rewrite.
 
 ## Decision
 
-Greenference uses a Python-first split that mirrors the upstream references:
+GreenCompute uses a Python-first split that mirrors the upstream references:
 
-- `greenference` for shared protocol and SDK
+- `greencompute` for shared protocol and SDK
 - `greencompute-api` for gateway, control-plane, validator, and builder
 - `greencompute-miner` for miner-side services and infra
 
@@ -28,7 +28,7 @@ Within each top-level project, code follows the same structure:
 
 ## Consequences
 
-- Shared contracts remain stable in `greenference/protocol`.
+- Shared contracts remain stable in `greencompute/protocol`.
 - Each top-level project can carry its own workspace config, tests, and tooling.
 - Service packages stay independently deployable.
 - Core scheduling, scoring, metering, and signing logic are testable without HTTP.

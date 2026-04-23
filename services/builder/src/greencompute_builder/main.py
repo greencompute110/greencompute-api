@@ -65,7 +65,7 @@ async def lifespan(_: FastAPI):
                 await task
 
 
-app = FastAPI(title="Greenference Builder", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="GreenCompute Builder", version="0.1.0", lifespan=lifespan)
 app.include_router(router)
 
 

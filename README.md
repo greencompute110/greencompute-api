@@ -102,12 +102,12 @@ pytest tests/gateway -k chat   # focused: chat completion routing
 
 All services read env vars; defaults live in [`services/{name}/src/greencompute_{name}/config.py`](services/validator/src/greencompute_validator/config.py). Highlights:
 
-- `GREENFERENCE_ADMIN_API_KEY` — bootstraps the admin API key that gates admin routes (also falls back as the inference canary auth key).
-- `GREENFERENCE_BITTENSOR_ENABLED` / `_NETWORK` / `_NETUID` / `_WALLET_PATH` — on-chain integration. Network + netuid pairs: `("test", 16)` for testnet, `("finney", 110)` for mainnet. When enabled, validator publishes weights + audit commitments.
-- `GREENFERENCE_FLUX_TARGET_RPM_PER_REPLICA=30` — Flux demand threshold per replica.
-- `GREENFERENCE_FLUX_COOLDOWN_SECONDS=300` — scale-down hysteresis.
-- `GREENFERENCE_IDLE_PRIVATE_ENDPOINT_TIMEOUT_SECONDS=1800` — idle-kill window for private endpoints.
-- `GREENFERENCE_INFERENCE_CANARY_INTERVAL_SECONDS=300` — periodic attestation cadence.
+- `GREENCOMPUTE_ADMIN_API_KEY` — bootstraps the admin API key that gates admin routes (also falls back as the inference canary auth key).
+- `GREENCOMPUTE_BITTENSOR_ENABLED` / `_NETWORK` / `_NETUID` / `_WALLET_PATH` — on-chain integration. Network + netuid pairs: `("test", 16)` for testnet, `("finney", 110)` for mainnet. When enabled, validator publishes weights + audit commitments.
+- `GREENCOMPUTE_FLUX_TARGET_RPM_PER_REPLICA=30` — Flux demand threshold per replica.
+- `GREENCOMPUTE_FLUX_COOLDOWN_SECONDS=300` — scale-down hysteresis.
+- `GREENCOMPUTE_IDLE_PRIVATE_ENDPOINT_TIMEOUT_SECONDS=1800` — idle-kill window for private endpoints.
+- `GREENCOMPUTE_INFERENCE_CANARY_INTERVAL_SECONDS=300` — periodic attestation cadence.
 
 ## hardening highlights (recent rounds)
 

@@ -1,7 +1,7 @@
 [project]
 name = "greencompute-persistence"
 version = "0.1.0"
-description = "Shared SQLAlchemy persistence for Greenference API services"
+description = "Shared SQLAlchemy persistence for GreenCompute API services"
 requires-python = ">=3.12"
 dependencies = [
   "sqlalchemy>=2.0,<3.0",
@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-greencompute-protocol = { path = "../../../greenference/protocol" }
+greencompute-protocol = { path = "../../../greencompute/protocol" }
 
 [build-system]
 requires = ["hatchling"]

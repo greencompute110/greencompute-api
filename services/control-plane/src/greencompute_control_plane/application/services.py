@@ -85,7 +85,7 @@ class ControlPlaneService:
 
     def update_capacity(self, update: CapacityUpdate) -> CapacityUpdate:
         # Miners occasionally report the wrong VRAM because the operator set
-        # GREENFERENCE_VRAM_GB_PER_GPU to a stale value on the miner host
+        # GREENCOMPUTE_VRAM_GB_PER_GPU to a stale value on the miner host
         # (common case: a 5090 box keeps the old 24GB env from when it was a
         # 4090). Correct the VRAM server-side against the known-good table
         # in protocol so the UI never shows misleading numbers.

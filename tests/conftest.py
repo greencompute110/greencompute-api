@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-os.environ.setdefault("GREENFERENCE_BUILD_EXECUTION_MODE", "simulated")
+os.environ.setdefault("GREENCOMPUTE_BUILD_EXECUTION_MODE", "simulated")
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = ROOT.parent

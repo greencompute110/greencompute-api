@@ -1,7 +1,7 @@
 [project]
 name = "greencompute-control-plane"
 version = "0.1.0"
-description = "Greenference control plane service"
+description = "GreenCompute control plane service"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115,<1.0",

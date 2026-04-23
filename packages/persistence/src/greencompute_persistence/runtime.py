@@ -37,34 +37,24 @@ class RuntimeSettings(BaseModel):
     bootstrap_schema: bool = False
 
 
-def _gc_getenv(key: str, default: str = "") -> str:
-    """Rebrand-aware env read — checks GREENCOMPUTE_X first then the legacy
-    GREENFERENCE_X prefix."""
-    if key.startswith("GREENFERENCE_"):
-        v = os.getenv("GREENCOMPUTE_" + key[len("GREENFERENCE_"):])
-        if v:
-            return v
-    return os.getenv(key, default)
-
-
 def load_runtime_settings(service_name: str) -> RuntimeSettings:
     return RuntimeSettings(
         service_name=service_name,
         database_url=get_database_url(),
-        redis_url=_gc_getenv("GREENFERENCE_REDIS_URL", "redis://127.0.0.1:6379/0"),
-        nats_url=_gc_getenv("GREENFERENCE_NATS_URL", "nats://127.0.0.1:4222"),
-        bus_transport=_gc_getenv("GREENFERENCE_BUS_TRANSPORT", "auto"),
-        build_execution_mode=_gc_getenv("GREENFERENCE_BUILD_EXECUTION_MODE", "live"),
-        object_store_endpoint=_gc_getenv("GREENFERENCE_OBJECT_STORE_ENDPOINT", "http://127.0.0.1:9000"),
-        object_store_access_key=_gc_getenv("GREENFERENCE_OBJECT_STORE_ACCESS_KEY", "greencompute"),
-        object_store_secret_key=_gc_getenv("GREENFERENCE_OBJECT_STORE_SECRET_KEY", "greencompute"),
-        object_store_bucket=_gc_getenv("GREENFERENCE_OBJECT_STORE_BUCKET", "greencompute-build-artifacts"),
-        registry_url=_gc_getenv("GREENFERENCE_REGISTRY_URL", "http://127.0.0.1:5000"),
-        registry_password=_gc_getenv("GREENFERENCE_REGISTRY_PASSWORD", "greencompute-registry"),
-        build_executor_endpoint=_gc_getenv("GREENFERENCE_BUILD_EXECUTOR_ENDPOINT", "http://127.0.0.1:8081"),
-        build_executor_auth_token=os.getenv("GREENFERENCE_BUILD_EXECUTOR_AUTH_TOKEN", "greencompute-builder"),
-        enable_background_workers=_env_bool("GREENFERENCE_ENABLE_BACKGROUND_WORKERS", False),
-        worker_poll_interval_seconds=float(os.getenv("GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS", "1.0")),
+        redis_url=os.getenv("GREENCOMPUTE_REDIS_URL", "redis://127.0.0.1:6379/0"),
+        nats_url=os.getenv("GREENCOMPUTE_NATS_URL", "nats://127.0.0.1:4222"),
+        bus_transport=os.getenv("GREENCOMPUTE_BUS_TRANSPORT", "auto"),
+        build_execution_mode=os.getenv("GREENCOMPUTE_BUILD_EXECUTION_MODE", "live"),
+        object_store_endpoint=os.getenv("GREENCOMPUTE_OBJECT_STORE_ENDPOINT", "http://127.0.0.1:9000"),
+        object_store_access_key=os.getenv("GREENCOMPUTE_OBJECT_STORE_ACCESS_KEY", "greencompute"),
+        object_store_secret_key=os.getenv("GREENCOMPUTE_OBJECT_STORE_SECRET_KEY", "greencompute"),
+        object_store_bucket=os.getenv("GREENCOMPUTE_OBJECT_STORE_BUCKET", "greencompute-build-artifacts"),
+        registry_url=os.getenv("GREENCOMPUTE_REGISTRY_URL", "http://127.0.0.1:5000"),
+        registry_password=os.getenv("GREENCOMPUTE_REGISTRY_PASSWORD", "greencompute-registry"),
+        build_executor_endpoint=os.getenv("GREENCOMPUTE_BUILD_EXECUTOR_ENDPOINT", "http://127.0.0.1:8081"),
+        build_executor_auth_token=os.getenv("GREENCOMPUTE_BUILD_EXECUTOR_AUTH_TOKEN", "greencompute-builder"),
+        enable_background_workers=_env_bool("GREENCOMPUTE_ENABLE_BACKGROUND_WORKERS", False),
+        worker_poll_interval_seconds=float(os.getenv("GREENCOMPUTE_WORKER_POLL_INTERVAL_SECONDS", "1.0")),
         bootstrap_schema=should_bootstrap_schema(),
     )
 

@@ -111,7 +111,7 @@ def publish_weights(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     """Admin — publish weight snapshot. netuid defaults to the configured
-    GREENFERENCE_BITTENSOR_NETUID (16 on testnet, 110 on mainnet). Pass
+    GREENCOMPUTE_BITTENSOR_NETUID (16 on testnet, 110 on mainnet). Pass
     `?netuid=110` to force mainnet publication in a mixed deployment."""
     require_admin_api_key(authorization, x_api_key)
     effective = netuid if netuid is not None else validator_settings.bittensor_netuid

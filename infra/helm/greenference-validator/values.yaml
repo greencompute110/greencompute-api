@@ -1,5 +1,5 @@
 image:
-  repository: greenference/validator
+  repository: greencompute/validator
   tag: latest
 service:
   port: 8002

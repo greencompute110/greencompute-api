@@ -733,11 +733,11 @@ def get_deployment_ssh(
 def _control_plane_base() -> str:
     """Internal base URL for control-plane HTTP calls. Inside compose we use
     the container hostname; the env var lets ops override for e.g. smoke tests."""
-    return os.environ.get("GREENFERENCE_CONTROL_PLANE_URL", "http://control-plane:8001").rstrip("/")
+    return os.environ.get("GREENCOMPUTE_CONTROL_PLANE_URL", "http://control-plane:8001").rstrip("/")
 
 
 def _admin_api_key() -> str | None:
-    return os.environ.get("GREENFERENCE_ADMIN_API_KEY") or None
+    return os.environ.get("GREENCOMPUTE_ADMIN_API_KEY") or None
 
 
 def _lookup_miner_base_url(hotkey: str, *, timeout: float = 3.0) -> str | None:

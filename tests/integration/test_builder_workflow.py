@@ -36,7 +36,7 @@ from greencompute_protocol import (
 
 def test_builder_processes_accepted_build_events(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    monkeypatch.setenv("GREENCOMPUTE_REGISTRY_URL", "http://registry.greencompute.local:5000")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     builder = BuilderService(repository, workflow_repository=workflow_repository)
@@ -59,7 +59,7 @@ def test_builder_processes_accepted_build_events(monkeypatch) -> None:
     assert len(processed) == 1
     assert saved is not None
     assert saved.status == "published"
-    assert saved.artifact_uri == "oci://registry.greenference.local:5000/greenference/echo:latest"
+    assert saved.artifact_uri == "oci://registry.greencompute.local:5000/greenference/echo:latest"
     assert saved.registry_repository == "greenference/echo"
     assert saved.image_tag == "latest"
     assert saved.artifact_digest is not None
@@ -70,7 +70,7 @@ def test_builder_processes_accepted_build_events(monkeypatch) -> None:
 
 def test_builder_records_failed_builds_and_image_history(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    monkeypatch.setenv("GREENCOMPUTE_REGISTRY_URL", "http://registry.greencompute.local:5000")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     builder = BuilderService(repository, workflow_repository=workflow_repository)
@@ -84,7 +84,7 @@ def test_builder_records_failed_builds_and_image_history(monkeypatch) -> None:
     failed = builder.start_build(
         BuildRequest(
             image="greenference/echo:latest",
-            context_uri="git://greenference/builds/echo.git",
+            context_uri="git://greencompute/builds/echo.git",
         )
     )
 
@@ -103,7 +103,7 @@ def test_builder_records_failed_builds_and_image_history(monkeypatch) -> None:
 
 def test_builder_persists_context_and_build_events(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    monkeypatch.setenv("GREENCOMPUTE_REGISTRY_URL", "http://registry.greencompute.local:5000")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     builder = BuilderService(repository, workflow_repository=workflow_repository)
@@ -137,14 +137,14 @@ def test_builder_persists_context_and_build_events(monkeypatch) -> None:
 
 def test_builder_accepts_inline_context_archive(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    monkeypatch.setenv("GREENCOMPUTE_REGISTRY_URL", "http://registry.greencompute.local:5000")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     builder = BuilderService(repository, workflow_repository=workflow_repository)
 
     build = builder.start_build(
         BuildRequest(
-            image="greenference/sdk:latest",
+            image="greencompute/sdk:latest",
             context_archive_b64=base64.b64encode(b"fake-archive").decode(),
             context_archive_name="sdk-context.zip",
         )
@@ -163,7 +163,7 @@ def test_builder_accepts_inline_context_archive(monkeypatch) -> None:
 
 def test_builder_uploads_context_archive_without_starting_build(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    monkeypatch.setenv("GREENCOMPUTE_REGISTRY_URL", "http://registry.greencompute.local:5000")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     builder = BuilderService(repository, workflow_repository=workflow_repository)
@@ -182,8 +182,8 @@ def test_builder_uploads_context_archive_without_starting_build(monkeypatch) -> 
 
 def test_builder_execution_status_exposes_live_adapter_configuration(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
-    monkeypatch.setenv("GREENFERENCE_BUILD_EXECUTION_MODE", "live")
+    monkeypatch.setenv("GREENCOMPUTE_REGISTRY_URL", "http://registry.greencompute.local:5000")
+    monkeypatch.setenv("GREENCOMPUTE_BUILD_EXECUTION_MODE", "live")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     builder = BuilderService(repository, workflow_repository=workflow_repository)
@@ -195,7 +195,7 @@ def test_builder_execution_status_exposes_live_adapter_configuration(monkeypatch
     assert status["object_store_adapter"] == "S3CompatibleObjectStoreAdapter"
     assert status["registry_adapter"] == "OCIRegistryAdapter"
     assert status["executor_adapter"] == "RemoteBuildExecutorAdapter"
-    assert status["registry_url"] == "http://registry.greenference.local:5000"
+    assert status["registry_url"] == "http://registry.greencompute.local:5000"
     assert status["build_executor_endpoint"] == "http://127.0.0.1:8081"
     assert status["pending_delivery_count"] == 0
     assert status["failed_delivery_count"] == 0
@@ -203,7 +203,7 @@ def test_builder_execution_status_exposes_live_adapter_configuration(monkeypatch
 
 def test_builder_live_mode_uses_remote_executor_before_publish(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_BUILD_EXECUTION_MODE", "simulated")
+    monkeypatch.setenv("GREENCOMPUTE_BUILD_EXECUTION_MODE", "simulated")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     settings = RuntimeSettings(
@@ -216,11 +216,11 @@ def test_builder_live_mode_uses_remote_executor_before_publish(monkeypatch) -> N
         def execute_build(self, build: BuildRecord, context: BuildContextRecord) -> PublishedImage:
             assert context.staged_context_uri is not None
             return PublishedImage(
-                registry_repository="greenference/live",
+                registry_repository="greencompute/live",
                 image_tag="latest",
-                artifact_uri="oci://registry.greenference.local:5000/greenference/live:latest",
+                artifact_uri="oci://registry.greencompute.local:5000/greencompute/live:latest",
                 artifact_digest="sha256:remote",
-                registry_manifest_uri="oci://registry.greenference.local:5000/greenference/live:latest@sha256:remote",
+                registry_manifest_uri="oci://registry.greencompute.local:5000/greencompute/live:latest@sha256:remote",
                 executor_name="remote-http-builder",
                 message="executed remote build request",
             )
@@ -240,7 +240,7 @@ def test_builder_live_mode_uses_remote_executor_before_publish(monkeypatch) -> N
 
     build = builder.start_build(
         BuildRequest(
-            image="greenference/live:latest",
+            image="greencompute/live:latest",
             context_uri="s3://greenference/builds/live.zip",
         )
     )
@@ -253,7 +253,7 @@ def test_builder_live_mode_uses_remote_executor_before_publish(monkeypatch) -> N
     assert saved is not None
     assert saved.status == "published"
     assert saved.executor_name == "remote-http-builder"
-    assert saved.registry_manifest_uri == "oci://registry.greenference.local:5000/greenference/live:latest@sha256:remote"
+    assert saved.registry_manifest_uri == "oci://registry.greencompute.local:5000/greencompute/live:latest@sha256:remote"
     timeline_stages = [item.stage for item in timeline]
     assert "building" in timeline_stages
     assert "publishing" in timeline_stages
@@ -262,7 +262,7 @@ def test_builder_live_mode_uses_remote_executor_before_publish(monkeypatch) -> N
 
 def test_builder_retry_and_cleanup_recover_transient_failure(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    monkeypatch.setenv("GREENCOMPUTE_REGISTRY_URL", "http://registry.greencompute.local:5000")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     builder = BuilderService(repository, workflow_repository=workflow_repository)
@@ -298,14 +298,14 @@ def test_builder_retry_and_cleanup_recover_transient_failure(monkeypatch) -> Non
 
 def test_builder_cleanup_clears_staged_context_references(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    monkeypatch.setenv("GREENCOMPUTE_REGISTRY_URL", "http://registry.greencompute.local:5000")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     builder = BuilderService(repository, workflow_repository=workflow_repository)
 
     build = builder.start_build(
         BuildRequest(
-            image="greenference/cleanup:latest",
+            image="greencompute/cleanup:latest",
             context_uri="s3://greenference/builds/cleanup.zip",
         )
     )
@@ -330,7 +330,7 @@ def test_builder_cleanup_clears_staged_context_references(monkeypatch) -> None:
 
 def test_builder_recovery_requeues_inflight_live_job_without_duplicate_delivery(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_BUILD_EXECUTION_MODE", "simulated")
+    monkeypatch.setenv("GREENCOMPUTE_BUILD_EXECUTION_MODE", "simulated")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     settings = RuntimeSettings(
@@ -343,11 +343,11 @@ def test_builder_recovery_requeues_inflight_live_job_without_duplicate_delivery(
         def execute_build(self, build: BuildRecord, context: BuildContextRecord) -> PublishedImage:
             assert context.staged_context_uri is not None
             return PublishedImage(
-                registry_repository="greenference/recovered",
+                registry_repository="greencompute/recovered",
                 image_tag="latest",
-                artifact_uri="oci://registry.greenference.local:5000/greenference/recovered:latest",
+                artifact_uri="oci://registry.greencompute.local:5000/greencompute/recovered:latest",
                 artifact_digest="sha256:recovered",
-                registry_manifest_uri="oci://registry.greenference.local:5000/greenference/recovered:latest@sha256:recovered",
+                registry_manifest_uri="oci://registry.greencompute.local:5000/greencompute/recovered:latest@sha256:recovered",
                 executor_name="remote-http-builder",
                 message="executed remote build request",
             )
@@ -367,7 +367,7 @@ def test_builder_recovery_requeues_inflight_live_job_without_duplicate_delivery(
 
     build = builder.start_build(
         BuildRequest(
-            image="greenference/recovered:latest",
+            image="greencompute/recovered:latest",
             context_uri="s3://greenference/builds/recovered.zip",
         )
     )
@@ -421,7 +421,7 @@ def test_builder_recovery_requeues_inflight_live_job_without_duplicate_delivery(
 
 def test_builder_persists_attempts_logs_and_cancellation(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    monkeypatch.setenv("GREENCOMPUTE_REGISTRY_URL", "http://registry.greencompute.local:5000")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     builder = BuilderService(repository, workflow_repository=workflow_repository)
@@ -476,7 +476,7 @@ def test_live_object_store_creates_bucket_on_missing_head() -> None:
     )
     build = BuildRecord(
         build_id="build-live",
-        image="greenference/live:latest",
+        image="greencompute/live:latest",
         context_uri=context.source_uri,
         dockerfile_path="Dockerfile",
     )
@@ -490,14 +490,14 @@ def test_live_object_store_creates_bucket_on_missing_head() -> None:
 
 def test_builder_marks_unexpected_runtime_errors_failed(monkeypatch) -> None:
     shared_db = "sqlite+pysqlite:///:memory:"
-    monkeypatch.setenv("GREENFERENCE_REGISTRY_URL", "http://registry.greenference.local:5000")
+    monkeypatch.setenv("GREENCOMPUTE_REGISTRY_URL", "http://registry.greencompute.local:5000")
     repository = BuilderRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
     builder = BuilderService(repository, workflow_repository=workflow_repository)
 
     build = builder.start_build(
         BuildRequest(
-            image="greenference/runtime-error:latest",
+            image="greencompute/runtime-error:latest",
             context_uri="s3://greenference/builds/runtime.zip",
         )
     )

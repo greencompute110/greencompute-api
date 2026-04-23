@@ -152,7 +152,7 @@ class ValidatorService:
         provided — append the scorecard vector to scorecard_history so audits
         can replay exactly what drove this epoch's weights.
 
-        `netuid` defaults to GREENFERENCE_BITTENSOR_NETUID (16 on testnet,
+        `netuid` defaults to GREENCOMPUTE_BITTENSOR_NETUID (16 on testnet,
         110 on mainnet) — pass explicitly only if you're cross-publishing."""
         if netuid is None:
             netuid = validator_settings.bittensor_netuid

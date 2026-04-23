@@ -47,7 +47,7 @@ def create_checkout_session(amount_cents: int, user_id: str) -> tuple[str, str]:
                 "currency": "usd",
                 "unit_amount": amount_cents,
                 "product_data": {
-                    "name": "Greenference Credits",
+                    "name": "GreenCompute Credits",
                     "description": f"${amount_cents / 100:.2f} USD top-up",
                 },
             },

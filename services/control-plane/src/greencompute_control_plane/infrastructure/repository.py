@@ -859,7 +859,7 @@ class ControlPlaneRepository:
     @staticmethod
     def _normalize_node(hotkey: str, node: NodeCapability, observed_at: datetime) -> NodeCapability:
         server_id = node.server_id or f"{hotkey}-server"
-        hostname = node.hostname or f"{server_id}.greenference.local"
+        hostname = node.hostname or f"{server_id}.greencompute.local"
         return node.model_copy(
             update={"hotkey": hotkey, "server_id": server_id, "hostname": hostname, "observed_at": observed_at}
         )

@@ -34,12 +34,12 @@ class HttpInferenceClient:
         miner_auth_secret: str | None = None,
     ) -> None:
         self.upstream_timeout_seconds = upstream_timeout_seconds or float(
-            os.getenv("GREENFERENCE_UPSTREAM_TIMEOUT_SECONDS", "120.0")
+            os.getenv("GREENCOMPUTE_UPSTREAM_TIMEOUT_SECONDS", "120.0")
         )
         self.health_timeout_seconds = health_timeout_seconds or float(
-            os.getenv("GREENFERENCE_HEALTH_TIMEOUT_SECONDS", "2.0")
+            os.getenv("GREENCOMPUTE_HEALTH_TIMEOUT_SECONDS", "2.0")
         )
-        self.miner_auth_secret = miner_auth_secret or os.getenv("GREENFERENCE_INFERENCE_AUTH_SECRET") or None
+        self.miner_auth_secret = miner_auth_secret or os.getenv("GREENCOMPUTE_INFERENCE_AUTH_SECRET") or None
 
     def _base_headers(self, request_id: str | None) -> dict[str, str]:
         h: dict[str, str] = {"content-type": "application/json"}

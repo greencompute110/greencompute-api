@@ -3,29 +3,18 @@ import os
 from pydantic import BaseModel, Field
 
 
-def _gc_env(name: str) -> str | None:
-    """Rebrand-aware env read: tries GREENCOMPUTE_ prefix first, then the
-    original GREENFERENCE_ prefix. Returns None if neither is set."""
-    if name.startswith("GREENFERENCE_"):
-        v = os.getenv("GREENCOMPUTE_" + name[len("GREENFERENCE_"):])
-        if v:
-            return v
-    return os.getenv(name)
-
-
 def _env(name: str, default: str) -> str:
-    return _gc_env(name) or default
+    return os.getenv(name, default)
 
 
 def _int(name: str, default: int) -> int:
-    val = _gc_env(name)
-    return int(val) if val else default
+    return int(os.getenv(name, str(default)))
 
 
 class Settings(BaseModel):
     service_name: str = "greencompute-control-plane"
-    # Greencompute netuid: 16 on testnet, 110 on mainnet. Override via
-    # GREENCOMPUTE_NETUID (or legacy GREENFERENCE_NETUID) env var.
+    # Green Compute netuid: 16 on testnet, 110 on mainnet. Override via
+    # GREENCOMPUTE_NETUID env var.
     netuid: int = Field(default=16, ge=0)
     default_lease_ttl_seconds: int = Field(default=3600, ge=1)
     miner_heartbeat_timeout_seconds: int = Field(default=120, ge=1)
@@ -43,15 +32,15 @@ class Settings(BaseModel):
 
 
 settings = Settings(
-    netuid=_int("GREENFERENCE_NETUID", 16),
-    default_lease_ttl_seconds=_int("GREENFERENCE_DEFAULT_LEASE_TTL_SECONDS", 3600),
-    miner_heartbeat_timeout_seconds=_int("GREENFERENCE_MINER_HEARTBEAT_TIMEOUT_SECONDS", 120),
-    node_inventory_timeout_seconds=_int("GREENFERENCE_NODE_INVENTORY_TIMEOUT_SECONDS", 300),
-    server_observed_timeout_seconds=_int("GREENFERENCE_SERVER_OBSERVED_TIMEOUT_SECONDS", 300),
-    deployment_request_retry_limit=_int("GREENFERENCE_DEPLOYMENT_REQUEST_RETRY_LIMIT", 10),
-    deployment_request_retry_delay_seconds=_int("GREENFERENCE_DEPLOYMENT_REQUEST_RETRY_DELAY_SECONDS", 10),
-    deployment_health_failure_threshold=_int("GREENFERENCE_DEPLOYMENT_HEALTH_FAILURE_THRESHOLD", 3),
-    placement_failure_cooldown_seconds=_int("GREENFERENCE_PLACEMENT_FAILURE_COOLDOWN_SECONDS", 120),
-    placement_failure_threshold=_int("GREENFERENCE_PLACEMENT_FAILURE_THRESHOLD", 3),
-    idle_private_endpoint_timeout_seconds=_int("GREENFERENCE_IDLE_PRIVATE_ENDPOINT_TIMEOUT_SECONDS", 1800),
+    netuid=_int("GREENCOMPUTE_NETUID", 16),
+    default_lease_ttl_seconds=_int("GREENCOMPUTE_DEFAULT_LEASE_TTL_SECONDS", 3600),
+    miner_heartbeat_timeout_seconds=_int("GREENCOMPUTE_MINER_HEARTBEAT_TIMEOUT_SECONDS", 120),
+    node_inventory_timeout_seconds=_int("GREENCOMPUTE_NODE_INVENTORY_TIMEOUT_SECONDS", 300),
+    server_observed_timeout_seconds=_int("GREENCOMPUTE_SERVER_OBSERVED_TIMEOUT_SECONDS", 300),
+    deployment_request_retry_limit=_int("GREENCOMPUTE_DEPLOYMENT_REQUEST_RETRY_LIMIT", 10),
+    deployment_request_retry_delay_seconds=_int("GREENCOMPUTE_DEPLOYMENT_REQUEST_RETRY_DELAY_SECONDS", 10),
+    deployment_health_failure_threshold=_int("GREENCOMPUTE_DEPLOYMENT_HEALTH_FAILURE_THRESHOLD", 3),
+    placement_failure_cooldown_seconds=_int("GREENCOMPUTE_PLACEMENT_FAILURE_COOLDOWN_SECONDS", 120),
+    placement_failure_threshold=_int("GREENCOMPUTE_PLACEMENT_FAILURE_THRESHOLD", 3),
+    idle_private_endpoint_timeout_seconds=_int("GREENCOMPUTE_IDLE_PRIVATE_ENDPOINT_TIMEOUT_SECONDS", 1800),
 )

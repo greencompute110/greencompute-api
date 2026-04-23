@@ -125,9 +125,9 @@ async def lifespan(_: FastAPI):
                 await task
 
 
-app = FastAPI(title="Greenference Validator", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="GreenCompute Validator", version="0.1.0", lifespan=lifespan)
 
-_cors_raw = os.getenv("GREENFERENCE_CORS_ALLOW_ORIGINS", "").strip()
+_cors_raw = os.getenv("GREENCOMPUTE_CORS_ALLOW_ORIGINS", "").strip()
 _cors_fallback = "http://localhost:3000,http://127.0.0.1:3000"
 _origins_line = _cors_raw if _cors_raw else _cors_fallback
 _origins = [o.strip() for o in _origins_line.split(",") if o.strip()]

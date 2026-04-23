@@ -2,19 +2,19 @@ services:
   postgres:
     image: postgres:16
     environment:
-      # NOTE: Postgres DB + user stay `greenference` for data-compat.
+      # NOTE: Postgres DB + user stay `greencompute` for data-compat.
       # The subnet is rebranded to Green Compute, but renaming a live DB
       # requires `CREATE DATABASE greencompute` + pg_dump+restore — done
       # separately, not here.
-      POSTGRES_DB: greenference
-      POSTGRES_USER: greenference
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-greenference123}
+      POSTGRES_DB: greencompute
+      POSTGRES_USER: greencompute
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-greencompute123}
     volumes:
       - validator-db:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U greenference -d greenference"]
+      test: ["CMD-SHELL", "pg_isready -U greencompute -d greencompute"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -27,7 +27,7 @@ services:
       - ../../:/app/api
       - ${PROTOCOL_DIR:-../../../greencompute/protocol}:/app/protocol
     environment:
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:${POSTGRES_PASSWORD:-greencompute123}@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       PYTHONPATH: /app/protocol/src:/app/api/packages/persistence/src:/app/api/services/control-plane/src:/app/api/services/validator/src
     depends_on:
@@ -45,7 +45,7 @@ services:
       - ${PROTOCOL_DIR:-../../../greencompute/protocol}:/app/protocol
     environment:
       GREENCOMPUTE_CORS_ALLOW_ORIGINS: ${GREENCOMPUTE_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:${POSTGRES_PASSWORD:-greencompute123}@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       GREENCOMPUTE_BUS_TRANSPORT: durable
@@ -88,7 +88,7 @@ services:
       - ${PROTOCOL_DIR:-../../../greencompute/protocol}:/app/protocol
     environment:
       GREENCOMPUTE_CORS_ALLOW_ORIGINS: ${GREENCOMPUTE_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:${POSTGRES_PASSWORD:-greencompute123}@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       GREENCOMPUTE_ENABLE_BACKGROUND_WORKERS: "true"
@@ -122,7 +122,7 @@ services:
       - ${BITTENSOR_WALLET_DIR:-~/.bittensor}:/root/.bittensor:ro
     environment:
       GREENCOMPUTE_CORS_ALLOW_ORIGINS: ${GREENCOMPUTE_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:${POSTGRES_PASSWORD:-greenference123}@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:${POSTGRES_PASSWORD:-greencompute123}@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENCOMPUTE_WORKER_POLL_INTERVAL_SECONDS: "1.0"

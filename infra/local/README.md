@@ -1,6 +1,6 @@
 # Local Stack
 
-This stack brings up the Greenference V1 control plane and two bootstrap miners:
+This stack brings up the GreenCompute V1 control plane and two bootstrap miners:
 
 - Postgres
 - Redis
@@ -29,9 +29,9 @@ The migration job runs first and the service containers only start after `alembi
 
 The local stack uses Postgres as the default development path through:
 
-`GREENFERENCE_DATABASE_URL=postgresql+psycopg://greenference:greenference@postgres:5432/greenference`
+`GREENCOMPUTE_DATABASE_URL=postgresql+psycopg://greencompute:greencompute@postgres:5432/greencompute`
 
-Runtime dependency URLs are injected for Redis, NATS, MinIO, and the local OCI registry. The `builder` container also runs with `GREENFERENCE_BUILD_EXECUTION_MODE=live`, so build workers stage context metadata and logs into MinIO and push OCI manifests to the local registry instead of using the simulated publish path. The `builder`, `control-plane`, and both miner containers run with background workers enabled. The miner containers bootstrap two default nodes and continuously reconcile assigned leases, so both the inference happy path and the reassignment path can complete without manual reconcile calls.
+Runtime dependency URLs are injected for Redis, NATS, MinIO, and the local OCI registry. The `builder` container also runs with `GREENCOMPUTE_BUILD_EXECUTION_MODE=live`, so build workers stage context metadata and logs into MinIO and push OCI manifests to the local registry instead of using the simulated publish path. The `builder`, `control-plane`, and both miner containers run with background workers enabled. The miner containers bootstrap two default nodes and continuously reconcile assigned leases, so both the inference happy path and the reassignment path can complete without manual reconcile calls.
 
 Host-exposed dependency ports are configurable so the stack can coexist with other local services. Defaults:
 
@@ -52,10 +52,10 @@ Host-exposed dependency ports are configurable so the stack can coexist with oth
 Override them with:
 
 ```bash
-GREENFERENCE_LOCAL_GATEWAY_PORT=38000 \
-GREENFERENCE_LOCAL_CONTROL_PLANE_PORT=38001 \
-GREENFERENCE_LOCAL_POSTGRES_PORT=25432 \
-GREENFERENCE_LOCAL_REDIS_PORT=26379 \
+GREENCOMPUTE_LOCAL_GATEWAY_PORT=38000 \
+GREENCOMPUTE_LOCAL_CONTROL_PLANE_PORT=38001 \
+GREENCOMPUTE_LOCAL_POSTGRES_PORT=25432 \
+GREENCOMPUTE_LOCAL_REDIS_PORT=26379 \
 docker compose -f greencompute-api/infra/local/docker-compose.yml up -d
 ```
 
@@ -113,7 +113,7 @@ python greencompute-api/infra/local/smoke_test.py --check-recovery
 By default, recovery mode restarts `control-plane`, `builder`, and `miner-agent`, waits for them to become ready again, then verifies the same deployment is still routable and usage continues to aggregate. You can override the restart set with:
 
 ```bash
-GREENFERENCE_STACK_RESTART_SERVICES=control-plane,validator python greencompute-api/infra/local/smoke_test.py --check-recovery
+GREENCOMPUTE_STACK_RESTART_SERVICES=control-plane,validator python greencompute-api/infra/local/smoke_test.py --check-recovery
 ```
 
 To validate operational surfaces exposed by the stack:
@@ -200,8 +200,8 @@ Use these runtime profiles as the working defaults:
 
 The compose stack expects these runtime secrets and defaults:
 
-- Postgres: `greenference` / `greenference`
-- MinIO: `greenference` / `greenference`
+- Postgres: `greencompute` / `greencompute`
+- MinIO: `greencompute` / `greencompute`
 - Registry: local unauthenticated `registry:5000`
 - Miner auth secrets:
   - `greencompute-miner-local-secret`

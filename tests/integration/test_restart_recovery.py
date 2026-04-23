@@ -42,7 +42,7 @@ class _FakeResponse:
 
 @pytest.fixture(autouse=True)
 def _enable_runtime_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GREENFERENCE_ALLOW_RUNTIME_FALLBACK", "true")
+    monkeypatch.setenv("GREENCOMPUTE_ALLOW_RUNTIME_FALLBACK", "true")
 
 
 def _patch_upstream(monkeypatch: pytest.MonkeyPatch, miner: MinerAgentService) -> None:
@@ -80,7 +80,7 @@ def test_restart_recovery_preserves_workflows_and_routing(
 
     gateway_a.start_build(
         BuildRequest(
-            image="greenference/recovery:latest",
+            image="greencompute/recovery:latest",
             context_uri="s3://greenference/builds/recovery.zip",
         )
     )

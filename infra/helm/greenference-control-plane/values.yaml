@@ -1,5 +1,5 @@
 image:
-  repository: greenference/control-plane
+  repository: greencompute/control-plane
   tag: latest
 service:
   port: 8001

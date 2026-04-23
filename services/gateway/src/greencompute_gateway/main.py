@@ -10,12 +10,12 @@ from greencompute_gateway.transport.routes import router
 
 settings = load_runtime_settings("greencompute-gateway")
 
-app = FastAPI(title="Greenference Gateway", version="0.1.0")
+app = FastAPI(title="GreenCompute Gateway", version="0.1.0")
 
-# Browser clients (Next.js, etc.) need CORS. Comma-separated origins in GREENFERENCE_CORS_ALLOW_ORIGINS.
+# Browser clients (Next.js, etc.) need CORS. Comma-separated origins in GREENCOMPUTE_CORS_ALLOW_ORIGINS.
 # If unset, default to local Next.js dev URLs so the gateway never runs without CORS (avoids silent browser blocks).
 # Use "*" only for local experiments (credentials disabled per spec). Production: set your public UI origin(s).
-_cors_raw = os.getenv("GREENFERENCE_CORS_ALLOW_ORIGINS", "").strip()
+_cors_raw = os.getenv("GREENCOMPUTE_CORS_ALLOW_ORIGINS", "").strip()
 _cors_fallback = "http://localhost:3000,http://127.0.0.1:3000"
 _origins_line = _cors_raw if _cors_raw else _cors_fallback
 _origins = [o.strip() for o in _origins_line.split(",") if o.strip()]

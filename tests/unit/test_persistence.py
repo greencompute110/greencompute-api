@@ -14,7 +14,7 @@ def test_control_plane_repository_round_trips_core_records():
     workload = WorkloadSpec(
         **WorkloadCreateRequest(
             name="demo-workload",
-            image="greenference/demo:latest",
+            image="greencompute/demo:latest",
         ).model_dump()
     )
 

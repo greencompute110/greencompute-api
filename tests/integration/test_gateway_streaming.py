@@ -62,7 +62,7 @@ class _FakeResponse:
 
 @pytest.fixture(autouse=True)
 def _enable_runtime_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GREENFERENCE_ALLOW_RUNTIME_FALLBACK", "true")
+    monkeypatch.setenv("GREENCOMPUTE_ALLOW_RUNTIME_FALLBACK", "true")
 
 
 def _patch_auth(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -286,7 +286,7 @@ def test_gateway_routes_by_ingress_host(monkeypatch: pytest.MonkeyPatch) -> None
         WorkloadCreateRequest(
             name="ingress-model",
             workload_alias="echo-alias",
-            ingress_host="echo.greenference.local",
+            ingress_host="echo.greencompute.local",
             image=build.image,
             requirements={"gpu_count": 1, "min_vram_gb_per_gpu": 40},
         )
@@ -302,7 +302,7 @@ def test_gateway_routes_by_ingress_host(monkeypatch: pytest.MonkeyPatch) -> None
             messages=[{"role": "user", "content": "route by host"}],
         ),
         api_key_id="key-1",
-        routed_host="echo.greenference.local:443",
+        routed_host="echo.greencompute.local:443",
     )
 
     assert response.content.strip()

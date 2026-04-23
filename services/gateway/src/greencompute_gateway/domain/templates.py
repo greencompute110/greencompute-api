@@ -1,4 +1,4 @@
-"""Workload templates (VLLM, VLLM-Vision, Diffusion) for Greenference."""
+"""Workload templates (VLLM, VLLM-Vision, Diffusion) for GreenCompute."""
 
 from __future__ import annotations
 

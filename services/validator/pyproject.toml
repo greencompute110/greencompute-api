@@ -1,7 +1,7 @@
 [project]
 name = "greencompute-validator"
 version = "0.1.0"
-description = "Greenference validator service"
+description = "GreenCompute validator service"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115,<1.0",

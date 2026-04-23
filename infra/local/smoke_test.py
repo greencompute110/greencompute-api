@@ -18,28 +18,28 @@ sys.path.insert(0, str(ROOT.parent / "greencompute" / "protocol" / "src"))
 
 from greencompute_protocol import NodeCapability, ProbeResult  # noqa: E402
 
-GATEWAY_URL = os.getenv("GREENFERENCE_GATEWAY_URL", "http://127.0.0.1:28000")
-CONTROL_PLANE_URL = os.getenv("GREENFERENCE_CONTROL_PLANE_URL", "http://127.0.0.1:28001")
-VALIDATOR_URL = os.getenv("GREENFERENCE_VALIDATOR_URL", "http://127.0.0.1:28002")
-BUILDER_URL = os.getenv("GREENFERENCE_BUILDER_URL", "http://127.0.0.1:28003")
-MINER_URL = os.getenv("GREENFERENCE_MINER_URL", "http://127.0.0.1:28004")
-FAILOVER_MINER_URL = os.getenv("GREENFERENCE_FAILOVER_MINER_URL", "http://127.0.0.1:28005")
-NODE_AGENT_URL = os.getenv("GREENFERENCE_NODE_AGENT_URL", "http://127.0.0.1:28007")
-NATS_MONITOR_URL = os.getenv("GREENFERENCE_NATS_MONITOR_URL", "http://127.0.0.1:18222/healthz")
-TIMEOUT_SECONDS = float(os.getenv("GREENFERENCE_STACK_TIMEOUT_SECONDS", "60"))
-MINER_HOTKEY = os.getenv("GREENFERENCE_MINER_HOTKEY", "miner-local")
-MINER_NODE_ID = os.getenv("GREENFERENCE_MINER_NODE_ID", "node-local")
-MINER_AUTH_SECRET = os.getenv("GREENFERENCE_MINER_AUTH_SECRET", "greencompute-miner-local-secret")
-FAILOVER_MINER_HOTKEY = os.getenv("GREENFERENCE_FAILOVER_MINER_HOTKEY", "miner-failover")
-FAILOVER_MINER_NODE_ID = os.getenv("GREENFERENCE_FAILOVER_MINER_NODE_ID", "node-failover")
+GATEWAY_URL = os.getenv("GREENCOMPUTE_GATEWAY_URL", "http://127.0.0.1:28000")
+CONTROL_PLANE_URL = os.getenv("GREENCOMPUTE_CONTROL_PLANE_URL", "http://127.0.0.1:28001")
+VALIDATOR_URL = os.getenv("GREENCOMPUTE_VALIDATOR_URL", "http://127.0.0.1:28002")
+BUILDER_URL = os.getenv("GREENCOMPUTE_BUILDER_URL", "http://127.0.0.1:28003")
+MINER_URL = os.getenv("GREENCOMPUTE_MINER_URL", "http://127.0.0.1:28004")
+FAILOVER_MINER_URL = os.getenv("GREENCOMPUTE_FAILOVER_MINER_URL", "http://127.0.0.1:28005")
+NODE_AGENT_URL = os.getenv("GREENCOMPUTE_NODE_AGENT_URL", "http://127.0.0.1:28007")
+NATS_MONITOR_URL = os.getenv("GREENCOMPUTE_NATS_MONITOR_URL", "http://127.0.0.1:18222/healthz")
+TIMEOUT_SECONDS = float(os.getenv("GREENCOMPUTE_STACK_TIMEOUT_SECONDS", "60"))
+MINER_HOTKEY = os.getenv("GREENCOMPUTE_MINER_HOTKEY", "miner-local")
+MINER_NODE_ID = os.getenv("GREENCOMPUTE_MINER_NODE_ID", "node-local")
+MINER_AUTH_SECRET = os.getenv("GREENCOMPUTE_MINER_AUTH_SECRET", "greencompute-miner-local-secret")
+FAILOVER_MINER_HOTKEY = os.getenv("GREENCOMPUTE_FAILOVER_MINER_HOTKEY", "miner-failover")
+FAILOVER_MINER_NODE_ID = os.getenv("GREENCOMPUTE_FAILOVER_MINER_NODE_ID", "node-failover")
 FAILOVER_MINER_AUTH_SECRET = os.getenv(
-    "GREENFERENCE_FAILOVER_MINER_AUTH_SECRET",
+    "GREENCOMPUTE_FAILOVER_MINER_AUTH_SECRET",
     "greencompute-miner-failover-secret",
 )
-COMPOSE_FILE = os.getenv("GREENFERENCE_DOCKER_COMPOSE_FILE", "greencompute-api/infra/local/docker-compose.yml")
+COMPOSE_FILE = os.getenv("GREENCOMPUTE_DOCKER_COMPOSE_FILE", "greencompute-api/infra/local/docker-compose.yml")
 RESTART_SERVICES = tuple(
     part.strip()
-    for part in os.getenv("GREENFERENCE_STACK_RESTART_SERVICES", "control-plane,builder,miner-agent").split(",")
+    for part in os.getenv("GREENCOMPUTE_STACK_RESTART_SERVICES", "control-plane,builder,miner-agent").split(",")
     if part.strip()
 )
 
@@ -172,7 +172,7 @@ def _register_admin() -> tuple[dict[str, str], dict[str, Any]]:
     user = _request_json(
         "POST",
         f"{GATEWAY_URL}/platform/register",
-        {"username": username, "email": f"{username}@greenference.local"},
+        {"username": username, "email": f"{username}@greencompute.local"},
     )
     admin_key = _request_json(
         "POST",
@@ -228,7 +228,7 @@ def run_happy_path() -> dict[str, Any]:
     run_suffix = f"{time.time_ns():x}"
     workload_name = f"stack-echo-model-{run_suffix}"
     workload_alias = f"stack-echo-alias-{run_suffix}"
-    ingress_host = f"{workload_alias}.greenference.local"
+    ingress_host = f"{workload_alias}.greencompute.local"
 
     capability_model = NodeCapability(
         hotkey=MINER_HOTKEY,
@@ -549,7 +549,7 @@ def verify_failures(headers: dict[str, str]) -> None:
         "POST",
         f"{GATEWAY_URL}/platform/images",
         {
-            "image": "greenference/failing:stack",
+            "image": "greencompute/failing:stack",
             "context_uri": "s3://greenference/fail-once-object-store/builds/failing.zip",
             "dockerfile_path": "Dockerfile",
             "public": False,
@@ -765,7 +765,7 @@ def verify_operator_actions(context: dict[str, Any]) -> None:
         "POST",
         f"{GATEWAY_URL}/platform/images",
         {
-            "image": "greenference/operator-cancel:stack",
+            "image": "greencompute/operator-cancel:stack",
             "context_uri": "s3://greenference/builds/operator-cancel.zip",
             "dockerfile_path": "Dockerfile",
             "public": False,

@@ -1,7 +1,7 @@
 [project]
 name = "greencompute-builder"
 version = "0.1.0"
-description = "Greenference image build service"
+description = "GreenCompute image build service"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115,<1.0",

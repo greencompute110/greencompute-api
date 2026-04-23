@@ -6,7 +6,7 @@ def test_scheduler_prefers_health_reliability_and_fit():
     workload = WorkloadSpec(
         **WorkloadCreateRequest(
             name="llm",
-            image="greenference/llm:latest",
+            image="greencompute/llm:latest",
             requirements={
                 "gpu_count": 1,
                 "min_vram_gb_per_gpu": 48,

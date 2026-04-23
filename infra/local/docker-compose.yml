@@ -2,13 +2,13 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_DB: greenference
-      POSTGRES_USER: greenference
-      POSTGRES_PASSWORD: greenference
+      POSTGRES_DB: greencompute
+      POSTGRES_USER: greencompute
+      POSTGRES_PASSWORD: greencompute
     ports:
       - "${GREENCOMPUTE_LOCAL_POSTGRES_PORT:-15432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U greenference -d greenference"]
+      test: ["CMD-SHELL", "pg_isready -U greencompute -d greencompute"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -26,8 +26,8 @@ services:
     image: minio/minio:latest
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: greenference
-      MINIO_ROOT_PASSWORD: greenference
+      MINIO_ROOT_USER: greencompute
+      MINIO_ROOT_PASSWORD: greencompute
     ports:
       - "${GREENCOMPUTE_LOCAL_MINIO_PORT:-19000}:9000"
       - "${GREENCOMPUTE_LOCAL_MINIO_CONSOLE_PORT:-19001}:9001"
@@ -41,13 +41,13 @@ services:
     volumes:
       - ../../../:/workspace
     environment:
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:greencompute@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_REDIS_URL: redis://redis:6379/0
       GREENCOMPUTE_NATS_URL: nats://nats:4222
       GREENCOMPUTE_OBJECT_STORE_ENDPOINT: http://minio:9000
-      GREENCOMPUTE_OBJECT_STORE_ACCESS_KEY: greenference
-      GREENCOMPUTE_OBJECT_STORE_SECRET_KEY: greenference
+      GREENCOMPUTE_OBJECT_STORE_ACCESS_KEY: greencompute
+      GREENCOMPUTE_OBJECT_STORE_SECRET_KEY: greencompute
       GREENCOMPUTE_REGISTRY_URL: http://registry:5000
       PYTHONPATH: /workspace/greencompute/protocol/src:/workspace/greencompute-api/packages/persistence/src:/workspace/greencompute-api/services/gateway/src:/workspace/greencompute-api/services/control-plane/src:/workspace/greencompute-api/services/validator/src:/workspace/greencompute-api/services/builder/src:/workspace/greencompute-miner/services/miner-agent/src
     depends_on:
@@ -63,13 +63,13 @@ services:
       - ../../../:/workspace
     environment:
       GREENCOMPUTE_CORS_ALLOW_ORIGINS: ${GREENCOMPUTE_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:greencompute@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_REDIS_URL: redis://redis:6379/0
       GREENCOMPUTE_NATS_URL: nats://nats:4222
       GREENCOMPUTE_OBJECT_STORE_ENDPOINT: http://minio:9000
-      GREENCOMPUTE_OBJECT_STORE_ACCESS_KEY: greenference
-      GREENCOMPUTE_OBJECT_STORE_SECRET_KEY: greenference
+      GREENCOMPUTE_OBJECT_STORE_ACCESS_KEY: greencompute
+      GREENCOMPUTE_OBJECT_STORE_SECRET_KEY: greencompute
       GREENCOMPUTE_REGISTRY_URL: http://registry:5000
       GREENCOMPUTE_BUS_TRANSPORT: durable
       PYTHONPATH: /workspace/greencompute/protocol/src:/workspace/greencompute-api/packages/persistence/src:/workspace/greencompute-api/services/gateway/src:/workspace/greencompute-api/services/control-plane/src:/workspace/greencompute-api/services/validator/src:/workspace/greencompute-api/services/builder/src:/workspace/greencompute-miner/services/miner-agent/src
@@ -97,13 +97,13 @@ services:
       - ../../../:/workspace
     environment:
       GREENCOMPUTE_CORS_ALLOW_ORIGINS: ${GREENCOMPUTE_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:greencompute@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_REDIS_URL: redis://redis:6379/0
       GREENCOMPUTE_NATS_URL: nats://nats:4222
       GREENCOMPUTE_OBJECT_STORE_ENDPOINT: http://minio:9000
-      GREENCOMPUTE_OBJECT_STORE_ACCESS_KEY: greenference
-      GREENCOMPUTE_OBJECT_STORE_SECRET_KEY: greenference
+      GREENCOMPUTE_OBJECT_STORE_ACCESS_KEY: greencompute
+      GREENCOMPUTE_OBJECT_STORE_SECRET_KEY: greencompute
       GREENCOMPUTE_REGISTRY_URL: http://registry:5000
       GREENCOMPUTE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENCOMPUTE_WORKER_POLL_INTERVAL_SECONDS: "0.5"
@@ -129,13 +129,13 @@ services:
       - ../../../:/workspace
     environment:
       GREENCOMPUTE_CORS_ALLOW_ORIGINS: ${GREENCOMPUTE_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:greencompute@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_REDIS_URL: redis://redis:6379/0
       GREENCOMPUTE_NATS_URL: nats://nats:4222
       GREENCOMPUTE_OBJECT_STORE_ENDPOINT: http://minio:9000
-      GREENCOMPUTE_OBJECT_STORE_ACCESS_KEY: greenference
-      GREENCOMPUTE_OBJECT_STORE_SECRET_KEY: greenference
+      GREENCOMPUTE_OBJECT_STORE_ACCESS_KEY: greencompute
+      GREENCOMPUTE_OBJECT_STORE_SECRET_KEY: greencompute
       GREENCOMPUTE_REGISTRY_URL: http://registry:5000
       GREENCOMPUTE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENCOMPUTE_WORKER_POLL_INTERVAL_SECONDS: "0.5"
@@ -160,13 +160,13 @@ services:
     volumes:
       - ../../../:/workspace
     environment:
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:greencompute@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_REDIS_URL: redis://redis:6379/0
       GREENCOMPUTE_NATS_URL: nats://nats:4222
       GREENCOMPUTE_OBJECT_STORE_ENDPOINT: http://minio:9000
-      GREENCOMPUTE_OBJECT_STORE_ACCESS_KEY: greenference
-      GREENCOMPUTE_OBJECT_STORE_SECRET_KEY: greenference
+      GREENCOMPUTE_OBJECT_STORE_ACCESS_KEY: greencompute
+      GREENCOMPUTE_OBJECT_STORE_SECRET_KEY: greencompute
       GREENCOMPUTE_OBJECT_STORE_BUCKET: greencompute-build-artifacts
       GREENCOMPUTE_REGISTRY_URL: http://registry:5000
       GREENCOMPUTE_ENABLE_BACKGROUND_WORKERS: "true"
@@ -194,7 +194,7 @@ services:
     volumes:
       - ../../../:/workspace
     environment:
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:greencompute@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENCOMPUTE_BOOTSTRAP_MINER: "true"
@@ -235,7 +235,7 @@ services:
     volumes:
       - ../../../:/workspace
     environment:
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:greencompute@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENCOMPUTE_BOOTSTRAP_MINER: "true"
@@ -326,7 +326,7 @@ services:
     volumes:
       - ../../../:/workspace
     environment:
-      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greenference:greenference@postgres:5432/greenference
+      GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:greencompute@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENCOMPUTE_BOOTSTRAP_MINER: "true"
