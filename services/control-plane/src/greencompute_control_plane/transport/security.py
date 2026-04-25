@@ -102,15 +102,17 @@ def require_miner_request(
 
     if not result.valid:
         metrics.increment(f"auth.failure.miner_{result.reason or 'invalid'}")
-        logger.warning(
-            "miner auth FAILED hotkey=%s auth_mode=%s reason=%s nonce=%s ts=%s body_len=%d",
-            expected_hotkey, auth_mode, result.reason, x_miner_nonce, x_miner_timestamp, len(payload_bytes),
+        print(
+            f"[AUTH FAIL] hotkey={expected_hotkey} auth_mode={auth_mode} "
+            f"reason={result.reason!r} nonce={x_miner_nonce} ts={x_miner_timestamp} "
+            f"body_len={len(payload_bytes)}",
+            flush=True,
         )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=result.reason or "invalid miner signature")
 
     if settings.whitelist_enabled and not service.repository.is_hotkey_whitelisted(expected_hotkey):
         metrics.increment("auth.failure.miner_not_whitelisted")
-        logger.warning("miner auth REJECTED hotkey=%s reason=not_whitelisted", expected_hotkey)
+        print(f"[AUTH REJECT] hotkey={expected_hotkey} reason=not_whitelisted", flush=True)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="hotkey not whitelisted")
 
     metrics.increment("auth.success.miner")
