@@ -102,10 +102,13 @@ def require_miner_request(
 
     if not result.valid:
         metrics.increment(f"auth.failure.miner_{result.reason or 'invalid'}")
+        import hashlib
+        body_sha = hashlib.sha256(payload_bytes).hexdigest()
         print(
             f"[AUTH FAIL] hotkey={expected_hotkey} auth_mode={auth_mode} "
             f"reason={result.reason!r} nonce={x_miner_nonce} ts={x_miner_timestamp} "
-            f"body_len={len(payload_bytes)}",
+            f"body_len={len(payload_bytes)} body_sha256={body_sha} "
+            f"body_repr={payload_bytes!r}",
             flush=True,
         )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=result.reason or "invalid miner signature")
