@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import logging
-
 from fastapi import HTTPException, status
 
 from greencompute_persistence import CredentialStore, get_metrics_store
 from greencompute_control_plane.application.services import service
 from greencompute_control_plane.config import settings
 from greencompute_protocol import MemoryReplayStore, SignedRequest, verify_payload, verify_payload_hotkey
-
-logger = logging.getLogger(__name__)
 
 
 credential_store = CredentialStore(
@@ -102,13 +98,12 @@ def require_miner_request(
 
     if not result.valid:
         metrics.increment(f"auth.failure.miner_{result.reason or 'invalid'}")
-        import hashlib
-        body_sha = hashlib.sha256(payload_bytes).hexdigest()
+        # Concise audit log — body bytes are NOT logged because they may
+        # carry secrets (auth_secret, payout addresses). Re-add temporarily
+        # only when actively debugging signature canonicalization drift.
         print(
             f"[AUTH FAIL] hotkey={expected_hotkey} auth_mode={auth_mode} "
-            f"reason={result.reason!r} nonce={x_miner_nonce} ts={x_miner_timestamp} "
-            f"body_len={len(payload_bytes)} body_sha256={body_sha} "
-            f"body_repr={payload_bytes!r}",
+            f"reason={result.reason!r} body_len={len(payload_bytes)}",
             flush=True,
         )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=result.reason or "invalid miner signature")
