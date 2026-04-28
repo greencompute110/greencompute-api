@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -125,7 +126,41 @@ class ControlPlaneRepository:
         with session_scope(self.session_factory) as session:
             row = session.get(CapacityORM, update.hotkey) or CapacityORM(hotkey=update.hotkey)
             normalized_nodes = [self._normalize_node(update.hotkey, node, update.observed_at) for node in update.nodes]
-            row.nodes = [node.model_dump(mode="json") for node in normalized_nodes]
+
+            # Merge by node_id with the existing nodes array. Supports the
+            # "single hotkey, multiple physical boxes" deployment pattern
+            # where each box's heartbeat carries only its own nodes — without
+            # this merge, the latest heartbeat would silently overwrite the
+            # others' entries (capacities row's primary key is just `hotkey`).
+            #
+            # Stale entries (older than `node_inventory_timeout_seconds`) are
+            # dropped here so a dead box's row doesn't linger forever.
+            from greencompute_control_plane.config import settings as _cp_settings
+
+            existing = row.nodes or []
+            incoming_ids = {n.node_id for n in normalized_nodes}
+            stale_cutoff = update.observed_at - timedelta(
+                seconds=_cp_settings.node_inventory_timeout_seconds
+            )
+            preserved: list[dict[str, Any]] = []
+            for prev in existing:
+                if not isinstance(prev, dict):
+                    continue
+                if prev.get("node_id") in incoming_ids:
+                    # Will be replaced by the fresh entry below
+                    continue
+                obs_str = prev.get("observed_at")
+                obs_dt: datetime | None = None
+                if isinstance(obs_str, str):
+                    try:
+                        obs_dt = datetime.fromisoformat(obs_str.replace("Z", "+00:00"))
+                    except ValueError:
+                        obs_dt = None
+                if obs_dt is not None and obs_dt < stale_cutoff:
+                    continue
+                preserved.append(prev)
+            preserved.extend(node.model_dump(mode="json") for node in normalized_nodes)
+            row.nodes = preserved
             row.observed_at = update.observed_at
             session.add(row)
             miner = session.get(MinerORM, update.hotkey)
