@@ -43,47 +43,112 @@ class ValidatorRepository:
         if needs_bootstrap(str(self.engine.url), bootstrap):
             init_database(self.engine)
 
+    # ──────────────────────────────────────────────────────────────────
+    # ValidatorCapabilityORM is keyed by `hotkey` (one row per miner) but
+    # supports multi-node-per-hotkey by nesting nodes inside the payload
+    # JSON: payload = {"nodes": {node_id: <NodeCapability dict>, ...}}.
+    #
+    # Why: GPU-infra subnets like Lium/Chutes operate one logical "miner"
+    # (a single Bittensor hotkey identity) that controls many physical
+    # boxes. Without this nesting, every box's heartbeat would silently
+    # overwrite the others' entries since the row is keyed by hotkey.
+    #
+    # Back-compat: `get_capability(hotkey)` and `list_capabilities()` still
+    # return one NodeCapability per hotkey (a representative node) so
+    # existing callers don't break. New per-node methods are below.
+    # ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _payload_to_nodes(payload: dict | None) -> list[NodeCapability]:
+        """Parse stored payload into the per-node NodeCapability list.
+        Handles both new shape ({"nodes": {...}}) and legacy single-node."""
+        if not payload:
+            return []
+        if "nodes" in payload and isinstance(payload["nodes"], dict):
+            return [NodeCapability(**n) for n in payload["nodes"].values()]
+        # Legacy: payload was a single NodeCapability dict
+        try:
+            return [NodeCapability(**payload)]
+        except Exception:
+            return []
+
     def upsert_capability(self, capability: NodeCapability) -> NodeCapability:
         with session_scope(self.session_factory) as session:
             row = session.get(ValidatorCapabilityORM, capability.hotkey) or ValidatorCapabilityORM(
-                hotkey=capability.hotkey
+                hotkey=capability.hotkey, payload={"nodes": {}}
             )
-            row.payload = capability.model_dump(mode="json")
+            payload = dict(row.payload or {})
+            nodes = dict(payload.get("nodes") or {})
+            # Migrate legacy single-payload rows to multi-node shape on first write
+            if not nodes and payload and "node_id" in payload:
+                try:
+                    legacy = NodeCapability(**payload)
+                    nodes[legacy.node_id] = legacy.model_dump(mode="json")
+                except Exception:
+                    pass
+            nodes[capability.node_id] = capability.model_dump(mode="json")
+            row.payload = {"nodes": nodes}
             session.add(row)
         return capability
 
     def get_capability(self, hotkey: str) -> NodeCapability | None:
+        """Return one representative NodeCapability for this hotkey.
+
+        Back-compat wrapper for callers that don't care about multi-node.
+        For multi-node-aware code, use `get_node_capabilities` instead."""
+        nodes = self.get_node_capabilities(hotkey)
+        return nodes[0] if nodes else None
+
+    def get_node_capabilities(self, hotkey: str) -> list[NodeCapability]:
         with session_scope(self.session_factory) as session:
             row = session.get(ValidatorCapabilityORM, hotkey)
-            return NodeCapability(**row.payload) if row else None
+            return self._payload_to_nodes(row.payload) if row else []
 
     def list_capabilities(self) -> dict[str, NodeCapability]:
+        """Back-compat: hotkey → one representative NodeCapability."""
         with session_scope(self.session_factory) as session:
             rows = session.scalars(select(ValidatorCapabilityORM)).all()
-            return {row.hotkey: NodeCapability(**row.payload) for row in rows}
+            out: dict[str, NodeCapability] = {}
+            for row in rows:
+                nodes = self._payload_to_nodes(row.payload)
+                if nodes:
+                    out[row.hotkey] = nodes[0]
+            return out
+
+    def list_node_capabilities(self) -> dict[str, list[NodeCapability]]:
+        """Multi-node view: hotkey → list of NodeCapability (one per node)."""
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(select(ValidatorCapabilityORM)).all()
+            return {row.hotkey: self._payload_to_nodes(row.payload) for row in rows}
 
     def sync_from_control_plane(self) -> int:
         """Mirror miners from control-plane's node_inventory → validator_capabilities.
-        Miners register once (with the control plane); the validator would
-        otherwise never learn about them unless bittensor-chain sync is
-        enabled. Returns number of rows inserted/updated."""
+        Aggregates multiple rows-per-hotkey from node_inventory into a single
+        row in validator_capabilities, with all that hotkey's nodes nested
+        under payload["nodes"]. Returns count of node rows ingested."""
         from greencompute_persistence.orm import NodeInventoryORM
 
         updated = 0
+        # Group node_inventory rows by hotkey first, then write one
+        # consolidated row per hotkey.
+        by_hotkey: dict[str, dict[str, dict]] = {}
         with session_scope(self.session_factory) as session:
             nodes = session.scalars(select(NodeInventoryORM)).all()
             for node in nodes:
                 payload = dict(node.payload or {})
-                # NodeInventoryORM payload already conforms to the NodeCapability
-                # shape because the control-plane stores the CapacityUpdate's
-                # node dict directly. Just upsert.
-                cap_row = session.get(ValidatorCapabilityORM, node.hotkey)
-                if cap_row is None:
-                    cap_row = ValidatorCapabilityORM(hotkey=node.hotkey, payload=payload)
-                else:
-                    cap_row.payload = payload
-                session.add(cap_row)
+                node_id = payload.get("node_id") or node.node_id
+                by_hotkey.setdefault(node.hotkey, {})[node_id] = payload
                 updated += 1
+
+            for hotkey, nodes_dict in by_hotkey.items():
+                cap_row = session.get(ValidatorCapabilityORM, hotkey)
+                if cap_row is None:
+                    cap_row = ValidatorCapabilityORM(
+                        hotkey=hotkey, payload={"nodes": nodes_dict}
+                    )
+                else:
+                    cap_row.payload = {"nodes": nodes_dict}
+                session.add(cap_row)
         return updated
 
     def save_challenge(self, challenge: ProbeChallenge) -> ProbeChallenge:

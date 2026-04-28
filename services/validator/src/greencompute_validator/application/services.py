@@ -71,7 +71,10 @@ class ValidatorService:
         )
         self.demand = DemandCollector()
         self.wait_estimator = WaitEstimator()
-        self._flux_states: dict[str, FluxState] = {}
+        # Keyed by (hotkey, node_id) — supports the multi-node-per-hotkey
+        # deployment pattern (a single miner identity controlling several
+        # physical boxes). For per-hotkey lookups, use _aggregate_flux_state.
+        self._flux_states: dict[tuple[str, str], FluxState] = {}
         # Phase 2I hysteresis — last time a model's blended rpm was seen
         # above its scale-up threshold. Used to defer scale-down.
         self._demand_last_hot_at: dict[str, "datetime"] = {}
@@ -127,7 +130,7 @@ class ValidatorService:
             raise UnknownCapabilityError(f"capability not found for hotkey={result.hotkey}")
 
         self.repository.add_result(result)
-        flux = self._flux_states.get(result.hotkey)
+        flux = self._aggregate_flux_state(result.hotkey)
         scorecard = self.scoring.compute_scorecard(capability, self.repository.list_results(result.hotkey), flux)
         saved = self.repository.save_scorecard(scorecard)
         self.bus.publish(
@@ -157,15 +160,40 @@ class ValidatorService:
         if netuid is None:
             netuid = validator_settings.bittensor_netuid
         scorecards: dict[str, ScoreCard] = {}
-        for hotkey, capability in sorted(self.repository.list_capabilities().items()):
+        # Multi-node aware: each hotkey may control multiple physical nodes.
+        # We aggregate gpu_count and vram across nodes to size the scorecard
+        # correctly (capacity_weight = sum(gpu_count * vram_gb_per_gpu)).
+        for hotkey, nodes in sorted(self.repository.list_node_capabilities().items()):
+            if not nodes:
+                continue
             if validator_settings.whitelist_enabled and not self.repository.is_whitelisted(hotkey):
                 logger.info("skipping non-whitelisted miner %s", hotkey)
                 continue
             results = self.repository.list_results(hotkey)
             if not results:
                 continue
-            flux = self._flux_states.get(hotkey)
-            scorecard = self.scoring.compute_scorecard(capability, results, flux)
+            # Synthesize a capability whose gpu_count * vram_gb_per_gpu
+            # equals the sum of the hotkey's per-node products (the score
+            # engine multiplies these to get capacity_weight). The
+            # NodeCapability schema caps gpu_count at 8 per node, so we
+            # keep gpu_count = primary node's count and stretch vram to
+            # encode the full fleet's total VRAM-GPU product.
+            total_capacity_units = sum(
+                n.gpu_count * n.vram_gb_per_gpu for n in nodes
+            )
+            primary = nodes[0]
+            synthetic_vram = max(
+                total_capacity_units // max(primary.gpu_count, 1), 1
+            )
+            avail_gpus = sum(n.available_gpus for n in nodes)
+            agg_capability = primary.model_copy(
+                update={
+                    "vram_gb_per_gpu": synthetic_vram,
+                    "available_gpus": min(avail_gpus, primary.gpu_count),
+                }
+            )
+            flux = self._aggregate_flux_state(hotkey)
+            scorecard = self.scoring.compute_scorecard(agg_capability, results, flux)
             scorecards[hotkey] = self.repository.save_scorecard(scorecard)
         weights = {
             hotkey: scorecard.final_score
@@ -463,11 +491,13 @@ class ValidatorService:
     # --- Flux orchestrator ---
 
     def get_flux_state(self, hotkey: str) -> FluxState | None:
-        return self._flux_states.get(hotkey)
+        """Aggregated FluxState across all of this hotkey's nodes."""
+        return self._aggregate_flux_state(hotkey)
 
     def init_flux_state(self, hotkey: str, node_id: str, total_gpus: int) -> FluxState:
-        """Initialize or update a miner's Flux state when capacity is registered."""
-        existing = self._flux_states.get(hotkey)
+        """Initialize or update a (hotkey, node_id) pair's Flux state."""
+        key = (hotkey, node_id)
+        existing = self._flux_states.get(key)
         if existing and existing.total_gpus == total_gpus:
             return existing
         state = FluxState(
@@ -478,40 +508,72 @@ class ValidatorService:
             inference_floor_pct=validator_settings.flux_inference_floor_pct,
             rental_floor_pct=validator_settings.flux_rental_floor_pct,
         )
-        self._flux_states[hotkey] = state
+        self._flux_states[key] = state
         return state
 
-    def rebalance_miner(self, hotkey: str) -> tuple[FluxState, list[FluxRebalanceEvent]]:
-        """Run Flux rebalance for a single miner.
+    def _states_for_hotkey(self, hotkey: str) -> list[FluxState]:
+        return [s for (h, _), s in self._flux_states.items() if h == hotkey]
 
-        Catalog-aware: pulls the current public catalog and the miner's
-        advertised VRAM, then lets the orchestrator both (a) pick the
-        inf/rental split and (b) assign catalog models to the inference GPUs.
-        """
-        state = self._flux_states.get(hotkey)
-        if state is None:
-            return FluxState(hotkey=hotkey, node_id="", total_gpus=0), []
-        # Inject latest demand scores
-        state = state.model_copy(update={
-            "inference_demand_score": self.demand.inference_score(hotkey),
-            "rental_demand_score": self.demand.rental_score(hotkey),
-        })
-        # Catalog + miner VRAM for model-assignment math
-        catalog = self.repository.list_catalog_entries(visibility="public")
-        vram = None
-        cap = self.repository.get_capability(hotkey)
-        if cap is not None:
-            vram = getattr(cap, "vram_gb_per_gpu", None)
-        new_state, events = self.flux.rebalance(
-            state,
-            catalog=catalog,
-            vram_gb_per_gpu=vram,
-            replica_targets=self._replica_targets or None,
+    def _aggregate_flux_state(self, hotkey: str) -> FluxState | None:
+        """Synthesize a single FluxState by summing across all of this
+        hotkey's per-node states. Used by scoring / dashboard / weight
+        publishing — places that operate on the per-miner level."""
+        states = self._states_for_hotkey(hotkey)
+        if not states:
+            return None
+        return FluxState(
+            hotkey=hotkey,
+            node_id=f"{hotkey}-aggregate",
+            total_gpus=sum(s.total_gpus for s in states),
+            inference_gpus=sum(s.inference_gpus for s in states),
+            rental_gpus=sum(s.rental_gpus for s in states),
+            idle_gpus=sum(s.idle_gpus for s in states),
+            inference_floor_pct=validator_settings.flux_inference_floor_pct,
+            rental_floor_pct=validator_settings.flux_rental_floor_pct,
         )
-        self._flux_states[hotkey] = new_state
-        self.metrics.increment("flux.rebalance", len(events))
-        self._reconcile_catalog_deployments(hotkey, new_state)
-        return new_state, events
+
+    def rebalance_miner(self, hotkey: str) -> tuple[FluxState, list[FluxRebalanceEvent]]:
+        """Run Flux rebalance for every node belonging to this miner.
+
+        For multi-node hotkeys (one identity, several physical boxes), this
+        rebalances each node independently — each gets its own catalog
+        assignments, idle/inference/rental split, etc. — and returns the
+        aggregated state + combined events for the caller's convenience.
+
+        Catalog-aware: pulls the current public catalog and each node's
+        advertised VRAM, then lets the orchestrator both (a) pick the
+        inf/rental split and (b) assign catalog models to inference GPUs.
+        """
+        states = self._states_for_hotkey(hotkey)
+        if not states:
+            return FluxState(hotkey=hotkey, node_id="", total_gpus=0), []
+        catalog = self.repository.list_catalog_entries(visibility="public")
+        node_caps = {
+            n.node_id: n for n in self.repository.get_node_capabilities(hotkey)
+        }
+        inf_score = self.demand.inference_score(hotkey)
+        rent_score = self.demand.rental_score(hotkey)
+        all_events: list[FluxRebalanceEvent] = []
+        for state in states:
+            primed = state.model_copy(update={
+                "inference_demand_score": inf_score,
+                "rental_demand_score": rent_score,
+            })
+            cap = node_caps.get(state.node_id)
+            vram = getattr(cap, "vram_gb_per_gpu", None) if cap else None
+            new_state, events = self.flux.rebalance(
+                primed,
+                catalog=catalog,
+                vram_gb_per_gpu=vram,
+                replica_targets=self._replica_targets or None,
+            )
+            self._flux_states[(hotkey, state.node_id)] = new_state
+            all_events.extend(events)
+            self._reconcile_catalog_deployments(hotkey, new_state)
+        self.metrics.increment("flux.rebalance", len(all_events))
+        # Return aggregate state for callers that expect one — actual
+        # per-node state lives in self._flux_states.
+        return self._aggregate_flux_state(hotkey) or states[0], all_events
 
     def _reconcile_catalog_deployments(self, hotkey: str, new_state: FluxState) -> None:
         """Drive catalog replica deployments through the shared DB.
@@ -601,25 +663,31 @@ class ValidatorService:
         except Exception:
             logger.exception("failed to sync capabilities from control plane")
 
-        # Bootstrap: ensure every registered miner has a Flux state so
-        # rebalance actually iterates them. Noop for miners already present.
-        for hotkey, cap in self.repository.list_capabilities().items():
-            if hotkey in self._flux_states:
-                continue
-            self._flux_states[hotkey] = FluxState(
-                hotkey=hotkey,
-                node_id=cap.node_id,
-                total_gpus=cap.gpu_count,
-                idle_gpus=cap.gpu_count,
-                inference_floor_pct=validator_settings.flux_inference_floor_pct,
-                rental_floor_pct=validator_settings.flux_rental_floor_pct,
-            )
+        # Bootstrap: ensure every registered (hotkey, node_id) has a Flux
+        # state so rebalance iterates them. Noop for entries already present.
+        for hotkey, nodes in self.repository.list_node_capabilities().items():
+            for cap in nodes:
+                key = (hotkey, cap.node_id)
+                if key in self._flux_states:
+                    continue
+                self._flux_states[key] = FluxState(
+                    hotkey=hotkey,
+                    node_id=cap.node_id,
+                    total_gpus=cap.gpu_count,
+                    idle_gpus=cap.gpu_count,
+                    inference_floor_pct=validator_settings.flux_inference_floor_pct,
+                    rental_floor_pct=validator_settings.flux_rental_floor_pct,
+                )
 
         self._replica_targets = self.compute_replica_targets()
         results: dict[str, FluxState] = {}
-        for hotkey in list(self._flux_states):
+        rebalanced_hotkeys: set[str] = set()
+        for hotkey, _node_id in list(self._flux_states):
+            if hotkey in rebalanced_hotkeys:
+                continue
             new_state, _ = self.rebalance_miner(hotkey)
             results[hotkey] = new_state
+            rebalanced_hotkeys.add(hotkey)
         return results
 
     # --- Demand-reactive replica targets (Phase 2I) --------------------
@@ -775,7 +843,9 @@ class ValidatorService:
         fleet so every replica gets probed eventually. Skips silently if
         no catalog replicas are running."""
         pairs: list[tuple[str, str]] = []
-        for hotkey, state in self._flux_states.items():
+        # Per-(hotkey, node) iteration — multi-node hotkeys generate one
+        # pair per node serving the catalog model.
+        for (hotkey, _node_id), state in self._flux_states.items():
             for model_id, idxs in state.inference_assignments.items():
                 if idxs:
                     pairs.append((hotkey, model_id))
@@ -849,20 +919,25 @@ class ValidatorService:
                 "serving_miners": serving_miners,
             })
 
-        # Miner fleet summary
+        # Miner fleet summary — aggregate across all of each hotkey's nodes
         miner_fleet: list[dict] = []
         for hotkey, cap in sorted(capabilities.items()):
-            state = self._flux_states.get(hotkey)
-            assigned = list(state.inference_assignments.keys()) if state else []
+            state = self._aggregate_flux_state(hotkey)
+            nodes = self.repository.get_node_capabilities(hotkey)
+            assigned: list[str] = []
+            for s in self._states_for_hotkey(hotkey):
+                assigned.extend(s.inference_assignments.keys())
+            assigned = sorted(set(assigned))
             sc = scorecards.get(hotkey)
+            total_gpus = sum(n.gpu_count for n in nodes) if nodes else cap.gpu_count
             miner_fleet.append({
                 "hotkey": hotkey,
                 "node_id": cap.node_id,
                 "gpu_model": cap.gpu_model,
-                "gpu_count": cap.gpu_count,
+                "gpu_count": total_gpus,
                 "inference_gpus": state.inference_gpus if state else 0,
                 "rental_gpus": state.rental_gpus if state else 0,
-                "idle_gpus": state.idle_gpus if state else cap.gpu_count,
+                "idle_gpus": state.idle_gpus if state else total_gpus,
                 "assigned_models": assigned,
                 "reliability_score": sc.reliability_score if sc else None,
                 "final_score": sc.final_score if sc else None,
@@ -876,7 +951,7 @@ class ValidatorService:
                 "inference_gpus": inference_gpus,
                 "rental_gpus": rental_gpus,
                 "idle_gpus": idle_gpus,
-                "miners_online": len(self._flux_states),
+                "miners_online": len({h for (h, _n) in self._flux_states}),
                 "miners_registered": len(capabilities),
                 "active_catalog_replicas": active_catalog_replicas,
                 "catalog_models": len(catalog_pool),
@@ -976,7 +1051,7 @@ class ValidatorService:
 
     def estimate_rental_wait(self, deployment_id: str, hotkey: str) -> RentalWaitEstimate:
         """Estimate wait time for a rental deployment on a specific miner."""
-        state = self._flux_states.get(hotkey)
+        state = self._aggregate_flux_state(hotkey)
         if state is None:
             return RentalWaitEstimate(
                 deployment_id=deployment_id,
