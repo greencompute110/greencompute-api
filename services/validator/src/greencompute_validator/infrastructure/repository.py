@@ -362,6 +362,7 @@ class ValidatorRepository:
             organization=row.organization,
             energy_source=row.energy_source,
             description=row.description or "",
+            details=getattr(row, "details", None) or {},
             status=row.status,
             reviewer_notes=row.reviewer_notes or "",
             submitted_at=row.submitted_at,
@@ -388,6 +389,7 @@ class ValidatorRepository:
                 organization=app.organization,
                 energy_source=app.energy_source,
                 description=app.description,
+                details=app.details or {},
                 status=app.status,
                 submitted_at=app.submitted_at,
             )

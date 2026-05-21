@@ -546,6 +546,10 @@ class GreenEnergyApplicationORM(Base):
     organization: Mapped[str] = mapped_column(String(255), default="")
     energy_source: Mapped[str] = mapped_column(String(128), default="")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Full structured form payload — business + DC address, accreditations,
+    # renewable energy mix, infrastructure, support, environment, node specs.
+    # Schema-less JSON so sales can iterate on the form without a migration.
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     reviewer_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

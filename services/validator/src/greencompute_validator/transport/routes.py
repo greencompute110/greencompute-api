@@ -327,11 +327,28 @@ async def submit_application(
     organization: str = Form(""),
     energy_source: str = Form(""),
     description: str = Form(""),
+    # Full structured form payload (business + DC address, accreditations,
+    # infrastructure, support, environment, node specs) as a JSON string.
+    # Optional for backwards compatibility — legacy clients sending just
+    # the five top-level fields above keep working.
+    details: str = Form(""),
     files: list[UploadFile] = File(default=[]),
 ) -> dict:
     """Public endpoint — providers submit green-energy proof here."""
     if not hotkey.strip():
         raise HTTPException(status_code=400, detail="hotkey is required")
+
+    parsed_details: dict = {}
+    if details:
+        try:
+            import json as _json
+            parsed_details = _json.loads(details)
+            if not isinstance(parsed_details, dict):
+                raise ValueError("details must be a JSON object")
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"details must be valid JSON: {exc}"
+            ) from exc
 
     app = GreenEnergyApplication(
         hotkey=hotkey.strip(),
@@ -339,6 +356,7 @@ async def submit_application(
         organization=organization,
         energy_source=energy_source,
         description=description,
+        details=parsed_details,
     )
     service.repository.create_application(app)
 
