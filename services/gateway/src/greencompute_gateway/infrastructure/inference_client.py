@@ -46,6 +46,10 @@ class HttpInferenceClient:
         if request_id is not None:
             h["x-request-id"] = request_id
         if self.miner_auth_secret:
+            # X-Agent-Auth is what node-agent's `validate_optional_auth`
+            # actually reads. X-Gateway-Auth is kept for backwards-compat
+            # in case any operator's reverse proxy filters on it.
+            h["X-Agent-Auth"] = self.miner_auth_secret
             h["X-Gateway-Auth"] = self.miner_auth_secret
         return h
 
@@ -54,6 +58,7 @@ class HttpInferenceClient:
             return False
         headers: dict[str, str] = {}
         if self.miner_auth_secret:
+            headers["X-Agent-Auth"] = self.miner_auth_secret
             headers["X-Gateway-Auth"] = self.miner_auth_secret
         upstream = request.Request(
             url=f"{deployment.endpoint.rstrip('/')}/healthz",
