@@ -1,4 +1,6 @@
+import asyncio
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import PlainTextResponse
@@ -10,7 +12,27 @@ from greencompute_gateway.transport.routes import router
 
 settings = load_runtime_settings("greencompute-gateway")
 
-app = FastAPI(title="GreenCompute Gateway", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Spawn long-running background tasks at startup; cancel them on
+    shutdown. Right now: the on-chain crypto deposit watcher."""
+    from greencompute_gateway.infrastructure.deposit_watcher import (
+        deposit_watcher_loop,
+    )
+
+    task = asyncio.create_task(deposit_watcher_loop(), name="deposit-watcher")
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+
+
+app = FastAPI(title="GreenCompute Gateway", version="0.1.0", lifespan=lifespan)
 
 # Browser clients (Next.js, etc.) need CORS. Comma-separated origins in GREENCOMPUTE_CORS_ALLOW_ORIGINS.
 # If unset, default to local Next.js dev URLs so the gateway never runs without CORS (avoids silent browser blocks).

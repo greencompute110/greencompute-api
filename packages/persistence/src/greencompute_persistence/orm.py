@@ -832,3 +832,16 @@ class CommercialInquiryORM(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class KeyValueStateORM(Base):
+    """Generic key-value state, used by the on-chain deposit watcher to
+    track per-chain `last_scanned_block` (e.g. key="watcher:eth:last_block",
+    value="20500123"). Reusable for future watcher-like cron state."""
+
+    __tablename__ = "key_value_state"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
