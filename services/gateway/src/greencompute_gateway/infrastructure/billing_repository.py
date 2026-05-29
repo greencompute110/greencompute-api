@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
 from greencompute_persistence.db import needs_bootstrap
@@ -251,17 +252,30 @@ class BillingRepository:
         invoice_id: str,
         tx_hash: str,
         description: str,
+        deposit_ref: str | None = None,
     ) -> dict | None:
         """Atomically confirm an invoice and credit the owning user.
 
         Runs inside a single session so partial failures (e.g. a ledger
         insert blowing up after we've flipped the invoice to `confirmed`)
-        roll back everything. Before crediting, checks for an existing
-        topup ledger entry referencing this invoice — if one is there,
-        treat the invoice as already credited and do not double-issue.
+        roll back everything.
+
+        Two layers of idempotency:
+          1. Per-INVOICE: an existing topup ledger row for this invoice_id
+             makes a retry a no-op (covers re-runs of the same invoice).
+          2. Per-ON-CHAIN-TRANSFER: `deposit_ref` (currency:tx_hash:log_index
+             for EVM, chain:block:event_index for TAO, or manual:... for
+             admin confirms) is the GLOBAL idempotency key. If any topup
+             ledger row already carries this deposit_ref, the transfer has
+             already credited *some* invoice and we refuse to credit again —
+             this is what stops "create N same-amount invoices, send ONE tx,
+             get credited N times". The ledger column is UNIQUE, so even a
+             concurrent racing replica that slips past the SELECT loses at
+             COMMIT (IntegrityError → treated as already-confirmed).
+
         Returns:
           - None if the invoice doesn't exist
-          - {"already_confirmed": True} if the invoice was already processed
+          - {"already_confirmed": True, ...} if invoice or transfer already processed
           - {"credited": True, ...} on a fresh confirm+credit
         """
         with session_scope(self.session_factory) as session:
@@ -269,10 +283,7 @@ class BillingRepository:
             if inv is None:
                 return None
 
-            # Idempotency: if we've already written a ledger entry for this
-            # invoice, short-circuit. Covers retries and also recovers the
-            # case where a stuck "confirmed-without-credit" gets retried
-            # manually and we want the second call to be a no-op.
+            # Layer 1 — per-invoice idempotency (retry of same invoice).
             existing = session.scalar(
                 select(LedgerEntryORM).where(
                     LedgerEntryORM.reference_id == invoice_id,
@@ -280,8 +291,6 @@ class BillingRepository:
                 )
             )
             if existing is not None:
-                # Make sure the invoice is marked confirmed even if a prior
-                # partial run left it in a mismatched state.
                 if inv.status != "confirmed":
                     inv.status = "confirmed"
                     if tx_hash and not inv.tx_hash:
@@ -289,6 +298,23 @@ class BillingRepository:
                     if inv.confirmed_at is None:
                         inv.confirmed_at = datetime.now(UTC)
                 return {"already_confirmed": True, "invoice_id": invoice_id}
+
+            # Layer 2 — per-transfer idempotency. If this on-chain transfer
+            # has already credited ANY invoice, do not credit a second one.
+            if deposit_ref:
+                already = session.scalar(
+                    select(LedgerEntryORM).where(
+                        LedgerEntryORM.kind == "topup",
+                        LedgerEntryORM.deposit_ref == deposit_ref,
+                    )
+                )
+                if already is not None:
+                    return {
+                        "already_confirmed": True,
+                        "invoice_id": invoice_id,
+                        "duplicate_deposit": True,
+                        "credited_invoice_id": already.reference_id,
+                    }
 
             user = session.get(UserORM, inv.user_id, with_for_update=True)
             if user is None:
@@ -309,10 +335,23 @@ class BillingRepository:
                     balance_after=user.balance_credits,
                     kind="topup",
                     reference_id=invoice_id,
+                    deposit_ref=deposit_ref or None,
                     description=description,
                     created_at=datetime.now(UTC),
                 )
             )
+            # Force the INSERT now so a UNIQUE(deposit_ref) violation from a
+            # concurrent replica surfaces here, inside our try, rather than
+            # at commit. The loser treats it as already-confirmed.
+            try:
+                session.flush()
+            except IntegrityError:
+                session.rollback()
+                return {
+                    "already_confirmed": True,
+                    "invoice_id": invoice_id,
+                    "duplicate_deposit": True,
+                }
             return {
                 "credited": True,
                 "invoice_id": invoice_id,

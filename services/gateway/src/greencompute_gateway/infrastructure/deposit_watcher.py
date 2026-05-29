@@ -69,6 +69,14 @@ log = logging.getLogger(__name__)
 # TAO ≈ 12s/block, same as ETH.
 MAX_BLOCKS_PER_TICK = 200
 
+# Reorg-safety: only credit transfers buried at least this many blocks deep,
+# so a transfer that later gets reorged out never credits funds we don't
+# actually hold. Keyed by chain_id.
+CONFIRMATIONS = {
+    "eth": 12,
+    "base": 20,   # Base is fast but reorgs deeper in block count terms
+}
+
 # Transfer(address,address,uint256) event topic (keccak256). Stable
 # across all ERC-20 tokens.
 ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -181,10 +189,16 @@ def _try_credit(
     invoices: list[CryptoInvoiceORM],
     deposit_amount: float,
     tx_hash: str,
+    deposit_ref: str,
 ) -> tuple[CryptoInvoiceORM, dict] | None:
     """Find the first pending invoice that fits this deposit amount and
-    confirm-credit it. Returns the matched (invoice, result) pair, or
-    None if no match. Mutates `invoices` (drops the matched one)."""
+    confirm-credit it. `deposit_ref` is the globally-unique on-chain
+    transfer key — passed to confirm_and_credit_invoice so a single
+    transfer can credit at most one invoice EVER (the column is UNIQUE).
+
+    Returns the matched (invoice, result) pair, or None if no invoice
+    matched the amount. If a match was found but the transfer was already
+    consumed (duplicate_deposit), we stop — the transfer is spent."""
     for inv in invoices:
         if _amount_matches(deposit_amount, float(inv.amount_crypto)):
             description = (
@@ -195,9 +209,14 @@ def _try_credit(
                 invoice_id=inv.invoice_id,
                 tx_hash=tx_hash,
                 description=description,
+                deposit_ref=deposit_ref,
             )
             if result is None:
                 continue
+            # The transfer was already consumed by another invoice — it's
+            # spent, don't keep trying to match it to further invoices.
+            if result.get("duplicate_deposit"):
+                return inv, result
             invoices.remove(inv)
             return inv, result
     return None
@@ -255,15 +274,27 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
         log.warning("watcher %s: failed to fetch head block: %s", chain_id, exc)
         return 0
 
+    # Only scan blocks that are deep enough to be reorg-safe. Crediting on a
+    # transfer that later gets reorged out would credit funds we never
+    # received. ETH finalizes slower than Base, so use a bigger buffer.
+    confirmations = CONFIRMATIONS.get(chain_id, 12)
+    safe_head = head - confirmations
+    if safe_head <= 0:
+        return 0
+
     last_seen_str = _kv_get(repo, state_key)
     # If first run, start from head - 1 day's worth of blocks (~7200 for ETH,
-    # ~43200 for Base). Keeps the first scan from going to genesis.
+    # ~43200 for Base). Keeps the first scan from going to genesis. We store
+    # last_scanned as "next block to scan", so on subsequent ticks we start
+    # exactly there — NO overlap with the previously-scanned range (an
+    # inclusive eth_getLogs re-scan of the boundary block was a double-credit
+    # trigger before the deposit_ref unique key existed; we close it here too).
     if last_seen_str:
         from_block = int(last_seen_str)
     else:
-        from_block = max(0, head - (7200 if chain_id == "eth" else 43200))
-    to_block = min(head, from_block + MAX_BLOCKS_PER_TICK)
-    if to_block <= from_block:
+        from_block = max(0, safe_head - (7200 if chain_id == "eth" else 43200))
+    to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
+    if to_block < from_block:
         return 0
 
     for token in tokens:
@@ -324,20 +355,32 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
                 tx_hash = entry.get("transactionHash", "")
                 if not tx_hash:
                     continue
-                matched = _try_credit(repo, invoices, deposit_amount, tx_hash)
+                # Globally-unique transfer key. One ERC-20 tx can carry
+                # several Transfer logs, so log_index is required for
+                # uniqueness within a tx. currency already encodes the chain
+                # (usdt-eth vs usdt-base), so this never collides cross-chain.
+                log_index = entry.get("logIndex", "0x0")
+                deposit_ref = f"{token.currency}:{tx_hash}:{_hex_to_int(log_index)}"
+                matched = _try_credit(
+                    repo, invoices, deposit_amount, tx_hash, deposit_ref
+                )
                 if matched is None:
                     continue
                 inv, result = matched
                 log.info(
-                    "watcher %s/%s: credited invoice %s (amount=%s, tx=%s, result=%s)",
+                    "watcher %s/%s: invoice %s ref=%s amount=%s -> %s",
                     chain_id, token.currency,
-                    inv.invoice_id[:8], deposit_amount, tx_hash[:12],
-                    result.get("credited") or result.get("already_confirmed"),
+                    inv.invoice_id[:8], deposit_ref[:40], deposit_amount,
+                    "credited" if result.get("credited")
+                    else "duplicate" if result.get("duplicate_deposit")
+                    else "already_confirmed",
                 )
                 if result.get("credited"):
                     credited += 1
 
-    _kv_set(repo, state_key, str(to_block))
+    # Persist the NEXT block to scan (to_block + 1) — non-overlapping with
+    # the range we just covered.
+    _kv_set(repo, state_key, str(to_block + 1))
     return credited
 
 
@@ -388,8 +431,12 @@ def scan_tao(repo: BillingRepository) -> int:
         )
         head_hash = substrate.get_chain_head()
         head_num = substrate.get_block_number(head_hash)
-        from_block = int(last_seen_str) if last_seen_str else max(0, head_num - 1800)  # ~6h
-        to_block = min(head_num, from_block + MAX_BLOCKS_PER_TICK)
+        # Small reorg-safety buffer (Bittensor finalizes fast).
+        safe_head = head_num - 10
+        if safe_head <= 0:
+            return 0
+        from_block = int(last_seen_str) if last_seen_str else max(0, safe_head - 1800)  # ~6h
+        to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
         if to_block <= from_block:
             return 0
 
@@ -403,7 +450,7 @@ def scan_tao(repo: BillingRepository) -> int:
                 )
                 continue
 
-            for ev in events:
+            for event_idx, ev in enumerate(events):
                 ev_obj = getattr(ev, "value", ev)
                 if not isinstance(ev_obj, dict):
                     continue
@@ -425,28 +472,32 @@ def scan_tao(repo: BillingRepository) -> int:
                 if dest not in addrs:
                     continue
                 deposit_amount = amount_raw / 1e9  # TAO has 9 decimals
-                # Tx hash for an event lives on the extrinsic that
-                # produced it. Best-effort lookup via the event's parent
-                # extrinsic index.
-                tx_hash = (
+                # Human-readable hash if available (for the invoice record);
+                # the dedup key is the block+event coordinate, which is
+                # globally unique and stable regardless of whether the
+                # extrinsic hash decodes.
+                tx_hash = str(
                     ev_obj.get("extrinsic_hash")
                     or ev_obj.get("extrinsic_idx")
                     or f"block-{block_num}"
                 )
+                deposit_ref = f"tao:{block_num}:{event_idx}"
 
                 invoices = _pending_invoices_for(repo, "tao", dest)
                 if not invoices:
                     continue
                 matched = _try_credit(
-                    repo, invoices, deposit_amount, str(tx_hash)
+                    repo, invoices, deposit_amount, tx_hash, deposit_ref
                 )
                 if matched is None:
                     continue
                 inv, result = matched
                 log.info(
-                    "watcher tao: credited invoice %s (amount=%s TAO, tx=%s, result=%s)",
-                    inv.invoice_id[:8], deposit_amount, str(tx_hash)[:16],
-                    result.get("credited") or result.get("already_confirmed"),
+                    "watcher tao: invoice %s ref=%s amount=%s TAO -> %s",
+                    inv.invoice_id[:8], deposit_ref, deposit_amount,
+                    "credited" if result.get("credited")
+                    else "duplicate" if result.get("duplicate_deposit")
+                    else "already_confirmed",
                 )
                 if result.get("credited"):
                     credited += 1

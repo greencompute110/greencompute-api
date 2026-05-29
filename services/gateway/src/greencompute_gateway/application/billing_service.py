@@ -200,10 +200,22 @@ class BillingService:
             f"${invoice.amount_usd:.2f} "
             f"(+{int(invoice.bonus_pct * 100)}% bonus)"
         )
+        # Route the manual admin confirm through the same per-transfer
+        # idempotency key as the auto-watcher. An admin pasting the same
+        # tx_hash into two different invoices now credits only the first —
+        # the UNIQUE deposit_ref blocks the second. Qualify with currency so
+        # a hash can't collide across chains, and prefix "manual:" so it
+        # never clashes with an auto-watcher ref for the same transfer
+        # (worst case the manual confirm wins; the watcher then sees the
+        # invoice already credited and no-ops).
+        deposit_ref = (
+            f"manual:{invoice.currency}:{tx_hash}" if tx_hash else None
+        )
         result = self.repo.confirm_and_credit_invoice(
             invoice_id=invoice_id,
             tx_hash=tx_hash,
             description=description,
+            deposit_ref=deposit_ref,
         )
         if result is None:
             return None

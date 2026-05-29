@@ -656,6 +656,15 @@ class LedgerEntryORM(Base):
     balance_after: Mapped[int] = mapped_column(BigInteger)
     kind: Mapped[str] = mapped_column(String(32), index=True)
     reference_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Globally-unique on-chain deposit reference for crypto top-ups, e.g.
+    # "usdt-eth:0xabc…:7" (currency:tx_hash:log_index) or "tao:5123456:3"
+    # (chain:block:event_index). UNIQUE so a single on-chain transfer can
+    # credit at most ONE invoice, ever — this is the idempotency key that
+    # stops the "create N same-amount invoices, pay once, get credited N
+    # times" exploit. NULL for non-deposit ledger rows (usage, stripe,
+    # manual adjustments); SQLite + Postgres both treat multiple NULLs as
+    # distinct, so the unique constraint only bites real deposit refs.
+    deposit_ref: Mapped[str | None] = mapped_column(String(300), nullable=True, unique=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
