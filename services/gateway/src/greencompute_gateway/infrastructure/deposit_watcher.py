@@ -127,12 +127,14 @@ TOKENS: list[TokenConfig] = [
 
 
 def _chain_rpc_url(chain_id: str) -> str:
+    # publicnode is keyless and reliable; override via env with an Alchemy /
+    # Infura URL for production-grade rate limits.
     if chain_id == "eth":
         return (os.environ.get("ETH_RPC_URL", "").strip()
-                or "https://eth.llamarpc.com")
+                or "https://ethereum-rpc.publicnode.com")
     if chain_id == "base":
         return (os.environ.get("BASE_RPC_URL", "").strip()
-                or "https://mainnet.base.org")
+                or "https://base-rpc.publicnode.com")
     raise ValueError(f"unknown EVM chain_id: {chain_id}")
 
 
@@ -234,7 +236,14 @@ def _jsonrpc(url: str, method: str, params: list, timeout: float = 15.0):
     req = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # Many public RPC gateways (llamarpc, base.org, …) sit behind a
+            # WAF that 403s the default "Python-urllib/x.y" User-Agent. Send a
+            # browser-like UA so keyless public endpoints don't reject us.
+            "User-Agent": "Mozilla/5.0 (compatible; GreenCompute-DepositWatcher/1.0)",
+        },
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
