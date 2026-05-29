@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
@@ -357,6 +357,31 @@ class BillingRepository:
                 "invoice_id": invoice_id,
                 "total_credits": inv.total_credits,
             }
+
+    def expire_stale_pending_invoices(self, grace_seconds: int) -> int:
+        """Bulk-mark pending invoices whose pay-by deadline passed more than
+        `grace_seconds` ago as `expired`.
+
+        The grace window beyond `expires_at` is deliberate: it covers
+        on-chain confirmation lag + watcher catch-up so we NEVER expire an
+        invoice the watcher is about to credit. The caller runs this AFTER
+        the per-tick credit scan, and the WHERE clause only touches rows
+        still `pending`, so an invoice credited earlier in the same tick is
+        already `confirmed` and won't be expired. Returns the count expired.
+        """
+        from datetime import timedelta
+
+        cutoff = datetime.now(UTC) - timedelta(seconds=max(0, grace_seconds))
+        with session_scope(self.session_factory) as session:
+            result = session.execute(
+                update(CryptoInvoiceORM)
+                .where(
+                    CryptoInvoiceORM.status == "pending",
+                    CryptoInvoiceORM.expires_at < cutoff,
+                )
+                .values(status="expired")
+            )
+            return result.rowcount or 0
 
     def reject_crypto_invoice(self, invoice_id: str) -> CryptoInvoice | None:
         """Admin action: mark invoice as rejected and never credit it.

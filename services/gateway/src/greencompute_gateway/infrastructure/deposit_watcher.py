@@ -535,35 +535,66 @@ def _bool_env(name: str, default: bool) -> bool:
     return default
 
 
+def _expiry_grace_seconds() -> int:
+    """Grace window past an invoice's expires_at before we auto-expire it.
+    Generous enough to cover on-chain confirmation lag + watcher catch-up so
+    a slightly-late-but-real payment still credits before we give up."""
+    try:
+        hours = float(os.environ.get("GREENCOMPUTE_INVOICE_EXPIRY_GRACE_HOURS", "1"))
+    except (TypeError, ValueError):
+        hours = 1.0
+    return int(max(0.0, hours) * 3600)
+
+
 async def deposit_watcher_loop() -> None:
     """Background coroutine. Spawned at gateway startup; tick every N
-    seconds (default 60). Logs all credit events; errors don't kill the
-    loop — they just get reported and we try again next tick."""
-    if not _bool_env("GREENCOMPUTE_DEPOSIT_WATCHER_ENABLED", True):
-        log.info("deposit watcher disabled via env")
-        return
+    seconds (default 60).
 
+    Each tick does two things:
+      1. (if enabled) scan chains and credit matching deposits
+      2. (always) expire stale pending invoices past their grace window
+
+    The expiry sweep runs AFTER the credit scan, so anything creditable this
+    tick is credited first and won't be expired. It's pure DB (no RPC), so it
+    still runs even when chain-scanning is disabled. Errors don't kill the
+    loop — they're logged and retried next tick."""
+    scan_enabled = _bool_env("GREENCOMPUTE_DEPOSIT_WATCHER_ENABLED", True)
     interval = max(10, int(
         os.environ.get("GREENCOMPUTE_DEPOSIT_WATCHER_INTERVAL_SECONDS", "60")
     ))
-    log.info("deposit watcher starting (interval=%ds)", interval)
+    if scan_enabled:
+        log.info("deposit watcher starting (interval=%ds)", interval)
+    else:
+        log.info(
+            "deposit watcher chain-scanning disabled; running invoice-expiry sweep only"
+        )
 
     while True:
         try:
             repo = get_billing_service().repo
-            for chain_id in ("eth", "base"):
+            if scan_enabled:
+                for chain_id in ("eth", "base"):
+                    try:
+                        n = await asyncio.to_thread(scan_evm_chain, repo, chain_id)
+                        if n:
+                            log.info("watcher %s: credited %d invoice(s) this tick", chain_id, n)
+                    except Exception:
+                        log.exception("watcher %s tick failed", chain_id)
                 try:
-                    n = await asyncio.to_thread(scan_evm_chain, repo, chain_id)
+                    n = await asyncio.to_thread(scan_tao, repo)
                     if n:
-                        log.info("watcher %s: credited %d invoice(s) this tick", chain_id, n)
+                        log.info("watcher tao: credited %d invoice(s) this tick", n)
                 except Exception:
-                    log.exception("watcher %s tick failed", chain_id)
+                    log.exception("watcher tao tick failed")
+            # Expiry sweep — always runs (DB-only).
             try:
-                n = await asyncio.to_thread(scan_tao, repo)
-                if n:
-                    log.info("watcher tao: credited %d invoice(s) this tick", n)
+                expired = await asyncio.to_thread(
+                    repo.expire_stale_pending_invoices, _expiry_grace_seconds()
+                )
+                if expired:
+                    log.info("expired %d stale pending invoice(s)", expired)
             except Exception:
-                log.exception("watcher tao tick failed")
+                log.exception("invoice expiry sweep failed")
         except Exception:
             log.exception("deposit watcher loop iteration failed")
         await asyncio.sleep(interval)

@@ -101,6 +101,44 @@ def test_unique_constraint_enforced_at_db_layer():
             s.add(row("e2"))
 
 
+def test_expiry_sweep_only_expires_stale_pending_past_grace():
+    """Auto-expiry: only PENDING invoices whose expires_at is older than the
+    grace window become `expired`. A recently-expired pending invoice (inside
+    grace) is kept so a late-but-real payment can still credit; confirmed and
+    rejected invoices are never touched."""
+    from greencompute_persistence.orm import CryptoInvoiceORM
+
+    repo = _repo()
+    now = datetime.now(UTC)
+
+    def mk(status: str, expires_delta_min: int) -> str:
+        inv = CryptoInvoice(
+            user_id="u", currency="tao", amount_crypto=1.0, amount_usd=1.0,
+            bonus_pct=0.0, total_credits=100, deposit_address="a",
+            expires_at=now + timedelta(minutes=expires_delta_min),
+        )
+        repo.create_crypto_invoice(inv)
+        with session_scope(repo.session_factory) as s:
+            s.get(CryptoInvoiceORM, inv.invoice_id).status = status
+        return inv.invoice_id
+
+    stale = mk("pending", -180)       # expired 3h ago -> expire
+    recent = mk("pending", -20)       # expired 20m ago, within 1h grace -> keep
+    future = mk("pending", 30)        # not yet expired -> keep
+    confirmed = mk("confirmed", -300) # terminal -> never touch
+    rejected = mk("rejected", -300)   # terminal -> never touch
+
+    n = repo.expire_stale_pending_invoices(grace_seconds=3600)
+    assert n == 1
+    with session_scope(repo.session_factory) as s:
+        get = lambda x: s.get(CryptoInvoiceORM, x).status
+        assert get(stale) == "expired"
+        assert get(recent) == "pending"
+        assert get(future) == "pending"
+        assert get(confirmed) == "confirmed"
+        assert get(rejected) == "rejected"
+
+
 def test_null_deposit_refs_are_not_unique_constrained():
     """Usage / stripe / manual ledger rows leave deposit_ref NULL and must
     not collide with each other."""
