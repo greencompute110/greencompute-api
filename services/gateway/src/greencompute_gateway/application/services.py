@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -40,6 +41,8 @@ from greencompute_protocol import (
     DeploymentUpdateRequest,
     GpuCapacityOverride,
     InvocationRecord,
+    ProviderServerCreateRequest,
+    ProviderServerRecord,
     UserRecord,
     UserProfileUpdateRequest,
     UserSecretCreateRequest,
@@ -641,6 +644,133 @@ class GatewayService:
 
     def delete_gpu_capacity_override(self, gpu_model: str) -> bool:
         return self.repository.delete_gpu_capacity_override(gpu_model)
+
+    # --- Provider server onboarding ----------------------------------------
+
+    def _hotkey_whitelisted(self, hotkey: str) -> bool:
+        from greencompute_persistence import session_scope
+        from greencompute_persistence.orm import MinerWhitelistORM
+
+        with session_scope(self.repository.session_factory) as session:
+            return session.get(MinerWhitelistORM, hotkey) is not None
+
+    def create_provider_server(
+        self,
+        request: ProviderServerCreateRequest,
+        *,
+        user_id: str | None,
+        admin: bool = False,
+    ) -> tuple[ProviderServerRecord, "ProvisionInputs"]:  # noqa: F821
+        """Validate + persist a pending server record and build the (non-
+        persisted) provisioning inputs. The route layer kicks off the actual
+        SSH provisioning in a background task. Raises ValueError/PermissionError
+        which the route maps to 400/403."""
+        from greencompute_gateway.infrastructure.server_provisioner import ProvisionInputs
+
+        hotkey = request.hotkey.strip()
+        if not hotkey:
+            raise ValueError("hotkey is required")
+        # Gate: the hotkey must be whitelisted (admins bypass for testing).
+        if not admin and not self._hotkey_whitelisted(hotkey):
+            raise PermissionError(
+                f"hotkey {hotkey[:10]}… is not whitelisted — submit a provider "
+                f"application and get approved before onboarding servers"
+            )
+        if not request.ssh_password.strip() and not request.ssh_private_key.strip():
+            raise ValueError("provide an SSH password or private key")
+
+        # Unique node_id (PK on node_inventory). Slugify the label + random.
+        slug = re.sub(r"[^a-z0-9]+", "-", (request.label or "node").lower()).strip("-") or "node"
+        node_id = f"{slug[:32]}-{secrets.token_hex(3)}"
+
+        record = ProviderServerRecord(
+            owner_user_id=user_id,
+            hotkey=hotkey,
+            payout_address=request.payout_address.strip(),
+            label=request.label.strip(),
+            ssh_host=request.ssh_host.strip(),
+            ssh_port=request.ssh_port,
+            ssh_user=request.ssh_user.strip() or "root",
+            node_id=node_id,
+            status="pending",
+        )
+        self.repository.save_provider_server(record)
+
+        inputs = ProvisionInputs(
+            server_id=record.server_id,
+            hotkey=hotkey,
+            payout_address=record.payout_address,
+            label=record.label,
+            ssh_host=record.ssh_host,
+            ssh_port=record.ssh_port,
+            ssh_user=record.ssh_user,
+            ssh_password=request.ssh_password,
+            ssh_private_key=request.ssh_private_key,
+            hf_token=request.hf_token,
+            node_id=node_id,
+        )
+        return record, inputs
+
+    def run_provisioning(self, inputs: "ProvisionInputs") -> None:  # noqa: F821
+        """Background entry — runs the SSH provisioning and streams progress
+        into the server record. Never raises (called from BackgroundTasks)."""
+        from greencompute_gateway.infrastructure.server_provisioner import provision_server
+
+        sid = inputs.server_id
+
+        def on_log(chunk: str) -> None:
+            try:
+                self.repository.update_provider_server_status(sid, append_log=chunk)
+            except Exception:
+                log.exception("provisioning log append failed for %s", sid)
+
+        def on_status(status: str) -> None:
+            try:
+                self.repository.update_provider_server_status(sid, status=status)
+            except Exception:
+                log.exception("provisioning status update failed for %s", sid)
+
+        result = provision_server(inputs, on_log, on_status)
+        if result.ok:
+            self.repository.update_provider_server_status(
+                sid,
+                status="running",
+                last_error="",
+                public_ip=result.public_ip,
+                hardware={
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "vram_gb_per_gpu": result.vram_gb_per_gpu,
+                    "cpu_cores": result.cpu_cores,
+                    "memory_gb": result.memory_gb,
+                },
+            )
+        else:
+            self.repository.update_provider_server_status(
+                sid, status="failed", last_error=result.error,
+            )
+
+    def list_provider_servers(self, user_id: str | None, *, admin: bool = False) -> list[ProviderServerRecord]:
+        return self.repository.list_provider_servers(user_id, admin=admin)
+
+    def get_provider_server(self, server_id: str, *, user_id: str | None, admin: bool = False) -> ProviderServerRecord:
+        rec = self.repository.get_provider_server(server_id)
+        if rec is None:
+            raise KeyError(f"server not found: {server_id}")
+        if not admin and rec.owner_user_id != user_id:
+            raise PermissionError("server access denied")
+        return rec
+
+    def delete_provider_server(self, server_id: str, *, user_id: str | None, admin: bool = False) -> ProviderServerRecord:
+        rec = self.repository.get_provider_server(server_id)
+        if rec is None:
+            raise KeyError(f"server not found: {server_id}")
+        if not admin and rec.owner_user_id != user_id:
+            raise PermissionError("server access denied")
+        deleted = self.repository.delete_provider_server(server_id)
+        if deleted is None:
+            raise KeyError(f"server not found: {server_id}")
+        return deleted
 
     def create_secret(self, user_id: str, request: UserSecretCreateRequest) -> UserSecretRecord:
         secret = UserSecretRecord(user_id=user_id, name=request.name, value=request.value)

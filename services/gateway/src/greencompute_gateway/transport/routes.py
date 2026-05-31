@@ -2,7 +2,7 @@ import json
 import os
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from greencompute_protocol import (
@@ -16,6 +16,7 @@ from greencompute_protocol import (
     DeploymentCreateRequest,
     DeploymentUpdateRequest,
     GpuCapacityOverride,
+    ProviderServerCreateRequest,
     UserProfileUpdateRequest,
     UserSecretCreateRequest,
     UserRegistrationRequest,
@@ -1106,6 +1107,90 @@ def delete_capacity_override(
     if not deleted:
         raise HTTPException(status_code=404, detail="override not found")
     return {"deleted": True, "gpu_model": gpu_model}
+
+
+# ---------------------------------------------------------------------------
+# Provider server onboarding — UI-driven SSH provisioning of a node-agent
+# onto a whitelisted provider's own hardware. The SSH credential is used by
+# the background job only and never persisted.
+# ---------------------------------------------------------------------------
+
+
+def _server_owner_view(rec) -> dict:
+    """Strip nothing secret here (no creds are stored), but cap the log on
+    the wire and present a clean dict."""
+    d = rec.model_dump(mode="json")
+    return d
+
+
+@router.post("/platform/provider/servers", status_code=201)
+def create_provider_server(
+    payload: ProviderServerCreateRequest,
+    background_tasks: BackgroundTasks,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.user_id is None and not api_key.admin:
+        raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    enforce_rate_limit("provider_server_create", api_key.key_id, limit=20, window_seconds=3600)
+    try:
+        record, inputs = service.create_provider_server(
+            payload, user_id=api_key.user_id, admin=api_key.admin,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Provision in the background (paramiko is blocking; BackgroundTasks runs
+    # sync callables in the threadpool, off the event loop).
+    background_tasks.add_task(service.run_provisioning, inputs)
+    return _server_owner_view(record)
+
+
+@router.get("/platform/provider/servers")
+def list_provider_servers(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    api_key = require_api_key(authorization, x_api_key)
+    return [
+        _server_owner_view(s)
+        for s in service.list_provider_servers(api_key.user_id, admin=api_key.admin)
+    ]
+
+
+@router.get("/platform/provider/servers/{server_id}")
+def get_provider_server(
+    server_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    try:
+        return _server_owner_view(
+            service.get_provider_server(server_id, user_id=api_key.user_id, admin=api_key.admin)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.delete("/platform/provider/servers/{server_id}")
+def delete_provider_server(
+    server_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    try:
+        deleted = service.delete_provider_server(server_id, user_id=api_key.user_id, admin=api_key.admin)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return {"deleted": True, "server_id": deleted.server_id}
 
 
 @router.post("/v1/chat/completions")

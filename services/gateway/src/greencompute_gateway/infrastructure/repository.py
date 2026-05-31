@@ -12,6 +12,7 @@ from greencompute_persistence.orm import (
     BareMetalInquiryORM,
     CommercialInquiryORM,
     GpuCapacityOverrideORM,
+    ProviderServerORM,
     UserORM,
     UserSecretORM,
     WorkloadShareORM,
@@ -21,6 +22,7 @@ from greencompute_protocol import (
     BareMetalInquiryRecord,
     CommercialInquiryRecord,
     GpuCapacityOverride,
+    ProviderServerRecord,
     UserRecord,
     UserSecretRecord,
     WorkloadShareRecord,
@@ -453,4 +455,119 @@ class GatewayRepository:
             shared_with_user_id=row.shared_with_user_id,
             permission=row.permission,
             created_at=row.created_at,
+        )
+
+    # --- Provider servers (self-service onboarding) --------------------
+
+    def save_provider_server(self, server: ProviderServerRecord) -> ProviderServerRecord:
+        with session_scope(self.session_factory) as session:
+            row = session.get(ProviderServerORM, server.server_id) or ProviderServerORM(
+                server_id=server.server_id
+            )
+            row.owner_user_id = server.owner_user_id
+            row.hotkey = server.hotkey
+            row.payout_address = server.payout_address
+            row.label = server.label
+            row.ssh_host = server.ssh_host
+            row.ssh_port = server.ssh_port
+            row.ssh_user = server.ssh_user
+            row.node_id = server.node_id
+            row.status = server.status
+            row.gpu_model = server.gpu_model
+            row.gpu_count = server.gpu_count
+            row.vram_gb_per_gpu = server.vram_gb_per_gpu
+            row.cpu_cores = server.cpu_cores
+            row.memory_gb = server.memory_gb
+            row.public_ip = server.public_ip
+            row.last_error = server.last_error
+            row.provision_log = server.provision_log
+            row.created_at = server.created_at
+            row.updated_at = server.updated_at
+            session.add(row)
+        return server
+
+    def get_provider_server(self, server_id: str) -> ProviderServerRecord | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(ProviderServerORM, server_id)
+            return self._to_provider_server(row) if row else None
+
+    def list_provider_servers(self, owner_user_id: str | None, *, admin: bool = False) -> list[ProviderServerRecord]:
+        with session_scope(self.session_factory) as session:
+            stmt = select(ProviderServerORM).order_by(ProviderServerORM.created_at.desc())
+            if not admin:
+                stmt = stmt.where(ProviderServerORM.owner_user_id == owner_user_id)
+            rows = session.scalars(stmt).all()
+            return [self._to_provider_server(r) for r in rows]
+
+    def update_provider_server_status(
+        self,
+        server_id: str,
+        *,
+        status: str | None = None,
+        append_log: str | None = None,
+        last_error: str | None = None,
+        hardware: dict[str, Any] | None = None,
+        node_id: str | None = None,
+        public_ip: str | None = None,
+    ) -> ProviderServerRecord | None:
+        """Atomic status/log update used by the provisioning job. `append_log`
+        is appended to the existing provision_log so the UI can stream it."""
+        from greencompute_persistence.orm import utcnow
+
+        with session_scope(self.session_factory) as session:
+            row = session.get(ProviderServerORM, server_id)
+            if row is None:
+                return None
+            if status is not None:
+                row.status = status
+            if last_error is not None:
+                row.last_error = last_error
+            if node_id is not None:
+                row.node_id = node_id
+            if public_ip is not None:
+                row.public_ip = public_ip
+            if append_log:
+                prev = row.provision_log or ""
+                # Cap the stored log so a pathological run can't bloat the row.
+                row.provision_log = (prev + append_log)[-20000:]
+            if hardware:
+                for k in ("gpu_model", "gpu_count", "vram_gb_per_gpu", "cpu_cores", "memory_gb"):
+                    if k in hardware and hardware[k] is not None:
+                        setattr(row, k, hardware[k])
+            row.updated_at = utcnow()
+            session.add(row)
+            return self._to_provider_server(row)
+
+    def delete_provider_server(self, server_id: str) -> ProviderServerRecord | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(ProviderServerORM, server_id)
+            if row is None:
+                return None
+            rec = self._to_provider_server(row)
+            session.delete(row)
+            return rec
+
+    @staticmethod
+    def _to_provider_server(row: ProviderServerORM) -> ProviderServerRecord:
+        return ProviderServerRecord(
+            server_id=row.server_id,
+            owner_user_id=row.owner_user_id,
+            hotkey=row.hotkey or "",
+            payout_address=row.payout_address or "",
+            label=row.label or "",
+            ssh_host=row.ssh_host or "",
+            ssh_port=row.ssh_port or 22,
+            ssh_user=row.ssh_user or "root",
+            node_id=row.node_id or "",
+            status=row.status or "pending",
+            gpu_model=row.gpu_model or "",
+            gpu_count=row.gpu_count or 0,
+            vram_gb_per_gpu=row.vram_gb_per_gpu or 0,
+            cpu_cores=row.cpu_cores or 0,
+            memory_gb=row.memory_gb or 0,
+            public_ip=row.public_ip or "",
+            last_error=row.last_error or "",
+            provision_log=row.provision_log or "",
+            created_at=row.created_at,
+            updated_at=row.updated_at,
         )

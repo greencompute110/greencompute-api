@@ -854,3 +854,34 @@ class KeyValueStateORM(Base):
     value: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
+
+
+class ProviderServerORM(Base):
+    """A provider's physical server onboarded via the self-service UI.
+
+    No SSH credential is stored — provisioning uses it transiently then
+    discards it. `provision_log` is append-only progress text shown live.
+    """
+
+    __tablename__ = "provider_servers"
+
+    server_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True, default="")
+    payout_address: Mapped[str] = mapped_column(String(256), default="")
+    label: Mapped[str] = mapped_column(String(64), default="")
+    ssh_host: Mapped[str] = mapped_column(String(255), default="")
+    ssh_port: Mapped[int] = mapped_column(Integer, default=22)
+    ssh_user: Mapped[str] = mapped_column(String(64), default="root")
+    node_id: Mapped[str] = mapped_column(String(128), default="")
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    gpu_model: Mapped[str] = mapped_column(String(64), default="")
+    gpu_count: Mapped[int] = mapped_column(Integer, default=0)
+    vram_gb_per_gpu: Mapped[int] = mapped_column(Integer, default=0)
+    cpu_cores: Mapped[int] = mapped_column(Integer, default=0)
+    memory_gb: Mapped[int] = mapped_column(Integer, default=0)
+    public_ip: Mapped[str] = mapped_column(String(64), default="")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provision_log: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
