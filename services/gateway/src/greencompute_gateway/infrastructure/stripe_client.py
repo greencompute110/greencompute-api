@@ -62,7 +62,36 @@ def create_checkout_session(amount_cents: int, user_id: str) -> tuple[str, str]:
 
 
 def verify_webhook_signature(payload: bytes, sig_header: str) -> dict:
-    """Verify and parse a Stripe webhook event."""
+    """Verify a Stripe webhook signature and return the event as a PLAIN dict.
+
+    `stripe.Webhook.construct_event` returns a `stripe.Event` StripeObject.
+    Across stripe-python versions that object does NOT reliably expose dict's
+    `.get()` (attribute access routes through __getattr__ and raises), which
+    made the webhook handler 500 on every event — so no Stripe payment ever
+    credited. construct_event still does the signature validation we need;
+    we then hand back `json.loads(payload)` (the same authenticated bytes) so
+    the caller can use ordinary dict access safely.
+    """
+    import json
+
     stripe = _get_stripe()
-    event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    return event
+    # Raises stripe.error.SignatureVerificationError on a bad signature.
+    stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    return json.loads(payload.decode() if isinstance(payload, bytes) else payload)
+
+
+def retrieve_checkout_session(stripe_session_id: str) -> dict:
+    """Fetch a Checkout Session from Stripe and return key fields as a plain
+    dict. Used by the reconcile job to confirm a session was actually PAID
+    before retroactively crediting (so abandoned checkouts aren't credited).
+    """
+    stripe = _get_stripe()
+    s = stripe.checkout.Session.retrieve(stripe_session_id)
+    # Attribute access is the documented StripeObject API and is safe (it was
+    # `.get()` specifically that misbehaved across versions).
+    return {
+        "id": s.id,
+        "status": getattr(s, "status", None),            # "complete" when finished
+        "payment_status": getattr(s, "payment_status", None),  # "paid" when captured
+        "amount_total": getattr(s, "amount_total", None),
+    }

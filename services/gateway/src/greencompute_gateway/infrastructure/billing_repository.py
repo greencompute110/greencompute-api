@@ -497,6 +497,16 @@ class BillingRepository:
             )
             return self._to_stripe_session(row) if row else None
 
+    def list_pending_stripe_sessions(self, limit: int = 500) -> list[StripeSession]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(StripeSessionORM)
+                .where(StripeSessionORM.status == "pending")
+                .order_by(StripeSessionORM.created_at.asc())
+                .limit(limit)
+            ).all()
+            return [self._to_stripe_session(r) for r in rows]
+
     def complete_stripe_session(self, stripe_session_id: str) -> StripeSession | None:
         from datetime import UTC, datetime
 

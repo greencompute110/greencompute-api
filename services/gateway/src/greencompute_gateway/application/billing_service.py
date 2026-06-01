@@ -135,6 +135,54 @@ class BillingService:
             log.exception("ops notification (stripe) failed for session %s", ss.session_id)
         return {"credited": True, "session_id": ss.session_id, "amount_cents": ss.amount_cents}
 
+    def reconcile_pending_stripe_sessions(self, *, dry_run: bool = True) -> dict:
+        """Recover top-ups that should have been credited by the webhook but
+        weren't (e.g. while the webhook handler was 500-ing).
+
+        SAFE: for each `pending` session we ask Stripe whether it was actually
+        PAID before crediting — abandoned checkouts (user never paid) stay
+        pending and are NOT credited. Idempotent via confirm_stripe_payment.
+
+        Returns a summary. With dry_run=True (default) nothing is credited;
+        it just reports what WOULD be credited.
+        """
+        from greencompute_gateway.infrastructure.stripe_client import (
+            retrieve_checkout_session,
+        )
+
+        pending = self.repo.list_pending_stripe_sessions()
+        summary = {
+            "checked": len(pending),
+            "paid_credited": [],
+            "paid_would_credit": [],
+            "unpaid_skipped": [],
+            "errors": [],
+            "dry_run": dry_run,
+        }
+        for ss in pending:
+            try:
+                remote = retrieve_checkout_session(ss.stripe_session_id)
+            except Exception as exc:  # noqa: BLE001
+                summary["errors"].append({"session": ss.stripe_session_id, "error": str(exc)})
+                continue
+            is_paid = (remote.get("payment_status") == "paid") or (remote.get("status") == "complete")
+            entry = {
+                "session": ss.stripe_session_id,
+                "user_id": ss.user_id,
+                "amount_cents": ss.amount_cents,
+                "payment_status": remote.get("payment_status"),
+            }
+            if not is_paid:
+                summary["unpaid_skipped"].append(entry)
+                continue
+            if dry_run:
+                summary["paid_would_credit"].append(entry)
+            else:
+                result = self.confirm_stripe_payment(ss.stripe_session_id)
+                entry["result"] = result
+                summary["paid_credited"].append(entry)
+        return summary
+
     # --- Crypto top-up ---
 
     def create_crypto_invoice(self, user_id: str, currency: str, amount_usd: float) -> dict:
