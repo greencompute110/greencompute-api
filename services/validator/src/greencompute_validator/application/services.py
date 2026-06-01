@@ -511,6 +511,17 @@ class ValidatorService:
         self._flux_states[key] = state
         return state
 
+    @staticmethod
+    def _is_cap_fresh(cap: NodeCapability, now_ts: datetime, timeout_seconds: float) -> bool:
+        """True if this node's mirrored inventory is recent enough to schedule
+        catalog replicas on. A missing or stale observed_at → treated as gone."""
+        obs = getattr(cap, "observed_at", None)
+        if obs is None:
+            return False
+        if obs.tzinfo is None:
+            obs = obs.replace(tzinfo=UTC)
+        return (now_ts - obs).total_seconds() <= timeout_seconds
+
     def _states_for_hotkey(self, hotkey: str) -> list[FluxState]:
         return [s for (h, _), s in self._flux_states.items() if h == hotkey]
 
@@ -581,8 +592,14 @@ class ValidatorService:
         Flux-managed deployment exists; terminate deployments for models no
         longer assigned. Miners pick up the new leases via sync_leases — no
         direct validator→miner HTTP needed."""
-        cap = self.repository.get_capability(hotkey)
-        if cap is None:
+        # Pin replicas to the node Flux actually assigned this model to
+        # (new_state.node_id). Using get_capability(hotkey) here pinned EVERY
+        # replica for a multi-node hotkey onto an arbitrary "first" node — and
+        # if a stale/renamed node_id sorted first, replicas were pinned to a
+        # ghost node that no live box runs (the lease only executed via the
+        # by-hotkey sync back-compat). new_state always carries the real node.
+        target_node_id = new_state.node_id
+        if not target_node_id:
             return
 
         # Detect deployments that failed/terminated since last reconcile and
@@ -635,7 +652,7 @@ class ValidatorService:
                 continue
             dep_id = self.repository.create_flux_deployment(
                 hotkey=hotkey,
-                node_id=cap.node_id,
+                node_id=target_node_id,
                 workload_id=workload_id,
             )
             self.bus.publish("flux.replica.provisioned", {
@@ -663,9 +680,31 @@ class ValidatorService:
         except Exception:
             logger.exception("failed to sync capabilities from control plane")
 
-        # Bootstrap: ensure every registered (hotkey, node_id) has a Flux
-        # state so rebalance iterates them. Noop for entries already present.
+        # Only consider nodes whose mirrored inventory is fresh. A node that
+        # stopped heartbeating (dead box, or an old node_id left behind after a
+        # rename) must not receive catalog replicas — Flux would pin them to a
+        # node no live box runs, draining the pool.
+        now_ts = datetime.now(UTC)
+        timeout = validator_settings.node_inventory_timeout_seconds
+        fresh_caps: dict[str, list[NodeCapability]] = {}
+        fresh_keys: set[tuple[str, str]] = set()
         for hotkey, nodes in self.repository.list_node_capabilities().items():
+            live = [c for c in nodes if self._is_cap_fresh(c, now_ts, timeout)]
+            if live:
+                fresh_caps[hotkey] = live
+            for c in live:
+                fresh_keys.add((hotkey, c.node_id))
+
+        # Drop Flux state for nodes that have gone stale (ghost cleanup) so the
+        # rebalance loop below stops allocating to them.
+        for key in list(self._flux_states):
+            if key not in fresh_keys:
+                logger.info("flux: dropping stale node %s from rebalance (inventory expired)", key)
+                del self._flux_states[key]
+
+        # Bootstrap: ensure every FRESH (hotkey, node_id) has a Flux state so
+        # rebalance iterates them. Noop for entries already present.
+        for hotkey, nodes in fresh_caps.items():
             for cap in nodes:
                 key = (hotkey, cap.node_id)
                 if key in self._flux_states:

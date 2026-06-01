@@ -52,6 +52,12 @@ class Settings(BaseModel):
     # for this long before Flux will actually drop a replica. Protects
     # against flapping when demand oscillates.
     flux_cooldown_seconds: float = Field(default=300.0, ge=0.0)
+    # A node whose mirrored inventory hasn't refreshed within this many seconds
+    # is treated as gone — Flux won't allocate catalog replicas to it. Guards
+    # against a dead/renamed node_id (e.g. an old "-alpha" id left in inventory)
+    # continuing to receive replicas that no live box runs. Generous default so
+    # brief heartbeat gaps on a live box don't drop it mid-rebalance.
+    node_inventory_timeout_seconds: float = Field(default=900.0, ge=1.0)
     # Phase 2F — inference attestation probes
     # Gateway URL for the canary chat completion. Empty disables the probe.
     gateway_url: str = ""
@@ -74,6 +80,7 @@ settings = Settings(
     metagraph_sync_interval_seconds=_float("GREENCOMPUTE_BITTENSOR_METAGRAPH_SYNC_INTERVAL", "BITTENSOR_METAGRAPH_SYNC_INTERVAL", 60.0),
     target_rpm_per_replica=_float("GREENCOMPUTE_FLUX_TARGET_RPM_PER_REPLICA", "FLUX_TARGET_RPM_PER_REPLICA", 30.0),
     flux_cooldown_seconds=_float("GREENCOMPUTE_FLUX_COOLDOWN_SECONDS", "FLUX_COOLDOWN_SECONDS", 300.0),
+    node_inventory_timeout_seconds=_float("GREENCOMPUTE_NODE_INVENTORY_TIMEOUT_SECONDS", "NODE_INVENTORY_TIMEOUT_SECONDS", 900.0),
     gateway_url=_env("GREENCOMPUTE_VALIDATOR_GATEWAY_URL", "VALIDATOR_GATEWAY_URL", "http://gateway:8000"),
     inference_canary_api_key=_env("GREENCOMPUTE_INFERENCE_CANARY_API_KEY", "INFERENCE_CANARY_API_KEY")
                               or _env("GREENCOMPUTE_ADMIN_API_KEY", "ADMIN_API_KEY", ""),
