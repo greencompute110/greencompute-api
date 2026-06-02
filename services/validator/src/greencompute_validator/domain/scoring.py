@@ -1,10 +1,26 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from math import sqrt
 from statistics import median
 
 from greencompute_protocol import FluxState, NodeCapability, ProbeResult, ScoreCard
 from greencompute_validator.config import settings
+
+# Fraud signature check only looks at the most recent N *signed* probes, so a
+# historical change in the signature scheme (e.g. the de-nonce rollout) ages
+# out within ~N fresh canary cycles instead of penalizing a miner forever from
+# thousands of legacy nonce-bearing signatures. MUST match the audit replay.
+_FRAUD_SIGNATURE_WINDOW = 10
+_MIN_DT = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _obs_sort_key(observed_at: datetime | None) -> datetime:
+    if observed_at is None:
+        return _MIN_DT
+    if observed_at.tzinfo is None:
+        return observed_at.replace(tzinfo=timezone.utc)
+    return observed_at
 
 
 class ScoreEngine:
@@ -85,8 +101,15 @@ class ScoreEngine:
             # zero the entire final_score. The no-data penalty is already
             # carried by reliability/performance (which halve when empty).
             return 1.0
-        signature_set = {result.benchmark_signature for result in results if result.benchmark_signature}
-        signature_penalty = 0.75 if len(signature_set) > 1 else 1.0
+        # Recency-windowed: only the most recent N signed probes count, so a
+        # legacy signature scheme (pre de-nonce) ages out instead of pinning
+        # the penalty at 0.75 forever (see _FRAUD_SIGNATURE_WINDOW).
+        signed = sorted(
+            (r for r in results if r.benchmark_signature),
+            key=lambda r: _obs_sort_key(r.observed_at),
+        )
+        recent_sigs = {r.benchmark_signature for r in signed[-_FRAUD_SIGNATURE_WINDOW:]}
+        signature_penalty = 0.75 if len(recent_sigs) > 1 else 1.0
         proxy_penalty = 0.4 if any(result.proxy_suspected for result in results) else 1.0
         consistency_penalty = self._consistency_penalty(results)
         readiness_penalty = max(0.2, 1.0 - (sum(result.readiness_failures for result in results) * 0.03))
