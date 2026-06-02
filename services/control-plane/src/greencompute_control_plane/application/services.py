@@ -222,7 +222,15 @@ class ControlPlaneService:
                 "scheduling deployment %s: %d eligible nodes out of %d total",
                 deployment_id, len(nodes), len(all_nodes),
             )
-        assignment = self.placement_policy.assign_lease(workload, deployment_id, nodes)
+        # ORCH-C2: derive effective availability from the reservation ledger so
+        # the miner heartbeat can't clobber the scheduler's committed holds. The
+        # reservation sum (per node) is subtracted from physical capacity inside
+        # the placement policy; the miner-reported available_gpus is only a
+        # ceiling. reserved_by_node is read once here and passed through.
+        reserved_by_node = self.repository.reserved_gpus_by_node()
+        assignment = self.placement_policy.assign_lease(
+            workload, deployment_id, nodes, reserved_by_node=reserved_by_node
+        )
         if assignment is None:
             logger.warning(
                 "scheduler returned no match for deployment %s among %d eligible nodes "
@@ -234,6 +242,18 @@ class ControlPlaneService:
                 workload.requirements.memory_gb,
             )
             return None
+        # ORCH-C2: the authoritative hold is a gpu_reservations row, NOT a
+        # mutation of CapacityORM.available_gpus (which the next heartbeat would
+        # overwrite). Record it at assign time; it is released on
+        # terminate/requeue/expire/suspend. We still keep adjust_node_capacity
+        # decrementing the reported value so the UI/heartbeat-merge stays roughly
+        # in sync, but the reservation is the floor the scheduler trusts.
+        self.repository.reserve_gpus(
+            deployment_id,
+            assignment.hotkey,
+            assignment.node_id,
+            workload.requirements.gpu_count,
+        )
         self.repository.adjust_node_capacity(
             assignment.hotkey,
             assignment.node_id,
@@ -243,7 +263,15 @@ class ControlPlaneService:
         return assignment
 
     def list_leases(self, hotkey: str) -> list[LeaseAssignment]:
-        return self.repository.list_assignments(hotkey, statuses=["assigned", "activating", "active"])
+        # ORCH-H3: 'suspended' leases are returned alongside the active ones so
+        # the node-agent's reconcile keeps the lease VISIBLE and does NOT treat
+        # it as a fleet-wide orphan to destroy (orphan teardown keys on lease
+        # ABSENCE). The lease stays present but flagged 'suspended', which the
+        # node-agent uses to docker-stop (not rm) the pod, preserving its
+        # filesystem/volume/SSH for a one-click resume.
+        return self.repository.list_assignments(
+            hotkey, statuses=["assigned", "activating", "active", "suspended"]
+        )
 
     def list_deployments(self) -> list[DeploymentRecord]:
         return self.repository.list_deployments()
@@ -312,14 +340,33 @@ class ControlPlaneService:
             DeploymentState.PULLING: "activating",
             DeploymentState.STARTING: "activating",
             DeploymentState.READY: "active",
+            # ORCH-H3: a SUSPENDED deployment flips its lease to the new
+            # 'suspended' value so the node-agent (which reads lease.status)
+            # docker-stops the pod. list_leases STILL returns 'suspended' leases
+            # so reconcile does NOT treat them as fleet-wide orphans and destroy
+            # the container — this is what makes suspend pod-safe + resumable.
+            DeploymentState.SUSPENDED: "suspended",
             DeploymentState.FAILED: "failed",
             DeploymentState.TERMINATED: "terminated",
         }.get(update.state)
         if assignment_status is not None:
             self.repository.update_assignment_status(update.deployment_id, assignment_status, reason=update.error)
+        # ORCH-C2 / ORCH-H3: a deployment that leaves the running pool releases
+        # its authoritative GPU hold so the freed GPUs become schedulable for
+        # paying workloads. SUSPENDED frees them (resume re-acquires); terminal
+        # states free them permanently. This is the ONLY place a suspend frees a
+        # reservation, and it fires strictly when the state-write happens — it
+        # never retroactively releases anything not transitioning here.
+        if update.state in {
+            DeploymentState.SUSPENDED,
+            DeploymentState.FAILED,
+            DeploymentState.TERMINATED,
+        }:
+            self.repository.release_gpu_reservation(update.deployment_id)
         saved = self.repository.update_deployment(deployment)
         subject = {
             DeploymentState.READY: "deployment.ready",
+            DeploymentState.SUSPENDED: "deployment.suspended",
             DeploymentState.FAILED: "deployment.failed",
             DeploymentState.TERMINATED: "deployment.terminated",
         }.get(update.state, "deployment.status.updated")
@@ -789,6 +836,103 @@ class ControlPlaneService:
         )
         return saved
 
+    def resume_deployment(self, deployment_id: str) -> DeploymentRecord:
+        """ORCH-H3: pod-safe resume of a SUSPENDED deployment — NO destroy &
+        recreate.
+
+        Re-acquires the GPU reservation on the SAME (hotkey, node) the
+        deployment was suspended from and flips its lease back to 'active'. The
+        node-agent, on its next reconcile, sees lease.status=='active' with a
+        locally-'suspended' runtime and `docker start`s the SAME container,
+        re-reporting STARTING then READY. The container filesystem / volume /
+        SSH keys are preserved.
+
+        The deployment row stays SUSPENDED until the miner reports READY (the
+        relaxed SUSPENDED→{PULLING,STARTING,READY} transitions cover the resume
+        reports). Metering only resumes once it's READY again.
+
+        Raises:
+          KeyError              — deployment not found.
+          ValueError            — deployment is not SUSPENDED, or its prior
+                                  placement is gone, or the node no longer has
+                                  capacity to re-acquire the hold (caller may
+                                  fall back to a fresh deploy rather than
+                                  oversubscribe).
+        """
+        deployment = self.repository.get_deployment(deployment_id)
+        if deployment is None:
+            raise KeyError(f"deployment not found: {deployment_id}")
+        if deployment.state != DeploymentState.SUSPENDED:
+            raise ValueError(
+                f"deployment {deployment_id} is not suspended "
+                f"(current state: {deployment.state.value})"
+            )
+        if not deployment.hotkey or not deployment.node_id:
+            raise ValueError(
+                f"deployment {deployment_id} has no recoverable placement to resume"
+            )
+
+        workload = self.repository.get_workload(deployment.workload_id)
+        if workload is None:
+            raise KeyError(f"workload not found: {deployment.workload_id}")
+        gpu_count = workload.requirements.gpu_count
+
+        # Re-acquire the GPU hold on the original node — but only if the node
+        # still has the effective headroom (so a resume can't oversubscribe a
+        # node that filled up while this deployment was suspended). The
+        # deployment's own (already-released) reservation is not counted, so a
+        # re-acquire of exactly what it held is always admissible on an
+        # otherwise-unchanged node.
+        node = self._find_node(deployment.node_id)
+        if node is None:
+            raise ValueError(
+                f"node {deployment.node_id} for deployment {deployment_id} is no longer "
+                "registered; cannot resume in place"
+            )
+        from greencompute_control_plane.domain.scheduler import effective_available_gpus
+
+        reserved_by_node = self.repository.reserved_gpus_by_node()
+        available = effective_available_gpus(node, reserved_by_node)
+        if available < gpu_count:
+            raise ValueError(
+                f"insufficient capacity to resume deployment {deployment_id} on node "
+                f"{deployment.node_id} (need {gpu_count}, effective available {available})"
+            )
+
+        self.repository.reserve_gpus(
+            deployment_id, deployment.hotkey, deployment.node_id, gpu_count
+        )
+        self.repository.adjust_node_capacity(
+            deployment.hotkey, deployment.node_id, -gpu_count
+        )
+        # Flip the lease back to 'active' so list_leases drives the node-agent to
+        # `docker start` the preserved container. The deployment row stays
+        # SUSPENDED until the miner re-reports READY.
+        self.repository.update_assignment_status(
+            deployment_id, "active", reason="resume requested"
+        )
+        deployment.last_error = None
+        deployment.failure_class = None
+        deployment.updated_at = datetime.now(UTC)
+        saved = self.repository.update_deployment(deployment)
+        self.bus.publish(
+            "deployment.resumed",
+            {
+                "deployment_id": saved.deployment_id,
+                "workload_id": saved.workload_id,
+                "hotkey": saved.hotkey,
+                "node_id": saved.node_id,
+            },
+        )
+        self.metrics.increment("deployment.resumed")
+        logger.info(
+            "Resuming deployment %s on node %s (re-acquired %d GPUs); lease back to active",
+            deployment_id,
+            deployment.node_id,
+            gpu_count,
+        )
+        return saved
+
     def fail_deployment(self, deployment_id: str) -> DeploymentRecord:
         deployment = self.repository.get_deployment(deployment_id)
         if deployment is None:
@@ -799,6 +943,7 @@ class ControlPlaneService:
         )
         if assignment is not None:
             workload = self.repository.get_workload(deployment.workload_id)
+            self.repository.release_gpu_reservation(deployment_id)
             if workload is not None:
                 self.repository.adjust_node_capacity(assignment.hotkey, assignment.node_id, workload.requirements.gpu_count)
             self.repository.update_assignment_status(deployment_id, "terminated", reason="operator forced failure")
@@ -832,6 +977,7 @@ class ControlPlaneService:
         )
         if active_assignment is not None:
             workload = self.repository.get_workload(deployment.workload_id)
+            self.repository.release_gpu_reservation(deployment_id)
             if workload is not None:
                 self.repository.adjust_node_capacity(
                     active_assignment.hotkey,
@@ -939,10 +1085,36 @@ class ControlPlaneService:
             if heartbeat is not None and heartbeat.healthy and heartbeat_observed_at is not None:
                 age_seconds = (observed_at - heartbeat_observed_at).total_seconds()
                 if age_seconds <= settings.miner_heartbeat_timeout_seconds:
-                    continue
-                reason = (
-                    f"miner heartbeat stale after {int(age_seconds)} seconds for hotkey={assignment.hotkey}"
-                )
+                    # ORCH-M4: the per-hotkey heartbeat is fresh+healthy, but for
+                    # a multi-box hotkey that signal can MASK a single dead box.
+                    # Each box stamps its own NodeInventoryORM.observed_at, so a
+                    # dead box's node goes stale even while a healthy sibling
+                    # keeps the hotkey heartbeat fresh. Consult THIS assignment's
+                    # node freshness: if its node inventory is missing or stale
+                    # beyond node_inventory_timeout_seconds, the box is genuinely
+                    # not reporting → requeue (which releases the reservation).
+                    # A node still heartbeating fresh is never requeued, so a
+                    # healthy in-flight pod is never disturbed. Keep
+                    # node_inventory_timeout_seconds >> capacity post interval to
+                    # avoid flapping on a single missed post.
+                    node = self._find_node(assignment.node_id)
+                    if node is None:
+                        reason = (
+                            f"node {assignment.node_id} inventory missing for "
+                            f"hotkey={assignment.hotkey} (per-node staleness)"
+                        )
+                    elif self._is_node_stale(node, now=observed_at):
+                        reason = (
+                            f"node {assignment.node_id} inventory stale beyond "
+                            f"{settings.node_inventory_timeout_seconds}s for "
+                            f"hotkey={assignment.hotkey} (per-node staleness)"
+                        )
+                    else:
+                        continue
+                else:
+                    reason = (
+                        f"miner heartbeat stale after {int(age_seconds)} seconds for hotkey={assignment.hotkey}"
+                    )
             elif heartbeat is not None and not heartbeat.healthy:
                 reason = f"miner marked unhealthy for hotkey={assignment.hotkey}"
             else:
@@ -1239,6 +1411,10 @@ class ControlPlaneService:
         workload = self.repository.get_workload(deployment.workload_id)
         if workload is None:
             return None
+        # ORCH-C2: release the scheduler's GPU hold so the freed GPUs become
+        # schedulable again. Reservation release is the authoritative free; the
+        # adjust_node_capacity increment just keeps the reported value in sync.
+        self.repository.release_gpu_reservation(assignment.deployment_id)
         self.repository.adjust_node_capacity(
             assignment.hotkey,
             assignment.node_id,

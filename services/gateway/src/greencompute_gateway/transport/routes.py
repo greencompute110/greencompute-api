@@ -1841,8 +1841,12 @@ def billing_topup_crypto(
 
 @router.post("/platform/billing/webhook/stripe")
 async def billing_stripe_webhook(request: Request) -> dict:
-    """Stripe webhook — called by Stripe when a checkout session completes."""
-    from greencompute_gateway.infrastructure.stripe_client import verify_webhook_signature
+    """Stripe webhook — called by Stripe when a checkout session completes,
+    or when a charge is refunded / disputed (BILL-M1 Part B)."""
+    from greencompute_gateway.infrastructure.stripe_client import (
+        _payment_intent_id,
+        verify_webhook_signature,
+    )
     payload = await request.body()
     sig = request.headers.get("stripe-signature", "")
     try:
@@ -1853,6 +1857,9 @@ async def billing_stripe_webhook(request: Request) -> dict:
     if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
         session_data = event["data"]["object"]
         stripe_session_id = session_data["id"]
+        # The completed session carries its PaymentIntent id — record it so a
+        # later refund/dispute can map back to this top-up (BILL-M1 Part B).
+        payment_intent_id = _payment_intent_id(session_data.get("payment_intent"))
         # Gate the credit on a PAID session. `checkout.session.completed` can
         # fire with payment_status in {'unpaid','no_payment_required'} for
         # async/delayed payment methods — crediting then books money we never
@@ -1866,14 +1873,70 @@ async def billing_stripe_webhook(request: Request) -> dict:
         # OR-ing it in would credit money we never captured. A delayed payment
         # arrives later as checkout.session.async_payment_succeeded (paid).
         if payment_status == "paid":
-            _get_billing().confirm_stripe_payment(stripe_session_id)
+            _get_billing().confirm_stripe_payment(
+                stripe_session_id, payment_intent_id=payment_intent_id
+            )
         else:
             log.info(
                 "Stripe %s for session %s not credited (payment_status=%r) — "
                 "awaiting capture / reconcile",
                 event_type, stripe_session_id, payment_status,
             )
+    elif event_type in ("charge.refunded", "charge.dispute.created"):
+        # BILL-M1 Part B: reverse a prior top-up on a verified (signature-
+        # checked above) refund or dispute. The event's `object` is a Charge
+        # (refund) or a Dispute (chargeback); both carry the `payment_intent`,
+        # which is our join key back to the originating checkout session — the
+        # event does NOT carry our checkout session id. We resolve via the
+        # session's recorded payment_intent_id and idempotently debit by the
+        # amount actually refunded/disputed, keyed on the Stripe event id so a
+        # re-delivered event reverses at most once. If the session can't be
+        # resolved (historical session with NULL payment_intent_id), we log +
+        # skip for manual reconcile rather than guess.
+        obj = event["data"]["object"]
+        event_id = event.get("id") or ""
+        payment_intent_id = _payment_intent_id(obj.get("payment_intent"))
+        if event_type == "charge.refunded":
+            # A charge can be partially refunded across several events; reverse
+            # the incremental amount of THIS refund. Prefer the most recent
+            # refund's amount; fall back to amount_refunded.
+            amount_cents = _latest_refund_amount_cents(obj)
+        else:  # charge.dispute.created — the Dispute object carries `amount`
+            amount_cents = int(obj.get("amount") or 0)
+        try:
+            _get_billing().reverse_stripe_topup_for_event(
+                event_id=event_id,
+                payment_intent_id=payment_intent_id,
+                amount_cents=amount_cents,
+                reason=("refund" if event_type == "charge.refunded" else "dispute"),
+            )
+        except Exception:
+            # Never 200-swallow a genuine processing failure silently into a
+            # lost reversal: log loudly and let Stripe retry (we re-raise as a
+            # 500 so the event is redelivered; the reversal is idempotent).
+            log.exception(
+                "Stripe %s reversal failed for event %s", event_type, event_id
+            )
+            raise HTTPException(status_code=500, detail="reversal processing failed")
     return {"received": True}
+
+
+def _latest_refund_amount_cents(charge: dict) -> int:
+    """Best-effort amount (in cents) for the most recent refund on a Charge.
+
+    `charge.refunded` fires once per refund. Stripe includes a `refunds` list
+    (data ordered newest-first) whose latest entry is this refund's amount; if
+    that's unavailable we fall back to the charge's cumulative
+    `amount_refunded`. Both are integer minor units (cents) already.
+    """
+    refunds = charge.get("refunds")
+    if isinstance(refunds, dict):
+        data = refunds.get("data")
+        if isinstance(data, list) and data:
+            amt = data[0].get("amount")
+            if amt is not None:
+                return int(amt)
+    return int(charge.get("amount_refunded") or 0)
 
 
 @router.post("/platform/billing/crypto/{invoice_id}/report-tx")

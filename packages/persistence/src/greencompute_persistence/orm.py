@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, JSON, Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import BigInteger, JSON, Boolean, DateTime, Float, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -168,6 +168,38 @@ class LeaseAssignmentORM(Base):
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="assigned")
+
+
+class GpuReservationORM(Base):
+    """Authoritative GPU-reservation ledger (ORCH-C2).
+
+    A reservation is the scheduler's own record that a deployment holds a
+    block of GPUs on a (hotkey, node). It is a SEPARATE source of truth from
+    the miner-reported `CapacityORM.available_gpus`, so a stale/clobbering
+    heartbeat can never silently free GPUs that the control-plane has
+    committed. Effective availability is derived on read as the stricter of
+    (physically-reported, total − sum(active reservations)).
+
+    One active reservation per deployment (UNIQUE deployment_id). Releasing a
+    reservation sets `status='released'` and stamps `released_at` rather than
+    deleting the row, preserving an audit trail. Nothing here touches leases,
+    deployment state, balances, or node-agent reconcile.
+    """
+
+    __tablename__ = "gpu_reservations"
+
+    reservation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    deployment_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    gpu_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_gpu_reservations_hotkey_node_status", "hotkey", "node_id", "status"),
+    )
 
 
 class PlacementORM(Base):
@@ -696,6 +728,12 @@ class StripeSessionORM(Base):
     amount_usd: Mapped[float] = mapped_column(Float)
     amount_cents: Mapped[int] = mapped_column(BigInteger)
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    # Stripe PaymentIntent id (e.g. "pi_…") for this checkout session, used to
+    # join refund/dispute webhook events (which carry payment_intent / charge,
+    # not the checkout session id) back to the originating top-up (BILL-M1
+    # Part B). Nullable + non-unique: historical sessions predate this column
+    # and stay NULL; only new checkouts populate it going forward.
+    payment_intent_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

@@ -94,4 +94,24 @@ def retrieve_checkout_session(stripe_session_id: str) -> dict:
         "status": getattr(s, "status", None),            # "complete" when finished
         "payment_status": getattr(s, "payment_status", None),  # "paid" when captured
         "amount_total": getattr(s, "amount_total", None),
+        # PaymentIntent id ("pi_..."), the join key for refund/dispute webhooks
+        # back to this top-up. NULL until the customer pays. (BILL-M1 Part B)
+        "payment_intent": _payment_intent_id(getattr(s, "payment_intent", None)),
     }
+
+
+def _payment_intent_id(pi) -> str | None:
+    """Normalize a Stripe `payment_intent` reference to its string id.
+
+    Depending on the API call / expansion, `payment_intent` may be a bare id
+    string, a dict, or a StripeObject. We only ever want the id string.
+    """
+    if pi is None:
+        return None
+    if isinstance(pi, str):
+        return pi or None
+    if isinstance(pi, dict):
+        val = pi.get("id")
+        return val or None
+    val = getattr(pi, "id", None)
+    return val or None

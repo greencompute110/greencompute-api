@@ -104,7 +104,11 @@ class BillingService:
             "amount_cents": amount_cents,
         }
 
-    def confirm_stripe_payment(self, stripe_session_id: str) -> dict | None:
+    def confirm_stripe_payment(
+        self,
+        stripe_session_id: str,
+        payment_intent_id: str | None = None,
+    ) -> dict | None:
         """Idempotent + atomic: credit the user for a completed Stripe session.
 
         Delegates the status-flip + credit to the single-transaction
@@ -112,12 +116,32 @@ class BillingService:
         deposit_ref idempotency), so concurrent webhook deliveries / a webhook
         racing the reconcile job credit exactly once. We only fire the ops
         notification on a FRESH credit so retries/races don't re-notify.
+
+        ``payment_intent_id`` (BILL-M1 Part B): the completed Stripe session
+        carries its PaymentIntent id ("pi_..."), which we record on the session
+        row so a later `charge.refunded` / `charge.dispute.created` webhook can
+        map back to this top-up. It doesn't exist at session-create time, so the
+        completion path (webhook / reconcile) is where we learn it. Recorded
+        even on a re-delivery (the repo write is idempotent on NULL) so an old
+        session that completed before this column existed still gets stamped.
         """
         # Look up first so a non-existent session returns None (the webhook /
         # reconcile callers distinguish "unknown session" from "credited").
         existing = self.repo.get_stripe_session_by_stripe_id(stripe_session_id)
         if existing is None:
             return None
+
+        # Record the payment_intent join key BEFORE crediting so a refund that
+        # races in immediately can still resolve the session. Idempotent: the
+        # repo only writes when the column is currently NULL/blank.
+        if payment_intent_id:
+            try:
+                self.repo.set_stripe_payment_intent(stripe_session_id, payment_intent_id)
+            except Exception:
+                log.exception(
+                    "failed to record payment_intent for stripe session %s",
+                    stripe_session_id,
+                )
 
         result = self.repo.complete_and_credit_stripe_session(stripe_session_id)
         if result is None:
@@ -187,10 +211,81 @@ class BillingService:
             if dry_run:
                 summary["paid_would_credit"].append(entry)
             else:
-                result = self.confirm_stripe_payment(ss.stripe_session_id)
+                # Pass the remote payment_intent so the reconcile path also
+                # backfills the refund/dispute join key on the session row.
+                result = self.confirm_stripe_payment(
+                    ss.stripe_session_id,
+                    payment_intent_id=remote.get("payment_intent"),
+                )
                 entry["result"] = result
                 summary["paid_credited"].append(entry)
         return summary
+
+    def reverse_stripe_topup_for_event(
+        self,
+        *,
+        event_id: str,
+        payment_intent_id: str | None,
+        amount_cents: int,
+        reason: str,
+    ) -> dict | None:
+        """Reverse a Stripe top-up in response to a `charge.refunded` /
+        `charge.dispute.created` webhook. (BILL-M1 Part B)
+
+        Resolves the originating top-up via the session's recorded
+        ``payment_intent_id`` (the refund/dispute event carries the
+        payment_intent, NOT our checkout session id). If the session can't be
+        resolved — e.g. a HISTORICAL session whose payment_intent_id is NULL
+        because it predates the column — we log + SKIP (return None) for manual
+        reconcile rather than guessing which user to debit.
+
+        On a resolved match, books an idempotent debit via
+        ``reverse_stripe_topup`` keyed on ``deposit_ref='stripe-refund:{event_id}'``
+        so a re-delivered event reverses at most once. The balance MAY go
+        negative (admin claw-back semantics, BILL-M1-A).
+        """
+        pi = (payment_intent_id or "").strip()
+        if not pi:
+            log.warning(
+                "Stripe %s event %s has no payment_intent — skipping (manual reconcile)",
+                reason, event_id,
+            )
+            return None
+        session = self.repo.get_stripe_session_by_payment_intent(pi)
+        if session is None:
+            log.warning(
+                "Stripe %s event %s: payment_intent %s does not map to any known "
+                "top-up session (historical NULL payment_intent_id?) — skipping "
+                "for manual reconcile",
+                reason, event_id, pi,
+            )
+            return None
+        amount_cents = int(amount_cents)
+        if amount_cents <= 0:
+            log.warning(
+                "Stripe %s event %s for session %s: non-positive amount %d — skipping",
+                reason, event_id, session.session_id, amount_cents,
+            )
+            return None
+        result = self.repo.reverse_stripe_topup(
+            user_id=session.user_id,
+            amount_cents=amount_cents,
+            event_id=event_id,
+            reference_id=session.session_id,
+            description=f"Stripe {reason} reversal (${amount_cents / 100:.2f})",
+            kind="chargeback",
+        )
+        if result.get("reversed"):
+            log.info(
+                "Stripe %s reversed: user=%s session=%s amount=%d event=%s",
+                reason, session.user_id, session.session_id, amount_cents, event_id,
+            )
+        else:
+            log.info(
+                "Stripe %s event %s already reversed (idempotent no-op)",
+                reason, event_id,
+            )
+        return result
 
     # --- Crypto top-up ---
 

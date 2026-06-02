@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
@@ -14,6 +15,7 @@ from greencompute_persistence.orm import (
     CapacityORM,
     DeploymentEventORM,
     DeploymentORM,
+    GpuReservationORM,
     HeartbeatORM,
     InvocationRecordORM,
     LeaseAssignmentORM,
@@ -220,6 +222,112 @@ class ControlPlaneRepository:
                 node.available_gpus += delta_gpus
                 break
         return self.upsert_capacity(update)
+
+    # --- GPU reservations (ORCH-C2) ---
+    #
+    # The scheduler's authoritative hold on a block of GPUs. SEPARATE from the
+    # miner-reported CapacityORM.available_gpus so a stale/clobbering heartbeat
+    # can never erase the decrement. Effective availability is derived on read.
+
+    def reserve_gpus(self, deployment_id: str, hotkey: str, node_id: str, gpu_count: int) -> bool:
+        """Record an active GPU reservation for a deployment (idempotent).
+
+        One active reservation per deployment (UNIQUE deployment_id). If a row
+        already exists for this deployment it is re-activated and re-sized in
+        place (covers a resume re-acquiring its hold). Returns True if a hold is
+        now active for the deployment. Never raises on a benign race — a
+        concurrent insert that loses the UNIQUE race is treated as success.
+        """
+        try:
+            with session_scope(self.session_factory) as session:
+                row = session.scalar(
+                    select(GpuReservationORM).where(GpuReservationORM.deployment_id == deployment_id)
+                )
+                if row is None:
+                    row = GpuReservationORM(
+                        reservation_id=f"resv:{deployment_id}",
+                        deployment_id=deployment_id,
+                    )
+                row.hotkey = hotkey
+                row.node_id = node_id
+                row.gpu_count = int(gpu_count)
+                row.status = "active"
+                row.released_at = None
+                if row.created_at is None:
+                    row.created_at = datetime.now(UTC)
+                session.add(row)
+        except IntegrityError:
+            # A concurrent caller inserted the same deployment_id row first —
+            # the hold exists either way, so this is success, not an error.
+            return True
+        return True
+
+    def release_gpu_reservation(self, deployment_id: str) -> bool:
+        """Mark a deployment's active reservation released (idempotent).
+
+        Sets status='released' + released_at rather than deleting the row, so
+        the ledger keeps an audit trail. Returns True if a row was flipped
+        (False if there was no active reservation to release).
+        """
+        with session_scope(self.session_factory) as session:
+            row = session.scalar(
+                select(GpuReservationORM).where(
+                    GpuReservationORM.deployment_id == deployment_id,
+                    GpuReservationORM.status == "active",
+                )
+            )
+            if row is None:
+                return False
+            row.status = "released"
+            row.released_at = datetime.now(UTC)
+            session.add(row)
+            return True
+
+    def get_active_reservation(self, deployment_id: str) -> dict[str, Any] | None:
+        with session_scope(self.session_factory) as session:
+            row = session.scalar(
+                select(GpuReservationORM).where(
+                    GpuReservationORM.deployment_id == deployment_id,
+                    GpuReservationORM.status == "active",
+                )
+            )
+            if row is None:
+                return None
+            return {
+                "deployment_id": row.deployment_id,
+                "hotkey": row.hotkey,
+                "node_id": row.node_id,
+                "gpu_count": row.gpu_count,
+                "status": row.status,
+            }
+
+    def reserved_gpus_by_node(self) -> dict[str, int]:
+        """Sum of active reservation gpu_count grouped by node_id.
+
+        This is the floor the scheduler trusts: the miner heartbeat may update
+        reported availability, but committed reservations are reconstructed on
+        every read from this table and subtracted from physical capacity.
+        """
+        with session_scope(self.session_factory) as session:
+            rows = session.execute(
+                select(
+                    GpuReservationORM.node_id,
+                    func.coalesce(func.sum(GpuReservationORM.gpu_count), 0),
+                )
+                .where(GpuReservationORM.status == "active")
+                .group_by(GpuReservationORM.node_id)
+            ).all()
+            return {node_id: int(total or 0) for node_id, total in rows}
+
+    def reserved_gpus_for_node(self, node_id: str) -> int:
+        with session_scope(self.session_factory) as session:
+            total = session.scalar(
+                select(func.coalesce(func.sum(GpuReservationORM.gpu_count), 0)).where(
+                    GpuReservationORM.status == "active",
+                    GpuReservationORM.node_id == node_id,
+                )
+            )
+            return int(total or 0)
 
     def upsert_workload(self, workload: WorkloadSpec) -> WorkloadSpec:
         with session_scope(self.session_factory) as session:

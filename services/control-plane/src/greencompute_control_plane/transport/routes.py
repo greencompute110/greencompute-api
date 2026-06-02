@@ -682,6 +682,25 @@ def cleanup_deployment(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/platform/v1/debug/deployments/{deployment_id}/resume")
+def resume_deployment(
+    deployment_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """ORCH-H3: pod-safe resume — flips a SUSPENDED deployment's lease back to
+    'active' and re-acquires its GPU reservation so the node-agent `docker
+    start`s the SAME container (no destroy-and-recreate). 409 if the deployment
+    isn't suspended or its node lacks capacity to re-acquire the hold."""
+    require_admin_api_key(authorization, x_api_key)
+    try:
+        return service.resume_deployment(deployment_id).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.post("/platform/v1/debug/miners/{hotkey}/drain")
 def drain_miner(
     hotkey: str,

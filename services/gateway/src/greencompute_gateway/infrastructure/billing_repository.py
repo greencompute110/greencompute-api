@@ -542,6 +542,10 @@ class BillingRepository:
                 session_id=ss.session_id,
                 user_id=ss.user_id,
                 stripe_session_id=ss.stripe_session_id,
+                # Usually NULL at create time (Stripe assigns the PaymentIntent
+                # after the customer pays); populated from the session's
+                # payment_intent when the checkout completes. (BILL-M1 Part B)
+                payment_intent_id=ss.payment_intent_id,
                 amount_usd=ss.amount_usd,
                 amount_cents=ss.amount_cents,
                 status=ss.status,
@@ -549,6 +553,55 @@ class BillingRepository:
             )
             session.add(row)
         return ss
+
+    def set_stripe_payment_intent(
+        self, stripe_session_id: str, payment_intent_id: str
+    ) -> None:
+        """Record the Stripe PaymentIntent id on a checkout session.
+
+        Called when the checkout completes and we learn the payment_intent (it
+        doesn't exist at session-create time). This is the join key that lets a
+        later `charge.refunded` / `charge.dispute.created` webhook (which carry
+        the payment_intent, NOT the checkout session id) map back to the
+        originating top-up. Idempotent: only writes when currently NULL/blank so
+        a re-delivered completion event can't clobber an existing value with a
+        mismatched one. (BILL-M1 Part B)
+        """
+        pi = (payment_intent_id or "").strip()
+        if not pi:
+            return
+        with session_scope(self.session_factory) as session:
+            row = session.scalar(
+                select(StripeSessionORM)
+                .where(StripeSessionORM.stripe_session_id == stripe_session_id)
+                .with_for_update()
+            )
+            if row is None:
+                return
+            if not row.payment_intent_id:
+                row.payment_intent_id = pi
+                session.add(row)
+
+    def get_stripe_session_by_payment_intent(
+        self, payment_intent_id: str
+    ) -> StripeSession | None:
+        """Resolve the originating top-up session from a Stripe payment_intent.
+
+        Used by the refund/dispute webhook to map a reversal back to the credit.
+        Returns None when no session carries this payment_intent (historical
+        sessions predate the column and stay NULL) — the caller then logs +
+        skips for manual reconcile rather than guessing. (BILL-M1 Part B)
+        """
+        pi = (payment_intent_id or "").strip()
+        if not pi:
+            return None
+        with session_scope(self.session_factory) as session:
+            row = session.scalar(
+                select(StripeSessionORM)
+                .where(StripeSessionORM.payment_intent_id == pi)
+                .order_by(StripeSessionORM.created_at.asc())
+            )
+            return self._to_stripe_session(row) if row else None
 
     def get_stripe_session_by_stripe_id(self, stripe_session_id: str) -> StripeSession | None:
         with session_scope(self.session_factory) as session:
@@ -657,6 +710,95 @@ class BillingRepository:
                 "amount_cents": ss.amount_cents,
             }
 
+    def reverse_stripe_topup(
+        self,
+        *,
+        user_id: str,
+        amount_cents: int,
+        event_id: str,
+        reference_id: str | None = None,
+        description: str = "",
+        kind: str = "chargeback",
+    ) -> dict:
+        """Idempotently DEBIT a user for a Stripe refund or dispute, reversing a
+        prior top-up. (BILL-M1 Part B)
+
+        Books a single ledger row of ``kind`` (default ``'chargeback'``) for
+        ``amount_cents`` against ``user_id``, in ONE SELECT..FOR UPDATE
+        transaction, using ``deposit_ref = 'stripe-refund:{event_id}'`` as the
+        idempotency key. Because Stripe retries the SAME ``event_id`` on a
+        redelivery, the existing UNIQUE ``uq_ledger_deposit_ref`` guard ensures
+        a given refund/dispute event reverses AT MOST ONCE, ever.
+
+        ``allow_negative`` semantics (BILL-M1-A): a refund/chargeback is an
+        admin-style claw-back of money the user may have already SPENT, so the
+        balance MAY go negative to represent the debt — this method NEVER raises
+        InsufficientBalanceError.
+
+        Returns:
+          - ``{"reversed": True, "user_id", "amount_cents", "deposit_ref"}`` on
+            a fresh reversal,
+          - ``{"already_reversed": True, "deposit_ref", "duplicate": True}`` if
+            this exact event was already booked (UNIQUE deposit_ref collision —
+            re-delivered webhook),
+
+        Does NOT swallow a missing user (KeyError) — let it propagate so a
+        genuinely-broken event 500s and Stripe retries.
+        """
+        amount_cents = int(amount_cents)
+        deposit_ref = f"stripe-refund:{event_id}"
+        with session_scope(self.session_factory) as session:
+            # Fast-path idempotency check inside the txn. The UNIQUE index is the
+            # authoritative guard (covers a concurrent racer at flush), but a
+            # pre-check avoids needlessly locking the user row on a redelivery.
+            existing = session.scalar(
+                select(LedgerEntryORM.entry_id).where(
+                    LedgerEntryORM.deposit_ref == deposit_ref
+                )
+            )
+            if existing is not None:
+                return {
+                    "already_reversed": True,
+                    "deposit_ref": deposit_ref,
+                    "duplicate": True,
+                }
+            user = session.get(UserORM, user_id, with_for_update=True)
+            if user is None:
+                raise KeyError(f"user {user_id} not found for stripe reversal {event_id}")
+            # Admin claw-back semantics: allow the balance to go negative.
+            user.balance_credits -= amount_cents
+            session.add(
+                LedgerEntryORM(
+                    entry_id=str(uuid4()),
+                    user_id=user_id,
+                    amount_cents=-amount_cents,
+                    balance_after=user.balance_credits,
+                    kind=kind,
+                    reference_id=reference_id,
+                    deposit_ref=deposit_ref,
+                    description=description,
+                    created_at=datetime.now(UTC),
+                )
+            )
+            # Force the INSERT so a UNIQUE(deposit_ref) collision from a
+            # concurrent redelivery surfaces here, inside our try, and reverses
+            # the balance change we just applied.
+            try:
+                session.flush()
+            except IntegrityError:
+                session.rollback()
+                return {
+                    "already_reversed": True,
+                    "deposit_ref": deposit_ref,
+                    "duplicate": True,
+                }
+            return {
+                "reversed": True,
+                "user_id": user_id,
+                "amount_cents": amount_cents,
+                "deposit_ref": deposit_ref,
+            }
+
     # --- Mappers ---
 
     @staticmethod
@@ -696,6 +838,7 @@ class BillingRepository:
             session_id=row.session_id,
             user_id=row.user_id,
             stripe_session_id=row.stripe_session_id,
+            payment_intent_id=row.payment_intent_id,
             amount_usd=row.amount_usd,
             amount_cents=row.amount_cents,
             status=row.status,

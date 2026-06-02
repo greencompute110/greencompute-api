@@ -14,17 +14,40 @@ class RankedNode:
     score: float
 
 
+def effective_available_gpus(node: NodeCapability, reserved_by_node: dict[str, int] | None) -> int:
+    """ORCH-C2: GPUs the scheduler may actually hand out on a node.
+
+    The miner-reported `available_gpus` is treated only as a PHYSICAL ceiling.
+    The authoritative floor is `gpu_count − sum(active reservations)` so a stale
+    or clobbering capacity heartbeat can never resurrect GPUs the control-plane
+    has already committed. We take the stricter (min) of the two views so the
+    scheduler is always conservative and never double-spends a physical GPU,
+    regardless of heartbeat timing. Reservation accounting starts at assign and
+    is reconstructed on every read; it is never erased by a heartbeat.
+    """
+    reserved = (reserved_by_node or {}).get(node.node_id, 0)
+    capacity_floor = node.gpu_count - reserved
+    return min(node.available_gpus, capacity_floor)
+
+
 class PlacementPolicy:
-    def rank_nodes(self, workload: WorkloadSpec, nodes: list[NodeCapability]) -> list[RankedNode]:
+    def rank_nodes(
+        self,
+        workload: WorkloadSpec,
+        nodes: list[NodeCapability],
+        reserved_by_node: dict[str, int] | None = None,
+    ) -> list[RankedNode]:
         candidates: list[RankedNode] = []
         for node in nodes:
             if workload.kind.value not in node.labels.get("workload_kinds", workload.kind.value):
                 logger.debug("node %s: skip workload_kinds mismatch (need %s, has %s)",
                              node.node_id, workload.kind.value, node.labels.get("workload_kinds"))
                 continue
-            if node.available_gpus < workload.requirements.gpu_count:
-                logger.debug("node %s: skip gpu_count (need %d, has %d)",
-                             node.node_id, workload.requirements.gpu_count, node.available_gpus)
+            available = effective_available_gpus(node, reserved_by_node)
+            if available < workload.requirements.gpu_count:
+                logger.debug("node %s: skip gpu_count (need %d, effective %d, reported %d, reserved %d)",
+                             node.node_id, workload.requirements.gpu_count, available,
+                             node.available_gpus, (reserved_by_node or {}).get(node.node_id, 0))
                 continue
             if node.vram_gb_per_gpu < workload.requirements.min_vram_gb_per_gpu:
                 logger.debug("node %s: skip vram (need %d, has %d)",
@@ -55,8 +78,14 @@ class PlacementPolicy:
             candidates.append(RankedNode(node=node, score=score))
         return sorted(candidates, key=lambda item: item.score, reverse=True)
 
-    def assign_lease(self, workload: WorkloadSpec, deployment_id: str, nodes: list[NodeCapability]) -> LeaseAssignment | None:
-        ranked = self.rank_nodes(workload, nodes)
+    def assign_lease(
+        self,
+        workload: WorkloadSpec,
+        deployment_id: str,
+        nodes: list[NodeCapability],
+        reserved_by_node: dict[str, int] | None = None,
+    ) -> LeaseAssignment | None:
+        ranked = self.rank_nodes(workload, nodes, reserved_by_node=reserved_by_node)
         if not ranked:
             return None
         selected = ranked[0].node
