@@ -105,35 +105,44 @@ class BillingService:
         }
 
     def confirm_stripe_payment(self, stripe_session_id: str) -> dict | None:
-        """Idempotent: credit the user for a completed Stripe session."""
+        """Idempotent + atomic: credit the user for a completed Stripe session.
+
+        Delegates the status-flip + credit to the single-transaction
+        `complete_and_credit_stripe_session` (SELECT..FOR UPDATE + UNIQUE
+        deposit_ref idempotency), so concurrent webhook deliveries / a webhook
+        racing the reconcile job credit exactly once. We only fire the ops
+        notification on a FRESH credit so retries/races don't re-notify.
+        """
+        # Look up first so a non-existent session returns None (the webhook /
+        # reconcile callers distinguish "unknown session" from "credited").
         existing = self.repo.get_stripe_session_by_stripe_id(stripe_session_id)
         if existing is None:
             return None
-        if existing.status == "paid":
-            return {"already_credited": True, "session_id": existing.session_id}
-        ss = self.repo.complete_stripe_session(stripe_session_id)
-        if ss is None:
-            return None
-        self.repo.credit_user(
-            user_id=ss.user_id,
-            amount_cents=ss.amount_cents,
-            kind="topup",
-            reference_id=ss.session_id,
-            description=f"Stripe payment ${ss.amount_usd:.2f}",
-        )
-        log.info("Stripe payment credited: user=%s amount=%d", ss.user_id, ss.amount_cents)
-        try:
-            from greencompute_gateway.infrastructure.notifications import notify_big_topup
 
-            notify_big_topup(
-                user_id=ss.user_id,
-                amount_usd=ss.amount_usd,
-                source="stripe",
-                reference=ss.session_id,
+        result = self.repo.complete_and_credit_stripe_session(stripe_session_id)
+        if result is None:
+            return None
+        if result.get("credited"):
+            amount_cents = int(result.get("amount_cents") or 0)
+            log.info(
+                "Stripe payment credited: user=%s amount=%d",
+                existing.user_id,
+                amount_cents,
             )
-        except Exception:
-            log.exception("ops notification (stripe) failed for session %s", ss.session_id)
-        return {"credited": True, "session_id": ss.session_id, "amount_cents": ss.amount_cents}
+            try:
+                from greencompute_gateway.infrastructure.notifications import notify_big_topup
+
+                notify_big_topup(
+                    user_id=existing.user_id,
+                    amount_usd=existing.amount_usd,
+                    source="stripe",
+                    reference=existing.session_id,
+                )
+            except Exception:
+                log.exception(
+                    "ops notification (stripe) failed for session %s", existing.session_id
+                )
+        return result
 
     def reconcile_pending_stripe_sessions(self, *, dry_run: bool = True) -> dict:
         """Recover top-ups that should have been credited by the webhook but

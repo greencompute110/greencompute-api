@@ -73,12 +73,24 @@ class BillingRepository:
         kind: str,
         reference_id: str | None = None,
         description: str = "",
+        allow_negative: bool = False,
     ) -> LedgerEntry:
+        """Debit `amount_cents` from a user's balance in one SELECT..FOR UPDATE
+        transaction.
+
+        By default this is STRICT: if the balance can't cover the debit it
+        raises InsufficientBalanceError and debits nothing — usage/inference
+        debits must never silently overdraw. Set ``allow_negative=True`` ONLY
+        for trusted admin claw-back/debit, where pushing the balance negative
+        is the intended behavior (e.g. clawing back funds the user already
+        spent). balance_credits is a signed BigInteger so negatives are
+        representable.
+        """
         with session_scope(self.session_factory) as session:
             row = session.get(UserORM, user_id, with_for_update=True)
             if row is None:
                 raise KeyError(f"user {user_id} not found")
-            if row.balance_credits < amount_cents:
+            if not allow_negative and row.balance_credits < amount_cents:
                 raise InsufficientBalanceError(
                     f"balance {row.balance_credits} < requested {amount_cents}"
                 )
@@ -95,6 +107,54 @@ class BillingRepository:
             )
             session.add(entry)
             return self._to_ledger_entry(entry)
+
+    def debit_user_to_floor(
+        self,
+        user_id: str,
+        amount_cents: int,
+        kind: str = "usage",
+        reference_id: str | None = None,
+        description: str = "",
+    ) -> dict:
+        """Debit up to `amount_cents`, draining the balance toward zero but
+        never below it, in ONE SELECT..FOR UPDATE transaction.
+
+        Unlike ``debit_user`` this NEVER raises InsufficientBalanceError and
+        NEVER drives the balance negative — it takes ``min(amount_cents,
+        max(0, balance))`` and writes a single ledger row for exactly the
+        amount taken (no row when nothing is taken). This closes the
+        "all-or-nothing debit gives free compute when the user can't cover the
+        full amount" hole on the metering/inference paths.
+
+        Returns a dict ``{"debited_cents": int, "shortfall_cents": int}`` where
+        ``shortfall_cents = amount_cents - debited_cents`` (>= 0). The caller
+        decides what to do with the shortfall (carry it back, increment a
+        metric, etc.).
+        """
+        amount_cents = max(0, int(amount_cents))
+        with session_scope(self.session_factory) as session:
+            row = session.get(UserORM, user_id, with_for_update=True)
+            if row is None:
+                raise KeyError(f"user {user_id} not found")
+            available = max(0, row.balance_credits)
+            take = min(amount_cents, available)
+            if take > 0:
+                row.balance_credits -= take
+                entry = LedgerEntryORM(
+                    entry_id=str(uuid4()),
+                    user_id=user_id,
+                    amount_cents=-take,
+                    balance_after=row.balance_credits,
+                    kind=kind,
+                    reference_id=reference_id,
+                    description=description,
+                    created_at=datetime.now(UTC),
+                )
+                session.add(entry)
+            return {
+                "debited_cents": int(take),
+                "shortfall_cents": int(amount_cents - take),
+            }
 
     def list_ledger(self, user_id: str, limit: int = 50, offset: int = 0) -> list[LedgerEntry]:
         with session_scope(self.session_factory) as session:
@@ -520,6 +580,82 @@ class BillingRepository:
             row.completed_at = datetime.now(UTC)
             session.add(row)
             return self._to_stripe_session(row)
+
+    def complete_and_credit_stripe_session(self, stripe_session_id: str) -> dict | None:
+        """Atomically flip a Stripe session to `paid` AND credit the owning
+        user, in a SINGLE SELECT..FOR UPDATE transaction.
+
+        This replaces the old non-atomic read-modify-write that spread the
+        status check, the status flip, and the credit across three separate
+        sessions — two concurrent webhook deliveries (Stripe retry, or a
+        webhook racing the reconcile job) could BOTH pass the status check
+        before either committed and double-credit.
+
+        Two layers of idempotency:
+          1. The row lock + in-lock status re-check: a concurrent caller blocks
+             on the FOR UPDATE and then sees status=='paid'.
+          2. A UNIQUE `deposit_ref='stripe:{stripe_session_id}'` on the credit
+             ledger row — even a replica that somehow slips past the row lock
+             loses at flush (IntegrityError -> already credited).
+
+        Returns:
+          - None if the session doesn't exist
+          - {"already_credited": True, ...} if it was already paid/credited
+          - {"credited": True, "session_id", "amount_cents"} on a fresh credit
+
+        Does NOT swallow a missing user (KeyError) — let it propagate so a
+        genuinely-broken session 500s and Stripe retries, rather than silently
+        dropping a payment.
+        """
+        with session_scope(self.session_factory) as session:
+            ss = session.scalar(
+                select(StripeSessionORM)
+                .where(StripeSessionORM.stripe_session_id == stripe_session_id)
+                .with_for_update()
+            )
+            if ss is None:
+                return None
+            # In-lock re-check — a concurrent caller that blocked on the lock
+            # sees the already-paid state here.
+            if ss.status == "paid":
+                return {"already_credited": True, "session_id": ss.session_id}
+
+            user = session.get(UserORM, ss.user_id, with_for_update=True)
+            if user is None:
+                raise KeyError(f"user {ss.user_id} not found for stripe session {ss.session_id}")
+
+            ss.status = "paid"
+            ss.completed_at = datetime.now(UTC)
+            user.balance_credits += ss.amount_cents
+            session.add(
+                LedgerEntryORM(
+                    entry_id=str(uuid4()),
+                    user_id=ss.user_id,
+                    amount_cents=ss.amount_cents,
+                    balance_after=user.balance_credits,
+                    kind="topup",
+                    reference_id=ss.session_id,
+                    deposit_ref=f"stripe:{ss.stripe_session_id}",
+                    description=f"Stripe payment ${ss.amount_usd:.2f}",
+                    created_at=datetime.now(UTC),
+                )
+            )
+            # Force the INSERT now so a UNIQUE(deposit_ref) violation from a
+            # concurrent replica surfaces here, inside our try.
+            try:
+                session.flush()
+            except IntegrityError:
+                session.rollback()
+                return {
+                    "already_credited": True,
+                    "session_id": ss.session_id,
+                    "duplicate": True,
+                }
+            return {
+                "credited": True,
+                "session_id": ss.session_id,
+                "amount_cents": ss.amount_cents,
+            }
 
     # --- Mappers ---
 

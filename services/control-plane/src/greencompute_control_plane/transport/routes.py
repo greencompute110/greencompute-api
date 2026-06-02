@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 from greencompute_persistence import get_metrics_store
 from greencompute_protocol import CapacityUpdate, DeploymentState, DeploymentStatusUpdate, Heartbeat, MinerRegistration
 from greencompute_control_plane.application.services import service
+from greencompute_control_plane.domain.state import InvalidDeploymentTransition
 from greencompute_control_plane.transport.security import require_admin_api_key, require_miner_request
 
 router = APIRouter()
@@ -166,7 +167,13 @@ def deployment_status(
         x_miner_timestamp,
         x_miner_auth_mode=x_miner_auth_mode,
     )
-    saved = service.update_deployment_status(payload)
+    try:
+        saved = service.update_deployment_status(payload)
+    except InvalidDeploymentTransition as exc:
+        # Illegal transition from a live (non-terminal) state — surface as a
+        # non-retryable 409 so the miner stops retrying, never a 500. Terminal
+        # states are absorbed inside update_deployment_status (returns no-op).
+        raise HTTPException(status_code=409, detail=str(exc))
     return saved.model_dump(mode="json")
 
 

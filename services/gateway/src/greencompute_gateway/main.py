@@ -7,10 +7,27 @@ from fastapi.responses import PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 
 from greencompute_persistence import database_ready, load_runtime_settings, render_prometheus_text
+from greencompute_gateway.transport.security import current_client_ip
 from greencompute_gateway.transport.security import metrics as gateway_metrics
 from greencompute_gateway.transport.routes import router
 
 settings = load_runtime_settings("greencompute-gateway")
+
+# Trust the first X-Forwarded-For hop only when explicitly enabled — otherwise
+# a client could spoof the rate-limit key by sending its own XFF header. The
+# gateway sits behind a proxy in prod, so ops set this to "1".
+_TRUST_PROXY = (os.getenv("GREENCOMPUTE_TRUSTED_PROXY", "") or "").strip() in ("1", "true", "yes", "on")
+
+
+def _client_ip_from_request(request) -> str | None:
+    if _TRUST_PROXY:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            first = xff.split(",", 1)[0].strip()
+            if first:
+                return first
+    client = request.client
+    return client.host if client else None
 
 
 @asynccontextmanager
@@ -50,6 +67,18 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+@app.middleware("http")
+async def _stash_client_ip(request, call_next):
+    """Record the per-request client IP in a ContextVar so the auth helpers can
+    apply a per-IP auth-failure rate limit without threading `request` through
+    every handler."""
+    token = current_client_ip.set(_client_ip_from_request(request))
+    try:
+        return await call_next(request)
+    finally:
+        current_client_ip.reset(token)
+
 
 app.include_router(router)
 

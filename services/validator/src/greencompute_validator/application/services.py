@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import UTC, datetime, timedelta
 from math import ceil
 
@@ -21,7 +22,11 @@ from greencompute_protocol import (
 )
 from greencompute_validator.config import settings as validator_settings
 from greencompute_validator.domain.chain import BittensorChainClient
-from greencompute_validator.domain.demand import DemandCollector
+from greencompute_validator.domain.demand import (
+    DemandCollector,
+    InferenceDemandSignal,
+    RentalDemandSignal,
+)
 from greencompute_validator.domain.flux import FluxOrchestrator
 from greencompute_validator.domain.metagraph import MetagraphCache
 from greencompute_validator.domain.scoring import ScoreEngine
@@ -75,12 +80,24 @@ class ValidatorService:
         # deployment pattern (a single miner identity controlling several
         # physical boxes). For per-hotkey lookups, use _aggregate_flux_state.
         self._flux_states: dict[tuple[str, str], FluxState] = {}
+        # Reentrant lock guarding ALL reads/iterations/mutations of the Flux
+        # in-memory maps (_flux_states, _replica_targets, _replica_cooldown_until,
+        # _demand_last_hot_at, _blended_rpm). These are touched from two concurrent
+        # contexts in the same process: the asyncio worker-loop (rebalance_all_miners)
+        # and the sync HTTP rebalance route (runs in FastAPI's threadpool). RLock
+        # (reentrant) is required because the public entry points nest — e.g.
+        # rebalance_all_miners → rebalance_miner, register_capability → init_flux_state.
+        self._flux_lock = threading.RLock()
         # Phase 2I hysteresis — last time a model's blended rpm was seen
         # above its scale-up threshold. Used to defer scale-down.
         self._demand_last_hot_at: dict[str, "datetime"] = {}
         # Cache of the latest computed replica targets so per-miner rebalance
         # can pass them to the orchestrator without recomputing.
         self._replica_targets: dict[str, int] = {}
+        # Cache of the latest blended rpm per catalog model (captured during
+        # compute_replica_targets) so the per-hotkey inference demand signal
+        # can be derived without re-querying read_demand_windows.
+        self._blended_rpm: dict[str, float] = {}
         # Failure cooldown: (hotkey, model_id) → datetime when deployment
         # last failed. Blocks respawning on the same miner for N minutes so
         # a broken miner (bad driver, OOM, missing weights, etc) doesn't burn
@@ -104,7 +121,12 @@ class ValidatorService:
         saved = self.repository.upsert_capability(capability)
         # Bootstrap Flux state so the first rebalance tick already considers
         # this miner. Re-seeds total_gpus if the miner changed capacity.
-        self.init_flux_state(capability.hotkey, capability.node_id, capability.gpu_count)
+        self.init_flux_state(
+            capability.hotkey,
+            capability.node_id,
+            capability.gpu_count,
+            available_gpus=getattr(capability, "available_gpus", None),
+        )
         return saved
 
     def create_probe(self, hotkey: str, node_id: str, kind: str = "latency") -> ProbeChallenge:
@@ -224,23 +246,21 @@ class ValidatorService:
                 logger.exception("failed to save scorecard history for epoch %s", epoch_id)
 
         # Push to Bittensor chain if enabled
-        print(
-            f"[CHAIN PUBLISH] scorecards={len(scorecards)} chain_init={self._chain is not None} "
-            f"bittensor_enabled={validator_settings.bittensor_enabled} netuid={netuid}",
-            flush=True,
+        logger.info(
+            "[chain publish] scorecards=%s chain_init=%s bittensor_enabled=%s netuid=%s",
+            len(scorecards), self._chain is not None,
+            validator_settings.bittensor_enabled, netuid,
         )
         if self._chain and validator_settings.bittensor_enabled:
             try:
                 commit = self._commit_weights_to_chain(scorecards)
-                print(f"[CHAIN PUBLISH] _commit_weights_to_chain returned: {commit!r}", flush=True)
-            except Exception as exc:
-                print(f"[CHAIN PUBLISH] EXCEPTION: {type(exc).__name__}: {exc}", flush=True)
+                logger.info("[chain publish] _commit_weights_to_chain returned ok=%s", commit is not None)
+            except Exception:
                 logger.exception("failed to commit weights to chain")
         else:
-            print(
-                f"[CHAIN PUBLISH] SKIPPED — chain={self._chain is not None} "
-                f"bittensor_enabled={validator_settings.bittensor_enabled}",
-                flush=True,
+            logger.info(
+                "[chain publish] skipped — chain=%s bittensor_enabled=%s",
+                self._chain is not None, validator_settings.bittensor_enabled,
             )
 
         return saved
@@ -248,26 +268,30 @@ class ValidatorService:
     def _commit_weights_to_chain(self, scorecards: dict[str, ScoreCard]) -> ChainWeightCommit | None:
         """Convert scorecards to uid/weight vectors and call set_weights."""
         if not self._chain:
-            print("[CHAIN COMMIT] no chain client, returning None", flush=True)
+            logger.debug("[chain commit] no chain client, returning None")
             return None
-        print(f"[CHAIN COMMIT] mapping {len(scorecards)} scorecards to UIDs; metagraph_size={self.metagraph.size}", flush=True)
+        logger.info(
+            "[chain commit] mapping %s scorecards to UIDs; metagraph_size=%s",
+            len(scorecards), self.metagraph.size,
+        )
         uids: list[int] = []
         weights: list[float] = []
         for hotkey, sc in sorted(scorecards.items()):
             uid = self.metagraph.hotkey_to_uid(hotkey)
-            print(f"[CHAIN COMMIT]   hotkey={hotkey} score={sc.final_score:.4f} uid={uid}", flush=True)
+            # Per-hotkey mapping at debug only — avoids dumping hotkeys+scores
+            # to stdout/info on every epoch boundary.
+            logger.debug("[chain commit]   hotkey=%s score=%.4f uid=%s", hotkey, sc.final_score, uid)
             if uid is None:
-                logger.warning("hotkey %s not in metagraph, skipping weight", hotkey)
+                logger.warning("hotkey not in metagraph, skipping weight")
                 continue
             uids.append(uid)
             weights.append(sc.final_score)
         if not uids:
-            print("[CHAIN COMMIT] no valid uids for set_weights — bailing", flush=True)
-            logger.warning("no valid uids for set_weights")
+            logger.warning("no valid uids for set_weights — bailing")
             return None
-        print(f"[CHAIN COMMIT] calling _chain.set_weights uids={uids} weights={weights}", flush=True)
+        logger.info("[chain commit] calling set_weights for %s uids", len(uids))
         commit = self._chain.set_weights(uids, weights)
-        print(f"[CHAIN COMMIT] set_weights returned: {commit!r}", flush=True)
+        logger.info("[chain commit] set_weights returned ok=%s", commit is not None)
         self.metrics.increment("chain.weights.committed")
         return commit
 
@@ -494,22 +518,38 @@ class ValidatorService:
         """Aggregated FluxState across all of this hotkey's nodes."""
         return self._aggregate_flux_state(hotkey)
 
-    def init_flux_state(self, hotkey: str, node_id: str, total_gpus: int) -> FluxState:
-        """Initialize or update a (hotkey, node_id) pair's Flux state."""
+    def init_flux_state(
+        self,
+        hotkey: str,
+        node_id: str,
+        total_gpus: int,
+        available_gpus: int | None = None,
+    ) -> FluxState:
+        """Initialize or update a (hotkey, node_id) pair's Flux state.
+
+        Only genuinely-free GPUs (available_gpus) seed the movable idle pool;
+        the reserved remainder (total - available, e.g. running tenant rentals)
+        is marked as locked rental_gpus so Flux never preempts a running pod.
+        available_gpus defaults to total_gpus to preserve existing callers/tests.
+        """
         key = (hotkey, node_id)
-        existing = self._flux_states.get(key)
-        if existing and existing.total_gpus == total_gpus:
-            return existing
-        state = FluxState(
-            hotkey=hotkey,
-            node_id=node_id,
-            total_gpus=total_gpus,
-            idle_gpus=total_gpus,
-            inference_floor_pct=validator_settings.flux_inference_floor_pct,
-            rental_floor_pct=validator_settings.flux_rental_floor_pct,
-        )
-        self._flux_states[key] = state
-        return state
+        with self._flux_lock:
+            existing = self._flux_states.get(key)
+            if existing and existing.total_gpus == total_gpus:
+                return existing
+            avail = total_gpus if available_gpus is None else max(0, min(available_gpus, total_gpus))
+            reserved = total_gpus - avail
+            state = FluxState(
+                hotkey=hotkey,
+                node_id=node_id,
+                total_gpus=total_gpus,
+                rental_gpus=reserved,
+                idle_gpus=avail,
+                inference_floor_pct=validator_settings.flux_inference_floor_pct,
+                rental_floor_pct=validator_settings.flux_rental_floor_pct,
+            )
+            self._flux_states[key] = state
+            return state
 
     @staticmethod
     def _is_cap_fresh(cap: NodeCapability, now_ts: datetime, timeout_seconds: float) -> bool:
@@ -523,25 +563,27 @@ class ValidatorService:
         return (now_ts - obs).total_seconds() <= timeout_seconds
 
     def _states_for_hotkey(self, hotkey: str) -> list[FluxState]:
-        return [s for (h, _), s in self._flux_states.items() if h == hotkey]
+        with self._flux_lock:
+            return [s for (h, _), s in self._flux_states.items() if h == hotkey]
 
     def _aggregate_flux_state(self, hotkey: str) -> FluxState | None:
         """Synthesize a single FluxState by summing across all of this
         hotkey's per-node states. Used by scoring / dashboard / weight
         publishing — places that operate on the per-miner level."""
-        states = self._states_for_hotkey(hotkey)
-        if not states:
-            return None
-        return FluxState(
-            hotkey=hotkey,
-            node_id=f"{hotkey}-aggregate",
-            total_gpus=sum(s.total_gpus for s in states),
-            inference_gpus=sum(s.inference_gpus for s in states),
-            rental_gpus=sum(s.rental_gpus for s in states),
-            idle_gpus=sum(s.idle_gpus for s in states),
-            inference_floor_pct=validator_settings.flux_inference_floor_pct,
-            rental_floor_pct=validator_settings.flux_rental_floor_pct,
-        )
+        with self._flux_lock:
+            states = self._states_for_hotkey(hotkey)
+            if not states:
+                return None
+            return FluxState(
+                hotkey=hotkey,
+                node_id=f"{hotkey}-aggregate",
+                total_gpus=sum(s.total_gpus for s in states),
+                inference_gpus=sum(s.inference_gpus for s in states),
+                rental_gpus=sum(s.rental_gpus for s in states),
+                idle_gpus=sum(s.idle_gpus for s in states),
+                inference_floor_pct=validator_settings.flux_inference_floor_pct,
+                rental_floor_pct=validator_settings.flux_rental_floor_pct,
+            )
 
     def rebalance_miner(self, hotkey: str) -> tuple[FluxState, list[FluxRebalanceEvent]]:
         """Run Flux rebalance for every node belonging to this miner.
@@ -555,36 +597,37 @@ class ValidatorService:
         advertised VRAM, then lets the orchestrator both (a) pick the
         inf/rental split and (b) assign catalog models to inference GPUs.
         """
-        states = self._states_for_hotkey(hotkey)
-        if not states:
-            return FluxState(hotkey=hotkey, node_id="", total_gpus=0), []
-        catalog = self.repository.list_catalog_entries(visibility="public")
-        node_caps = {
-            n.node_id: n for n in self.repository.get_node_capabilities(hotkey)
-        }
-        inf_score = self.demand.inference_score(hotkey)
-        rent_score = self.demand.rental_score(hotkey)
-        all_events: list[FluxRebalanceEvent] = []
-        for state in states:
-            primed = state.model_copy(update={
-                "inference_demand_score": inf_score,
-                "rental_demand_score": rent_score,
-            })
-            cap = node_caps.get(state.node_id)
-            vram = getattr(cap, "vram_gb_per_gpu", None) if cap else None
-            new_state, events = self.flux.rebalance(
-                primed,
-                catalog=catalog,
-                vram_gb_per_gpu=vram,
-                replica_targets=self._replica_targets or None,
-            )
-            self._flux_states[(hotkey, state.node_id)] = new_state
-            all_events.extend(events)
-            self._reconcile_catalog_deployments(hotkey, new_state)
-        self.metrics.increment("flux.rebalance", len(all_events))
-        # Return aggregate state for callers that expect one — actual
-        # per-node state lives in self._flux_states.
-        return self._aggregate_flux_state(hotkey) or states[0], all_events
+        with self._flux_lock:
+            states = self._states_for_hotkey(hotkey)
+            if not states:
+                return FluxState(hotkey=hotkey, node_id="", total_gpus=0), []
+            catalog = self.repository.list_catalog_entries(visibility="public")
+            node_caps = {
+                n.node_id: n for n in self.repository.get_node_capabilities(hotkey)
+            }
+            inf_score = self.demand.inference_score(hotkey)
+            rent_score = self.demand.rental_score(hotkey)
+            all_events: list[FluxRebalanceEvent] = []
+            for state in states:
+                primed = state.model_copy(update={
+                    "inference_demand_score": inf_score,
+                    "rental_demand_score": rent_score,
+                })
+                cap = node_caps.get(state.node_id)
+                vram = getattr(cap, "vram_gb_per_gpu", None) if cap else None
+                new_state, events = self.flux.rebalance(
+                    primed,
+                    catalog=catalog,
+                    vram_gb_per_gpu=vram,
+                    replica_targets=self._replica_targets or None,
+                )
+                self._flux_states[(hotkey, state.node_id)] = new_state
+                all_events.extend(events)
+                self._reconcile_catalog_deployments(hotkey, new_state)
+            self.metrics.increment("flux.rebalance", len(all_events))
+            # Return aggregate state for callers that expect one — actual
+            # per-node state lives in self._flux_states.
+            return self._aggregate_flux_state(hotkey) or states[0], all_events
 
     def _reconcile_catalog_deployments(self, hotkey: str, new_state: FluxState) -> None:
         """Drive catalog replica deployments through the shared DB.
@@ -618,7 +661,13 @@ class ValidatorService:
                 )
 
         target_models = set(new_state.inference_assignments.keys())
-        existing = self.repository.list_flux_deployments(hotkey)
+        # Scope the existing-replica view to THIS node. Without the node filter
+        # the termination loop below tore down healthy replicas living on the
+        # hotkey's OTHER nodes (cross-node termination), and the provision branch
+        # under-provisioned this node because a model already running on a
+        # sibling node counted as 'existing' here. Pinning to target_node_id
+        # makes each node reconcile only its own deficit/surplus.
+        existing = self.repository.list_flux_deployments(hotkey, node_id=target_node_id)
         existing_models = {d["model_id"] for d in existing if d["model_id"]}
 
         # Terminate replicas no longer targeted by Flux
@@ -695,39 +744,92 @@ class ValidatorService:
             for c in live:
                 fresh_keys.add((hotkey, c.node_id))
 
-        # Drop Flux state for nodes that have gone stale (ghost cleanup) so the
-        # rebalance loop below stops allocating to them.
-        for key in list(self._flux_states):
-            if key not in fresh_keys:
-                logger.info("flux: dropping stale node %s from rebalance (inventory expired)", key)
-                del self._flux_states[key]
+        # Single coarse critical section over all the in-memory Flux maps so a
+        # concurrent admin /flux/rebalance (FastAPI threadpool) can't interleave
+        # a half-updated target map, resurrect a just-deleted ghost node, or lose
+        # a decrement against the worker-loop tick.
+        with self._flux_lock:
+            # Drop Flux state for nodes that have gone stale (ghost cleanup) so the
+            # rebalance loop below stops allocating to them.
+            for key in list(self._flux_states):
+                if key not in fresh_keys:
+                    logger.info("flux: dropping stale node %s from rebalance (inventory expired)", key)
+                    del self._flux_states[key]
 
-        # Bootstrap: ensure every FRESH (hotkey, node_id) has a Flux state so
-        # rebalance iterates them. Noop for entries already present.
-        for hotkey, nodes in fresh_caps.items():
-            for cap in nodes:
-                key = (hotkey, cap.node_id)
-                if key in self._flux_states:
+            # Bootstrap: ensure every FRESH (hotkey, node_id) has a Flux state so
+            # rebalance iterates them. Noop for entries already present.
+            for hotkey, nodes in fresh_caps.items():
+                for cap in nodes:
+                    key = (hotkey, cap.node_id)
+                    if key in self._flux_states:
+                        continue
+                    # Seed the movable idle pool from genuinely-free GPUs only.
+                    # available_gpus lumps rentals + inference replicas together;
+                    # the reserved block (gpu_count - available_gpus) is marked as
+                    # locked rental_gpus so Flux never provisions inference replicas
+                    # on top of a running tenant rental. Rebalance only ever moves
+                    # idle GPUs, so locked rental GPUs are never preempted. The true
+                    # inf/rental split self-corrects on later state updates.
+                    avail = max(0, min(cap.available_gpus, cap.gpu_count))
+                    reserved = cap.gpu_count - avail
+                    self._flux_states[key] = FluxState(
+                        hotkey=hotkey,
+                        node_id=cap.node_id,
+                        total_gpus=cap.gpu_count,
+                        rental_gpus=reserved,
+                        idle_gpus=avail,
+                        inference_floor_pct=validator_settings.flux_inference_floor_pct,
+                        rental_floor_pct=validator_settings.flux_rental_floor_pct,
+                    )
+
+            self._replica_targets = self.compute_replica_targets()
+            # Populate the per-hotkey demand collector so the Flux flex split is
+            # demand-driven instead of a hardcoded 50/50. Without this, inference_score
+            # / rental_score always returned 0.0 → total_demand == 0 → the orchestrator
+            # split the idle flex pool evenly regardless of real load.
+            self._update_demand_signals()
+            results: dict[str, FluxState] = {}
+            rebalanced_hotkeys: set[str] = set()
+            for hotkey, _node_id in list(self._flux_states):
+                if hotkey in rebalanced_hotkeys:
                     continue
-                self._flux_states[key] = FluxState(
-                    hotkey=hotkey,
-                    node_id=cap.node_id,
-                    total_gpus=cap.gpu_count,
-                    idle_gpus=cap.gpu_count,
-                    inference_floor_pct=validator_settings.flux_inference_floor_pct,
-                    rental_floor_pct=validator_settings.flux_rental_floor_pct,
-                )
+                new_state, _ = self.rebalance_miner(hotkey)
+                results[hotkey] = new_state
+                rebalanced_hotkeys.add(hotkey)
+            return results
 
-        self._replica_targets = self.compute_replica_targets()
-        results: dict[str, FluxState] = {}
-        rebalanced_hotkeys: set[str] = set()
-        for hotkey, _node_id in list(self._flux_states):
-            if hotkey in rebalanced_hotkeys:
-                continue
-            new_state, _ = self.rebalance_miner(hotkey)
-            results[hotkey] = new_state
-            rebalanced_hotkeys.add(hotkey)
-        return results
+    def _update_demand_signals(self) -> None:
+        """Refresh the DemandCollector with the latest per-hotkey inference and
+        rental demand. Inference demand = sum of blended rpm across the catalog
+        models each hotkey currently serves (reuses the blended-rpm map captured
+        in compute_replica_targets). Rental demand = count of owner-bound rental
+        deployments pinned to that hotkey still awaiting placement. Both signals
+        only influence how the IDLE flex pool is split — no running pod is moved.
+        Must be called while holding the flux lock (iterates _flux_states)."""
+        # Aggregate each hotkey's currently-served models across all its nodes.
+        served_by_hotkey: dict[str, set[str]] = {}
+        for (hotkey, _node_id), state in self._flux_states.items():
+            served = served_by_hotkey.setdefault(hotkey, set())
+            for model_id, idxs in state.inference_assignments.items():
+                if idxs:
+                    served.add(model_id)
+        for hotkey, models in served_by_hotkey.items():
+            inf_rpm = sum(self._blended_rpm.get(m, 0.0) for m in models)
+            self.demand.update_inference(
+                InferenceDemandSignal(
+                    hotkey=hotkey,
+                    pending_requests=int(inf_rpm),
+                    avg_queue_depth=0.0,
+                )
+            )
+            try:
+                pending = self.repository.count_pending_rentals(hotkey)
+            except Exception:
+                logger.exception("failed to count pending rentals for hotkey")
+                pending = 0
+            self.demand.update_rental(
+                RentalDemandSignal(hotkey=hotkey, pending_deployments=pending)
+            )
 
     # --- Demand-reactive replica targets (Phase 2I) --------------------
 
@@ -829,11 +931,28 @@ class ValidatorService:
                 # (hex) must appear literally.
                 if nonce in response_text:
                     success = True
-                    # Signature now encodes model + response prefix; auditors
-                    # can recompute it to catch miners that modified their
-                    # output post-hoc.
-                    norm = response_text.upper()[:64]
-                    signature = hashlib.sha256(f"{model_id}:{nonce}:{norm}".encode()).hexdigest()[:16]
+                    # De-nonced cross-probe fingerprint, used by the fraud check
+                    # (scoring._fraud_penalty: >1 distinct signature across a
+                    # hotkey's probes == inconsistent backend). It MUST be stable
+                    # across every honest probe of one hotkey, or honest miners
+                    # eat a permanent 0.75 penalty. Two things would otherwise
+                    # break that — both fixed here:
+                    #   (1) the random nonce — stripped out before hashing, so
+                    #       two honest answers to different nonces collapse.
+                    #   (2) model_id — _fraud_penalty aggregates ALL of a
+                    #       hotkey's probes, and a miner serving MULTIPLE catalog
+                    #       models (the whole point of the shared catalog pool)
+                    #       would get one signature per model -> >1 -> penalty.
+                    #       Since this canary is a model-independent ECHO test
+                    #       ("reply {nonce} DONE"), model_id carries no real
+                    #       signal here, so it is intentionally excluded.
+                    # Anti-proxy is unaffected — that is the separate verbatim
+                    # nonce-echo check above + the proxy_suspected flag.
+                    norm = response_text.upper()
+                    denonced = norm.replace(nonce.upper(), "")[:64]
+                    signature = hashlib.sha256(
+                        denonced.encode()
+                    ).hexdigest()[:16]
                 else:
                     # Nonce missing = response did not come from a real
                     # inference on THIS prompt. Either cached, pre-computed,
@@ -883,11 +1002,14 @@ class ValidatorService:
         no catalog replicas are running."""
         pairs: list[tuple[str, str]] = []
         # Per-(hotkey, node) iteration — multi-node hotkeys generate one
-        # pair per node serving the catalog model.
-        for (hotkey, _node_id), state in self._flux_states.items():
-            for model_id, idxs in state.inference_assignments.items():
-                if idxs:
-                    pairs.append((hotkey, model_id))
+        # pair per node serving the catalog model. Snapshot under the lock so a
+        # concurrent rebalance can't mutate the dict mid-iteration; release
+        # before the (slow, network-bound) canary call below.
+        with self._flux_lock:
+            for (hotkey, _node_id), state in self._flux_states.items():
+                for model_id, idxs in state.inference_assignments.items():
+                    if idxs:
+                        pairs.append((hotkey, model_id))
         if not pairs:
             return None
         # Deterministic round-robin without storing a pointer: hash on
@@ -911,13 +1033,21 @@ class ValidatorService:
         capabilities = self.repository.list_capabilities()
         scorecards = self.repository.list_scorecards()
 
+        # Take a consistent snapshot of the in-memory Flux maps under the lock,
+        # then build the (DB-heavy) dashboard off the snapshot so a concurrent
+        # rebalance can't mutate the dicts mid-iteration.
+        with self._flux_lock:
+            flux_states = list(self._flux_states.values())
+            replica_targets = dict(self._replica_targets)
+            online_hotkeys = {h for (h, _n) in self._flux_states}
+
         # Fleet strip — derived from the in-memory Flux state map
         total_gpus = 0
         inference_gpus = 0
         rental_gpus = 0
         idle_gpus = 0
         active_catalog_replicas = 0
-        for state in self._flux_states.values():
+        for state in flux_states:
             total_gpus += state.total_gpus
             inference_gpus += state.inference_gpus
             rental_gpus += state.rental_gpus
@@ -928,17 +1058,17 @@ class ValidatorService:
         # Catalog pool — per-model replica counts and demand
         catalog_pool: list[dict] = []
         running_by_model: dict[str, int] = {}
-        for state in self._flux_states.values():
+        for state in flux_states:
             for model_id, idxs in state.inference_assignments.items():
                 if idxs:
                     running_by_model[model_id] = running_by_model.get(model_id, 0) + 1
         for entry in self.repository.list_catalog_entries(visibility="public"):
             windows = self.repository.read_demand_windows(entry.model_id, now=now)
             running = running_by_model.get(entry.model_id, 0)
-            target = self._replica_targets.get(entry.model_id, entry.min_replicas)
+            target = replica_targets.get(entry.model_id, entry.min_replicas)
             serving_miners = [
                 state.hotkey
-                for state in self._flux_states.values()
+                for state in flux_states
                 if state.inference_assignments.get(entry.model_id)
             ]
             if windows["rpm_10m"] > validator_settings.target_rpm_per_replica:
@@ -990,7 +1120,7 @@ class ValidatorService:
                 "inference_gpus": inference_gpus,
                 "rental_gpus": rental_gpus,
                 "idle_gpus": idle_gpus,
-                "miners_online": len({h for (h, _n) in self._flux_states}),
+                "miners_online": len(online_hotkeys),
                 "miners_registered": len(capabilities),
                 "active_catalog_replicas": active_catalog_replicas,
                 "catalog_models": len(catalog_pool),
@@ -1057,36 +1187,44 @@ class ValidatorService:
         `flux_cooldown_seconds` is never dropped below its previous target."""
         now = now or datetime.now(UTC)
         targets: dict[str, int] = {}
+        blended_rpm: dict[str, float] = {}
         catalog = self.repository.list_catalog_entries(visibility="public")
-        for entry in catalog:
-            windows = self.repository.read_demand_windows(entry.model_id, now=now)
-            rpm_10 = windows["rpm_10m"]
-            rpm_60 = windows["rpm_1h"]
-            blended = 0.7 * rpm_10 + 0.3 * rpm_60
-            raw_target = ceil(blended / validator_settings.target_rpm_per_replica)
-            target = max(entry.min_replicas, raw_target)
-            if entry.max_replicas is not None:
-                target = min(target, entry.max_replicas)
+        # Guard the hysteresis/target maps. Reentrant — this is normally already
+        # held via rebalance_all_miners, but the lock makes a direct call safe too.
+        with self._flux_lock:
+            for entry in catalog:
+                windows = self.repository.read_demand_windows(entry.model_id, now=now)
+                rpm_10 = windows["rpm_10m"]
+                rpm_60 = windows["rpm_1h"]
+                blended = 0.7 * rpm_10 + 0.3 * rpm_60
+                blended_rpm[entry.model_id] = blended
+                raw_target = ceil(blended / validator_settings.target_rpm_per_replica)
+                target = max(entry.min_replicas, raw_target)
+                if entry.max_replicas is not None:
+                    target = min(target, entry.max_replicas)
 
-            # Hysteresis — if the model was above its scale-up floor
-            # recently, block scale-down until cooldown elapses.
-            scale_up_floor = validator_settings.target_rpm_per_replica
-            if blended > scale_up_floor:
-                self._demand_last_hot_at[entry.model_id] = now
-            last_hot = self._demand_last_hot_at.get(entry.model_id)
-            in_cooldown = (
-                last_hot is not None
-                and (now - last_hot).total_seconds() < validator_settings.flux_cooldown_seconds
-            )
-            if in_cooldown:
-                prev = self._replica_targets.get(entry.model_id, target)
-                target = max(target, prev)
+                # Hysteresis — if the model was above its scale-up floor
+                # recently, block scale-down until cooldown elapses.
+                scale_up_floor = validator_settings.target_rpm_per_replica
+                if blended > scale_up_floor:
+                    self._demand_last_hot_at[entry.model_id] = now
+                last_hot = self._demand_last_hot_at.get(entry.model_id)
+                in_cooldown = (
+                    last_hot is not None
+                    and (now - last_hot).total_seconds() < validator_settings.flux_cooldown_seconds
+                )
+                if in_cooldown:
+                    prev = self._replica_targets.get(entry.model_id, target)
+                    target = max(target, prev)
 
-            targets[entry.model_id] = target
-            self.metrics.set_gauge(f"flux.target_replicas.{entry.model_id}", float(target))
-            self.metrics.set_gauge(f"flux.rpm_10m.{entry.model_id}", rpm_10)
-            self.metrics.set_gauge(f"flux.rpm_1h.{entry.model_id}", rpm_60)
-        return targets
+                targets[entry.model_id] = target
+                self.metrics.set_gauge(f"flux.target_replicas.{entry.model_id}", float(target))
+                self.metrics.set_gauge(f"flux.rpm_10m.{entry.model_id}", rpm_10)
+                self.metrics.set_gauge(f"flux.rpm_1h.{entry.model_id}", rpm_60)
+            # Stash the blended rpm so rebalance_all_miners can build per-hotkey
+            # inference demand signals without re-querying.
+            self._blended_rpm = blended_rpm
+            return targets
 
     def estimate_rental_wait(self, deployment_id: str, hotkey: str) -> RentalWaitEstimate:
         """Estimate wait time for a rental deployment on a specific miner."""

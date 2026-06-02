@@ -158,12 +158,65 @@ class GatewayService:
         user.metadata = request.metadata
         return self.repository.save_user(user)
 
-    def create_api_key(self, request: APIKeyCreateRequest) -> APIKeyRecord:
+    def create_api_key(
+        self,
+        request: APIKeyCreateRequest,
+        *,
+        caller_user_id: str | None = None,
+        caller_admin: bool | None = None,
+        allow_user_id_override: bool | None = None,
+        allow_admin_grant: bool = False,
+    ) -> APIKeyRecord:
+        """Mint an api key, deriving privilege from the authenticated caller
+        rather than trusting the wire.
+
+        - ``allow_user_id_override``: when True the client-supplied
+          ``user_id``/``scopes`` are honored (master admin AND the provisioning
+          principal both set this — the UI provisions a key for an explicit
+          user_id). When False the key is bound to ``caller_user_id``
+          (self-service) and client scopes are dropped.
+        - ``allow_admin_grant``: only when True may the new key be
+          ``admin=True`` (master admin only — the provision secret must NOT be
+          able to mint admin keys).
+
+        Caller tiers map to flags like this:
+          - env master admin:  override=True,  admin_grant=True
+          - provision secret:   override=True,  admin_grant=False
+          - self-service user:  override=False, admin_grant=False
+
+        Backward-compatibility: when neither ``caller_admin`` nor
+        ``allow_user_id_override`` is supplied (the legacy in-process call
+        shape, e.g. integration fixtures that already vetted the request) the
+        request fields are honored verbatim, matching the original behavior.
+        All HTTP entrypoints pass these explicitly so the wire is never trusted
+        from a non-admin caller.
+        """
+        # Derive override from the legacy caller_admin flag when not given, so
+        # existing call sites keep working.
+        if allow_user_id_override is None:
+            allow_user_id_override = caller_admin
+
+        if allow_user_id_override is None:
+            # Legacy trusted in-process caller — honor the request as-is.
+            user_id = request.user_id
+            scopes = request.scopes
+            admin = request.admin
+        elif allow_user_id_override:
+            # Master admin or provisioning principal — explicit user_id allowed.
+            user_id = request.user_id
+            scopes = request.scopes
+            admin = bool(request.admin) and allow_admin_grant
+        else:
+            # Self-service: bind to the authenticated principal, drop scopes,
+            # never admin — even if the body asked for admin=true / another user.
+            user_id = caller_user_id
+            scopes = []
+            admin = False
         api_key = APIKeyRecord(
             name=request.name,
-            user_id=request.user_id,
-            admin=request.admin,
-            scopes=request.scopes,
+            user_id=user_id,
+            admin=admin,
+            scopes=scopes,
             secret=f"gk_{secrets.token_urlsafe(24)}",
         )
         return self.repository.save_api_key(api_key)
@@ -665,11 +718,28 @@ class GatewayService:
         persisted) provisioning inputs. The route layer kicks off the actual
         SSH provisioning in a background task. Raises ValueError/PermissionError
         which the route maps to 400/403."""
-        from greencompute_gateway.infrastructure.server_provisioner import ProvisionInputs
+        from greencompute_gateway.infrastructure.server_provisioner import (
+            ProvisionInputs,
+            resolve_and_guard_host,
+        )
 
         hotkey = request.hotkey.strip()
         if not hotkey:
             raise ValueError("hotkey is required")
+        # Reject control chars (CR/LF) in any field that flows into the node
+        # .env, so a malicious value can't inject extra GREENCOMPUTE_* lines.
+        # Fail fast at the API edge (ValueError -> 400) in addition to the
+        # render-time guard (defense in depth).
+        def _no_ctrl(value: str | None, field: str) -> None:
+            v = value or ""
+            if any(c in v for c in "\r\n") or any(ord(c) < 32 and c != "\t" for c in v):
+                raise ValueError(f"{field} contains invalid control characters")
+
+        _no_ctrl(request.hotkey, "hotkey")
+        _no_ctrl(request.payout_address, "payout_address")
+        _no_ctrl(request.label, "label")
+        _no_ctrl(request.hf_token, "hf_token")
+        _no_ctrl(request.ssh_user, "ssh_user")
         # Gate: the hotkey must be whitelisted (admins bypass for testing).
         if not admin and not self._hotkey_whitelisted(hotkey):
             raise PermissionError(
@@ -678,6 +748,12 @@ class GatewayService:
             )
         if not request.ssh_password.strip() and not request.ssh_private_key.strip():
             raise ValueError("provide an SSH password or private key")
+        # SSRF guard — resolve ssh_host and reject private/loopback/link-local/
+        # multicast/reserved/unspecified destinations BEFORE persisting or
+        # queuing, so the API returns 400 synchronously and no provider_servers
+        # row is left in `provisioning`. Re-checked again right before connect
+        # (server_provisioner._SSH) to defeat DNS rebinding.
+        resolve_and_guard_host(request.ssh_host.strip(), request.ssh_port)
 
         # Unique node_id (PK on node_inventory). Slugify the label + random.
         slug = re.sub(r"[^a-z0-9]+", "-", (request.label or "node").lower()).strip("-") or "node"
@@ -1286,21 +1362,25 @@ class GatewayService:
         treasury wallet and reads these rows.
 
         Uses the shared `inference_cost_cents` helper so the UI's estimate
-        matches the actual charge. Failures (insufficient balance, user
-        missing) log-and-swallow — by the time we get here the response has
-        already been yielded to the user, so raising would just confuse the
-        caller without saving any cost.
+        matches the actual charge. We DRAIN the user's balance to zero via
+        `debit_user_to_floor` (never raises, never goes negative) instead of
+        the old all-or-nothing debit that took NOTHING when the balance
+        couldn't cover the full cost — that gave the user "keep your cent AND
+        get the request free". Now the remaining balance is always captured and
+        the pre-flight `<=0` gate blocks the NEXT request. A shortfall (the
+        single overdrawn request) is recorded as a metric, not swallowed
+        silently. By the time we get here the response has already been yielded,
+        so we never raise.
         """
         from greencompute_protocol import inference_cost_cents
         from greencompute_gateway.infrastructure.billing_repository import (
             BillingRepository,
-            InsufficientBalanceError,
         )
 
         cents = inference_cost_cents(prompt_tokens, completion_tokens)
         billing = BillingRepository()
         try:
-            billing.debit_user(
+            result = billing.debit_user_to_floor(
                 user_id=user_id,
                 amount_cents=cents,
                 kind="inference",
@@ -1310,15 +1390,13 @@ class GatewayService:
                     f"{prompt_tokens} in + {completion_tokens} out tokens"
                 ),
             )
-        except InsufficientBalanceError:
-            # User went negative on this request. We already delivered the
-            # response — record it to a metric and move on. Subsequent
-            # requests will be blocked by the pre-flight gate.
-            self.metrics.increment("inference.debit.insufficient_balance")
-            return
         except Exception:
             self.metrics.increment("inference.debit.failed")
             return
+        if result.get("shortfall_cents", 0) > 0:
+            # The user couldn't fully cover this one request; we drained what
+            # they had. The pre-flight gate blocks subsequent requests.
+            self.metrics.increment("inference.debit.shortfall")
 
         # Debit succeeded → accrue the miner's cut. Accrual captures the
         # full revenue for now; payout split + on-chain transfer is a later

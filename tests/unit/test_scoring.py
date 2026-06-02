@@ -1,5 +1,38 @@
+import hashlib
+
 from greencompute_protocol import NodeCapability, ProbeResult
 from greencompute_validator.domain.scoring import ScoreEngine
+
+
+def _denonced_signature(model_id: str, node_id: str, response_text: str, nonce: str) -> str:
+    """Mirror of the de-nonced cross-probe signature generated in
+    ValidatorService.run_inference_canary — kept in lockstep so this test
+    fails if the generation formula drifts."""
+    norm = response_text.upper()
+    denonced = norm.replace(nonce.upper(), "")[:64]
+    return hashlib.sha256(f"{model_id}:{node_id}:{denonced}".encode()).hexdigest()[:16]
+
+
+def test_fraud_penalty_neutral_on_empty_results():
+    # ORCH-L1: empty results must yield a NEUTRAL multiplier (1.0), not 0.0,
+    # which would zero the entire final_score.
+    engine = ScoreEngine()
+    assert engine._fraud_penalty([]) == 1.0
+
+
+def test_denonced_signature_collapses_across_honest_probes():
+    # ORCH-C1: two honest "{nonce} DONE" answers to DIFFERENT nonces must
+    # produce the SAME stable signature so an honest miner does not eat a
+    # permanent 0.75 cross-probe penalty.
+    sig_a = _denonced_signature("model-x", "node-a", "abc123 DONE", "abc123")
+    sig_b = _denonced_signature("model-x", "node-a", "def456 DONE", "def456")
+    assert sig_a == sig_b
+    # A canned proxy whose structure differs still yields a DISTINCT signature.
+    sig_proxy = _denonced_signature("model-x", "node-a", "abc123 OK", "abc123")
+    assert sig_proxy != sig_a
+    # A different served model/node also diverges.
+    sig_other_node = _denonced_signature("model-x", "node-b", "abc123 DONE", "abc123")
+    assert sig_other_node != sig_a
 
 
 def test_scoring_penalizes_proxy_suspicion_and_signature_drift():

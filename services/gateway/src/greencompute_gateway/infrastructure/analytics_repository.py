@@ -37,6 +37,12 @@ from greencompute_persistence.orm import (
 # from someone curling `?days=99999` and blowing through the index.
 _MAX_DAYS = 365
 
+# Ledger `kind` values that represent user SPEND (stored as negative debits).
+# Both 'usage' (GPU rental metering) and 'inference' (per-token) are real
+# revenue; the analytics aggregations must count both. Refunds/adjustments are
+# NOT in this set so claw-backs don't inflate "spend".
+_DEBIT_KINDS = ("usage", "inference")
+
 
 def _cutoff(days: int) -> datetime:
     days = max(1, min(int(days or 7), _MAX_DAYS))
@@ -117,7 +123,7 @@ class AnalyticsRepository:
                 )
                 .join(UserORM, UserORM.user_id == LedgerEntryORM.user_id, isouter=True)
                 .where(
-                    LedgerEntryORM.kind == "usage",
+                    LedgerEntryORM.kind.in_(_DEBIT_KINDS),
                     LedgerEntryORM.amount_cents < 0,
                     LedgerEntryORM.created_at >= cutoff,
                 )
@@ -185,7 +191,7 @@ class AnalyticsRepository:
                     select(
                         func.coalesce(func.sum(-LedgerEntryORM.amount_cents), 0)
                     ).where(
-                        LedgerEntryORM.kind == "usage",
+                        LedgerEntryORM.kind.in_(_DEBIT_KINDS),
                         LedgerEntryORM.amount_cents < 0,
                         LedgerEntryORM.created_at >= cutoff,
                     )

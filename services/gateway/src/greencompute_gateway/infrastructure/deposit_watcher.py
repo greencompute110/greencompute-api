@@ -71,11 +71,23 @@ MAX_BLOCKS_PER_TICK = 200
 
 # Reorg-safety: only credit transfers buried at least this many blocks deep,
 # so a transfer that later gets reorged out never credits funds we don't
-# actually hold. Keyed by chain_id.
+# actually hold. Keyed by chain_id. These are DEFAULTS — ops can raise the
+# buffer toward finality without a code change via
+# GREENCOMPUTE_WATCHER_CONFIRMATIONS_<CHAIN> (see _confirmations).
 CONFIRMATIONS = {
     "eth": 12,
     "base": 20,   # Base is fast but reorgs deeper in block count terms
 }
+
+
+def _confirmations(chain_id: str) -> int:
+    """Effective reorg-confirmation depth for a chain. Env-overridable so ops
+    can push the buffer toward finality (e.g. 64+ on ETH) without redeploying.
+    Falls back to the hardcoded CONFIRMATIONS default, then 12."""
+    env = os.environ.get(f"GREENCOMPUTE_WATCHER_CONFIRMATIONS_{chain_id.upper()}")
+    if env and env.strip().isdigit():
+        return int(env.strip())
+    return CONFIRMATIONS.get(chain_id, 12)
 
 # Transfer(address,address,uint256) event topic (keccak256). Stable
 # across all ERC-20 tokens.
@@ -126,16 +138,27 @@ TOKENS: list[TokenConfig] = [
 ]
 
 
+_DEFAULT_RPC_URLS = {
+    "eth": "https://ethereum-rpc.publicnode.com",
+    "base": "https://base-rpc.publicnode.com",
+}
+
+# Env var that overrides the default public RPC per chain.
+_RPC_URL_ENV = {"eth": "ETH_RPC_URL", "base": "BASE_RPC_URL"}
+
+
 def _chain_rpc_url(chain_id: str) -> str:
-    # publicnode is keyless and reliable; override via env with an Alchemy /
-    # Infura URL for production-grade rate limits.
-    if chain_id == "eth":
-        return (os.environ.get("ETH_RPC_URL", "").strip()
-                or "https://ethereum-rpc.publicnode.com")
-    if chain_id == "base":
-        return (os.environ.get("BASE_RPC_URL", "").strip()
-                or "https://base-rpc.publicnode.com")
-    raise ValueError(f"unknown EVM chain_id: {chain_id}")
+    # publicnode is keyless but can be flaky/rate-limited; override via env with
+    # an Alchemy / Infura URL for production-grade rate limits.
+    env_name = _RPC_URL_ENV.get(chain_id)
+    if env_name is None:
+        raise ValueError(f"unknown EVM chain_id: {chain_id}")
+    return os.environ.get(env_name, "").strip() or _DEFAULT_RPC_URLS[chain_id]
+
+
+def _using_default_rpc(chain_id: str) -> bool:
+    env_name = _RPC_URL_ENV.get(chain_id)
+    return not (env_name and (os.environ.get(env_name, "").strip()))
 
 
 def _kv_get(repo: BillingRepository, key: str) -> str | None:
@@ -286,7 +309,9 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
     # Only scan blocks that are deep enough to be reorg-safe. Crediting on a
     # transfer that later gets reorged out would credit funds we never
     # received. ETH finalizes slower than Base, so use a bigger buffer.
-    confirmations = CONFIRMATIONS.get(chain_id, 12)
+    # Env-overridable (GREENCOMPUTE_WATCHER_CONFIRMATIONS_<CHAIN>) so ops can
+    # raise it toward finality without a redeploy.
+    confirmations = _confirmations(chain_id)
     safe_head = head - confirmations
     if safe_head <= 0:
         return 0
@@ -564,6 +589,24 @@ async def deposit_watcher_loop() -> None:
     ))
     if scan_enabled:
         log.info("deposit watcher starting (interval=%ds)", interval)
+        # Surface the effective reorg buffer + RPC source so flakiness / a
+        # too-shallow confirmation depth is visible at startup.
+        for chain_id in ("eth", "base"):
+            log.info(
+                "deposit watcher %s: confirmations=%d rpc=%s",
+                chain_id,
+                _confirmations(chain_id),
+                _chain_rpc_url(chain_id),
+            )
+            if _using_default_rpc(chain_id):
+                log.warning(
+                    "deposit watcher %s: using DEFAULT public RPC %s (can be "
+                    "flaky/rate-limited) — set %s to an Alchemy/Infura URL in "
+                    "production",
+                    chain_id,
+                    _DEFAULT_RPC_URLS[chain_id],
+                    _RPC_URL_ENV[chain_id],
+                )
     else:
         log.info(
             "deposit watcher chain-scanning disabled; running invoice-expiry sweep only"

@@ -413,6 +413,29 @@ class ControlPlaneRepository:
             session.add(row)
             return whole_cents, remainder
 
+    def return_metering_mcents(self, deployment_id: str, *, mcents: int) -> int:
+        """Carry undebited millicents back onto the deployment's accumulator.
+
+        accrue_metering subtracts whole-cents from the remainder eagerly (and
+        commits). If the matching user debit only partially succeeds (balance
+        drained to its floor), the undebited whole-cents would otherwise be
+        lost — pure free compute. This adds them back so that, after a top-up
+        and resume, billing remains exact. Atomic SELECT FOR UPDATE += so a
+        concurrent metering cycle can't clobber the accumulator. Returns the
+        new remainder (or 0 if the deployment is missing).
+        """
+        if mcents <= 0:
+            with session_scope(self.session_factory) as session:
+                row = session.get(DeploymentORM, deployment_id)
+                return (row.metering_remainder_mcents or 0) if row is not None else 0
+        with session_scope(self.session_factory) as session:
+            row = session.get(DeploymentORM, deployment_id, with_for_update=True)
+            if row is None:
+                return 0
+            row.metering_remainder_mcents = (row.metering_remainder_mcents or 0) + mcents
+            session.add(row)
+            return row.metering_remainder_mcents
+
     def save_assignment(self, assignment: LeaseAssignment) -> LeaseAssignment:
         with session_scope(self.session_factory) as session:
             row = session.scalar(

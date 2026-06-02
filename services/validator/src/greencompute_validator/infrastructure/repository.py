@@ -612,19 +612,27 @@ class ValidatorRepository:
             )
             return row.workload_id if row else None
 
-    def list_flux_deployments(self, hotkey: str) -> list[dict]:
+    def list_flux_deployments(self, hotkey: str, node_id: str | None = None) -> list[dict]:
         """Return [(deployment_id, workload_id, model_id, state)] for live
         Flux-managed deployments on this miner. Excludes terminated (the
-        reconciler treats terminated as 'no current replica')."""
-        return self._list_flux_deployments(hotkey, include_terminated=False)
+        reconciler treats terminated as 'no current replica').
 
-    def list_flux_deployments_incl_terminated(self, hotkey: str) -> list[dict]:
+        When node_id is given, the result is scoped to that node so a per-node
+        reconcile only sees ITS OWN replicas — without this the reconciler
+        terminated other nodes' healthy replicas (cross-node termination) and
+        under-provisioned because a model already running on a sibling node was
+        treated as 'existing' for the node being reconciled."""
+        return self._list_flux_deployments(hotkey, node_id=node_id, include_terminated=False)
+
+    def list_flux_deployments_incl_terminated(self, hotkey: str, node_id: str | None = None) -> list[dict]:
         """Same as list_flux_deployments but includes recently terminated
         rows. Used to populate failure cooldown — a recently-terminated
         (miner, model) pair blocks re-scheduling for a cooldown window."""
-        return self._list_flux_deployments(hotkey, include_terminated=True)
+        return self._list_flux_deployments(hotkey, node_id=node_id, include_terminated=True)
 
-    def _list_flux_deployments(self, hotkey: str, *, include_terminated: bool) -> list[dict]:
+    def _list_flux_deployments(
+        self, hotkey: str, *, node_id: str | None = None, include_terminated: bool
+    ) -> list[dict]:
         with session_scope(self.session_factory) as session:
             stmt = (
                 select(
@@ -637,6 +645,8 @@ class ValidatorRepository:
                 .join(WorkloadORM, WorkloadORM.workload_id == DeploymentORM.workload_id)
                 .where(DeploymentORM.hotkey == hotkey)
             )
+            if node_id is not None:
+                stmt = stmt.where(DeploymentORM.node_id == node_id)
             if not include_terminated:
                 stmt = stmt.where(DeploymentORM.state != "terminated")
             rows = session.execute(stmt).all()
@@ -718,15 +728,60 @@ class ValidatorRepository:
                 .where(InferenceDemandStatsORM.model_id == model_id)
                 .where(InferenceDemandStatsORM.window_start >= cutoff_10)
             ) or 0
+            earliest_10 = session.scalar(
+                select(func.min(InferenceDemandStatsORM.window_start))
+                .where(InferenceDemandStatsORM.model_id == model_id)
+                .where(InferenceDemandStatsORM.window_start >= cutoff_10)
+            )
             total_60 = session.scalar(
                 select(func.coalesce(func.sum(InferenceDemandStatsORM.invocations), 0))
                 .where(InferenceDemandStatsORM.model_id == model_id)
                 .where(InferenceDemandStatsORM.window_start >= cutoff_60)
             ) or 0
+            earliest_60 = session.scalar(
+                select(func.min(InferenceDemandStatsORM.window_start))
+                .where(InferenceDemandStatsORM.model_id == model_id)
+                .where(InferenceDemandStatsORM.window_start >= cutoff_60)
+            )
+        # Divide by the ACTUAL observed span (clamped to >=1 min, capped at the
+        # nominal window) rather than the fixed 10/60, so a fresh deploy / sparse
+        # data window reports the true requests-per-minute instead of dividing a
+        # few minutes of traffic by the full window. At steady state span ==
+        # 10/60 → identical to the previous behavior. No rows (earliest is None)
+        # → nominal denominator → 0/10 == 0, preserving the zero contract.
         return {
-            "rpm_10m": float(total_10) / 10.0,
-            "rpm_1h": float(total_60) / 60.0,
+            "rpm_10m": float(total_10) / self._span_minutes(now, earliest_10, 10.0),
+            "rpm_1h": float(total_60) / self._span_minutes(now, earliest_60, 60.0),
         }
+
+    @staticmethod
+    def _span_minutes(now: "datetime", earliest: "datetime | None", nominal: float) -> float:
+        """Observed minute-span for the demand window, clamped to [1, nominal]."""
+        if earliest is None:
+            return nominal
+        if earliest.tzinfo is None:
+            from datetime import UTC as _UTC
+            earliest = earliest.replace(tzinfo=_UTC)
+        span = (now - earliest).total_seconds() / 60.0
+        return max(1.0, min(nominal, span))
+
+    def count_pending_rentals(self, hotkey: str) -> int:
+        """Count owner-bound (non-flux) rental deployments pinned to this
+        hotkey that are still awaiting placement (not yet ready/terminal).
+        Feeds the Flux rental demand signal so the idle flex pool tilts toward
+        rentals when real rental demand is queued. Read-only."""
+        from sqlalchemy import func
+
+        pending_states = ("pending", "scheduled", "pulling", "starting")
+        with session_scope(self.session_factory) as session:
+            total = session.scalar(
+                select(func.count())
+                .select_from(DeploymentORM)
+                .where(DeploymentORM.hotkey == hotkey)
+                .where(DeploymentORM.owner_user_id.is_not(None))
+                .where(DeploymentORM.state.in_(pending_states))
+            )
+            return int(total or 0)
 
     def prune_demand_stats(self, retention_hours: int = 48) -> int:
         """Drop demand rows older than `retention_hours`. Returns row count."""

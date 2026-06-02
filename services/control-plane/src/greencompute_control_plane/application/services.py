@@ -267,6 +267,28 @@ class ControlPlaneService:
         deployment = self.repository.get_deployment(update.deployment_id)
         if deployment is None:
             raise KeyError(f"deployment not found: {update.deployment_id}")
+        # Terminal states (TERMINATED/FAILED) are absorbing. A miner that posts
+        # a stale forward report (READY/STARTING/…) for a deployment the
+        # control-plane already terminated/failed (orphan cleanup, scheduler
+        # give-up, the ORCH-M2 give-up double-fire) is a benign race — swallow
+        # it and return the existing row rather than mutating state, re-firing
+        # bus events, or 500ing the miner. This covers BOTH an equal terminal
+        # re-report (FAILED→FAILED) and an illegal forward jump out of a
+        # terminal state (TERMINATED→READY). Genuinely illegal transitions FROM
+        # a live (non-terminal) state still raise InvalidDeploymentTransition,
+        # which the route surfaces as 409.
+        if deployment.state in {DeploymentState.TERMINATED, DeploymentState.FAILED}:
+            if update.state != deployment.state:
+                logger.info(
+                    "Ignoring late %s report for %s already in terminal state %s",
+                    update.state.value,
+                    deployment.deployment_id,
+                    deployment.state.value,
+                )
+            return deployment
+        # transition_state no-ops on equal (so a live-state re-report still
+        # applies endpoint/ready_instances/port-mapping updates below) and
+        # raises on a disallowed live→X transition.
         deployment.state = transition_state(deployment.state, update.state)
         deployment.ready_instances = update.ready_instances if update.state == DeploymentState.READY else 0
         deployment.endpoint = update.endpoint or deployment.endpoint
@@ -1080,18 +1102,36 @@ class ControlPlaneService:
             deployment.failure_class = "scheduler_failure"
             deployment.updated_at = datetime.now(UTC)
             self.repository.update_deployment(deployment)
-            if event.attempts >= settings.deployment_request_retry_limit:
+            # Give up on TWO independent signals:
+            #  - event.attempts: per-delivery bus retries (fast give-up when the
+            #    scheduler simply can't place it at all). Resets to 0 on every
+            #    new deployment.requested delivery published by _requeue_assignment.
+            #  - deployment.retry_count: the PERSISTENT lifetime counter that
+            #    survives requeue (incremented in _requeue_assignment), so a
+            #    deployment that keeps landing on dying miners and getting
+            #    reassigned forever is now bounded by deployment_reassign_retry_limit
+            #    instead of looping indefinitely with attempts perpetually reset.
+            attempts_exhausted = event.attempts >= settings.deployment_request_retry_limit
+            reassign_exhausted = deployment.retry_count >= settings.deployment_reassign_retry_limit
+            if attempts_exhausted or reassign_exhausted:
                 deployment.retry_exhausted = True
                 deployment.updated_at = datetime.now(UTC)
                 self.repository.update_deployment(deployment)
+                if reassign_exhausted and not attempts_exhausted:
+                    give_up_reason = (
+                        "no compatible miner capacity available after "
+                        f"{deployment.retry_count} reassignments"
+                    )
+                else:
+                    give_up_reason = (
+                        "no compatible miner capacity available after "
+                        f"{settings.deployment_request_retry_limit} attempts"
+                    )
                 failed = self.update_deployment_status(
                     DeploymentStatusUpdate(
                         deployment_id=deployment.deployment_id,
                         state=DeploymentState.FAILED,
-                        error=(
-                            "no compatible miner capacity available after "
-                            f"{settings.deployment_request_retry_limit} attempts"
-                        ),
+                        error=give_up_reason,
                         observed_at=deployment.updated_at,
                     )
                 )
@@ -1318,10 +1358,15 @@ class ControlPlaneService:
     def meter_usage(self) -> dict[str, int]:
         """Deduct per-minute GPU usage from user balances for all READY deployments.
 
-        Returns dict of deployment_id -> cents deducted. Suspends deployments
-        when user balance is insufficient.
+        Returns dict of deployment_id -> cents actually debited. Drains the
+        user's balance to its floor (never below 0, never free up to the
+        balance they hold) and only suspends a deployment AFTER the balance is
+        exhausted (a positive shortfall). Any whole-cents that couldn't be
+        debited are carried back onto the deployment's millicent accumulator so
+        no realized usage is silently dropped — billing stays exact across a
+        suspend/top-up/resume cycle.
         """
-        from greencompute_gateway.infrastructure.billing_repository import BillingRepository, InsufficientBalanceError
+        from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 
         billing_repo = BillingRepository()
         ready_deployments = self.repository.list_deployments_by_state(DeploymentState.READY)
@@ -1363,20 +1408,75 @@ class ControlPlaneService:
                 continue
             amount = whole_cents
 
+            # Drain-to-floor: take min(amount, balance), never raising and
+            # never driving balance negative. Returns a dict
+            # {"debited_cents": int, "shortfall_cents": int}.
+            # The helper is the SHARED implementation on the gateway
+            # BillingRepository (also used by inference billing). If a partial
+            # rollout means it isn't present yet, fall back conservatively:
+            # debit nothing this cycle and carry the whole accrued amount back
+            # (never free compute, never a crash) until the gateway ships it.
+            debit_to_floor = getattr(billing_repo, "debit_user_to_floor", None)
+            if debit_to_floor is None:
+                logger.error(
+                    "BillingRepository.debit_user_to_floor unavailable — "
+                    "carrying back %d cents for %s without debiting",
+                    amount,
+                    deployment.deployment_id,
+                )
+                try:
+                    self.repository.return_metering_mcents(
+                        deployment.deployment_id, mcents=amount * 1000
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Failed to carry back %d cents for %s: %s",
+                        amount,
+                        deployment.deployment_id,
+                        exc,
+                    )
+                continue
+
             try:
-                billing_repo.debit_user(
+                _drain = debit_to_floor(
                     user_id=deployment.owner_user_id,
                     amount_cents=amount,
                     kind="usage",
                     reference_id=deployment.deployment_id,
                     description=f"GPU usage {gpu_count}× GPU @ ${hourly_cents/100:.2f}/hr",
                 )
-                result[deployment.deployment_id] = amount
-            except InsufficientBalanceError:
+            except KeyError:
+                # User not found — skip (matches prior behavior).
+                continue
+            # debit_user_to_floor returns a dict, NOT a tuple.
+            debited = int(_drain.get("debited_cents", 0))
+            shortfall = int(_drain.get("shortfall_cents", 0))
+
+            if debited > 0:
+                result[deployment.deployment_id] = debited
+
+            if shortfall > 0:
+                # Carry the undebited whole-cents back onto the accumulator so
+                # accrue_metering's eager remainder decrement isn't lost (no
+                # free compute). Then suspend — the balance is now exhausted.
+                try:
+                    self.repository.return_metering_mcents(
+                        deployment.deployment_id,
+                        mcents=shortfall * 1000,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Failed to carry back %d undebited cents for %s: %s",
+                        shortfall,
+                        deployment.deployment_id,
+                        exc,
+                    )
                 logger.warning(
-                    "Suspending deployment %s — user %s has insufficient balance",
+                    "Suspending deployment %s — user %s balance drained (debited %d, shortfall %d)",
                     deployment.deployment_id,
                     deployment.owner_user_id,
+                    debited,
+                    shortfall,
                 )
                 try:
                     self.update_deployment_status(
@@ -1389,9 +1489,6 @@ class ControlPlaneService:
                     self.metrics.increment("deployment.suspended.insufficient_balance")
                 except Exception as exc:
                     logger.error("Failed to suspend deployment %s: %s", deployment.deployment_id, exc)
-            except KeyError:
-                # User not found — skip
-                pass
 
         if result:
             self.metrics.increment("metering.cycles")

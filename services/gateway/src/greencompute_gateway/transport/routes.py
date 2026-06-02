@@ -1,4 +1,6 @@
 import json
+import logging
+import math
 import os
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
@@ -32,9 +34,58 @@ from greencompute_gateway.infrastructure.inference_client import (
     InferenceTimeoutError,
     InferenceUpstreamError,
 )
-from greencompute_gateway.transport.security import enforce_rate_limit, metrics, require_api_key
+from greencompute_gateway.transport.security import (
+    current_client_ip,
+    enforce_rate_limit,
+    metrics,
+    require_api_key,
+    require_provision_or_admin,
+)
 
 router = APIRouter()
+log = logging.getLogger(__name__)
+
+
+# --- Top-up amount bounds (single source of truth for UI + backend) --------
+# Keep the default minimum at $1 (don't reject existing low-value flows). The
+# UI references MIN_TOPUP_USD so the preset/custom-input minimum can never
+# drift from what the backend enforces (BILL-M3). MAX is env-overridable so
+# ops can raise it for a known big customer without a redeploy.
+MIN_TOPUP_USD = 1.0
+try:
+    MAX_TOPUP_USD = float(os.environ.get("GREENCOMPUTE_MAX_TOPUP_USD", "50000"))
+except (TypeError, ValueError):
+    MAX_TOPUP_USD = 50000.0
+
+
+def _validate_topup_amount(raw) -> float:
+    """Validate a user-supplied top-up amount: numeric, finite, within
+    [MIN_TOPUP_USD, MAX_TOPUP_USD]. Rounds to cents server-side. Raises
+    HTTPException(400) on any violation (NaN/Inf/non-numeric/out-of-range)."""
+    try:
+        amt = float(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="amount_usd must be a number")
+    if not math.isfinite(amt):
+        raise HTTPException(status_code=400, detail="amount_usd must be finite")
+    if amt < MIN_TOPUP_USD:
+        raise HTTPException(
+            status_code=400, detail=f"amount_usd must be >= {MIN_TOPUP_USD:g}"
+        )
+    if amt > MAX_TOPUP_USD:
+        raise HTTPException(
+            status_code=400, detail=f"amount_usd must be <= {MAX_TOPUP_USD:g}"
+        )
+    return round(amt, 2)
+
+
+def _audit_client_ip() -> str | None:
+    """Best-effort client IP for audit logs, read from the request-context
+    ContextVar populated by the middleware."""
+    try:
+        return current_client_ip.get()
+    except LookupError:
+        return None
 
 
 def _feature_disabled(feature: str) -> None:
@@ -49,8 +100,47 @@ def _feature_disabled(feature: str) -> None:
 
 
 @router.post("/platform/api-keys")
-def create_api_key(payload: APIKeyCreateRequest) -> dict:
-    return service.create_api_key(payload).model_dump(mode="json")
+def create_api_key(
+    payload: APIKeyCreateRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Mint an api key. AUTHENTICATED — anonymous callers are rejected.
+
+    Caller tiers (most → least privileged):
+      - env master-admin key: may set an arbitrary user_id and admin=true.
+      - GREENCOMPUTE_PROVISION_SECRET (UI server provisioning): may bind the
+        key to an explicit user_id, but admin is forced false.
+      - a normal user api key: may only mint a key bound to its OWN user_id;
+        client-supplied user_id/admin/scopes are ignored.
+
+    Client-supplied `admin`/`user_id`/`scopes` are NEVER trusted from a
+    non-admin caller — privilege is derived from the authenticated principal.
+    """
+    try:
+        caller, is_master_admin = require_provision_or_admin(authorization, x_api_key)
+    except HTTPException as exc:
+        # Not a privileged caller — fall back to self-service: a normal,
+        # valid user key may mint a key for its own user_id only. A truly
+        # anonymous/invalid caller still gets rejected here.
+        if exc.status_code not in (401, 403):
+            raise
+        api_key = require_api_key(authorization, x_api_key)
+        return service.create_api_key(
+            payload,
+            caller_user_id=api_key.user_id,
+            allow_user_id_override=False,  # bound to own user_id
+            allow_admin_grant=False,
+        ).model_dump(mode="json")
+    # Privileged caller. Both the env master admin AND the provision secret may
+    # bind the key to an explicit user_id (the UI provisions a key for the
+    # newly-registered user). Only the master admin may grant admin=true.
+    return service.create_api_key(
+        payload,
+        caller_user_id=caller.user_id,
+        allow_user_id_override=True,
+        allow_admin_grant=is_master_admin,
+    ).model_dump(mode="json")
 
 
 @router.get("/platform/api-keys")
@@ -117,7 +207,15 @@ def delete_api_key(
 
 
 @router.post("/platform/register")
-def register_user(payload: UserRegistrationRequest) -> dict:
+def register_user(
+    payload: UserRegistrationRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Register (or idempotently return) a user. AUTHENTICATED — requires the
+    provisioning secret or an admin key (the UI server sends the provision
+    secret). register is idempotent-by-email so re-running is safe."""
+    require_provision_or_admin(authorization, x_api_key)
     return service.register_user(payload).model_dump(mode="json")
 
 
@@ -725,6 +823,16 @@ def get_deployment_ssh(
     host_port = parts[-1].rsplit(":", 1)
     host = host_port[0]
     port = int(host_port[1]) if len(host_port) == 2 else 22
+    # Audit: a long-lived SSH private key is being handed out. Authz already
+    # passed (owner/admin), but record WHO pulled it.
+    metrics.increment("secret_access.deployment_ssh")
+    log.info(
+        "secret_access event=deployment_ssh_key deployment_id=%s key_id=%s user_id=%s ip=%s",
+        deployment_id,
+        api_key.key_id,
+        api_key.user_id,
+        _audit_client_ip(),
+    )
     return {
         "ssh_host": host,
         "ssh_port": port,
@@ -1490,7 +1598,20 @@ def registry_auth(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    require_api_key(authorization, x_api_key)
+    api_key = require_api_key(authorization, x_api_key)
+    # The registry password is a shared infra credential. Scope-tighten: only
+    # hand it to a user-bound key or an admin — never to an anonymous/system
+    # key (user_id None and not admin).
+    if api_key.user_id is None and not api_key.admin:
+        raise HTTPException(status_code=403, detail="registry auth requires a user-bound api key")
+    # Audit: a shared infra credential is being handed out.
+    metrics.increment("secret_access.registry_auth")
+    log.info(
+        "secret_access event=registry_auth key_id=%s user_id=%s ip=%s",
+        api_key.key_id,
+        api_key.user_id,
+        _audit_client_ip(),
+    )
     import base64
     from greencompute_persistence.runtime import load_runtime_settings
     settings = load_runtime_settings("greencompute-gateway")
@@ -1686,11 +1807,9 @@ def billing_topup_stripe(
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
-    amount_usd = payload.get("amount_usd")
-    if not amount_usd or amount_usd < 1:
-        raise HTTPException(status_code=400, detail="amount_usd must be >= 1")
+    amount_usd = _validate_topup_amount(payload.get("amount_usd"))
     try:
-        return _get_billing().create_stripe_topup(api_key.user_id, float(amount_usd))
+        return _get_billing().create_stripe_topup(api_key.user_id, amount_usd)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -1705,7 +1824,6 @@ def billing_topup_crypto(
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
     currency = payload.get("currency", "").lower()
-    amount_usd = payload.get("amount_usd")
     allowed = (
         "usdt", "usdc",                           # legacy — single address for either chain
         "usdt-eth", "usdt-base",                  # chain-qualified
@@ -1717,9 +1835,8 @@ def billing_topup_crypto(
             status_code=400,
             detail=f"currency must be one of: {', '.join(allowed)}",
         )
-    if not amount_usd or amount_usd < 1:
-        raise HTTPException(status_code=400, detail="amount_usd must be >= 1")
-    return _get_billing().create_crypto_invoice(api_key.user_id, currency, float(amount_usd))
+    amount_usd = _validate_topup_amount(payload.get("amount_usd"))
+    return _get_billing().create_crypto_invoice(api_key.user_id, currency, amount_usd)
 
 
 @router.post("/platform/billing/webhook/stripe")
@@ -1732,10 +1849,30 @@ async def billing_stripe_webhook(request: Request) -> dict:
         event = verify_webhook_signature(payload, sig)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"webhook verification failed: {exc}") from exc
-    if event.get("type") == "checkout.session.completed":
+    event_type = event.get("type")
+    if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
         session_data = event["data"]["object"]
         stripe_session_id = session_data["id"]
-        _get_billing().confirm_stripe_payment(stripe_session_id)
+        # Gate the credit on a PAID session. `checkout.session.completed` can
+        # fire with payment_status in {'unpaid','no_payment_required'} for
+        # async/delayed payment methods — crediting then books money we never
+        # captured. Only credit when paid/complete; otherwise leave the session
+        # pending for the reconcile job or a later async_payment_succeeded
+        # event. confirm_stripe_payment is idempotent (BILL-C2), so a later
+        # async event after a borderline 'complete' is safe.
+        payment_status = session_data.get("payment_status")
+        # MUST be payment_status=='paid'. `status=='complete'` is true for EVERY
+        # checkout.session.completed event (incl. unpaid async sessions), so
+        # OR-ing it in would credit money we never captured. A delayed payment
+        # arrives later as checkout.session.async_payment_succeeded (paid).
+        if payment_status == "paid":
+            _get_billing().confirm_stripe_payment(stripe_session_id)
+        else:
+            log.info(
+                "Stripe %s for session %s not credited (payment_status=%r) — "
+                "awaiting capture / reconcile",
+                event_type, stripe_session_id, payment_status,
+            )
     return {"received": True}
 
 
@@ -1976,16 +2113,17 @@ def billing_admin_debit(
         raise HTTPException(status_code=400, detail="amount_usd must be > 0")
     amount_cents = int(round(float(amount_usd) * 100))
     billing = _get_billing()
-    from greencompute_gateway.infrastructure.billing_repository import InsufficientBalanceError
-    try:
-        entry = billing.repo.debit_user(
-            user_id=user_id,
-            amount_cents=amount_cents,
-            kind="refund",
-            description=description,
-        )
-    except InsufficientBalanceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Admin claw-back is trusted and may push the balance negative — this is
+    # the fraud/chargeback case where the user already spent the funds, so a
+    # strict debit (which would 400) is exactly wrong here. Usage/inference
+    # debits stay strict (they call debit_user without allow_negative).
+    entry = billing.repo.debit_user(
+        user_id=user_id,
+        amount_cents=amount_cents,
+        kind="refund",
+        description=description,
+        allow_negative=True,
+    )
     return {
         "debited": True,
         "user_id": user_id,

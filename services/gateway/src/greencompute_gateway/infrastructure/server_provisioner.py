@@ -25,14 +25,117 @@ set and parse known-format output.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
 import secrets
+import socket
 import time
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
+
+
+class HostNotAllowedError(ValueError):
+    """Raised when an onboarding ssh_host resolves to a disallowed
+    (private/loopback/link-local/multicast/reserved/unspecified) address.
+    Subclasses ValueError so the route layer maps it to a 400."""
+
+
+def resolve_and_guard_host(host: str, port: int = 22) -> str:
+    """Resolve `host` and REJECT it if ANY resolved address is private,
+    loopback, link-local, multicast, reserved, or unspecified (0.0.0.0/::).
+
+    This is the load-bearing SSRF control for provider onboarding: it stops a
+    user pointing the gateway's outbound SSH at internal infra
+    (169.254.169.254 cloud metadata, 127.0.0.1, 10/8, 172.16/12, 192.168/16,
+    ::1, fc00::/7, the control-plane/postgres containers, etc.).
+
+    Returns the original host on success (we keep the hostname so paramiko can
+    still do its own connect/host-key handling); raises HostNotAllowedError on
+    any violation. An operator may further restrict via the CIDR allowlist env
+    GREENCOMPUTE_ONBOARD_HOST_ALLOWLIST.
+    """
+    host = (host or "").strip()
+    if not host:
+        raise HostNotAllowedError("ssh_host is required")
+    # Reject control chars / whitespace outright (also blocks header/CRLF
+    # smuggling into downstream commands).
+    if any(c in host for c in "\r\n\t ") or any(ord(c) < 32 for c in host):
+        raise HostNotAllowedError("ssh_host contains invalid characters")
+
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise HostNotAllowedError(f"could not resolve ssh_host: {host}") from exc
+
+    addrs: list[ipaddress._BaseAddress] = []
+    for info in infos:
+        sockaddr = info[4]
+        ip_str = sockaddr[0]
+        try:
+            addr = ipaddress.ip_address(ip_str)
+        except ValueError:
+            raise HostNotAllowedError(f"ssh_host resolved to an invalid address: {ip_str}")
+        addrs.append(addr)
+
+    if not addrs:
+        raise HostNotAllowedError(f"ssh_host did not resolve to any address: {host}")
+
+    allowlist = _host_allowlist()
+    for addr in addrs:
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_multicast
+            or addr.is_reserved
+            or addr.is_unspecified
+        ):
+            raise HostNotAllowedError(
+                f"ssh_host {host} resolves to a disallowed address ({addr}) — "
+                "private/loopback/link-local/multicast/reserved hosts are not "
+                "allowed for onboarding"
+            )
+        if allowlist and not any(addr in net for net in allowlist):
+            raise HostNotAllowedError(
+                f"ssh_host {host} ({addr}) is not in the onboarding allowlist"
+            )
+    return host
+
+
+def _host_allowlist() -> list:
+    """Optional operator allowlist of CIDRs (comma-separated) that onboarding
+    targets must fall within. Empty/unset = no extra restriction beyond the
+    private/loopback/etc. rejection."""
+    raw = (os.environ.get("GREENCOMPUTE_ONBOARD_HOST_ALLOWLIST", "") or "").strip()
+    if not raw:
+        return []
+    nets = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            log.warning("ignoring invalid onboarding allowlist CIDR: %r", part)
+    return nets
+
+
+def _env_safe(value: str, *, field: str) -> str:
+    """Reject control characters (esp. CR/LF) in a value destined for the
+    node `.env`. A newline in payout_address/hotkey/hf_token/label would
+    inject/override arbitrary GREENCOMPUTE_* env lines on the provisioned
+    node (e.g. flip auth mode, repoint the validator URL). The base64 heredoc
+    protects the SHELL transport but NOT the .env file CONTENT, so this guard
+    must run at render time."""
+    if value is None:
+        return ""
+    if any(c in value for c in "\r\n") or any(ord(c) < 32 and c != "\t" for c in value):
+        raise ValueError(f"{field} contains invalid control characters")
+    return value
 
 
 # Public endpoints the provisioned node should talk to. Arbitrary provider
@@ -101,6 +204,45 @@ def _normalize_gpu(raw: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s)[:32] or "unknown"
 
 
+def _known_hosts_path() -> str:
+    """Where the gateway persists captured host keys (TOFU pin file). Override
+    via env for tests / non-default deployments."""
+    return (
+        os.environ.get("GREENCOMPUTE_ONBOARD_KNOWN_HOSTS", "").strip()
+        or "/var/lib/greencompute/onboard_known_hosts"
+    )
+
+
+def _make_host_key_policy(paramiko, on_log):
+    """Trust-on-first-use with pinning: capture+store the host key on the
+    FIRST connect, and (because we load the known_hosts file before connecting)
+    a CHANGED key on re-provision triggers paramiko's RejectPolicy / known-hosts
+    mismatch (SSHException), which we let propagate. We never blindly AutoAdd a
+    key that contradicts a stored one."""
+
+    class _PinFirstSeenPolicy(paramiko.MissingHostKeyPolicy):
+        """Only fires when the host key is MISSING from known_hosts (i.e. first
+        contact). A key that is PRESENT-but-DIFFERENT never reaches this policy
+        — paramiko raises BadHostKeyException before calling it — so this is
+        safe TOFU. Captures the fingerprint to the provision log for audit."""
+
+        def missing_host_key(self, client, hostname, key):  # noqa: D401
+            fp = key.get_fingerprint().hex()
+            try:
+                on_log(f"  host key (first contact) {key.get_name()} SHA fingerprint={fp}\n")
+            except Exception:  # noqa: BLE001
+                pass
+            client.get_host_keys().add(hostname, key.get_name(), key)
+            path = _known_hosts_path()
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                client.save_host_keys(path)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not persist onboarding host key to %s: %s", path, exc)
+
+    return _PinFirstSeenPolicy()
+
+
 class _SSH:
     """Thin paramiko wrapper with a logging `run`."""
 
@@ -109,8 +251,22 @@ class _SSH:
 
         self._paramiko = paramiko
         self.on_log = on_log
+        # Anti-DNS-rebind: re-validate the destination right before connecting,
+        # not only at the API edge. A host that passed the sync pre-queue check
+        # could re-resolve to an internal IP by the time the background task
+        # runs; this closes that window.
+        resolve_and_guard_host(inp.ssh_host, inp.ssh_port)
         self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Load any previously-captured host keys so a CHANGED key on
+        # re-provision is rejected (BadHostKeyException) instead of silently
+        # trusted. First contact is captured by the pin policy below.
+        try:
+            kh = _known_hosts_path()
+            if os.path.exists(kh):
+                self.client.load_host_keys(kh)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not load onboarding known_hosts: %s", exc)
+        self.client.set_missing_host_key_policy(_make_host_key_policy(paramiko, on_log))
         connect_kwargs: dict = dict(
             hostname=inp.ssh_host,
             port=inp.ssh_port,
@@ -371,21 +527,32 @@ def provision_server(inp: ProvisionInputs, on_log, on_status) -> ProvisionResult
 
 
 def _render_env(**kw) -> str:
+    # Sanitize every value that lands in the .env. A CR/LF in any of these
+    # would inject/override arbitrary GREENCOMPUTE_* lines on the node.
+    hotkey = _env_safe(kw["hotkey"], field="hotkey")
+    payout = _env_safe(kw["payout"], field="payout_address")
+    auth_secret = _env_safe(kw["auth_secret"], field="auth_secret")
+    api_base_url = _env_safe(kw["api_base_url"], field="api_base_url")
+    node_id = _env_safe(kw["node_id"], field="node_id")
+    gpu_model = _env_safe(kw["gpu_model"], field="gpu_model")
+    hf_token = _env_safe(kw["hf_token"], field="hf_token")
+    control_plane_url = _env_safe(kw["control_plane_url"], field="control_plane_url")
+    validator_url = _env_safe(kw["validator_url"], field="validator_url")
     return f"""# Auto-generated by Green Compute provider onboarding.
-GREENCOMPUTE_CONTROL_PLANE_URL={kw['control_plane_url']}
-GREENCOMPUTE_MINER_VALIDATOR_URL={kw['validator_url']}
+GREENCOMPUTE_CONTROL_PLANE_URL={control_plane_url}
+GREENCOMPUTE_MINER_VALIDATOR_URL={validator_url}
 
-GREENCOMPUTE_MINER_HOTKEY={kw['hotkey']}
-GREENCOMPUTE_MINER_PAYOUT_ADDRESS={kw['payout']}
-GREENCOMPUTE_MINER_AUTH_SECRET={kw['auth_secret']}
-GREENCOMPUTE_MINER_API_BASE_URL={kw['api_base_url']}
-GREENCOMPUTE_MINER_NODE_ID={kw['node_id']}
+GREENCOMPUTE_MINER_HOTKEY={hotkey}
+GREENCOMPUTE_MINER_PAYOUT_ADDRESS={payout}
+GREENCOMPUTE_MINER_AUTH_SECRET={auth_secret}
+GREENCOMPUTE_MINER_API_BASE_URL={api_base_url}
+GREENCOMPUTE_MINER_NODE_ID={node_id}
 
 # Auth: HMAC (no Bittensor wallet on this box).
 GREENCOMPUTE_AUTH_MODE=hmac
 
 # Hardware (auto-detected).
-GREENCOMPUTE_GPU_MODEL={kw['gpu_model']}
+GREENCOMPUTE_GPU_MODEL={gpu_model}
 GREENCOMPUTE_GPU_COUNT={kw['gpu_count']}
 GREENCOMPUTE_VRAM_GB_PER_GPU={kw['vram_gb']}
 GREENCOMPUTE_CPU_CORES={kw['cpu_cores']}
@@ -400,7 +567,7 @@ GREENCOMPUTE_INFERENCE_BACKEND=docker
 GREENCOMPUTE_SUPPORTED_WORKLOAD_KINDS=inference,pod,vm
 
 # HuggingFace (for gated model pulls).
-HF_TOKEN={kw['hf_token']}
+HF_TOKEN={hf_token}
 HF_HOME=/root/.cache/huggingface
 
 # Agent loop.

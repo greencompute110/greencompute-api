@@ -80,7 +80,11 @@ class ScoreEngine:
 
     def _fraud_penalty(self, results: list[ProbeResult]) -> float:
         if not results:
-            return 0.0
+            # No probe data → neutral fraud multiplier. fraud_penalty is a
+            # MULTIPLIER (1.0 == no fraud detected); returning 0.0 here would
+            # zero the entire final_score. The no-data penalty is already
+            # carried by reliability/performance (which halve when empty).
+            return 1.0
         signature_set = {result.benchmark_signature for result in results if result.benchmark_signature}
         signature_penalty = 0.75 if len(signature_set) > 1 else 1.0
         proxy_penalty = 0.4 if any(result.proxy_suspected for result in results) else 1.0

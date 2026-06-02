@@ -28,6 +28,14 @@ class Settings(BaseModel):
     node_inventory_timeout_seconds: int = Field(default=300, ge=1)
     server_observed_timeout_seconds: int = Field(default=300, ge=1)
     deployment_request_retry_limit: int = Field(default=10, ge=1)
+    # Lifetime cross-miner reassignment cap. Gates give-up on the PERSISTENT
+    # deployment.retry_count (which survives requeue), separate from the
+    # per-delivery bus-attempts cap above (which resets to 0 on every new
+    # deployment.requested delivery). Without this, a deployment that keeps
+    # landing on dying miners is reassigned forever and never fails. Defaulted
+    # higher than the attempts cap so churn isn't terminated as aggressively as
+    # same-miner scheduler retries.
+    deployment_reassign_retry_limit: int = Field(default=10, ge=1)
     deployment_request_retry_delay_seconds: int = Field(default=10, ge=1)
     deployment_health_failure_threshold: int = Field(default=3, ge=1)
     placement_failure_cooldown_seconds: int = Field(default=120, ge=1)
@@ -50,6 +58,7 @@ settings = Settings(
     node_inventory_timeout_seconds=_int("GREENCOMPUTE_NODE_INVENTORY_TIMEOUT_SECONDS", 300),
     server_observed_timeout_seconds=_int("GREENCOMPUTE_SERVER_OBSERVED_TIMEOUT_SECONDS", 300),
     deployment_request_retry_limit=_int("GREENCOMPUTE_DEPLOYMENT_REQUEST_RETRY_LIMIT", 10),
+    deployment_reassign_retry_limit=_int("GREENCOMPUTE_DEPLOYMENT_REASSIGN_RETRY_LIMIT", 10),
     deployment_request_retry_delay_seconds=_int("GREENCOMPUTE_DEPLOYMENT_REQUEST_RETRY_DELAY_SECONDS", 10),
     deployment_health_failure_threshold=_int("GREENCOMPUTE_DEPLOYMENT_HEALTH_FAILURE_THRESHOLD", 3),
     placement_failure_cooldown_seconds=_int("GREENCOMPUTE_PLACEMENT_FAILURE_COOLDOWN_SECONDS", 120),
