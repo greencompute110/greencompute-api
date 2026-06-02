@@ -25,7 +25,11 @@ class Settings(BaseModel):
     netuid: int = Field(default=16, ge=0)
     default_lease_ttl_seconds: int = Field(default=3600, ge=1)
     miner_heartbeat_timeout_seconds: int = Field(default=120, ge=1)
-    node_inventory_timeout_seconds: int = Field(default=300, ge=1)
+    # Generous so a HEALTHY box that briefly stops posting (e.g. a slow
+    # node-agent restart/pip-install) is never treated as dead. ORCH-M4 requeues
+    # a deployment when its per-node inventory is stale beyond this — keep it well
+    # above the capacity-post interval to avoid flapping a live tenant.
+    node_inventory_timeout_seconds: int = Field(default=900, ge=1)
     server_observed_timeout_seconds: int = Field(default=300, ge=1)
     deployment_request_retry_limit: int = Field(default=10, ge=1)
     # Lifetime cross-miner reassignment cap. Gates give-up on the PERSISTENT
@@ -55,7 +59,7 @@ settings = Settings(
     netuid=_int("GREENCOMPUTE_NETUID", 16),
     default_lease_ttl_seconds=_int("GREENCOMPUTE_DEFAULT_LEASE_TTL_SECONDS", 3600),
     miner_heartbeat_timeout_seconds=_int("GREENCOMPUTE_MINER_HEARTBEAT_TIMEOUT_SECONDS", 120),
-    node_inventory_timeout_seconds=_int("GREENCOMPUTE_NODE_INVENTORY_TIMEOUT_SECONDS", 300),
+    node_inventory_timeout_seconds=_int("GREENCOMPUTE_NODE_INVENTORY_TIMEOUT_SECONDS", 900),
     server_observed_timeout_seconds=_int("GREENCOMPUTE_SERVER_OBSERVED_TIMEOUT_SECONDS", 300),
     deployment_request_retry_limit=_int("GREENCOMPUTE_DEPLOYMENT_REQUEST_RETRY_LIMIT", 10),
     deployment_reassign_retry_limit=_int("GREENCOMPUTE_DEPLOYMENT_REASSIGN_RETRY_LIMIT", 10),
