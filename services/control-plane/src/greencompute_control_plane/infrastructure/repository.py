@@ -423,6 +423,8 @@ class ControlPlaneRepository:
                 ssh_private_key=deployment.ssh_private_key,
                 port_mappings=_serialize_port_mappings(deployment.port_mappings),
                 hourly_rate_cents=deployment.hourly_rate_cents,
+                save_on_exhaustion=deployment.save_on_exhaustion,
+                suspended_at=deployment.suspended_at,
                 deployment_fee_usd=deployment.deployment_fee_usd,
                 fee_acknowledged=deployment.fee_acknowledged,
                 warmup_state=deployment.warmup_state,
@@ -458,6 +460,8 @@ class ControlPlaneRepository:
             row.ssh_private_key = deployment.ssh_private_key
             row.port_mappings = _serialize_port_mappings(deployment.port_mappings)
             row.hourly_rate_cents = deployment.hourly_rate_cents
+            row.save_on_exhaustion = deployment.save_on_exhaustion
+            row.suspended_at = deployment.suspended_at
             row.deployment_fee_usd = deployment.deployment_fee_usd
             row.fee_acknowledged = deployment.fee_acknowledged
             row.warmup_state = deployment.warmup_state
@@ -520,6 +524,23 @@ class ControlPlaneRepository:
             row.metering_remainder_mcents = remainder
             session.add(row)
             return whole_cents, remainder
+
+    def accrue_storage(self, deployment_id: str, *, add_mcents: int) -> int:
+        """Accumulate per-minute SAVED-pod storage charge (millicents) on the
+        deployment's storage_remainder_mcents accumulator; return the whole
+        cents to debit. Mirrors accrue_metering — the sub-cent remainder is
+        carried so the $1/day total converges exactly. No return-path is needed
+        (storage debits go negative, so they never partially fail). Returns 0 if
+        the deployment is missing."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(DeploymentORM, deployment_id, with_for_update=True)
+            if row is None:
+                return 0
+            total = (row.storage_remainder_mcents or 0) + add_mcents
+            whole_cents = total // 1000
+            row.storage_remainder_mcents = total - whole_cents * 1000
+            session.add(row)
+            return whole_cents
 
     def return_metering_mcents(self, deployment_id: str, *, mcents: int) -> int:
         """Carry undebited millicents back onto the deployment's accumulator.
@@ -965,6 +986,8 @@ class ControlPlaneRepository:
             ssh_private_key=row.ssh_private_key,
             port_mappings=_deserialize_port_mappings(row.port_mappings),
             hourly_rate_cents=row.hourly_rate_cents if row.hourly_rate_cents is not None else 10,
+            save_on_exhaustion=row.save_on_exhaustion if row.save_on_exhaustion is not None else True,
+            suspended_at=row.suspended_at,
             deployment_fee_usd=row.deployment_fee_usd,
             fee_acknowledged=row.fee_acknowledged,
             warmup_state=row.warmup_state,

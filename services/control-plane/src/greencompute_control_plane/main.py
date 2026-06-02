@@ -50,6 +50,26 @@ async def _control_plane_worker_loop() -> None:
                         "metering cycle failed: %s", meter_exc
                     )
                     _worker_state["last_error"] = f"metering: {meter_exc}"
+                # Saved-pod storage billing + exhaustion reaper — same ~60s
+                # cadence. Both are internally gated (OFF by default) so they're
+                # cheap no-ops until enabled. Isolated try/except so a failure in
+                # one never blocks usage metering or the other.
+                try:
+                    service.meter_pod_storage()
+                except Exception as storage_exc:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "storage cycle failed: %s", storage_exc
+                    )
+                    _worker_state["last_error"] = f"storage: {storage_exc}"
+                try:
+                    service.reap_exhausted_pods()
+                except Exception as reap_exc:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "reaper cycle failed: %s", reap_exc
+                    )
+                    _worker_state["last_error"] = f"reaper: {reap_exc}"
             _worker_state["last_successful_iteration"] = asyncio.get_running_loop().time()
             _worker_state["last_error"] = None
         except Exception as exc:

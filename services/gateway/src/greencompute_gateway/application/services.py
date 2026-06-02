@@ -448,6 +448,7 @@ class GatewayService:
                 "workload_id": payload.workload_id,
                 "requested_instances": payload.requested_instances,
                 "accept_fee": payload.accept_fee,
+                "save_on_exhaustion": payload.save_on_exhaustion,
                 "owner_user_id": user_id,
             }
         )
