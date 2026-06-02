@@ -44,6 +44,11 @@ services:
       GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:${POSTGRES_PASSWORD:-greencompute123}@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
       GREENCOMPUTE_ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      # Server-side provisioning secret (BILL-C1): the UI server presents this to
+      # mint per-user keys on /platform/register + /platform/api-keys. Gateway
+      # fails CLOSED if unset, so it MUST be set in .env (PROVISION_SECRET) in
+      # lockstep with the same value in the UI's env.
+      GREENCOMPUTE_PROVISION_SECRET: ${PROVISION_SECRET:-}
       GREENCOMPUTE_BUS_TRANSPORT: durable
       # Stripe
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
