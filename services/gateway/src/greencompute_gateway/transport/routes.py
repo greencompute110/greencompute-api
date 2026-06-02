@@ -951,8 +951,11 @@ def resume_deployment(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    """Re-deploy a SUSPENDED deployment with the same workload + instance
-    count. Returns the *new* deployment record. Old one flips to TERMINATED.
+    """Pod-safe in-place resume of a SUSPENDED deployment — restarts the SAME
+    container (preserves the user's saved work) after a 1-hour credit gate.
+    Returns the same deployment record (SUSPENDED until the miner re-reports
+    READY). 402 if balance can't cover an hour, 409 if the original node is
+    full / its placement is gone.
     """
     from greencompute_gateway.application.services import InsufficientBalanceForRentalError
 
