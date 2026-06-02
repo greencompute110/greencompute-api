@@ -144,6 +144,20 @@ class DeploymentORM(Base):
     port_mappings: Mapped[dict[int, int]] = mapped_column(JSON, default=dict)
     hourly_rate_cents: Mapped[int] = mapped_column(Integer, default=10)
     metering_remainder_mcents: Mapped[int] = mapped_column(Integer, default=0)
+    # Credit-exhaustion lifecycle (opt-in "save my pod").
+    # save_on_exhaustion: preserve this pod (storage-billed) when credits run
+    #   out instead of deleting it shortly after. Defaults TRUE (opt-OUT) so a
+    #   customer's work is saved by default; they can untick to let it delete.
+    # suspended_at: when the pod last entered SUSPENDED — the clock for the
+    #   delete reaper and storage accrual. NULL on pre-existing suspended pods,
+    #   which grandfathers them out of the reaper entirely.
+    # storage_remainder_mcents: sub-cent storage-charge accumulator, mirrors
+    #   metering_remainder_mcents.
+    save_on_exhaustion: Mapped[bool] = mapped_column(Boolean, default=True)
+    suspended_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    storage_remainder_mcents: Mapped[int] = mapped_column(Integer, default=0)
     deployment_fee_usd: Mapped[float] = mapped_column(Float, default=0.0)
     fee_acknowledged: Mapped[bool] = mapped_column(Boolean, default=True)
     warmup_state: Mapped[str] = mapped_column(String(32), default="pending")

@@ -614,7 +614,7 @@ class GatewayService:
         )
 
     def update_commercial_inquiry_status(
-        self, inquiry_id: str, *, status: str, notes: str | None = None
+        self, inquiry_id: str, *, status: str | None = None, notes: str | None = None
     ) -> CommercialInquiryRecord:
         updated = self.repository.update_commercial_inquiry_status(
             inquiry_id, status=status, notes=notes
@@ -676,7 +676,7 @@ class GatewayService:
         )
 
     def update_bare_metal_inquiry_status(
-        self, inquiry_id: str, *, status: str, review_notes: str | None = None
+        self, inquiry_id: str, *, status: str | None = None, review_notes: str | None = None
     ) -> BareMetalInquiryRecord:
         updated = self.repository.update_bare_metal_inquiry_status(
             inquiry_id, status=status, review_notes=review_notes

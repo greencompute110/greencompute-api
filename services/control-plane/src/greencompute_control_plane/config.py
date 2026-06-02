@@ -54,6 +54,21 @@ class Settings(BaseModel):
     # so both services share the same gate.
     whitelist_enabled: bool = True
 
+    # --- Credit-exhaustion pod lifecycle (opt-in "save my pod") ------------
+    # When a rental's credits run out it is SUSPENDED (pod-safe docker stop,
+    # GPU freed, work preserved). What happens next depends on the user's
+    # opt-in `save_on_exhaustion` choice:
+    #   • save ON  → bill STORAGE_CENTS_PER_DAY/day (negative-balance debt),
+    #                keep up to `pod_saved_retention_days`, then terminate.
+    #   • save OFF → terminate `pod_unsaved_grace_minutes` after suspend.
+    # BOTH gates default OFF so shipping this code changes nothing live; the
+    # reaper additionally only ever acts on pods carrying a NEW `suspended_at`
+    # stamp, so pre-existing suspended pods are grandfathered (never reaped).
+    pod_storage_billing_enabled: bool = False
+    pod_exhaustion_reaper_enabled: bool = False
+    pod_unsaved_grace_minutes: int = Field(default=15, ge=1)
+    pod_saved_retention_days: int = Field(default=30, ge=1)
+
 
 settings = Settings(
     netuid=_int("GREENCOMPUTE_NETUID", 16),
@@ -69,4 +84,8 @@ settings = Settings(
     placement_failure_threshold=_int("GREENCOMPUTE_PLACEMENT_FAILURE_THRESHOLD", 3),
     idle_private_endpoint_timeout_seconds=_int("GREENCOMPUTE_IDLE_PRIVATE_ENDPOINT_TIMEOUT_SECONDS", 1800),
     whitelist_enabled=_bool("GREENCOMPUTE_WHITELIST_ENABLED", True),
+    pod_storage_billing_enabled=_bool("GREENCOMPUTE_POD_STORAGE_BILLING_ENABLED", False),
+    pod_exhaustion_reaper_enabled=_bool("GREENCOMPUTE_POD_EXHAUSTION_REAPER_ENABLED", False),
+    pod_unsaved_grace_minutes=_int("GREENCOMPUTE_POD_UNSAVED_GRACE_MINUTES", 15),
+    pod_saved_retention_days=_int("GREENCOMPUTE_POD_SAVED_RETENTION_DAYS", 30),
 )
