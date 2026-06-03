@@ -951,8 +951,11 @@ def resume_deployment(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    """Re-deploy a SUSPENDED deployment with the same workload + instance
-    count. Returns the *new* deployment record. Old one flips to TERMINATED.
+    """Pod-safe in-place resume of a SUSPENDED deployment — restarts the SAME
+    container (preserves the user's saved work) after a 1-hour credit gate.
+    Returns the same deployment record (SUSPENDED until the miner re-reports
+    READY). 402 if balance can't cover an hour, 409 if the original node is
+    full / its placement is gone.
     """
     from greencompute_gateway.application.services import InsufficientBalanceForRentalError
 
@@ -1037,6 +1040,13 @@ def _client_ip(request: Request) -> str:
     return (request.client.host if request.client else "")[:64]
 
 
+# Allowed sales-inquiry statuses (free-string column, validated here).
+# "attempted" = outreach has been attempted but the contact has NOT yet been
+# reached — distinct from "contacted". Order reflects the funnel:
+# new → attempted → contacted → won/lost.
+_ALLOWED_INQUIRY_STATUSES = {"new", "attempted", "contacted", "won", "lost"}
+
+
 @router.post("/platform/sales/inquiries", status_code=201)
 def create_commercial_inquiry(
     payload: CommercialInquiryCreateRequest,
@@ -1082,12 +1092,23 @@ def update_commercial_inquiry(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     require_api_key(authorization, x_api_key, admin_required=True)
-    status = str(body.get("status") or "").strip()
-    if status not in {"new", "contacted", "won", "lost"}:
-        raise HTTPException(status_code=400, detail="status must be one of new|contacted|won|lost")
+    # `status` is OPTIONAL: omit it (or send "") to save notes only without
+    # changing the funnel stage — lets sales log context before reaching a
+    # contact. When present it must be a known status.
+    raw_status = body.get("status")
+    status = str(raw_status).strip() if raw_status is not None else None
+    if not status:
+        status = None
+    elif status not in _ALLOWED_INQUIRY_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail="status must be one of " + "|".join(sorted(_ALLOWED_INQUIRY_STATUSES)),
+        )
     notes = body.get("notes")
     if notes is not None:
         notes = str(notes)[:5000]
+    if status is None and notes is None:
+        raise HTTPException(status_code=400, detail="provide status and/or notes")
     try:
         return service.update_commercial_inquiry_status(
             inquiry_id, status=status, notes=notes
@@ -1146,12 +1167,22 @@ def update_bare_metal_inquiry(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     require_api_key(authorization, x_api_key, admin_required=True)
-    status = str(body.get("status") or "").strip()
-    if status not in {"new", "contacted", "won", "lost"}:
-        raise HTTPException(status_code=400, detail="status must be one of new|contacted|won|lost")
+    # `status` optional — omit (or "") to save review_notes only. See the
+    # commercial PATCH above for the rationale.
+    raw_status = body.get("status")
+    status = str(raw_status).strip() if raw_status is not None else None
+    if not status:
+        status = None
+    elif status not in _ALLOWED_INQUIRY_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail="status must be one of " + "|".join(sorted(_ALLOWED_INQUIRY_STATUSES)),
+        )
     review_notes = body.get("review_notes")
     if review_notes is not None:
         review_notes = str(review_notes)[:5000]
+    if status is None and review_notes is None:
+        raise HTTPException(status_code=400, detail="provide status and/or review_notes")
     try:
         return service.update_bare_metal_inquiry_status(
             inquiry_id, status=status, review_notes=review_notes

@@ -224,7 +224,7 @@ class GatewayRepository:
             return len(rows)
 
     def update_commercial_inquiry_status(
-        self, inquiry_id: str, *, status: str, notes: str | None = None
+        self, inquiry_id: str, *, status: str | None = None, notes: str | None = None
     ) -> CommercialInquiryRecord | None:
         from greencompute_persistence.orm import utcnow
 
@@ -232,7 +232,8 @@ class GatewayRepository:
             row = session.get(CommercialInquiryORM, inquiry_id)
             if row is None:
                 return None
-            row.status = status
+            if status is not None:
+                row.status = status
             if notes is not None:
                 row.notes = notes
             row.reviewed_at = utcnow()
@@ -302,7 +303,7 @@ class GatewayRepository:
             return len(rows)
 
     def update_bare_metal_inquiry_status(
-        self, inquiry_id: str, *, status: str, review_notes: str | None = None
+        self, inquiry_id: str, *, status: str | None = None, review_notes: str | None = None
     ) -> BareMetalInquiryRecord | None:
         from greencompute_persistence.orm import utcnow
 
@@ -310,7 +311,8 @@ class GatewayRepository:
             row = session.get(BareMetalInquiryORM, inquiry_id)
             if row is None:
                 return None
-            row.status = status
+            if status is not None:
+                row.status = status
             if review_notes is not None:
                 row.review_notes = review_notes
             row.reviewed_at = utcnow()

@@ -143,6 +143,7 @@ class ControlPlaneService:
             workload_id=payload.workload_id,
             owner_user_id=owner_user_id,
             requested_instances=payload.requested_instances,
+            save_on_exhaustion=payload.save_on_exhaustion,
             deployment_fee_usd=self._estimate_deployment_fee(workload, payload.requested_instances),
             fee_acknowledged=payload.accept_fee,
         )
@@ -335,6 +336,19 @@ class ControlPlaneService:
         elif update.state in {DeploymentState.FAILED, DeploymentState.TERMINATED}:
             deployment.warmup_state = "stopped"
         deployment.updated_at = update.observed_at
+        # Credit-exhaustion lifecycle: stamp the suspend clock the first time a
+        # pod enters SUSPENDED (drives storage accrual + the delete reaper), and
+        # clear it when the pod returns to a live state (resume) so the clock
+        # doesn't carry over. A re-report of SUSPENDED never resets the clock.
+        if update.state == DeploymentState.SUSPENDED:
+            if deployment.suspended_at is None:
+                deployment.suspended_at = update.observed_at
+        elif update.state in {
+            DeploymentState.PULLING,
+            DeploymentState.STARTING,
+            DeploymentState.READY,
+        }:
+            deployment.suspended_at = None
         self.repository.add_deployment_event(update)
         assignment_status = {
             DeploymentState.PULLING: "activating",
@@ -1671,6 +1685,103 @@ class ControlPlaneService:
             logger.info("Metered %d deployments, total %d cents", len(result), sum(result.values()))
 
         return result
+
+    def meter_pod_storage(self) -> dict[str, int]:
+        """Charge SAVED suspended pods a per-day storage hold ($1/day) as a
+        NEGATIVE-balance debt, so a later top-up settles it via ordinary balance
+        arithmetic. Gated by settings.pod_storage_billing_enabled. Only SUSPENDED
+        pods with save_on_exhaustion=True and a post-feature suspended_at stamp
+        are billed (pre-existing suspended pods are grandfathered). The 30-day
+        reaper bounds the worst-case debt to ~$30. Returns deployment_id -> cents
+        debited this cycle."""
+        if not settings.pod_storage_billing_enabled:
+            return {}
+        from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+        from greencompute_protocol.billing_rates import (
+            STORAGE_CENTS_PER_DAY,
+            storage_mcents_per_minute,
+        )
+
+        billing_repo = BillingRepository()
+        debit = getattr(billing_repo, "debit_user", None)
+        if debit is None:
+            return {}
+        add_mcents = storage_mcents_per_minute()
+        result: dict[str, int] = {}
+        for deployment in self.repository.list_deployments_by_state(DeploymentState.SUSPENDED):
+            if not deployment.owner_user_id or not deployment.save_on_exhaustion:
+                continue
+            if deployment.suspended_at is None:
+                continue  # grandfathered pre-feature suspend — never bill
+            whole_cents = self.repository.accrue_storage(
+                deployment.deployment_id, add_mcents=add_mcents
+            )
+            if whole_cents <= 0:
+                continue
+            try:
+                debit(
+                    user_id=deployment.owner_user_id,
+                    amount_cents=whole_cents,
+                    kind="storage",
+                    reference_id=deployment.deployment_id,
+                    description=f"Saved-pod storage ${STORAGE_CENTS_PER_DAY / 100:.2f}/day",
+                    allow_negative=True,
+                )
+            except KeyError:
+                continue
+            result[deployment.deployment_id] = whole_cents
+        if result:
+            self.metrics.increment("storage.cycles")
+            logger.info(
+                "Storage-billed %d saved pods, total %d cents",
+                len(result),
+                sum(result.values()),
+            )
+        return result
+
+    def reap_exhausted_pods(self, now: datetime | None = None) -> list[str]:
+        """Terminate suspended pods past their retention window. Gated by
+        settings.pod_exhaustion_reaper_enabled. Only acts on pods carrying a
+        post-feature suspended_at stamp (pre-existing suspended pods are
+        grandfathered out entirely). Opt-OUT pods (save_on_exhaustion=False) are
+        deleted pod_unsaved_grace_minutes after suspend; SAVED pods after
+        pod_saved_retention_days. Returns the reaped deployment IDs."""
+        if not settings.pod_exhaustion_reaper_enabled:
+            return []
+        observed_at = now or datetime.now(UTC)
+        grace_seconds = settings.pod_unsaved_grace_minutes * 60
+        retention_seconds = settings.pod_saved_retention_days * 86400
+        reaped: list[str] = []
+        for deployment in self.repository.list_deployments_by_state(DeploymentState.SUSPENDED):
+            if deployment.suspended_at is None:
+                continue  # grandfathered — never auto-reap
+            age = (observed_at - self._ensure_utc(deployment.suspended_at)).total_seconds()
+            deadline = retention_seconds if deployment.save_on_exhaustion else grace_seconds
+            if age < deadline:
+                continue
+            reason = (
+                f"saved-pod retention expired ({settings.pod_saved_retention_days}d)"
+                if deployment.save_on_exhaustion
+                else f"unsaved pod removed {settings.pod_unsaved_grace_minutes}min after credits ran out"
+            )
+            try:
+                self.update_deployment_status(
+                    DeploymentStatusUpdate(
+                        deployment_id=deployment.deployment_id,
+                        state=DeploymentState.TERMINATED,
+                        error=reason,
+                    )
+                )
+                self.metrics.increment(
+                    "deployment.reaped.saved"
+                    if deployment.save_on_exhaustion
+                    else "deployment.reaped.unsaved"
+                )
+                reaped.append(deployment.deployment_id)
+                logger.info("Reaped suspended deployment %s — %s", deployment.deployment_id, reason)
+            except Exception as exc:
+                logger.error("Failed to reap deployment %s: %s", deployment.deployment_id, exc)
+        return reaped
 
 
 service = ControlPlaneService()
