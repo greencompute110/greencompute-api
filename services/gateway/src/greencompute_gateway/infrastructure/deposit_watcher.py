@@ -209,6 +209,46 @@ def _amount_matches(deposit_amount: float, invoice_amount: float) -> bool:
     return deposit_amount >= invoice_amount and deposit_amount <= invoice_amount * 1.05
 
 
+def _normalize_tx_hash(h: str | None) -> str:
+    """Lower-cased, 0x-stripped hex tx hash for comparison. Returns "" for
+    None / non-hash values (e.g. a bare extrinsic index like "19") so those
+    can never produce a false hash match."""
+    if not h:
+        return ""
+    s = str(h).strip().lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    if len(s) >= 32 and all(c in "0123456789abcdef" for c in s):
+        return s
+    return ""
+
+
+def _credit_invoice(
+    repo: BillingRepository,
+    invoices: list[CryptoInvoiceORM],
+    inv: CryptoInvoiceORM,
+    tx_hash: str,
+    deposit_ref: str,
+) -> tuple[CryptoInvoiceORM, dict] | None:
+    description = (
+        f"Crypto deposit {inv.currency.upper()} "
+        f"${inv.amount_usd:.2f} (+{int((inv.bonus_pct or 0) * 100)}% bonus)"
+    )
+    result = repo.confirm_and_credit_invoice(
+        invoice_id=inv.invoice_id,
+        tx_hash=tx_hash,
+        description=description,
+        deposit_ref=deposit_ref,
+    )
+    if result is None:
+        return None
+    # duplicate_deposit => the transfer is already spent; don't drop the invoice
+    # (it's still pending a different deposit). Otherwise it's been credited.
+    if not result.get("duplicate_deposit"):
+        invoices.remove(inv)
+    return inv, result
+
+
 def _try_credit(
     repo: BillingRepository,
     invoices: list[CryptoInvoiceORM],
@@ -216,34 +256,33 @@ def _try_credit(
     tx_hash: str,
     deposit_ref: str,
 ) -> tuple[CryptoInvoiceORM, dict] | None:
-    """Find the first pending invoice that fits this deposit amount and
-    confirm-credit it. `deposit_ref` is the globally-unique on-chain
-    transfer key — passed to confirm_and_credit_invoice so a single
-    transfer can credit at most one invoice EVER (the column is UNIQUE).
+    """Confirm-credit the invoice this on-chain transfer belongs to.
 
-    Returns the matched (invoice, result) pair, or None if no invoice
-    matched the amount. If a match was found but the transfer was already
-    consumed (duplicate_deposit), we stop — the transfer is spent."""
-    for inv in invoices:
+    Matching priority:
+      1. EXACT user-reported tx hash — the unambiguous payment id the customer
+         pastes when they pay. This is what stops one customer's transfer from
+         crediting another customer's same-amount invoice on the SHARED deposit
+         address (the bug that mis-credited axe.vldk's TAO).
+      2. Fallback: amount-match (legacy), only for invoices with no reported
+         hash. Logged as ambiguous because same-amount invoices on a shared
+         address can't be told apart this way.
+
+    `deposit_ref` is the globally-unique on-chain transfer key — passed to
+    confirm_and_credit_invoice so a single transfer credits at most one invoice
+    EVER (the column is UNIQUE). Returns (invoice, result) or None."""
+    norm = _normalize_tx_hash(tx_hash)
+    if norm:
+        for inv in list(invoices):
+            if _normalize_tx_hash(inv.tx_hash) == norm:
+                return _credit_invoice(repo, invoices, inv, tx_hash, deposit_ref)
+    for inv in list(invoices):
         if _amount_matches(deposit_amount, float(inv.amount_crypto)):
-            description = (
-                f"Crypto deposit {inv.currency.upper()} "
-                f"${inv.amount_usd:.2f} (+{int((inv.bonus_pct or 0) * 100)}% bonus)"
+            log.warning(
+                "watcher: crediting invoice %s by AMOUNT (no tx-hash match) "
+                "ref=%s — ambiguous on a shared deposit address",
+                inv.invoice_id[:8], deposit_ref,
             )
-            result = repo.confirm_and_credit_invoice(
-                invoice_id=inv.invoice_id,
-                tx_hash=tx_hash,
-                description=description,
-                deposit_ref=deposit_ref,
-            )
-            if result is None:
-                continue
-            # The transfer was already consumed by another invoice — it's
-            # spent, don't keep trying to match it to further invoices.
-            if result.get("duplicate_deposit"):
-                return inv, result
-            invoices.remove(inv)
-            return inv, result
+            return _credit_invoice(repo, invoices, inv, tx_hash, deposit_ref)
     return None
 
 
@@ -423,19 +462,56 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _hash_to_hex(h: object) -> str:
+    """Normalize a substrate extrinsic hash (bytes or str) to a 0x-hex string."""
+    if h is None:
+        return ""
+    if isinstance(h, (bytes, bytearray)):
+        return "0x" + bytes(h).hex()
+    s = str(h)
+    return s if s.startswith("0x") else "0x" + s
+
+
+def _block_extrinsic_hashes(substrate, block_hash) -> list[str]:
+    """0x extrinsic hashes for a block, indexed by extrinsic_idx. A
+    Balances.Transfer event's `extrinsic_idx` indexes into this, letting us
+    recover the real on-chain tx hash the customer reported. Empty on error."""
+    try:
+        block = substrate.get_block(block_hash)
+    except Exception as exc:
+        log.warning("watcher tao: get_block for extrinsic hashes failed: %s", exc)
+        return []
+    out: list[str] = []
+    for x in (block or {}).get("extrinsics", []) or []:
+        h = getattr(x, "extrinsic_hash", None)
+        if h is None and hasattr(x, "value") and isinstance(x.value, dict):
+            h = x.value.get("extrinsic_hash")
+        out.append(_hash_to_hex(h))
+    return out
+
+
 def scan_tao(repo: BillingRepository) -> int:
     """Scan Bittensor mainnet for Balances.Transfer events to our TAO
-    deposit address. Returns invoices credited."""
+    deposit address. Returns invoices credited.
+
+    NOTE: needs an ARCHIVE node — set GREENCOMPUTE_SUBTENSOR_URL to one (e.g.
+    wss://archive.minersunion.ai). The public finney entrypoint prunes block
+    state, so get_events on any block more than a few minutes old fails with
+    'State already discarded' and no deposits are ever seen."""
     try:
         from substrateinterface import SubstrateInterface
     except ImportError:
         log.warning("watcher tao: substrate-interface not installed — skipping")
         return 0
 
+    # MUST be an ARCHIVE node — finney's public entrypoint prunes block state,
+    # so get_events on anything but the chain tip fails ('State already
+    # discarded') and no deposits are ever detected. Override per-deploy with
+    # GREENCOMPUTE_SUBTENSOR_URL (prod uses wss://archive.minersunion.ai).
     rpc_url = (
         os.environ.get("GREENCOMPUTE_SUBTENSOR_URL")
         or os.environ.get("SUBTENSOR_URL")
-        or "wss://entrypoint-finney.opentensor.ai:443/"
+        or "wss://archive.chain.opentensor.ai:443/"
     )
 
     # Pull pending TAO invoices first — bail early if there's nothing to
@@ -482,8 +558,13 @@ def scan_tao(repo: BillingRepository) -> int:
                 log.warning(
                     "watcher tao: get_events block %d failed: %s", block_num, exc
                 )
-                continue
+                # Do NOT advance the cursor past a block we couldn't read — a
+                # transient RPC failure must not silently skip transfers in it
+                # (that's what made the earlier mis-scan unrecoverable).
+                to_block = block_num - 1
+                break
 
+            xt_hashes: list[str] | None = None  # extrinsic hashes, lazily loaded
             for event_idx, ev in enumerate(events):
                 ev_obj = getattr(ev, "value", ev)
                 if not isinstance(ev_obj, dict):
@@ -506,15 +587,19 @@ def scan_tao(repo: BillingRepository) -> int:
                 if dest not in addrs:
                     continue
                 deposit_amount = amount_raw / 1e9  # TAO has 9 decimals
-                # Human-readable hash if available (for the invoice record);
-                # the dedup key is the block+event coordinate, which is
-                # globally unique and stable regardless of whether the
-                # extrinsic hash decodes.
-                tx_hash = str(
-                    ev_obj.get("extrinsic_hash")
-                    or ev_obj.get("extrinsic_idx")
-                    or f"block-{block_num}"
-                )
+                # Resolve the REAL on-chain extrinsic hash (the unambiguous id a
+                # customer reports when they pay) via this event's
+                # extrinsic_idx, so _try_credit can match by hash instead of
+                # amount. Falls back to the block/event coordinate.
+                xidx = ev_obj.get("extrinsic_idx")
+                tx_hash = f"tao-{block_num}-{event_idx}"
+                if isinstance(xidx, int):
+                    if xt_hashes is None:
+                        xt_hashes = _block_extrinsic_hashes(substrate, block_hash)
+                    if 0 <= xidx < len(xt_hashes) and xt_hashes[xidx]:
+                        tx_hash = xt_hashes[xidx]
+                # The dedup key is the block+event coordinate — globally unique
+                # and stable regardless of whether the extrinsic hash decodes.
                 deposit_ref = f"tao:{block_num}:{event_idx}"
 
                 invoices = _pending_invoices_for(repo, "tao", dest)
