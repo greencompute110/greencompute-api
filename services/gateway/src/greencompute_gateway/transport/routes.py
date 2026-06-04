@@ -598,7 +598,27 @@ def create_workload(
         )
     else:
         request = WorkloadCreateRequest(**payload_data)
-    return service.create_workload(request, api_key.user_id).model_dump(mode="json")
+    return _redact_workload(service.create_workload(request, api_key.user_id).model_dump(mode="json"))
+
+
+def _is_secret_meta_key(key: str) -> bool:
+    k = key.lower().replace("_", "")
+    return any(s in k for s in ("token", "secret", "password", "apikey", "privatekey"))
+
+
+def _redact_workload(d: dict) -> dict:
+    """Strip owner-supplied secrets (HF tokens, API keys, passwords) from a
+    workload's metadata before it leaves the gateway — these must never reach
+    any client, owner or not. Public keys / ports / other config stay intact.
+    (A workload is visible cross-user when public, so an un-redacted hf_token
+    would otherwise leak to every authenticated user.)"""
+    meta = d.get("metadata")
+    if isinstance(meta, dict):
+        d["metadata"] = {
+            k: ("***redacted***" if _is_secret_meta_key(k) else v)
+            for k, v in meta.items()
+        }
+    return d
 
 
 @router.get("/platform/workloads")
@@ -608,7 +628,7 @@ def list_workloads(
 ) -> list[dict]:
     api_key = require_api_key(authorization, x_api_key)
     return [
-        workload.model_dump(mode="json")
+        _redact_workload(workload.model_dump(mode="json"))
         for workload in service.list_workloads(user_id=api_key.user_id, admin=api_key.admin)
     ]
 
@@ -623,7 +643,7 @@ def get_workload(
     workload = service.get_workload(workload_id, user_id=api_key.user_id, admin=api_key.admin)
     if workload is None:
         raise HTTPException(status_code=404, detail="workload not found")
-    return workload.model_dump(mode="json")
+    return _redact_workload(workload.model_dump(mode="json"))
 
 
 @router.patch("/platform/workloads/{workload_id}")
