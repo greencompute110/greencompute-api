@@ -59,7 +59,7 @@ def build_vllm_workload(
             warmup_path="/health",
         ),
         readme=kwargs.get("readme", ""),
-        public=kwargs.get("public", True),
+        public=kwargs.get("public", False),
         metadata=_metadata_with_hf_token(kwargs),
     )
 
@@ -100,7 +100,7 @@ def build_diffusion_workload(
             warmup_path="/health",
         ),
         readme=kwargs.get("readme", ""),
-        public=kwargs.get("public", True),
+        public=kwargs.get("public", False),
         metadata=_metadata_with_hf_token(kwargs),
     )
 
@@ -142,6 +142,6 @@ def build_vllm_vision_workload(
             warmup_path="/health",
         ),
         readme=kwargs.get("readme", ""),
-        public=kwargs.get("public", True),
+        public=kwargs.get("public", False),
         metadata=_metadata_with_hf_token(kwargs),
     )
