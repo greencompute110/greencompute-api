@@ -591,6 +591,8 @@ class GatewayService:
             deployment_date=request.deployment_date,
             budget=request.budget,
             use_case=request.use_case,
+            discord=request.discord,
+            phone=request.phone,
             source_ip=source_ip,
             user_agent=user_agent,
         )
@@ -654,6 +656,8 @@ class GatewayService:
             deployment_date=request.deployment_date,
             duration=request.duration,
             notes=request.notes,
+            discord=request.discord,
+            phone=request.phone,
             source_ip=source_ip,
             user_agent=user_agent,
         )

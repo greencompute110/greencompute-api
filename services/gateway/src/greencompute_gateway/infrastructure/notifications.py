@@ -83,6 +83,10 @@ def _format_inquiry(inquiry: CommercialInquiryRecord) -> str:
         parts.append(f"Name: {inquiry.name}")
     if inquiry.company:
         parts.append(f"Company: {inquiry.company}")
+    if inquiry.discord:
+        parts.append(f"Discord: {inquiry.discord}")
+    if inquiry.phone:
+        parts.append(f"Phone: {inquiry.phone}")
     if inquiry.gpu_count is not None:
         parts.append(f"GPUs: {inquiry.gpu_count}")
     if inquiry.duration:
@@ -115,6 +119,10 @@ def _format_bare_metal(inquiry: BareMetalInquiryRecord) -> str:
         parts.append(f"Name: {inquiry.name}")
     if inquiry.company:
         parts.append(f"Company: {inquiry.company}")
+    if inquiry.discord:
+        parts.append(f"Discord: {inquiry.discord}")
+    if inquiry.phone:
+        parts.append(f"Phone: {inquiry.phone}")
     if inquiry.card_type:
         parts.append(f"Card: {inquiry.card_type.upper()}")
     if inquiry.node_count is not None:

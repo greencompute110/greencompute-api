@@ -179,6 +179,8 @@ class GatewayRepository:
             row.deployment_date = inquiry.deployment_date
             row.budget = inquiry.budget
             row.use_case = inquiry.use_case
+            row.discord = inquiry.discord
+            row.phone = inquiry.phone
             row.source_ip = inquiry.source_ip
             row.user_agent = inquiry.user_agent
             row.status = inquiry.status
@@ -259,6 +261,8 @@ class GatewayRepository:
             row.deployment_date = inquiry.deployment_date
             row.duration = inquiry.duration
             row.notes = inquiry.notes
+            row.discord = inquiry.discord
+            row.phone = inquiry.phone
             row.source_ip = inquiry.source_ip
             row.user_agent = inquiry.user_agent
             row.status = inquiry.status
@@ -334,6 +338,8 @@ class GatewayRepository:
             deployment_date=row.deployment_date or "",
             duration=row.duration or "",
             notes=row.notes or "",
+            discord=getattr(row, "discord", "") or "",
+            phone=getattr(row, "phone", "") or "",
             source_ip=row.source_ip,
             user_agent=row.user_agent,
             status=row.status or "new",
@@ -403,6 +409,8 @@ class GatewayRepository:
             deployment_date=getattr(row, "deployment_date", "") or "",
             budget=row.budget or "",
             use_case=row.use_case or "",
+            discord=getattr(row, "discord", "") or "",
+            phone=getattr(row, "phone", "") or "",
             source_ip=row.source_ip,
             user_agent=row.user_agent,
             status=row.status or "new",
