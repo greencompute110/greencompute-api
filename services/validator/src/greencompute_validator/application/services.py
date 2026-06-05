@@ -608,6 +608,27 @@ class ValidatorService:
             inf_score = self.demand.inference_score(hotkey)
             rent_score = self.demand.rental_score(hotkey)
             all_events: list[FluxRebalanceEvent] = []
+
+            # Coordinate the FLEET-WIDE replica target across this hotkey's
+            # nodes. Each node's rebalance is otherwise independent, so without
+            # this every node fills its inference GPUs toward the SAME fleet
+            # target — N nodes each running a replica of a target-1 model (the
+            # phantom over-count that left the dashboard showing running=3 for a
+            # single real replica). We seed `remaining` with the deficit after
+            # what's already running, and hand each node only that shrinking
+            # deficit, so only as many NEW replicas as the fleet still needs get
+            # placed. (Per-node pins below keep existing replicas where they are.)
+            live_states = {"ready", "starting", "scheduled", "provisioning", "pending"}
+            fleet_running: dict[str, int] = {}
+            for d in self.repository.list_flux_deployments(hotkey):
+                mid = d.get("model_id")
+                if mid and d.get("state") in live_states:
+                    fleet_running[mid] = fleet_running.get(mid, 0) + 1
+            remaining: dict[str, int] = {
+                mid: max(0, tgt - fleet_running.get(mid, 0))
+                for mid, tgt in (self._replica_targets or {}).items()
+            }
+
             for state in states:
                 primed = state.model_copy(update={
                     "inference_demand_score": inf_score,
@@ -615,12 +636,27 @@ class ValidatorService:
                 })
                 cap = node_caps.get(state.node_id)
                 vram = getattr(cap, "vram_gb_per_gpu", None) if cap else None
+                # Pin the models THIS node already serves so its replica stays
+                # in place rather than churning to another node on rebalance.
+                pinned = {
+                    d["model_id"]
+                    for d in self.repository.list_flux_deployments(
+                        hotkey, node_id=state.node_id
+                    )
+                    if d.get("model_id") and d.get("state") in live_states
+                }
                 new_state, events = self.flux.rebalance(
                     primed,
                     catalog=catalog,
                     vram_gb_per_gpu=vram,
-                    replica_targets=self._replica_targets or None,
+                    replica_targets=remaining or None,
+                    pinned_model_ids=pinned,
                 )
+                # A model this node NEWLY took (vs. one it already ran) consumes
+                # one unit of the fleet-wide deficit so siblings don't re-add it.
+                for mid, idxs in new_state.inference_assignments.items():
+                    if idxs and mid not in pinned:
+                        remaining[mid] = max(0, remaining.get(mid, 0) - 1)
                 self._flux_states[(hotkey, state.node_id)] = new_state
                 all_events.extend(events)
                 self._reconcile_catalog_deployments(hotkey, new_state)
