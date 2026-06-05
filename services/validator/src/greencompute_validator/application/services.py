@@ -650,15 +650,30 @@ class ValidatorService:
         # model) pair. Without this, a miner that can't run a given model
         # (bad driver, CUDA version, OOM) burns an infinite respawn loop.
         now_ts = datetime.now(UTC)
+        cooldown = timedelta(minutes=15)
         all_deps = self.repository.list_flux_deployments_incl_terminated(hotkey)
         for d in all_deps:
-            if d["model_id"] and d["state"] in ("failed", "terminated"):
-                key = (hotkey, d["model_id"])
-                # 15-min cooldown. Admin can manually retry sooner by
-                # clearing service._replica_cooldown_until.
-                self._replica_cooldown_until.setdefault(
-                    key, now_ts + timedelta(minutes=15),
-                )
+            if not (d["model_id"] and d["state"] in ("failed", "terminated")):
+                continue
+            # Only arm the cooldown for a RECENT failure, anchored to the
+            # failure's own timestamp. Previously this used setdefault with
+            # `now + 15min` over EVERY failed/terminated row — so on each
+            # validator restart the reconcile re-read the full failure history
+            # (hundreds of rows accumulate for a flaky model) and re-armed a
+            # fresh 15-min cooldown off ancient failures, silently blocking
+            # placement for 15 min after every restart. setdefault made it
+            # worse — the first (often stale) value stuck permanently. Anchoring
+            # to updated_at and keeping the max means ancient rows are ignored
+            # and the window reflects the actual last failure.
+            failed_at = d.get("updated_at")
+            if failed_at is None or (now_ts - failed_at) >= cooldown:
+                continue
+            key = (hotkey, d["model_id"])
+            until = failed_at + cooldown
+            existing = self._replica_cooldown_until.get(key)
+            self._replica_cooldown_until[key] = (
+                max(until, existing) if existing else until
+            )
 
         target_models = set(new_state.inference_assignments.keys())
         # Scope the existing-replica view to THIS node. Without the node filter
