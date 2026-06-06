@@ -44,6 +44,7 @@ class FluxOrchestrator:
         vram_gb_per_gpu: int,
         catalog: list[ModelCatalogEntry],
         replica_targets: dict[str, int] | None = None,
+        pinned_model_ids: set[str] | None = None,
     ) -> dict[str, list[int]]:
         """Map inference-allocated GPU indices to catalog model_ids.
 
@@ -72,25 +73,42 @@ class FluxOrchestrator:
             return {}
 
         targets = dict(replica_targets or {})
+        eligible_by_id = {e.model_id: e for e in eligible}
         assignments: dict[str, list[int]] = {e.model_id: [] for e in eligible}
         cursor = 0
-        # Round-robin through eligible models. On each pass, assign a block
-        # of e.gpu_count GPUs. If targets dict is present, skip models whose
-        # current replica count meets/exceeds their target.
+
+        # 1. Pin replicas already running on THIS node first, so a rebalance
+        #    keeps an existing replica in place instead of tearing it down and
+        #    re-creating it on whichever node the loop reaches first (churn +
+        #    downtime). The caller passes the catalog model_ids this node is
+        #    currently serving.
+        for model_id in pinned_model_ids or set():
+            e = eligible_by_id.get(model_id)
+            if e is None or cursor + e.gpu_count > inference_gpu_count:
+                continue
+            assignments[model_id] = list(range(cursor, cursor + e.gpu_count))
+            cursor += e.gpu_count
+
+        def _deficit(e: ModelCatalogEntry) -> int:
+            have = len(assignments[e.model_id]) // max(1, e.gpu_count)
+            return targets.get(e.model_id, 0) - have
+
+        # 2. Fill remaining inference GPUs toward the (fleet-wide remaining)
+        #    target. When targets are supplied we STOP once every model's
+        #    deficit is met — previously this packed every inference GPU on
+        #    every node, so N nodes each spun up a replica of a target-1 model
+        #    (the phantom over-count). Without targets, keep the legacy fill.
         rotate_idx = 0
         while cursor < inference_gpu_count:
             # Choose next candidate: prefer highest remaining deficit if
             # replica_targets passed; otherwise rotate through eligible list.
             if targets:
-                candidates = sorted(
-                    eligible,
-                    key=lambda e: (
-                        -(targets.get(e.model_id, 0) - len(assignments[e.model_id]) // max(1, e.gpu_count)),
-                        e.model_id,
-                    ),
-                )
+                candidates = sorted(eligible, key=lambda e: (-_deficit(e), e.model_id))
                 candidate = next(
-                    (c for c in candidates if c.gpu_count <= inference_gpu_count - cursor),
+                    (
+                        c for c in candidates
+                        if c.gpu_count <= inference_gpu_count - cursor and _deficit(c) > 0
+                    ),
                     None,
                 )
             else:
@@ -116,6 +134,7 @@ class FluxOrchestrator:
         catalog: list[ModelCatalogEntry] | None = None,
         vram_gb_per_gpu: int | None = None,
         replica_targets: dict[str, int] | None = None,
+        pinned_model_ids: set[str] | None = None,
     ) -> tuple[FluxState, list[FluxRebalanceEvent]]:
         """Compute optimal allocation and return updated state + audit events.
 
@@ -198,6 +217,7 @@ class FluxOrchestrator:
                 vram_gb_per_gpu=vram_gb_per_gpu,
                 catalog=catalog,
                 replica_targets=replica_targets,
+                pinned_model_ids=pinned_model_ids,
             )
 
         # Backfill model_id on inference-transition events using the new

@@ -608,6 +608,27 @@ class ValidatorService:
             inf_score = self.demand.inference_score(hotkey)
             rent_score = self.demand.rental_score(hotkey)
             all_events: list[FluxRebalanceEvent] = []
+
+            # Coordinate the FLEET-WIDE replica target across this hotkey's
+            # nodes. Each node's rebalance is otherwise independent, so without
+            # this every node fills its inference GPUs toward the SAME fleet
+            # target — N nodes each running a replica of a target-1 model (the
+            # phantom over-count that left the dashboard showing running=3 for a
+            # single real replica). We seed `remaining` with the deficit after
+            # what's already running, and hand each node only that shrinking
+            # deficit, so only as many NEW replicas as the fleet still needs get
+            # placed. (Per-node pins below keep existing replicas where they are.)
+            live_states = {"ready", "starting", "scheduled", "provisioning", "pending"}
+            fleet_running: dict[str, int] = {}
+            for d in self.repository.list_flux_deployments(hotkey):
+                mid = d.get("model_id")
+                if mid and d.get("state") in live_states:
+                    fleet_running[mid] = fleet_running.get(mid, 0) + 1
+            remaining: dict[str, int] = {
+                mid: max(0, tgt - fleet_running.get(mid, 0))
+                for mid, tgt in (self._replica_targets or {}).items()
+            }
+
             for state in states:
                 primed = state.model_copy(update={
                     "inference_demand_score": inf_score,
@@ -615,12 +636,27 @@ class ValidatorService:
                 })
                 cap = node_caps.get(state.node_id)
                 vram = getattr(cap, "vram_gb_per_gpu", None) if cap else None
+                # Pin the models THIS node already serves so its replica stays
+                # in place rather than churning to another node on rebalance.
+                pinned = {
+                    d["model_id"]
+                    for d in self.repository.list_flux_deployments(
+                        hotkey, node_id=state.node_id
+                    )
+                    if d.get("model_id") and d.get("state") in live_states
+                }
                 new_state, events = self.flux.rebalance(
                     primed,
                     catalog=catalog,
                     vram_gb_per_gpu=vram,
-                    replica_targets=self._replica_targets or None,
+                    replica_targets=remaining or None,
+                    pinned_model_ids=pinned,
                 )
+                # A model this node NEWLY took (vs. one it already ran) consumes
+                # one unit of the fleet-wide deficit so siblings don't re-add it.
+                for mid, idxs in new_state.inference_assignments.items():
+                    if idxs and mid not in pinned:
+                        remaining[mid] = max(0, remaining.get(mid, 0) - 1)
                 self._flux_states[(hotkey, state.node_id)] = new_state
                 all_events.extend(events)
                 self._reconcile_catalog_deployments(hotkey, new_state)
@@ -650,15 +686,30 @@ class ValidatorService:
         # model) pair. Without this, a miner that can't run a given model
         # (bad driver, CUDA version, OOM) burns an infinite respawn loop.
         now_ts = datetime.now(UTC)
+        cooldown = timedelta(minutes=15)
         all_deps = self.repository.list_flux_deployments_incl_terminated(hotkey)
         for d in all_deps:
-            if d["model_id"] and d["state"] in ("failed", "terminated"):
-                key = (hotkey, d["model_id"])
-                # 15-min cooldown. Admin can manually retry sooner by
-                # clearing service._replica_cooldown_until.
-                self._replica_cooldown_until.setdefault(
-                    key, now_ts + timedelta(minutes=15),
-                )
+            if not (d["model_id"] and d["state"] in ("failed", "terminated")):
+                continue
+            # Only arm the cooldown for a RECENT failure, anchored to the
+            # failure's own timestamp. Previously this used setdefault with
+            # `now + 15min` over EVERY failed/terminated row — so on each
+            # validator restart the reconcile re-read the full failure history
+            # (hundreds of rows accumulate for a flaky model) and re-armed a
+            # fresh 15-min cooldown off ancient failures, silently blocking
+            # placement for 15 min after every restart. setdefault made it
+            # worse — the first (often stale) value stuck permanently. Anchoring
+            # to updated_at and keeping the max means ancient rows are ignored
+            # and the window reflects the actual last failure.
+            failed_at = d.get("updated_at")
+            if failed_at is None or (now_ts - failed_at) >= cooldown:
+                continue
+            key = (hotkey, d["model_id"])
+            until = failed_at + cooldown
+            existing = self._replica_cooldown_until.get(key)
+            self._replica_cooldown_until[key] = (
+                max(until, existing) if existing else until
+            )
 
         target_models = set(new_state.inference_assignments.keys())
         # Scope the existing-replica view to THIS node. Without the node filter
@@ -668,9 +719,27 @@ class ValidatorService:
         # sibling node counted as 'existing' here. Pinning to target_node_id
         # makes each node reconcile only its own deficit/surplus.
         existing = self.repository.list_flux_deployments(hotkey, node_id=target_node_id)
-        existing_models = {d["model_id"] for d in existing if d["model_id"]}
+        # Only LIVE deployments count as "already serving" this model. A failed /
+        # unhealthy replica is NOT serving, yet list_flux_deployments still returns
+        # it (it isn't 'terminated'). Counting it as existing deadlocks recovery:
+        # the model stays targeted, so the terminate branch below leaves the dead
+        # row in place, and the provision branch skips the model as already-present
+        # — the catalog can never respawn a crashed replica. This is exactly what
+        # wedged the whole catalog when a validator restart flipped live runtimes
+        # to 'failed'. Count only live states here; reap the dead rows below.
+        live_states = {"ready", "starting", "scheduled", "provisioning", "pending"}
+        existing_models = {
+            d["model_id"] for d in existing
+            if d["model_id"] and d["state"] in live_states
+        }
 
-        # Terminate replicas no longer targeted by Flux
+        # Terminate live replicas no longer targeted by Flux. A 'failed' row is
+        # intentionally left as a historical record (terminate_flux_deployment
+        # guards against re-terminating it) — the live-only existing_models set
+        # above is what stops it blocking re-provision, which is the actual fix
+        # for the catalog wedging after a restart flipped live runtimes to
+        # 'failed' (the model stayed targeted, so the dead row was never cleaned
+        # and the provision branch skipped it as already-present).
         for d in existing:
             if d["model_id"] and d["model_id"] not in target_models:
                 if self.repository.terminate_flux_deployment(d["deployment_id"]):
