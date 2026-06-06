@@ -719,11 +719,29 @@ class ValidatorService:
         # sibling node counted as 'existing' here. Pinning to target_node_id
         # makes each node reconcile only its own deficit/surplus.
         existing = self.repository.list_flux_deployments(hotkey, node_id=target_node_id)
-        existing_models = {d["model_id"] for d in existing if d["model_id"]}
+        # Only LIVE deployments count as "already serving" this model. A failed /
+        # unhealthy replica is NOT serving, yet list_flux_deployments still returns
+        # it (it isn't 'terminated'). Counting it as existing deadlocks recovery:
+        # the model stays targeted, so the terminate branch below leaves the dead
+        # row in place, and the provision branch skips the model as already-present
+        # — the catalog can never respawn a crashed replica. This is exactly what
+        # wedged the whole catalog when a validator restart flipped live runtimes
+        # to 'failed'. Count only live states here; reap the dead rows below.
+        live_states = {"ready", "starting", "scheduled", "provisioning", "pending"}
+        existing_models = {
+            d["model_id"] for d in existing
+            if d["model_id"] and d["state"] in live_states
+        }
 
-        # Terminate replicas no longer targeted by Flux
+        # Terminate replicas no longer targeted by Flux, plus any dead (non-live)
+        # row — a crashed replica must be reaped so the provision loop re-creates
+        # it fresh instead of treating the corpse as a live replica. (Cooldown is
+        # anchored to the original failure time above, so reaping here doesn't
+        # re-arm it; the fresh replica provisions in this same reconcile pass.)
         for d in existing:
-            if d["model_id"] and d["model_id"] not in target_models:
+            if not d["model_id"]:
+                continue
+            if d["model_id"] not in target_models or d["state"] not in live_states:
                 if self.repository.terminate_flux_deployment(d["deployment_id"]):
                     self.bus.publish("flux.replica.terminated", {
                         "hotkey": hotkey,
