@@ -733,15 +733,15 @@ class ValidatorService:
             if d["model_id"] and d["state"] in live_states
         }
 
-        # Terminate replicas no longer targeted by Flux, plus any dead (non-live)
-        # row — a crashed replica must be reaped so the provision loop re-creates
-        # it fresh instead of treating the corpse as a live replica. (Cooldown is
-        # anchored to the original failure time above, so reaping here doesn't
-        # re-arm it; the fresh replica provisions in this same reconcile pass.)
+        # Terminate live replicas no longer targeted by Flux. A 'failed' row is
+        # intentionally left as a historical record (terminate_flux_deployment
+        # guards against re-terminating it) — the live-only existing_models set
+        # above is what stops it blocking re-provision, which is the actual fix
+        # for the catalog wedging after a restart flipped live runtimes to
+        # 'failed' (the model stayed targeted, so the dead row was never cleaned
+        # and the provision branch skipped it as already-present).
         for d in existing:
-            if not d["model_id"]:
-                continue
-            if d["model_id"] not in target_models or d["state"] not in live_states:
+            if d["model_id"] and d["model_id"] not in target_models:
                 if self.repository.terminate_flux_deployment(d["deployment_id"]):
                     self.bus.publish("flux.replica.terminated", {
                         "hotkey": hotkey,
