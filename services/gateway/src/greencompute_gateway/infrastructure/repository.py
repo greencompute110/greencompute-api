@@ -65,6 +65,18 @@ class GatewayRepository:
             ).first()
             return self._to_user(row) if row else None
 
+    def get_user_by_username(self, username: str) -> UserRecord | None:
+        # `username` carries a UNIQUE index (ix_users_username). register_user
+        # uses this to find a free username before INSERT so a duplicate display
+        # name never 500s the signup (which left users with a null greenfApiKey).
+        if not username:
+            return None
+        with session_scope(self.session_factory) as session:
+            row = session.scalars(
+                select(UserORM).where(UserORM.username == username).limit(1)
+            ).first()
+            return self._to_user(row) if row else None
+
     def list_users(self) -> list[UserRecord]:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(select(UserORM)).all()
