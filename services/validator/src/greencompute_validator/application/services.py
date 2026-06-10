@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from datetime import UTC, datetime, timedelta
 from math import ceil
@@ -34,6 +35,18 @@ from greencompute_validator.domain.wait_estimator import WaitEstimator
 from greencompute_validator.infrastructure.repository import ValidatorRepository
 
 logger = logging.getLogger(__name__)
+
+
+def _flux_excluded_gpu_models() -> set[str]:
+    """GPU models that Flux must NOT auto-assign catalog inference to.
+
+    Defaults to the A4000: it has 16 GB VRAM and cannot run the 24 GB-class
+    catalog models (vLLM OOMs at load), and the internal A4000 box is reserved
+    for manual model-deploy testing — Flux placing replicas there caused an
+    infinite fail/cooldown/respawn loop. Override with
+    GREENCOMPUTE_FLUX_EXCLUDE_GPU_MODELS (comma-separated, e.g. "a4000,a2000")."""
+    raw = os.getenv("GREENCOMPUTE_FLUX_EXCLUDE_GPU_MODELS", "a4000")
+    return {m.strip().lower() for m in raw.split(",") if m.strip()}
 
 
 class UnknownCapabilityError(KeyError):
@@ -635,6 +648,15 @@ class ValidatorService:
                     "rental_demand_score": rent_score,
                 })
                 cap = node_caps.get(state.node_id)
+                # Exclude configured GPU models from Flux catalog-inference
+                # placement (default: a4000). The internal A4000 test box has
+                # 16 GB VRAM — it can't run the 24 GB-class catalog models (OOM)
+                # and is reserved for manual testing, so Flux must never
+                # auto-assign inference replicas there. Manual/API deploys still
+                # work (they go through the scheduler, not Flux).
+                gpu_model = (getattr(cap, "gpu_model", "") or "").lower() if cap else ""
+                if gpu_model and gpu_model in _flux_excluded_gpu_models():
+                    continue
                 vram = getattr(cap, "vram_gb_per_gpu", None) if cap else None
                 # Pin the models THIS node already serves so its replica stays
                 # in place rather than churning to another node on rebalance.
