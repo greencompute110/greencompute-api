@@ -512,9 +512,17 @@ class ControlPlaneService:
     def recovery_status(self) -> dict[str, object | None]:
         return dict(self._recovery_state)
 
-    def recover_inflight_events(self) -> dict[str, object | None]:
+    def recover_inflight_events(
+        self, stale_after_seconds: float | None = None
+    ) -> dict[str, object | None]:
+        """Requeue deliveries stuck in 'processing'. The default (aggressive)
+        threshold is tuned for STARTUP, where nothing can legitimately be
+        in-flight. Periodic callers on a live worker MUST pass a threshold
+        comfortably above the slowest legitimate handler, or they'll requeue
+        (and double-run) an event that's merely slow."""
         subjects = ["deployment.requested", "usage.recorded", "invocation.recorded"]
-        stale_after_seconds = max(self.runtime_settings.worker_poll_interval_seconds * 4, 2.0)
+        if stale_after_seconds is None:
+            stale_after_seconds = max(self.runtime_settings.worker_poll_interval_seconds * 4, 2.0)
         requeued = self.bus.requeue_stale_processing(
             "control-plane-worker",
             subjects,
@@ -1200,6 +1208,11 @@ class ControlPlaneService:
                 )
         return suspended
 
+    # A raising event gets this many handler attempts (claim_pending bumps
+    # `attempts` on every claim) before it's parked as terminally 'failed'
+    # instead of retried — a poison payload must not wedge the queue.
+    _MAX_EVENT_ATTEMPTS = 5
+
     def process_pending_events(self, limit: int = 10) -> dict[str, list]:
         events = self.bus.claim_pending(
             "control-plane-worker",
@@ -1211,22 +1224,53 @@ class ControlPlaneService:
         invocation_records: list[InvocationRecord] = []
 
         for event in events:
-            if event.subject == "deployment.requested":
-                processed = self._process_deployment_request(event)
-                if processed is not None:
-                    scheduled.append(processed)
-                continue
-            if event.subject == "usage.recorded":
-                usage_record = self._process_usage_record(event)
-                if usage_record is not None:
-                    usage_records.append(usage_record)
-                continue
-            if event.subject == "invocation.recorded":
-                invocation_record = self._process_invocation_record(event)
-                if invocation_record is not None:
-                    invocation_records.append(invocation_record)
-                continue
-            self.bus.mark_failed(event.delivery_id, f"unsupported workflow subject={event.subject}")
+            # Per-event guard: claim_pending already flipped the delivery to
+            # 'processing', so an exception that escapes the handler would
+            # otherwise orphan it there forever (claim only selects 'pending';
+            # stale-recovery used to run at startup only). Mark it back as
+            # retryable-pending with a backoff — or terminally failed once the
+            # attempt budget is spent, so a poison event can't loop forever.
+            try:
+                if event.subject == "deployment.requested":
+                    processed = self._process_deployment_request(event)
+                    if processed is not None:
+                        scheduled.append(processed)
+                elif event.subject == "usage.recorded":
+                    usage_record = self._process_usage_record(event)
+                    if usage_record is not None:
+                        usage_records.append(usage_record)
+                elif event.subject == "invocation.recorded":
+                    invocation_record = self._process_invocation_record(event)
+                    if invocation_record is not None:
+                        invocation_records.append(invocation_record)
+                else:
+                    self.bus.mark_failed(
+                        event.delivery_id, f"unsupported workflow subject={event.subject}"
+                    )
+            except Exception as exc:
+                retryable = event.attempts < self._MAX_EVENT_ATTEMPTS
+                logger.exception(
+                    "event handler failed: subject=%s delivery=%s attempt=%d/%d retryable=%s",
+                    event.subject,
+                    event.delivery_id,
+                    event.attempts,
+                    self._MAX_EVENT_ATTEMPTS,
+                    retryable,
+                )
+                try:
+                    self.bus.mark_failed(
+                        event.delivery_id,
+                        str(exc),
+                        retryable=retryable,
+                        retry_after_seconds=min(30.0 * event.attempts, 300.0),
+                    )
+                except Exception:
+                    # DB hiccup while marking — the delivery stays
+                    # 'processing'; the periodic stale-recovery in the worker
+                    # loop reclaims it.
+                    logger.exception(
+                        "failed to mark delivery %s failed", event.delivery_id
+                    )
 
         self.metrics.set_gauge(
             "workflow.pending.deployment.requested",

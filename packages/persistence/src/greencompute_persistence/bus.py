@@ -101,6 +101,12 @@ class SubjectBus:
     def claim_pending(self, consumer: str, subjects: list[str], limit: int = 10) -> list[BusMessage]:
         now = utcnow()
         with session_scope(self.session_factory) as session:
+            # FOR UPDATE SKIP LOCKED: concurrent claimers (the worker loop and
+            # the admin /events/process route both call this) get disjoint
+            # rows instead of both reading the same pending delivery and
+            # double-running its handler — which for deployment.requested
+            # means a double lease-assign / capacity double-decrement.
+            # SQLite ignores the clause (single-writer anyway).
             rows = session.scalars(
                 select(BusDeliveryORM)
                 .where(
@@ -111,6 +117,7 @@ class SubjectBus:
                 )
                 .order_by(BusDeliveryORM.created_at.asc())
                 .limit(limit)
+                .with_for_update(skip_locked=True)
             ).all()
             messages: list[BusMessage] = []
             for row in rows:

@@ -70,6 +70,27 @@ async def _control_plane_worker_loop() -> None:
                         "reaper cycle failed: %s", reap_exc
                     )
                     _worker_state["last_error"] = f"reaper: {reap_exc}"
+                # Stale-delivery recovery — used to run ONLY at startup, so a
+                # delivery orphaned in 'processing' (worker killed mid-event,
+                # or mark_failed itself erroring) wedged its deployment until
+                # a restart. The 15-minute threshold is deliberately far above
+                # any legitimate handler runtime: with per-event try/except in
+                # process_pending_events this is a backstop, not the primary
+                # error path, and an aggressive value would requeue+double-run
+                # slow-but-alive events.
+                try:
+                    recovery = service.recover_inflight_events(stale_after_seconds=900.0)
+                    _worker_state["last_recovery_at"] = recovery["last_recovery_at"]
+                    _worker_state["last_recovery_error"] = None
+                    _worker_state["last_recovery_requeued_deliveries"] = recovery[
+                        "requeued_deliveries"
+                    ]
+                except Exception as recovery_exc:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "stale-delivery recovery failed: %s", recovery_exc
+                    )
+                    _worker_state["last_recovery_error"] = str(recovery_exc)
             _worker_state["last_successful_iteration"] = asyncio.get_running_loop().time()
             _worker_state["last_error"] = None
         except Exception as exc:
