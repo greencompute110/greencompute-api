@@ -2073,6 +2073,11 @@ def billing_confirm_crypto(
     result = _get_billing().confirm_crypto_deposit(invoice_id, tx_hash)
     if result is None:
         raise HTTPException(status_code=404, detail="invoice not found")
+    if result.get("refused"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"invoice is {result.get('status')} and can no longer be credited",
+        )
     return result
 
 

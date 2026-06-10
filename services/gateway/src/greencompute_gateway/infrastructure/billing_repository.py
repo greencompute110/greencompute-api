@@ -335,6 +335,7 @@ class BillingRepository:
 
         Returns:
           - None if the invoice doesn't exist
+          - {"refused": True, "status": ...} if the invoice is rejected/expired
           - {"already_confirmed": True, ...} if invoice or transfer already processed
           - {"credited": True, ...} on a fresh confirm+credit
         """
@@ -342,6 +343,21 @@ class BillingRepository:
             inv = session.get(CryptoInvoiceORM, invoice_id, with_for_update=True)
             if inv is None:
                 return None
+
+            # Terminal-state guard: this is the single charge-money primitive,
+            # so it must refuse rejected/expired invoices itself — the reject
+            # endpoint's "never credited" promise can't depend on every caller
+            # checking status first. (The watcher's pending-only scan protects
+            # the auto path; this protects the admin confirm and any future
+            # caller.) An admin who genuinely needs to credit a late-but-real
+            # payment re-opens the invoice first, rather than this silently
+            # overriding the terminal state.
+            if inv.status in ("rejected", "expired"):
+                return {
+                    "refused": True,
+                    "invoice_id": invoice_id,
+                    "status": inv.status,
+                }
 
             # Layer 1 — per-invoice idempotency (retry of same invoice).
             existing = session.scalar(

@@ -426,11 +426,12 @@ class GatewayService:
                 )
 
             gpu_count = workload.requirements.gpu_count or 1
-            required_cents = (
-                max_rate_cents_per_hour
-                * gpu_count
-                * payload.requested_instances
-            )
+            # The gate mirrors what metering will actually charge: one
+            # placed instance (the scheduler never scales out
+            # requested_instances — see meter_usage's billed_instances).
+            # Gating on requested_instances would 402 users for balance
+            # they'll never be billed.
+            required_cents = max_rate_cents_per_hour * gpu_count
             current_cents = BillingRepository().get_balance(user_id)
             if current_cents < required_cents:
                 # Raised as ValueError so the route layer can catch and return
@@ -440,7 +441,7 @@ class GatewayService:
                     current_cents=current_cents,
                     rate_cents_per_hour=max_rate_cents_per_hour,
                     gpu_count=gpu_count,
-                    requested_instances=payload.requested_instances,
+                    requested_instances=1,
                 )
 
         return self.control_plane.create_deployment(
@@ -491,7 +492,9 @@ class GatewayService:
         if not admin and user_id is not None:
             workload = self.control_plane.repository.get_workload(old.workload_id)
             gpu_count = (workload.requirements.gpu_count if workload else 1) or 1
-            required_cents = old.hourly_rate_cents * gpu_count * old.requested_instances
+            # One hour at the billed quantity — a single placed instance
+            # (matches meter_usage's billed_instances, not requested_instances).
+            required_cents = old.hourly_rate_cents * gpu_count
             from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 
             current_cents = BillingRepository().get_balance(user_id)
@@ -503,7 +506,7 @@ class GatewayService:
                     current_cents=current_cents,
                     rate_cents_per_hour=old.hourly_rate_cents,
                     gpu_count=gpu_count,
-                    requested_instances=old.requested_instances,
+                    requested_instances=1,
                 )
 
         # In-place restart of the SAME container — preserves the saved work.
@@ -1003,6 +1006,16 @@ class GatewayService:
             self.metrics.observe("invoke.latency_ms", latency_ms)
             self._track_latency_ema(deployment.deployment_id, latency_ms)
             response.id = request_id
+            # Miner-reported usage is clamped to the request's plausible
+            # bounds before it feeds billing, accrual, or demand stats.
+            billed_prompt = billed_completion = 0
+            if response.usage is not None:
+                billed_prompt, billed_completion = self._clamp_reported_usage(
+                    request,
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    deployment=deployment,
+                )
             # Record demand stats for every successful call (admin + anon
             # included). Gives Flux a signal even when the caller doesn't pay.
             if response.usage is not None:
@@ -1010,8 +1023,8 @@ class GatewayService:
                     from greencompute_gateway.infrastructure.billing_repository import BillingRepository
                     BillingRepository().record_demand_tick(
                         model_id=request.model,
-                        prompt_tokens=response.usage.prompt_tokens,
-                        completion_tokens=response.usage.completion_tokens,
+                        prompt_tokens=billed_prompt,
+                        completion_tokens=billed_completion,
                         latency_ms=latency_ms,
                     )
                 except Exception:
@@ -1024,8 +1037,8 @@ class GatewayService:
                     user_id=user_id,
                     reference_id=request_id,
                     model=request.model,
-                    prompt_tokens=response.usage.prompt_tokens,
-                    completion_tokens=response.usage.completion_tokens,
+                    prompt_tokens=billed_prompt,
+                    completion_tokens=billed_completion,
                     deployment=deployment,
                 )
             self._record_invocation(
@@ -1094,6 +1107,16 @@ class GatewayService:
                 continue
             self._handle_upstream_success(deployment, routing)
             self._record_usage(deployment, stream=True, stream_chunk_count=chunk_count)
+            # Miner-reported usage from the final chunk is clamped to the
+            # request's plausible bounds before billing/accrual/demand.
+            billed_prompt = billed_completion = 0
+            if stream_usage:
+                billed_prompt, billed_completion = self._clamp_reported_usage(
+                    request,
+                    int(stream_usage.get("prompt_tokens", 0) or 0),
+                    int(stream_usage.get("completion_tokens", 0) or 0),
+                    deployment=deployment,
+                )
             # Per-token charge — requires usage from final chunk. If it's
             # missing (older vLLM or user override of stream_options), skip
             # the debit rather than guess at token counts. Acceptable for
@@ -1103,8 +1126,8 @@ class GatewayService:
                     user_id=user_id,
                     reference_id=request_id,
                     model=request.model,
-                    prompt_tokens=int(stream_usage.get("prompt_tokens", 0) or 0),
-                    completion_tokens=int(stream_usage.get("completion_tokens", 0) or 0),
+                    prompt_tokens=billed_prompt,
+                    completion_tokens=billed_completion,
                     deployment=deployment,
                 )
             stream_latency_ms = (perf_counter() - started) * 1000.0
@@ -1115,8 +1138,8 @@ class GatewayService:
                     from greencompute_gateway.infrastructure.billing_repository import BillingRepository
                     BillingRepository().record_demand_tick(
                         model_id=request.model,
-                        prompt_tokens=int(stream_usage.get("prompt_tokens", 0) or 0),
-                        completion_tokens=int(stream_usage.get("completion_tokens", 0) or 0),
+                        prompt_tokens=billed_prompt,
+                        completion_tokens=billed_completion,
                         latency_ms=stream_latency_ms,
                     )
                 except Exception:
@@ -1357,6 +1380,82 @@ class GatewayService:
                 occupancy_seconds=0.25,
             )
         )
+
+    # Bounds for billable token counts. The miner's self-reported usage is
+    # the ONLY usage signal we have, and the miner profits from it (accrual)
+    # while the caller pays for it — so it is never trusted raw. Completion
+    # is capped by what the caller asked for; prompt by an upper bound
+    # derived from the request itself: a text token is never shorter than a
+    # character, plus generous allowances for chat-template overhead and
+    # multimodal image tokens. Legitimate usage stays under these bounds;
+    # a 10^9-token report gets clamped to the request's plausible maximum.
+    _BILLED_COMPLETION_TOKENS_CEILING = 131_072
+    _BILLED_PROMPT_TOKENS_PER_IMAGE = 16_384
+    _BILLED_PROMPT_TOKENS_PER_MESSAGE = 32
+    _BILLED_PROMPT_TOKENS_BASE = 256
+
+    def _clamp_reported_usage(
+        self,
+        request: ChatCompletionRequest,
+        prompt_tokens: int,
+        completion_tokens: int,
+        deployment: DeploymentRecord | None = None,
+    ) -> tuple[int, int]:
+        """Clamp miner-reported token counts to what this request could
+        plausibly have produced, before any money moves. Returns the
+        (billable_prompt_tokens, billable_completion_tokens) pair used for
+        the user debit, the miner accrual, and the demand signal — so an
+        inflated report can neither drain the caller nor pay the miner.
+        Clamps are flagged (metric + log) so a consistently-inflating miner
+        shows up in ops."""
+        reported_prompt = max(int(prompt_tokens or 0), 0)
+        reported_completion = max(int(completion_tokens or 0), 0)
+
+        chars = 0
+        images = 0
+        for message in request.messages:
+            if isinstance(message.content, str):
+                chars += len(message.content)
+            else:
+                for block in message.content:
+                    if block.text:
+                        chars += len(block.text)
+                    if block.type == "image_url":
+                        images += 1
+        prompt_bound = (
+            chars
+            + images * self._BILLED_PROMPT_TOKENS_PER_IMAGE
+            + len(request.messages) * self._BILLED_PROMPT_TOKENS_PER_MESSAGE
+            + self._BILLED_PROMPT_TOKENS_BASE
+        )
+
+        completion_bound = self._BILLED_COMPLETION_TOKENS_CEILING
+        requested_max = request.max_tokens
+        # OpenAI's newer field name, passed through via extra=allow and
+        # honored by vLLM — take whichever cap the caller set higher.
+        max_completion_tokens = (request.model_extra or {}).get("max_completion_tokens")
+        if isinstance(max_completion_tokens, int) and max_completion_tokens > 0:
+            requested_max = max(requested_max or 0, max_completion_tokens)
+        if requested_max:
+            completion_bound = min(requested_max, completion_bound)
+
+        billed_prompt = min(reported_prompt, prompt_bound)
+        billed_completion = min(reported_completion, completion_bound)
+        if billed_prompt < reported_prompt or billed_completion < reported_completion:
+            self.metrics.increment("inference.usage.clamped")
+            log.warning(
+                "Implausible miner-reported usage clamped: model=%s hotkey=%s "
+                "prompt %d→%d (bound %d) completion %d→%d (bound %d)",
+                request.model,
+                deployment.hotkey if deployment else None,
+                reported_prompt,
+                billed_prompt,
+                prompt_bound,
+                reported_completion,
+                billed_completion,
+                completion_bound,
+            )
+        return billed_prompt, billed_completion
 
     def _charge_inference_tokens(
         self,
