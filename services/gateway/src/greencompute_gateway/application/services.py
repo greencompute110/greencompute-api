@@ -971,10 +971,13 @@ class GatewayService:
         api_key_id: str | None = None,
         user_id: str | None = None,
         routed_host: str | None = None,
+        admin: bool = False,
     ):
         request_id = str(uuid4())
         started = perf_counter()
-        candidates, routing = self._select_healthy_deployments(request, routed_host=routed_host)
+        candidates, routing = self._select_healthy_deployments(
+            request, routed_host=routed_host, user_id=user_id, admin=admin
+        )
         last_exc: RuntimeError | None = None
         for deployment in candidates:
             try:
@@ -1044,10 +1047,13 @@ class GatewayService:
         api_key_id: str | None = None,
         user_id: str | None = None,
         routed_host: str | None = None,
+        admin: bool = False,
     ) -> Iterator[str]:
         request_id = str(uuid4())
         started = perf_counter()
-        candidates, routing = self._select_healthy_deployments(request, routed_host=routed_host)
+        candidates, routing = self._select_healthy_deployments(
+            request, routed_host=routed_host, user_id=user_id, admin=admin
+        )
         last_exc: RuntimeError | None = None
         for deployment in candidates:
             chunk_count = 0
@@ -1170,9 +1176,17 @@ class GatewayService:
         self,
         request: ChatCompletionRequest,
         routed_host: str | None = None,
+        *,
+        user_id: str | None = None,
+        admin: bool = False,
     ) -> tuple[list[DeploymentRecord], dict]:
         """Return all healthy deployments in round-robin order, plus routing metadata."""
         workload, routing = self.resolve_workload_reference(request.model, routed_host=routed_host)
+        # Authorization: a caller may only invoke a workload they own, one shared
+        # with them, or a public one. Otherwise report it as an unknown model so
+        # a private workload's existence is not enumerable via its id/alias/name.
+        if not admin and not self._user_can_access_workload(workload, user_id):
+            raise NoReadyDeploymentError(f"unknown model={request.model}")
         workload_id = workload.workload_id
         candidates = [
             deployment
