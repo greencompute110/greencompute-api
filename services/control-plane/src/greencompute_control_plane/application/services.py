@@ -442,9 +442,13 @@ class ControlPlaneService:
 
     @staticmethod
     def _estimate_deployment_fee(workload: WorkloadSpec, requested_instances: int) -> float:
+        # Quoted for ONE instance — the scheduler places exactly one per
+        # deployment and metering bills the placed instance, so quoting
+        # requested_instances× would advertise a charge that never happens.
+        del requested_instances
         gpu_count = workload.requirements.gpu_count
         base_hourly = 0.1 * gpu_count
-        return round(base_hourly * 3 * requested_instances, 4)
+        return round(base_hourly * 3, 4)
 
     def list_ready_deployments(self, workload_id: str) -> list[DeploymentRecord]:
         routable: list[DeploymentRecord] = []
@@ -1581,12 +1585,19 @@ class ControlPlaneService:
             # remainder so hourly totals converge exactly to the advertised
             # rate instead of biasing +50% (small) or −25% (2×).
             hourly_cents = deployment.hourly_rate_cents or 10
+            # Bill the instances that actually RUN, not what was requested:
+            # the scheduler places exactly one instance per deployment (and
+            # the node-agent runs one container), so requested_instances>1
+            # would charge N× for capacity that was never provisioned.
+            # ready_instances is the node-reported truth; a READY deployment
+            # with a stale 0 still bills its one running instance.
+            billed_instances = max(deployment.ready_instances or 0, 1)
             # Round-to-nearest (not truncate) so the per-minute increment
                 #   40 × 1000 × 1 / 60 = 666.67  → 667 (not 666)
             # Over 60 minutes at 667 mcents/min = 40020 mcents → 40 full cents
             # billed + 20 mcents carried over. Drift is < 1 cent/hour.
             add_mcents = round(
-                hourly_cents * 1000 * gpu_count * deployment.requested_instances / 60
+                hourly_cents * 1000 * gpu_count * billed_instances / 60
             )
             whole_cents, _remainder = self.repository.accrue_metering(
                 deployment.deployment_id,

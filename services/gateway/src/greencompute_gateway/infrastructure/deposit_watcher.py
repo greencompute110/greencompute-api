@@ -238,6 +238,11 @@ def _try_credit(
             )
             if result is None:
                 continue
+            # Invoice hit a terminal state (admin reject / expiry) between
+            # our pending scan and the confirm — it can't be credited, and
+            # the transfer is NOT spent. Keep trying other matches.
+            if result.get("refused"):
+                continue
             # The transfer was already consumed by another invoice — it's
             # spent, don't keep trying to match it to further invoices.
             if result.get("duplicate_deposit"):
