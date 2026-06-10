@@ -871,4 +871,25 @@ def gpu_pool() -> list[dict]:
     except Exception:
         pass
 
-    return sorted(buckets.values(), key=lambda b: -b["available_gpus"])
+    # Company policy: the PUBLIC rental pool only advertises the GPU classes we
+    # actually rent out (4090 / 5090). Internal / test nodes — e.g. the 10x
+    # A4000 box used only for model-deploy testing — still register and accept
+    # internal deployments, but must never surface on the public rentals page.
+    # Match by model-family substring so "rtx4090", "rtx 4090", "4090" all pass
+    # while "a4000" (or any other class) is filtered out. Override per-env if the
+    # offered hardware ever changes.
+    import os
+
+    families = [
+        f.strip().lower()
+        for f in os.getenv(
+            "GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", "4090,5090"
+        ).split(",")
+        if f.strip()
+    ]
+    public = [
+        b
+        for b in buckets.values()
+        if any(fam in (b["gpu_model"] or "").lower() for fam in families)
+    ]
+    return sorted(public, key=lambda b: -b["available_gpus"])

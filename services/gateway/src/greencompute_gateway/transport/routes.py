@@ -6,6 +6,7 @@ from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from greencompute_protocol import (
     APIKeyCreateRequest,
@@ -569,35 +570,51 @@ def create_workload(
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
     payload_data = payload if isinstance(payload, dict) else payload.model_dump(mode="json")
     template = payload_data.get("template")
-    if template == "vllm":
-        from greencompute_gateway.domain.templates import build_vllm_workload
-        model = payload_data.get("model")
-        if not model:
-            raise HTTPException(status_code=400, detail="model required for vllm template")
-        request = build_vllm_workload(
-            model,
-            **{k: v for k, v in payload_data.items() if k not in ("template", "model")},
-        )
-    elif template == "vllm-vision":
-        from greencompute_gateway.domain.templates import build_vllm_vision_workload
-        model = payload_data.get("model")
-        if not model:
-            raise HTTPException(status_code=400, detail="model required for vllm-vision template")
-        request = build_vllm_vision_workload(
-            model,
-            **{k: v for k, v in payload_data.items() if k not in ("template", "model")},
-        )
-    elif template == "diffusion":
-        from greencompute_gateway.domain.templates import build_diffusion_workload
-        model = payload_data.get("model")
-        if not model:
-            raise HTTPException(status_code=400, detail="model required for diffusion template")
-        request = build_diffusion_workload(
-            model,
-            **{k: v for k, v in payload_data.items() if k not in ("template", "model")},
-        )
-    else:
-        request = WorkloadCreateRequest(**payload_data)
+    # NOTE: the route accepts `WorkloadCreateRequest | dict`, so an invalid body
+    # (e.g. gpu_count > 16) silently falls back to `dict` at parse time instead
+    # of FastAPI's 422 — then re-validating here would raise an *uncaught*
+    # ValidationError and surface as a 500. Catch it and return a clean 422 so
+    # clients see what they got wrong (this is what made `gpu_count:10` a 500).
+    try:
+        if template == "vllm":
+            from greencompute_gateway.domain.templates import build_vllm_workload
+            model = payload_data.get("model")
+            if not model:
+                raise HTTPException(status_code=400, detail="model required for vllm template")
+            request = build_vllm_workload(
+                model,
+                **{k: v for k, v in payload_data.items() if k not in ("template", "model")},
+            )
+        elif template == "vllm-vision":
+            from greencompute_gateway.domain.templates import build_vllm_vision_workload
+            model = payload_data.get("model")
+            if not model:
+                raise HTTPException(status_code=400, detail="model required for vllm-vision template")
+            request = build_vllm_vision_workload(
+                model,
+                **{k: v for k, v in payload_data.items() if k not in ("template", "model")},
+            )
+        elif template == "diffusion":
+            from greencompute_gateway.domain.templates import build_diffusion_workload
+            model = payload_data.get("model")
+            if not model:
+                raise HTTPException(status_code=400, detail="model required for diffusion template")
+            request = build_diffusion_workload(
+                model,
+                **{k: v for k, v in payload_data.items() if k not in ("template", "model")},
+            )
+        else:
+            request = WorkloadCreateRequest(**payload_data)
+    except ValidationError as exc:
+        detail = [
+            {"loc": list(e.get("loc", ())), "msg": str(e.get("msg", "")), "type": str(e.get("type", ""))}
+            for e in exc.errors(include_url=False)
+        ]
+        raise HTTPException(status_code=422, detail=detail) from exc
+    except ValueError as exc:
+        # Template builders raise ValueError (e.g. "model must be org/model
+        # format"); without this it would surface as a 500.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _redact_workload(service.create_workload(request, api_key.user_id).model_dump(mode="json"))
 
 
@@ -1425,13 +1442,22 @@ def completions(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     host: str | None = Header(default=None, alias="Host"),
 ) -> dict:
-    request = ChatCompletionRequest(
-        model=payload["model"],
-        messages=[{"role": "user", "content": payload.get("prompt", "")}],
-        max_tokens=payload.get("max_tokens", 128),
-        temperature=payload.get("temperature", 0.7),
-        stream=payload.get("stream", False),
-    )
+    if not payload.get("model"):
+        raise HTTPException(status_code=400, detail="model required")
+    try:
+        request = ChatCompletionRequest(
+            model=payload["model"],
+            messages=[{"role": "user", "content": payload.get("prompt", "")}],
+            max_tokens=payload.get("max_tokens", 128),
+            temperature=payload.get("temperature", 0.7),
+            stream=payload.get("stream", False),
+        )
+    except ValidationError as exc:
+        detail = [
+            {"loc": list(e.get("loc", ())), "msg": str(e.get("msg", "")), "type": str(e.get("type", ""))}
+            for e in exc.errors(include_url=False)
+        ]
+        raise HTTPException(status_code=422, detail=detail) from exc
     return chat_completions(request, authorization=authorization, x_api_key=x_api_key, host=host)
 
 
@@ -1589,6 +1615,8 @@ def create_or_update_model_alias(
             actor_user_id=api_key.user_id,
             admin=api_key.admin,
         ).model_dump(mode="json")
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail="alias must be a 1–100 char string") from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
