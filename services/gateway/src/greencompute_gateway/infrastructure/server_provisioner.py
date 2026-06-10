@@ -532,6 +532,11 @@ def _render_env(**kw) -> str:
     hotkey = _env_safe(kw["hotkey"], field="hotkey")
     payout = _env_safe(kw["payout"], field="payout_address")
     auth_secret = _env_safe(kw["auth_secret"], field="auth_secret")
+    # Shared gateway↔node :8007 secret — propagate the gateway's own value so a
+    # newly-onboarded node enforces X-Agent-Auth from the start. Empty if unset.
+    inference_auth_secret = _env_safe(
+        os.environ.get("GREENCOMPUTE_INFERENCE_AUTH_SECRET", ""), field="inference_auth_secret"
+    )
     api_base_url = _env_safe(kw["api_base_url"], field="api_base_url")
     node_id = _env_safe(kw["node_id"], field="node_id")
     gpu_model = _env_safe(kw["gpu_model"], field="gpu_model")
@@ -545,6 +550,7 @@ GREENCOMPUTE_MINER_VALIDATOR_URL={validator_url}
 GREENCOMPUTE_MINER_HOTKEY={hotkey}
 GREENCOMPUTE_MINER_PAYOUT_ADDRESS={payout}
 GREENCOMPUTE_MINER_AUTH_SECRET={auth_secret}
+GREENCOMPUTE_INFERENCE_AUTH_SECRET={inference_auth_secret}
 GREENCOMPUTE_MINER_API_BASE_URL={api_base_url}
 GREENCOMPUTE_MINER_NODE_ID={node_id}
 

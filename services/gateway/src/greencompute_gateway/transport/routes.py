@@ -933,6 +933,11 @@ def get_deployment_stats(
     url = f"{miner_base}/pods/{deployment_id}/stats"
     try:
         req = urllib_request.Request(url, method="GET")
+        # Authenticate to the node-agent the same way the inference client does,
+        # so this relay keeps working once the node :8007 secret is enforced.
+        _agent_secret = os.environ.get("GREENCOMPUTE_INFERENCE_AUTH_SECRET")
+        if _agent_secret:
+            req.add_header("X-Agent-Auth", _agent_secret)
         with urllib_request.urlopen(req, timeout=3.0) as resp:  # noqa: S310
             if resp.status != 200:
                 return {}
