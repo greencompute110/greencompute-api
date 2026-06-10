@@ -196,10 +196,10 @@ class ValidatorService:
                 continue
             # Synthesize a capability whose gpu_count * vram_gb_per_gpu
             # equals the sum of the hotkey's per-node products (the score
-            # engine multiplies these to get capacity_weight). The
-            # NodeCapability schema caps gpu_count at 8 per node, so we
-            # keep gpu_count = primary node's count and stretch vram to
-            # encode the full fleet's total VRAM-GPU product.
+            # engine multiplies these to get capacity_weight). We keep
+            # gpu_count = primary node's count and stretch vram to encode
+            # the full fleet's total VRAM-GPU product (works for any
+            # gpu_count within the NodeCapability bound).
             total_capacity_units = sum(
                 n.gpu_count * n.vram_gb_per_gpu for n in nodes
             )
