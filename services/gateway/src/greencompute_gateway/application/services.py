@@ -134,8 +134,33 @@ class GatewayService:
             existing = self.repository.get_user_by_email(request.email)
             if existing is not None:
                 return existing
-        user = UserRecord(username=request.username, email=request.email)
+        # `username` carries a UNIQUE index but the UI sends the user's DISPLAY
+        # NAME, which is not unique — two people called "Mark" collided and the
+        # INSERT 500'd, leaving the user with no platform account + a null
+        # greenfApiKey (which then black-screened them on the client). Resolve
+        # to a free username before inserting so a common name never blocks
+        # signup.
+        username = self._unique_username(request.username, request.email)
+        user = UserRecord(username=username, email=request.email)
         return self.repository.save_user(user)
+
+    def _unique_username(self, desired: str | None, email: str | None) -> str:
+        """Pick a username not already taken (ix_users_username is UNIQUE).
+        Preference order: the display name as given → the email local-part
+        (usually unique + meaningful) → numbered variants → a uuid suffix."""
+        base = (desired or "").strip()
+        local = email.split("@")[0].strip() if email else ""
+        candidates: list[str] = []
+        if base:
+            candidates.append(base)
+        if local and local != base:
+            candidates.append(local)
+        seed = base or local or "user"
+        candidates.extend(f"{seed}{i}" for i in range(2, 100))
+        for candidate in candidates:
+            if self.repository.get_user_by_username(candidate) is None:
+                return candidate
+        return f"{seed}-{uuid4().hex[:8]}"
 
     def get_user(self, user_id: str) -> UserRecord | None:
         return self.repository.get_user(user_id)
