@@ -1411,6 +1411,7 @@ def chat_completions(
                     api_key_id=api_key.key_id,
                     user_id=api_key.user_id,
                     routed_host=host,
+                    admin=api_key.admin,
                 ),
                 media_type="text/event-stream",
                 headers={"cache-control": "no-cache"},
@@ -1420,6 +1421,7 @@ def chat_completions(
             api_key_id=api_key.key_id,
             user_id=api_key.user_id,
             routed_host=host,
+            admin=api_key.admin,
         ).model_dump(mode="json")
         metrics.increment("invoke.success")
         return response
