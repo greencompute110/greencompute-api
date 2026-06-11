@@ -21,7 +21,8 @@ class RuntimeSettings(BaseModel):
     service_name: str
     database_url: str
     redis_url: str = "redis://127.0.0.1:6379/0"
-    nats_url: str = "nats://127.0.0.1:4222"
+    # None = no broker configured; bus "auto" mode then stays durable.
+    nats_url: str | None = None
     bus_transport: str = "auto"
     build_execution_mode: str = "live"
     object_store_endpoint: str = "http://127.0.0.1:9000"
@@ -42,7 +43,7 @@ def load_runtime_settings(service_name: str) -> RuntimeSettings:
         service_name=service_name,
         database_url=get_database_url(),
         redis_url=os.getenv("GREENCOMPUTE_REDIS_URL", "redis://127.0.0.1:6379/0"),
-        nats_url=os.getenv("GREENCOMPUTE_NATS_URL", "nats://127.0.0.1:4222"),
+        nats_url=os.getenv("GREENCOMPUTE_NATS_URL"),
         bus_transport=os.getenv("GREENCOMPUTE_BUS_TRANSPORT", "auto"),
         build_execution_mode=os.getenv("GREENCOMPUTE_BUILD_EXECUTION_MODE", "live"),
         object_store_endpoint=os.getenv("GREENCOMPUTE_OBJECT_STORE_ENDPOINT", "http://127.0.0.1:9000"),
