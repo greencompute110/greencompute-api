@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 from collections.abc import Iterator
@@ -81,10 +82,25 @@ class BuilderService:
             "recovered_build_ids": [],
         }
 
+    @staticmethod
+    def _namespace_image(image: str, owner_user_id: str | None) -> str:
+        """Prefix a user's image with their own registry namespace so two
+        tenants can't collide on (or overwrite) the same repository, and a user
+        can't push into another tenant's path. Idempotent; admin/system builds
+        (no owner_user_id) are left as-is. BuildRequest.image is already
+        validated to a safe OCI charset, so this only adds an owner prefix.
+        """
+        if not owner_user_id:
+            return image
+        ns = "u-" + re.sub(r"[^a-z0-9]+", "-", owner_user_id.lower()).strip("-")
+        if image == ns or image.startswith(ns + "/"):
+            return image
+        return f"{ns}/{image}"
+
     def start_build(self, request: BuildRequest, *, owner_user_id: str | None = None) -> BuildRecord:
         context_uri = self._materialize_context_source(request)
         build = BuildRecord(
-            image=request.image,
+            image=self._namespace_image(request.image, owner_user_id),
             owner_user_id=owner_user_id,
             context_uri=context_uri,
             dockerfile_path=request.dockerfile_path,

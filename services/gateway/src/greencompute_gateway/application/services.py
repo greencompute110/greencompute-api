@@ -1133,6 +1133,7 @@ class GatewayService:
             # only arrives when stream_options.include_usage is True —
             # injected by the node-agent automatically).
             stream_usage: dict | None = None
+            served_any = False
             try:
                 for line in self._invoke_upstream_stream(deployment, request, request_id=request_id):
                     stripped = line.strip()
@@ -1145,7 +1146,23 @@ class GatewayService:
                         # (choices=[] at that point, usage populated).
                         if isinstance(payload.get("usage"), dict):
                             stream_usage = payload["usage"]
+                    served_any = True
                     yield line
+            except GeneratorExit:
+                # The client disconnected mid-stream. Starlette closes this sync
+                # generator by raising GeneratorExit AT the `yield` above — which
+                # is NOT a RuntimeError, so without this handler it would skip
+                # ALL settlement below: repeatable free inference. Bill for what
+                # was actually served, then re-raise so the generator closes.
+                if served_any:
+                    self._finalize_stream(
+                        deployment, request, routing,
+                        request_id=request_id, started=started,
+                        api_key_id=api_key_id, user_id=user_id,
+                        chunk_count=chunk_count, stream_usage=stream_usage,
+                        status="client_disconnected",
+                    )
+                raise
             except RuntimeError as exc:
                 last_exc = exc
                 self._handle_upstream_failure(deployment, routing, exc)
@@ -1164,58 +1181,92 @@ class GatewayService:
                 if chunk_count > 0:
                     raise
                 continue
-            self._handle_upstream_success(deployment, routing)
-            self._record_usage(deployment, stream=True, stream_chunk_count=chunk_count)
-            # Miner-reported usage from the final chunk is clamped to the
-            # request's plausible bounds before billing/accrual/demand.
-            billed_prompt = billed_completion = 0
-            if stream_usage:
-                billed_prompt, billed_completion = self._clamp_reported_usage(
-                    request,
-                    int(stream_usage.get("prompt_tokens", 0) or 0),
-                    int(stream_usage.get("completion_tokens", 0) or 0),
-                    deployment=deployment,
-                )
-            # Per-token charge — requires usage from final chunk. If it's
-            # missing (older vLLM or user override of stream_options), skip
-            # the debit rather than guess at token counts. Acceptable for
-            # MVP; upgrade path is a tokenizer-based fallback count.
-            if user_id and stream_usage:
-                self._charge_inference_tokens(
-                    user_id=user_id,
-                    reference_id=request_id,
-                    model=request.model,
-                    prompt_tokens=billed_prompt,
-                    completion_tokens=billed_completion,
-                    deployment=deployment,
-                )
-            stream_latency_ms = (perf_counter() - started) * 1000.0
-            self.metrics.observe("invoke.latency_ms", stream_latency_ms)
-            self._track_latency_ema(deployment.deployment_id, stream_latency_ms)
-            if stream_usage:
-                try:
-                    from greencompute_gateway.infrastructure.billing_repository import BillingRepository
-                    BillingRepository().record_demand_tick(
-                        model_id=request.model,
-                        prompt_tokens=billed_prompt,
-                        completion_tokens=billed_completion,
-                        latency_ms=stream_latency_ms,
-                    )
-                except Exception:
-                    self.metrics.increment("inference.demand.record_failed")
-            self._record_invocation(
-                deployment,
-                request,
-                routing=routing,
-                request_id=request_id,
-                api_key_id=api_key_id,
-                stream=True,
-                started=started,
+            self._finalize_stream(
+                deployment, request, routing,
+                request_id=request_id, started=started,
+                api_key_id=api_key_id, user_id=user_id,
+                chunk_count=chunk_count, stream_usage=stream_usage,
                 status="succeeded",
             )
             return
         if last_exc is not None:
             raise last_exc
+
+    def _finalize_stream(
+        self,
+        deployment: DeploymentRecord,
+        request: ChatCompletionRequest,
+        routing: dict,
+        *,
+        request_id: str,
+        started: float,
+        api_key_id: str | None,
+        user_id: str | None,
+        chunk_count: int,
+        stream_usage: dict | None,
+        status: str,
+    ) -> None:
+        """Settle one streamed completion exactly once — on normal completion
+        AND on a mid-stream client disconnect — so a disconnect can't yield free
+        inference. Marks the upstream healthy, records usage, bills the user,
+        accrues to the miner, emits the demand tick and records the invocation.
+        """
+        self._handle_upstream_success(deployment, routing)
+        self._record_usage(deployment, stream=True, stream_chunk_count=chunk_count)
+
+        # Miner-reported usage from the final chunk is clamped to the request's
+        # plausible bounds before any money moves.
+        billed_prompt = billed_completion = 0
+        if stream_usage:
+            billed_prompt, billed_completion = self._clamp_reported_usage(
+                request,
+                int(stream_usage.get("prompt_tokens", 0) or 0),
+                int(stream_usage.get("completion_tokens", 0) or 0),
+                deployment=deployment,
+            )
+        elif chunk_count > 0:
+            # No final usage chunk (client disconnected before it arrived, or an
+            # older vLLM omitted it) yet content WAS streamed. Bill the prompt —
+            # known entirely from the request, independent of the miner — plus
+            # the content chunks actually delivered (≈1 token/chunk for vLLM),
+            # so partial delivery is never free.
+            billed_prompt = self._prompt_token_bound(request)
+            billed_completion = min(chunk_count, self._completion_token_bound(request))
+
+        if user_id and (billed_prompt or billed_completion):
+            self._charge_inference_tokens(
+                user_id=user_id,
+                reference_id=request_id,
+                model=request.model,
+                prompt_tokens=billed_prompt,
+                completion_tokens=billed_completion,
+                deployment=deployment,
+            )
+
+        stream_latency_ms = (perf_counter() - started) * 1000.0
+        self.metrics.observe("invoke.latency_ms", stream_latency_ms)
+        self._track_latency_ema(deployment.deployment_id, stream_latency_ms)
+        if billed_prompt or billed_completion:
+            try:
+                from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+                BillingRepository().record_demand_tick(
+                    model_id=request.model,
+                    prompt_tokens=billed_prompt,
+                    completion_tokens=billed_completion,
+                    latency_ms=stream_latency_ms,
+                )
+            except Exception:
+                self.metrics.increment("inference.demand.record_failed")
+        self._record_invocation(
+            deployment,
+            request,
+            routing=routing,
+            request_id=request_id,
+            api_key_id=api_key_id,
+            stream=True,
+            started=started,
+            status=status,
+        )
 
     def resolve_workload_reference(self, model: str, routed_host: str | None = None) -> tuple[WorkloadSpec, dict]:
         normalized_host = self._normalize_host(routed_host)
@@ -1453,6 +1504,41 @@ class GatewayService:
     _BILLED_PROMPT_TOKENS_PER_MESSAGE = 32
     _BILLED_PROMPT_TOKENS_BASE = 256
 
+    def _prompt_token_bound(self, request: ChatCompletionRequest) -> int:
+        """Upper bound on plausible prompt tokens, derived purely from the
+        request content (no miner input). Also used to bill the prompt when a
+        client disconnects before the upstream's usage chunk arrives."""
+        chars = 0
+        images = 0
+        for message in request.messages:
+            if isinstance(message.content, str):
+                chars += len(message.content)
+            else:
+                for block in message.content:
+                    if block.text:
+                        chars += len(block.text)
+                    if block.type == "image_url":
+                        images += 1
+        return (
+            chars
+            + images * self._BILLED_PROMPT_TOKENS_PER_IMAGE
+            + len(request.messages) * self._BILLED_PROMPT_TOKENS_PER_MESSAGE
+            + self._BILLED_PROMPT_TOKENS_BASE
+        )
+
+    def _completion_token_bound(self, request: ChatCompletionRequest) -> int:
+        """Upper bound on plausible completion tokens for this request."""
+        completion_bound = self._BILLED_COMPLETION_TOKENS_CEILING
+        requested_max = request.max_tokens
+        # OpenAI's newer field name, passed through via extra=allow and
+        # honored by vLLM — take whichever cap the caller set higher.
+        max_completion_tokens = (request.model_extra or {}).get("max_completion_tokens")
+        if isinstance(max_completion_tokens, int) and max_completion_tokens > 0:
+            requested_max = max(requested_max or 0, max_completion_tokens)
+        if requested_max:
+            completion_bound = min(requested_max, completion_bound)
+        return completion_bound
+
     def _clamp_reported_usage(
         self,
         request: ChatCompletionRequest,
@@ -1470,33 +1556,8 @@ class GatewayService:
         reported_prompt = max(int(prompt_tokens or 0), 0)
         reported_completion = max(int(completion_tokens or 0), 0)
 
-        chars = 0
-        images = 0
-        for message in request.messages:
-            if isinstance(message.content, str):
-                chars += len(message.content)
-            else:
-                for block in message.content:
-                    if block.text:
-                        chars += len(block.text)
-                    if block.type == "image_url":
-                        images += 1
-        prompt_bound = (
-            chars
-            + images * self._BILLED_PROMPT_TOKENS_PER_IMAGE
-            + len(request.messages) * self._BILLED_PROMPT_TOKENS_PER_MESSAGE
-            + self._BILLED_PROMPT_TOKENS_BASE
-        )
-
-        completion_bound = self._BILLED_COMPLETION_TOKENS_CEILING
-        requested_max = request.max_tokens
-        # OpenAI's newer field name, passed through via extra=allow and
-        # honored by vLLM — take whichever cap the caller set higher.
-        max_completion_tokens = (request.model_extra or {}).get("max_completion_tokens")
-        if isinstance(max_completion_tokens, int) and max_completion_tokens > 0:
-            requested_max = max(requested_max or 0, max_completion_tokens)
-        if requested_max:
-            completion_bound = min(requested_max, completion_bound)
+        prompt_bound = self._prompt_token_bound(request)
+        completion_bound = self._completion_token_bound(request)
 
         billed_prompt = min(reported_prompt, prompt_bound)
         billed_completion = min(reported_completion, completion_bound)

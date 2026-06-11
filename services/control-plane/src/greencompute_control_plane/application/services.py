@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -54,6 +55,14 @@ class ControlPlaneService:
             transport=runtime_settings.bus_transport,
         )
         self.placement_policy = PlacementPolicy()
+        # Serializes the read-reserved → choose-node → write-reservation section
+        # of _assign_lease. The worker loop (event-loop thread) and the admin
+        # /events/process route (threadpool) both schedule in this one process,
+        # so without this two deployments could pass the same capacity snapshot
+        # and double-book a node's GPUs. (Multi-replica would additionally need
+        # a DB advisory lock; the capacity re-check in reserve_gpus is the
+        # cross-process backstop.)
+        self._placement_lock = threading.Lock()
         self.usage_aggregator = UsageAggregator()
         self.metrics = get_metrics_store("greencompute-control-plane")
         self._recovery_state: dict[str, object | None] = {
@@ -228,40 +237,65 @@ class ControlPlaneService:
         # reservation sum (per node) is subtracted from physical capacity inside
         # the placement policy; the miner-reported available_gpus is only a
         # ceiling. reserved_by_node is read once here and passed through.
-        reserved_by_node = self.repository.reserved_gpus_by_node()
-        assignment = self.placement_policy.assign_lease(
-            workload, deployment_id, nodes, reserved_by_node=reserved_by_node
-        )
-        if assignment is None:
-            logger.warning(
-                "scheduler returned no match for deployment %s among %d eligible nodes "
-                "(workload kind=%s gpu=%d vram=%d cpu=%d mem=%d)",
-                deployment_id, len(nodes), workload.kind.value,
-                workload.requirements.gpu_count,
-                workload.requirements.min_vram_gb_per_gpu,
-                workload.requirements.cpu_cores,
-                workload.requirements.memory_gb,
+        # ORCH-C2: derive effective availability from the reservation ledger and
+        # commit the hold atomically. The read of reserved_gpus_by_node, the
+        # placement decision, and the reserve_gpus write must not interleave with
+        # another scheduling pass for the same node, or two deployments can pass
+        # the same capacity snapshot and double-book the node's GPUs.
+        with self._placement_lock:
+            reserved_by_node = self.repository.reserved_gpus_by_node()
+            assignment = self.placement_policy.assign_lease(
+                workload, deployment_id, nodes, reserved_by_node=reserved_by_node
             )
-            return None
-        # ORCH-C2: the authoritative hold is a gpu_reservations row, NOT a
-        # mutation of CapacityORM.available_gpus (which the next heartbeat would
-        # overwrite). Record it at assign time; it is released on
-        # terminate/requeue/expire/suspend. We still keep adjust_node_capacity
-        # decrementing the reported value so the UI/heartbeat-merge stays roughly
-        # in sync, but the reservation is the floor the scheduler trusts.
-        self.repository.reserve_gpus(
-            deployment_id,
-            assignment.hotkey,
-            assignment.node_id,
-            workload.requirements.gpu_count,
-        )
-        self.repository.adjust_node_capacity(
-            assignment.hotkey,
-            assignment.node_id,
-            -workload.requirements.gpu_count,
-        )
+            if assignment is None:
+                logger.warning(
+                    "scheduler returned no match for deployment %s among %d eligible nodes "
+                    "(workload kind=%s gpu=%d vram=%d cpu=%d mem=%d)",
+                    deployment_id, len(nodes), workload.kind.value,
+                    workload.requirements.gpu_count,
+                    workload.requirements.min_vram_gb_per_gpu,
+                    workload.requirements.cpu_cores,
+                    workload.requirements.memory_gb,
+                )
+                return None
+            # The authoritative hold is a gpu_reservations row, NOT a mutation of
+            # CapacityORM.available_gpus (which the next heartbeat would
+            # overwrite). Record it at assign time, capacity-checked against the
+            # chosen node's physical GPU count; it is released on
+            # terminate/requeue/expire/suspend.
+            chosen = next((n for n in nodes if n.node_id == assignment.node_id), None)
+            capacity_gpus = chosen.gpu_count if chosen is not None else None
+            reserved_ok = self.repository.reserve_gpus(
+                deployment_id,
+                assignment.hotkey,
+                assignment.node_id,
+                workload.requirements.gpu_count,
+                capacity_gpus=capacity_gpus,
+            )
+            if not reserved_ok:
+                logger.warning(
+                    "reservation refused for deployment %s on node %s "
+                    "(would exceed %s physical GPUs) — will retry next pass",
+                    deployment_id, assignment.node_id, capacity_gpus,
+                )
+                return None
+            self.repository.adjust_node_capacity(
+                assignment.hotkey,
+                assignment.node_id,
+                -workload.requirements.gpu_count,
+            )
         assignment.expires_at = datetime.now(UTC) + timedelta(seconds=settings.default_lease_ttl_seconds)
         return assignment
+
+    def reclaim_orphaned_reservations(self) -> int:
+        """Release GPU reservations whose deployment is gone or terminal. Run on
+        the worker's ~60s cadence so any leaked hold self-corrects rather than
+        permanently shrinking schedulable capacity."""
+        released = self.repository.release_orphaned_reservations()
+        if released:
+            logger.info("reclaimed %d orphaned GPU reservation(s)", released)
+            self.metrics.increment("scheduler.reservations.reclaimed", released)
+        return released
 
     def list_leases(self, hotkey: str) -> list[LeaseAssignment]:
         # ORCH-H3: 'suspended' leases are returned alongside the active ones so
@@ -1593,8 +1627,15 @@ class ControlPlaneService:
 
     # --- Usage metering ---
 
-    def meter_usage(self) -> dict[str, int]:
-        """Deduct per-minute GPU usage from user balances for all READY deployments.
+    def meter_usage(self, elapsed_seconds: float | None = None) -> dict[str, int]:
+        """Deduct GPU usage from user balances for all READY deployments.
+
+        ``elapsed_seconds`` is the real wall-clock time since the previous
+        metering cycle (the worker passes a monotonic delta). Charges are
+        pro-rated by that delta rather than assuming a fixed 60s, so loop work
+        time, DB contention and restarts can't make the cycle bill one minute of
+        cost for >60s of real runtime (systematic under-billing). When omitted
+        (tests / ad-hoc calls) it falls back to the nominal one-minute charge.
 
         Returns dict of deployment_id -> cents actually debited. Drains the
         user's balance to its floor (never below 0, never free up to the
@@ -1604,6 +1645,12 @@ class ControlPlaneService:
         no realized usage is silently dropped — billing stays exact across a
         suspend/top-up/resume cycle.
         """
+        # Clamp to [0, 1h]: monotonic deltas never go backward, and a delta
+        # larger than an hour means the cycle stalled badly — cap the charge
+        # rather than bill a surprise multi-hour amount from one tick.
+        billed_seconds = None
+        if elapsed_seconds is not None:
+            billed_seconds = max(0.0, min(float(elapsed_seconds), 3600.0))
         from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 
         billing_repo = BillingRepository()
@@ -1636,13 +1683,19 @@ class ControlPlaneService:
             # ready_instances is the node-reported truth; a READY deployment
             # with a stale 0 still bills its one running instance.
             billed_instances = max(deployment.ready_instances or 0, 1)
-            # Round-to-nearest (not truncate) so the per-minute increment
-                #   40 × 1000 × 1 / 60 = 666.67  → 667 (not 666)
-            # Over 60 minutes at 667 mcents/min = 40020 mcents → 40 full cents
-            # billed + 20 mcents carried over. Drift is < 1 cent/hour.
-            add_mcents = round(
-                hourly_cents * 1000 * gpu_count * billed_instances / 60
-            )
+            # Millicents accrued this cycle. Anchored to real elapsed seconds
+            # when the worker provides them (hourly_cents × 1000 / 3600 per
+            # second), else the nominal per-minute amount. Round-to-nearest; the
+            # deployment's millicent accumulator carries any sub-cent remainder
+            # so hourly totals converge exactly to the advertised rate.
+            if billed_seconds is not None:
+                add_mcents = round(
+                    hourly_cents * 1000 * gpu_count * billed_instances * billed_seconds / 3600
+                )
+            else:
+                add_mcents = round(
+                    hourly_cents * 1000 * gpu_count * billed_instances / 60
+                )
             whole_cents, _remainder = self.repository.accrue_metering(
                 deployment.deployment_id,
                 add_mcents=add_mcents,

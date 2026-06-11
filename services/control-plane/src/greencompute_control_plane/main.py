@@ -28,6 +28,10 @@ async def _control_plane_worker_loop() -> None:
     _worker_state["running"] = True
     _metering_counter = 0
     _metering_interval = max(1, int(60 / max(1, settings.worker_poll_interval_seconds)))
+    # Wall-clock anchor for metering — the real elapsed time between metering
+    # cycles, not an assumed 60s, so loop work time / DB contention / restarts
+    # can't systematically under-bill GPU rentals.
+    _last_metered_at = asyncio.get_running_loop().time()
     while True:
         try:
             service.process_pending_events()
@@ -38,8 +42,11 @@ async def _control_plane_worker_loop() -> None:
             _metering_counter += 1
             if _metering_counter >= _metering_interval:
                 _metering_counter = 0
+                _now = asyncio.get_running_loop().time()
+                _elapsed = _now - _last_metered_at
+                _last_metered_at = _now
                 try:
-                    service.meter_usage()
+                    service.meter_usage(elapsed_seconds=_elapsed)
                 except Exception as meter_exc:
                     # Log loudly — the outer try/except wrapper clears
                     # `last_error` on every successful iteration, so without
@@ -70,6 +77,17 @@ async def _control_plane_worker_loop() -> None:
                         "reaper cycle failed: %s", reap_exc
                     )
                     _worker_state["last_error"] = f"reaper: {reap_exc}"
+                # Reclaim GPU reservations orphaned by a delete/terminate that
+                # didn't release them — keeps leaked holds from permanently
+                # shrinking schedulable capacity. Isolated try/except.
+                try:
+                    service.reclaim_orphaned_reservations()
+                except Exception as reclaim_exc:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "reservation reclaim failed: %s", reclaim_exc
+                    )
+                    _worker_state["last_error"] = f"reservation_reclaim: {reclaim_exc}"
                 # Stale-delivery recovery — used to run ONLY at startup, so a
                 # delivery orphaned in 'processing' (worker killed mid-event,
                 # or mark_failed itself erroring) wedged its deployment until
