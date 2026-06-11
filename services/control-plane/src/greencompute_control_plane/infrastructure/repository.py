@@ -229,7 +229,15 @@ class ControlPlaneRepository:
     # miner-reported CapacityORM.available_gpus so a stale/clobbering heartbeat
     # can never erase the decrement. Effective availability is derived on read.
 
-    def reserve_gpus(self, deployment_id: str, hotkey: str, node_id: str, gpu_count: int) -> bool:
+    def reserve_gpus(
+        self,
+        deployment_id: str,
+        hotkey: str,
+        node_id: str,
+        gpu_count: int,
+        *,
+        capacity_gpus: int | None = None,
+    ) -> bool:
         """Record an active GPU reservation for a deployment (idempotent).
 
         One active reservation per deployment (UNIQUE deployment_id). If a row
@@ -237,9 +245,25 @@ class ControlPlaneRepository:
         place (covers a resume re-acquiring its hold). Returns True if a hold is
         now active for the deployment. Never raises on a benign race — a
         concurrent insert that loses the UNIQUE race is treated as success.
+
+        When ``capacity_gpus`` is given, the node's already-active reservations
+        (excluding this deployment) are summed inside the SAME transaction and
+        the reservation is REFUSED (returns False) if it would push the node
+        over its physical GPU count — a capacity-checked reserve that, together
+        with the caller's placement lock, prevents double-booking a node.
         """
         try:
             with session_scope(self.session_factory) as session:
+                if capacity_gpus is not None:
+                    already = session.scalar(
+                        select(func.coalesce(func.sum(GpuReservationORM.gpu_count), 0)).where(
+                            GpuReservationORM.status == "active",
+                            GpuReservationORM.node_id == node_id,
+                            GpuReservationORM.deployment_id != deployment_id,
+                        )
+                    ) or 0
+                    if int(already) + int(gpu_count) > int(capacity_gpus):
+                        return False
                 row = session.scalar(
                     select(GpuReservationORM).where(GpuReservationORM.deployment_id == deployment_id)
                 )
@@ -282,6 +306,27 @@ class ControlPlaneRepository:
             row.released_at = datetime.now(UTC)
             session.add(row)
             return True
+
+    def release_orphaned_reservations(self) -> int:
+        """Release any active reservation whose deployment no longer exists or
+        has reached a terminal state. Backstop for code paths that destroy or
+        terminate a deployment without releasing its hold (e.g. a crash between
+        the two), so leaked holds can't permanently shrink schedulable capacity.
+        Returns the number of reservations released."""
+        terminal = {DeploymentState.TERMINATED.value, DeploymentState.FAILED.value}
+        released = 0
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(GpuReservationORM).where(GpuReservationORM.status == "active")
+            ).all()
+            for row in rows:
+                dep = session.get(DeploymentORM, row.deployment_id)
+                if dep is None or dep.state in terminal:
+                    row.status = "released"
+                    row.released_at = datetime.now(UTC)
+                    session.add(row)
+                    released += 1
+        return released
 
     def get_active_reservation(self, deployment_id: str) -> dict[str, Any] | None:
         with session_scope(self.session_factory) as session:
@@ -401,6 +446,12 @@ class ControlPlaneRepository:
                     session.delete(ur)
                 for inv in session.scalars(select(InvocationRecordORM).where(InvocationRecordORM.deployment_id == dep_id)).all():
                     session.delete(inv)
+                # Release the deployment's GPU reservation(s). Without this the
+                # active hold survives the deployment row that owned it, so the
+                # GPUs are subtracted from schedulable capacity forever (no
+                # release path can fire once the deployment is gone).
+                for resv in session.scalars(select(GpuReservationORM).where(GpuReservationORM.deployment_id == dep_id)).all():
+                    session.delete(resv)
             for share in session.scalars(select(WorkloadShareORM).where(WorkloadShareORM.workload_id == workload_id)).all():
                 session.delete(share)
             for dep in session.scalars(select(DeploymentORM).where(DeploymentORM.workload_id == workload_id)).all():

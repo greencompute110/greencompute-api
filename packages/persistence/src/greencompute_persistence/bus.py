@@ -77,11 +77,15 @@ class SubjectBus:
         return "durable"
 
     def publish(self, subject: str, payload: dict[str, Any]) -> WorkflowEvent:
-        event = self.workflow_repository.publish(subject, payload)
+        # Insert the workflow event AND all of its bus deliveries in ONE
+        # transaction. Previously the event committed in its own transaction
+        # before a second transaction inserted the deliveries — a crash between
+        # the two left a committed event with zero deliveries that no consumer
+        # would ever claim (silent loss of deployment.requested / usage.recorded
+        # / invocation.recorded). Now it's all-or-nothing.
         consumers = SUBJECT_CONSUMERS.get(subject, [])
-        if not consumers:
-            return event
         with session_scope(self.session_factory) as session:
+            event = self.workflow_repository.add_event(session, subject, payload)
             for consumer in consumers:
                 session.add(
                     BusDeliveryORM(

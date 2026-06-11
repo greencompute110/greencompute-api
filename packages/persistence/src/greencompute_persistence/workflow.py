@@ -42,23 +42,32 @@ class WorkflowEventRepository:
         if engine is None and session_factory is None and needs_bootstrap(str(self.engine.url), bootstrap):
             init_database(self.engine)
 
-    def publish(self, subject: str, payload: dict[str, Any]) -> WorkflowEvent:
+    def add_event(self, session: Session, subject: str, payload: dict[str, Any]) -> WorkflowEvent:
+        """Stage a WorkflowEventORM into an EXISTING session WITHOUT committing.
+
+        Lets a caller (SubjectBus.publish) insert the event AND its bus
+        deliveries in ONE transaction, so a crash can never leave a committed
+        event with zero deliveries (which would never be claimed/processed).
+        """
         event = WorkflowEvent(subject=subject, payload=payload)
-        with session_scope(self.session_factory) as session:
-            session.add(
-                WorkflowEventORM(
-                    event_id=event.event_id,
-                    subject=event.subject,
-                    payload=event.payload,
-                    status=event.status,
-                    attempts=event.attempts,
-                    available_at=event.available_at,
-                    last_error=event.last_error,
-                    created_at=event.created_at,
-                    updated_at=event.updated_at,
-                )
+        session.add(
+            WorkflowEventORM(
+                event_id=event.event_id,
+                subject=event.subject,
+                payload=event.payload,
+                status=event.status,
+                attempts=event.attempts,
+                available_at=event.available_at,
+                last_error=event.last_error,
+                created_at=event.created_at,
+                updated_at=event.updated_at,
             )
+        )
         return event
+
+    def publish(self, subject: str, payload: dict[str, Any]) -> WorkflowEvent:
+        with session_scope(self.session_factory) as session:
+            return self.add_event(session, subject, payload)
 
     def claim_pending(self, subjects: list[str], limit: int = 10) -> list[WorkflowEvent]:
         now = utcnow()

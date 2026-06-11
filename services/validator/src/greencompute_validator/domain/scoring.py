@@ -58,11 +58,24 @@ class ScoreEngine:
             final_score=round(final_score, 6),
         )
 
+    # No-fresh-flux-state penalty. A miner whose mirrored inventory went stale
+    # (dropped from _flux_states) or that reports 0 total GPUs has no evidence of
+    # serving work — it must NOT receive the maximum utilization multiplier.
+    # 0.5 mirrors the no-probe-data halving used by reliability/performance.
+    # NOTE: the deeper structural issue — utilization is seeded from
+    # miner-reported available_gpus, so under-reporting idle GPUs inflates this
+    # score — is a scoring-trust redesign that changes live emission
+    # distribution and is intentionally NOT changed here.
+    _NO_DATA_UTILIZATION = 0.5
+
     @staticmethod
     def _utilization_factor(flux_state: FluxState | None) -> float:
         """(inference_gpus + rental_gpus) / total_gpus — how busy the node is."""
         if flux_state is None or flux_state.total_gpus == 0:
-            return 1.0  # No flux data — neutral
+            # No flux data — penalize, don't reward. A stale/offline miner used
+            # to get 1.0 (the maximum), scoring HIGHER than a node genuinely
+            # serving at partial utilization.
+            return ScoreEngine._NO_DATA_UTILIZATION
         used = flux_state.inference_gpus + flux_state.rental_gpus
         return round(max(used / flux_state.total_gpus, 0.01), 6)
 

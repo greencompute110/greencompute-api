@@ -336,6 +336,12 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
     if to_block < from_block:
         return 0
 
+    # Only advance the persisted cursor if EVERY eth_getLogs in this range
+    # succeeded. A transient RPC failure (timeout/429/5xx — the default public
+    # RPC is explicitly flaky) on any address would otherwise let us skip past
+    # blocks we never read, permanently losing real deposits. Re-scanning is
+    # safe: crediting is idempotent via the UNIQUE deposit_ref.
+    scan_ok = True
     for token in tokens:
         # Collect deposit-address topics. The address is the SAME for all
         # pending invoices of this currency (we only ever set one global
@@ -382,6 +388,7 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
                     "watcher %s/%s: eth_getLogs failed: %s",
                     chain_id, token.currency, exc,
                 )
+                scan_ok = False
                 continue
 
             invoices = _pending_invoices_for(repo, token.currency, addr)
@@ -417,9 +424,17 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
                 if result.get("credited"):
                     credited += 1
 
-    # Persist the NEXT block to scan (to_block + 1) — non-overlapping with
-    # the range we just covered.
-    _kv_set(repo, state_key, str(to_block + 1))
+    # Persist the NEXT block to scan (to_block + 1) — non-overlapping with the
+    # range we just covered — ONLY if every eth_getLogs succeeded. On a
+    # transient RPC failure we leave the cursor put so this range is retried
+    # next tick rather than silently skipped.
+    if scan_ok:
+        _kv_set(repo, state_key, str(to_block + 1))
+    else:
+        log.warning(
+            "watcher %s: RPC error(s) this tick — NOT advancing cursor past "
+            "blocks %d..%d; will retry next tick", chain_id, from_block, to_block,
+        )
     return credited
 
 
@@ -479,15 +494,20 @@ def scan_tao(repo: BillingRepository) -> int:
         if to_block <= from_block:
             return 0
 
+        # Advance the cursor only across blocks we actually read. On a failed
+        # block we STOP (not skip) so the next tick resumes from it — skipping
+        # would silently lose any deposit in that block.
+        scanned_through = from_block
         for block_num in range(from_block + 1, to_block + 1):
             try:
                 block_hash = substrate.get_block_hash(block_num)
                 events = substrate.get_events(block_hash) or []
             except Exception as exc:
                 log.warning(
-                    "watcher tao: get_events block %d failed: %s", block_num, exc
+                    "watcher tao: get_events block %d failed: %s — stopping; "
+                    "will resume here next tick", block_num, exc
                 )
-                continue
+                break
 
             for event_idx, ev in enumerate(events):
                 ev_obj = getattr(ev, "value", ev)
@@ -541,7 +561,10 @@ def scan_tao(repo: BillingRepository) -> int:
                 if result.get("credited"):
                     credited += 1
 
-        _kv_set(repo, state_key, str(to_block))
+            # Block fully read — safe to advance the cursor through it.
+            scanned_through = block_num
+
+        _kv_set(repo, state_key, str(scanned_through))
     finally:
         if substrate is not None:
             try:

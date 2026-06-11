@@ -1914,7 +1914,12 @@ def billing_topup_crypto(
         "usdt", "usdc",                           # legacy — single address for either chain
         "usdt-eth", "usdt-base",                  # chain-qualified
         "usdc-eth", "usdc-base",                  # chain-qualified
-        "tao", "alpha",
+        "tao",
+        # NOTE: "alpha" is intentionally NOT accepted. The deposit watcher has
+        # no Alpha scanner (and subnet Alpha transfers don't emit a
+        # Balances.Transfer event the TAO scanner could see), so an Alpha
+        # invoice could never auto-credit — the user would lose funds. Re-enable
+        # here and in the UI only once a real Alpha scanner exists.
     )
     if currency not in allowed:
         raise HTTPException(
