@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy import select
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope

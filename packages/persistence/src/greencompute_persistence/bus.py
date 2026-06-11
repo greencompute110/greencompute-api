@@ -491,7 +491,7 @@ def create_subject_bus(
     engine: Engine | None = None,
     session_factory: sessionmaker[Session] | None = None,
     workflow_repository: WorkflowEventRepository | None = None,
-    nats_url: str = "nats://127.0.0.1:4222",
+    nats_url: str | None = None,
     transport: str = "auto",
 ):
     durable = SubjectBus(
@@ -503,7 +503,18 @@ def create_subject_bus(
     )
     if transport == "durable":
         return durable
-    nats_bus = NatsJetStreamBus(durable_bus=durable, nats_url=nats_url, enabled=transport in {"auto", "nats"})
+    # "auto" opts into NATS only when a broker was explicitly configured
+    # (GREENCOMPUTE_NATS_URL / nats_url). The client library being
+    # importable proves nothing — nats-py is a hard dependency of this
+    # package, so it is ALWAYS importable; keying on it made every "auto"
+    # deployment without a broker pay a connect-timeout on each publish.
+    if transport == "auto" and not nats_url:
+        return durable
+    nats_bus = NatsJetStreamBus(
+        durable_bus=durable,
+        nats_url=nats_url or "nats://127.0.0.1:4222",
+        enabled=transport in {"auto", "nats"},
+    )
     if transport == "nats" and not nats_bus.client_available:
         return nats_bus
     if transport == "auto" and not nats_bus.client_available:
