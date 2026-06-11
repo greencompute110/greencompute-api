@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
 from greencompute_persistence.db import needs_bootstrap
 from greencompute_persistence.orm import (
     CryptoInvoiceORM,
+    InferenceBalanceHoldORM,
     InferenceDemandStatsORM,
     LedgerEntryORM,
     MinerPayoutAccrualORM,
@@ -155,6 +156,90 @@ class BillingRepository:
                 "debited_cents": int(take),
                 "shortfall_cents": int(amount_cents - take),
             }
+
+    # --- In-flight inference authorization holds (concurrent-spend gate) ---
+
+    def reserve_inference_hold(
+        self,
+        user_id: str,
+        amount_cents: int,
+        reference_id: str,
+        ttl_seconds: int = 300,
+    ) -> bool:
+        """Atomically reserve ``amount_cents`` against the user's *available*
+        balance for one in-flight request, returning True on success.
+
+        Available = ``balance_credits - SUM(this user's other non-expired
+        holds)``. The user row is locked SELECT..FOR UPDATE for the whole
+        check-and-insert so two concurrent requests can't both observe the same
+        availability and over-commit — this is what stops a near-zero balance
+        from fanning out into many "free" concurrent completions.
+
+        Idempotent per ``reference_id`` (= request_id): re-reserving the same id
+        updates its amount/TTL in place rather than double-counting. Returns
+        False (no hold written) when the available balance can't cover it.
+        """
+        amount_cents = max(0, int(amount_cents))
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=max(1, int(ttl_seconds)))
+        with session_scope(self.session_factory) as session:
+            row = session.get(UserORM, user_id, with_for_update=True)
+            if row is None:
+                return False
+            # Opportunistic cleanup of this user's expired holds keeps the table
+            # bounded without a separate sweep job (correctness doesn't depend on
+            # it — the SUM below already ignores expired rows).
+            for stale in session.scalars(
+                select(InferenceBalanceHoldORM).where(
+                    InferenceBalanceHoldORM.user_id == user_id,
+                    InferenceBalanceHoldORM.expires_at <= now,
+                )
+            ).all():
+                session.delete(stale)
+            active = session.scalar(
+                select(func.coalesce(func.sum(InferenceBalanceHoldORM.amount_cents), 0)).where(
+                    InferenceBalanceHoldORM.user_id == user_id,
+                    InferenceBalanceHoldORM.expires_at > now,
+                    InferenceBalanceHoldORM.reference_id != reference_id,
+                )
+            ) or 0
+            available = int(row.balance_credits) - int(active)
+            if available < amount_cents:
+                return False
+            existing = session.get(InferenceBalanceHoldORM, reference_id)
+            if existing is None:
+                session.add(
+                    InferenceBalanceHoldORM(
+                        reference_id=reference_id,
+                        user_id=user_id,
+                        amount_cents=amount_cents,
+                        created_at=now,
+                        expires_at=expires_at,
+                    )
+                )
+            else:
+                existing.amount_cents = amount_cents
+                existing.expires_at = expires_at
+            return True
+
+    def release_inference_hold(self, reference_id: str) -> None:
+        """Release a hold once its request settles (idempotent no-op if absent)."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(InferenceBalanceHoldORM, reference_id)
+            if row is not None:
+                session.delete(row)
+
+    def active_hold_cents(self, user_id: str) -> int:
+        """Sum of the user's currently-active (non-expired) holds. For tests/ops."""
+        now = datetime.now(UTC)
+        with session_scope(self.session_factory) as session:
+            total = session.scalar(
+                select(func.coalesce(func.sum(InferenceBalanceHoldORM.amount_cents), 0)).where(
+                    InferenceBalanceHoldORM.user_id == user_id,
+                    InferenceBalanceHoldORM.expires_at > now,
+                )
+            )
+            return int(total or 0)
 
     def list_ledger(self, user_id: str, limit: int = 50, offset: int = 0) -> list[LedgerEntry]:
         with session_scope(self.session_factory) as session:

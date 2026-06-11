@@ -1013,6 +1013,32 @@ class GatewayService:
         candidates, routing = self._select_healthy_deployments(
             request, routed_host=routed_host, user_id=user_id, admin=admin
         )
+        # Reserve this request's worst-case cost so concurrent requests from a
+        # near-zero balance can't all pass the gate. Released in finally once the
+        # real charge has settled (or the request failed).
+        if user_id and not admin:
+            self._reserve_inference_budget(user_id, request_id, request)
+        try:
+            return self._invoke_from_candidates(
+                request, candidates, routing,
+                request_id=request_id, started=started,
+                api_key_id=api_key_id, user_id=user_id,
+            )
+        finally:
+            if user_id:
+                self._release_inference_budget(request_id)
+
+    def _invoke_from_candidates(
+        self,
+        request: ChatCompletionRequest,
+        candidates: list[DeploymentRecord],
+        routing: dict,
+        *,
+        request_id: str,
+        started: float,
+        api_key_id: str | None,
+        user_id: str | None,
+    ):
         last_exc: RuntimeError | None = None
         for deployment in candidates:
             try:
@@ -1105,7 +1131,11 @@ class GatewayService:
         candidates, routing = self._select_healthy_deployments(
             request, routed_host=routed_host, user_id=user_id, admin=admin
         )
-        return self._stream_from_candidates(
+        # Reserve eagerly (before returning the generator) so an insufficient
+        # balance raises HERE and maps to a 402, instead of dying mid-stream.
+        if user_id and not admin:
+            self._reserve_inference_budget(user_id, request_id, request)
+        inner = self._stream_from_candidates(
             request,
             candidates,
             routing,
@@ -1114,6 +1144,19 @@ class GatewayService:
             api_key_id=api_key_id,
             user_id=user_id,
         )
+        if not user_id:
+            return inner
+
+        # Wrap so the hold is released when the stream finishes — including a
+        # client disconnect (GeneratorExit propagates through `yield from` to the
+        # inner generator's finalize-and-bill path FIRST, then this finally runs).
+        def _with_release() -> Iterator[str]:
+            try:
+                yield from inner
+            finally:
+                self._release_inference_budget(request_id)
+
+        return _with_release()
 
     def _stream_from_candidates(
         self,
@@ -1538,6 +1581,45 @@ class GatewayService:
         if requested_max:
             completion_bound = min(requested_max, completion_bound)
         return completion_bound
+
+    def _reserve_inference_budget(
+        self, user_id: str, reference_id: str, request: ChatCompletionRequest
+    ) -> None:
+        """Reserve this request's WORST-CASE cost against the user's available
+        balance (balance − other active holds) before dispatch, raising
+        InsufficientBalanceForInferenceError if it can't be covered. Together
+        with the post-response settle this stops a near-zero balance from fanning
+        out into many concurrent ~free completions (each in-flight request must
+        fit under the running reservation). Fails OPEN on a DB/holds-table error
+        so a migration lag can't 500 all paid inference — the route's balance>0
+        gate still applies.
+        """
+        from greencompute_protocol import inference_cost_cents
+        from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+        try:
+            estimate = inference_cost_cents(
+                self._prompt_token_bound(request),
+                self._completion_token_bound(request),
+            )
+            reserved = BillingRepository().reserve_inference_hold(user_id, estimate, reference_id)
+        except Exception:
+            self.metrics.increment("inference.hold.reserve_error")
+            return  # fail open — do not block paid inference on a holds-table fault
+        if not reserved:
+            current = 0
+            try:
+                current = BillingRepository().get_balance(user_id)
+            except Exception:
+                pass
+            raise InsufficientBalanceForInferenceError(current_cents=current)
+
+    def _release_inference_budget(self, reference_id: str) -> None:
+        """Release the in-flight hold once the real charge has settled."""
+        from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+        try:
+            BillingRepository().release_inference_hold(reference_id)
+        except Exception:
+            self.metrics.increment("inference.hold.release_failed")
 
     def _clamp_reported_usage(
         self,

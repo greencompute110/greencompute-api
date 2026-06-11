@@ -715,6 +715,24 @@ class LedgerEntryORM(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class InferenceBalanceHoldORM(Base):
+    """Short-lived authorization hold against a user's balance for one in-flight
+    inference request. The pre-flight gate reserves the request's worst-case
+    cost here; the gate's available balance is ``balance_credits - SUM(active
+    holds)``, so N concurrent requests from a near-zero balance can't all pass
+    (each must fit under the running reservation). The hold is released after
+    the real charge settles; ``expires_at`` is a TTL backstop so a crashed /
+    abandoned request can't reserve capacity forever. Keyed by request_id."""
+
+    __tablename__ = "inference_balance_holds"
+
+    reference_id: Mapped[str] = mapped_column(String(64), primary_key=True)  # = request_id
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    amount_cents: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class CryptoInvoiceORM(Base):
     __tablename__ = "crypto_invoices"
 
