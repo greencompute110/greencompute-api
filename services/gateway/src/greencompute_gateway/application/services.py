@@ -180,7 +180,13 @@ class GatewayService:
             user.bio = request.bio
         if request.website is not None:
             user.website = request.website
-        if request.metadata is not None:
+        # Assign only when the caller actually SENT the field. Keying on
+        # model_fields_set (not just a None check) keeps this correct under
+        # both protocol versions: with the old `default_factory=dict` schema
+        # an omitted field materializes as {} — assigning that wiped the
+        # user's stored metadata on every partial update. Explicit {} still
+        # clears; explicit null is ignored rather than nulling the column.
+        if "metadata" in request.model_fields_set and request.metadata is not None:
             user.metadata = request.metadata
         return self.repository.save_user(user)
 
