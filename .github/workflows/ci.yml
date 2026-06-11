@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # The uv workspace + tests/conftest.py expect the protocol repo as a
+      # SIBLING directory (path = "../../../greencompute/protocol"), so check
+      # both repos out side by side.
+      - uses: actions/checkout@v4
+        with:
+          path: greencompute-api
+
+      - uses: actions/checkout@v4
+        with:
+          repository: greencompute110/greencompute
+          path: greencompute
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      # Hard gate on the errors that are always bugs (syntax errors,
+      # undefined names). The full ruff ruleset has a pre-existing backlog,
+      # so it runs advisory-only below.
+      - name: Lint (critical)
+        working-directory: greencompute-api
+        run: uvx ruff check --select E9,F63,F7,F82 .
+
+      - name: Lint (advisory)
+        working-directory: greencompute-api
+        continue-on-error: true
+        run: uvx ruff check .
+
+      - name: Unit tests
+        working-directory: greencompute-api
+        run: uv run --package greencompute-gateway --with pytest pytest tests/unit -q
