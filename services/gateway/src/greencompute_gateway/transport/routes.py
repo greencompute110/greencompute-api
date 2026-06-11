@@ -1425,6 +1425,12 @@ def chat_completions(
         ).model_dump(mode="json")
         metrics.increment("invoke.success")
         return response
+    except InsufficientBalanceForInferenceError as exc:
+        metrics.increment("invoke.failure.insufficient_balance")
+        raise HTTPException(
+            status_code=402,
+            detail={"message": "insufficient balance for inference", "reason": str(exc)},
+        ) from exc
     except NoReadyDeploymentError as exc:
         metrics.increment("invoke.failure.no_ready_deployment")
         raise HTTPException(status_code=409, detail=str(exc)) from exc
