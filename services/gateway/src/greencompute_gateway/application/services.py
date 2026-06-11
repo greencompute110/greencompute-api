@@ -180,7 +180,8 @@ class GatewayService:
             user.bio = request.bio
         if request.website is not None:
             user.website = request.website
-        user.metadata = request.metadata
+        if request.metadata is not None:
+            user.metadata = request.metadata
         return self.repository.save_user(user)
 
     def create_api_key(
@@ -1087,11 +1088,38 @@ class GatewayService:
         routed_host: str | None = None,
         admin: bool = False,
     ) -> Iterator[str]:
+        # NOT a generator: deployment selection must run EAGERLY, at call
+        # time, so NoReadyDeploymentError reaches the route's except and maps
+        # to a 409. With selection inside the generator body it ran lazily on
+        # first SSE iteration — after StreamingResponse had already begun the
+        # 200 — so routing errors surfaced as a dead stream instead of a
+        # status code.
         request_id = str(uuid4())
         started = perf_counter()
         candidates, routing = self._select_healthy_deployments(
             request, routed_host=routed_host, user_id=user_id, admin=admin
         )
+        return self._stream_from_candidates(
+            request,
+            candidates,
+            routing,
+            request_id=request_id,
+            started=started,
+            api_key_id=api_key_id,
+            user_id=user_id,
+        )
+
+    def _stream_from_candidates(
+        self,
+        request: ChatCompletionRequest,
+        candidates: list[DeploymentRecord],
+        routing: dict,
+        *,
+        request_id: str,
+        started: float,
+        api_key_id: str | None,
+        user_id: str | None,
+    ) -> Iterator[str]:
         last_exc: RuntimeError | None = None
         for deployment in candidates:
             chunk_count = 0

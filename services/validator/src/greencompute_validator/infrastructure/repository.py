@@ -200,6 +200,8 @@ class ValidatorRepository:
                 benchmark_signature=row.benchmark_signature,
                 proxy_suspected=row.proxy_suspected,
                 readiness_failures=row.readiness_failures,
+                prompt_sha256=row.prompt_sha256,
+                response_sha256=row.response_sha256,
                 observed_at=row.observed_at,
             )
 
@@ -215,6 +217,11 @@ class ValidatorRepository:
                 benchmark_signature=result.benchmark_signature,
                 proxy_suspected=result.proxy_suspected,
                 readiness_failures=result.readiness_failures,
+                # A.5 anti-proxy audit trail — without these every stored
+                # probe row carried null digests and auditors couldn't
+                # verify the miner served the nonce-bearing prompt.
+                prompt_sha256=result.prompt_sha256,
+                response_sha256=result.response_sha256,
                 observed_at=result.observed_at,
             )
             session.add(row)
@@ -237,6 +244,8 @@ class ValidatorRepository:
                     benchmark_signature=row.benchmark_signature,
                     proxy_suspected=row.proxy_suspected,
                     readiness_failures=row.readiness_failures,
+                    prompt_sha256=row.prompt_sha256,
+                    response_sha256=row.response_sha256,
                     observed_at=row.observed_at,
                 )
                 for row in rows
