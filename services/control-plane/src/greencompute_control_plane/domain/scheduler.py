@@ -39,9 +39,18 @@ class PlacementPolicy:
     ) -> list[RankedNode]:
         candidates: list[RankedNode] = []
         for node in nodes:
-            if workload.kind.value not in node.labels.get("workload_kinds", workload.kind.value):
+            # Exact-token membership against the comma-separated label
+            # (labels values are strings). The old check was a no-op twice
+            # over: nodes never set the label, so the .get default made the
+            # test `kind in kind` (always true), and `in` on a string is a
+            # SUBSTRING test ('pod' matches inside 'tripod'). A node that
+            # doesn't declare workload_kinds accepts everything — legacy
+            # node-agents don't report the label, so absent ≠ inference-only.
+            kinds_label = node.labels.get("workload_kinds", "")
+            allowed_kinds = {k.strip().lower() for k in kinds_label.split(",") if k.strip()}
+            if allowed_kinds and workload.kind.value not in allowed_kinds:
                 logger.debug("node %s: skip workload_kinds mismatch (need %s, has %s)",
-                             node.node_id, workload.kind.value, node.labels.get("workload_kinds"))
+                             node.node_id, workload.kind.value, kinds_label)
                 continue
             available = effective_available_gpus(node, reserved_by_node)
             if available < workload.requirements.gpu_count:
