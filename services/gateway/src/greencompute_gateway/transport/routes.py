@@ -1940,11 +1940,10 @@ def billing_topup_crypto(
         "usdt-eth", "usdt-base",                  # chain-qualified
         "usdc-eth", "usdc-base",                  # chain-qualified
         "tao",
-        # NOTE: "alpha" is intentionally NOT accepted. The deposit watcher has
-        # no Alpha scanner (and subnet Alpha transfers don't emit a
-        # Balances.Transfer event the TAO scanner could see), so an Alpha
-        # invoice could never auto-credit — the user would lose funds. Re-enable
-        # here and in the UI only once a real Alpha scanner exists.
+        # Alpha (subnet token) — auto-credited by scan_alpha in the deposit
+        # watcher, which matches SubtensorModule.StakeTransferred events to our
+        # deposit coldkey on the configured netuid. Priced via price_feed.
+        "alpha",
     )
     if currency not in allowed:
         raise HTTPException(
