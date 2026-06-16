@@ -2133,6 +2133,23 @@ def billing_reject_crypto(
     return {"rejected": True, "invoice_id": result.invoice_id}
 
 
+@router.get("/platform/billing/crypto/invoices")
+def billing_list_crypto_invoices(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    """User-side — the caller's own crypto top-up invoices, newest first, so
+    they can track status (pending / confirmed / expired / rejected) after
+    generating one. Scoped to the api key's user_id."""
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.user_id is None:
+        raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    return [
+        inv.model_dump(mode="json")
+        for inv in _get_billing().repo.list_crypto_invoices(api_key.user_id)
+    ]
+
+
 @router.get("/platform/billing/admin/crypto/invoices")
 def billing_admin_list_crypto_invoices(
     status: str | None = None,
