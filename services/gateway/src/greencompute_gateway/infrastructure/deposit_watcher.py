@@ -9,6 +9,9 @@ overlapping ticks or restarts.
 ## Supported chains
 
 - **TAO** (Bittensor mainnet) — Substrate `Balances.Transfer` events.
+- **Alpha** (Bittensor subnet token) — `SubtensorModule.StakeTransferred`
+  events to our deposit coldkey on the configured netuid (customers pay by
+  `transfer_stake`-ing alpha to the same address as TAO).
 - **USDT-ETH, USDC-ETH** — ERC-20 `Transfer` logs via JSON-RPC `eth_getLogs`.
 - **USDT-BASE, USDC-BASE** — same, against Base mainnet RPC.
 
@@ -575,6 +578,183 @@ def scan_tao(repo: BillingRepository) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Alpha scanner (Bittensor subnet token via SubtensorModule.StakeTransferred)
+# ---------------------------------------------------------------------------
+
+
+def _extract_alpha_transfer(
+    ev_obj: object, dest_addrs: set[str], want_netuid: int
+) -> tuple[str, float, str] | None:
+    """Decode a SubtensorModule.StakeTransferred event into
+    (destination_coldkey, alpha_amount, origin_coldkey) when it credits one of
+    our deposit addresses on the expected subnet — else None.
+
+    Customers top up with alpha by `transfer_stake`-ing it to our deposit
+    coldkey, which emits (subtensor pallet, unnamed 6-tuple):
+
+        StakeTransferred(origin_coldkey, destination_coldkey, hotkey,
+                         origin_netuid, destination_netuid, amount_rao)
+
+    We match on destination_coldkey and REQUIRE destination_netuid == the
+    subnet we priced the invoice against — alpha of another subnet has a
+    different TAO value, so crediting it at our price would be wrong. amount is
+    alpha RAO (9 decimals, like TAO)."""
+    if not isinstance(ev_obj, dict):
+        return None
+    module = (ev_obj.get("module_id") or "").lower()
+    event = (ev_obj.get("event_id") or "").lower()
+    if module != "subtensormodule" or event != "staketransferred":
+        return None
+    attrs = ev_obj.get("attributes")
+    try:
+        if isinstance(attrs, (list, tuple)):
+            if len(attrs) < 6:
+                return None
+            origin = str(attrs[0])
+            dest = str(attrs[1])
+            dest_netuid = int(attrs[4])
+            amount_raw = int(attrs[5])
+        elif isinstance(attrs, dict):
+            origin = str(attrs.get("origin_coldkey") or attrs.get("coldkey") or "")
+            dest = str(attrs.get("destination_coldkey") or attrs.get("dest") or "")
+            raw_netuid = attrs.get("destination_netuid")
+            dest_netuid = int(raw_netuid) if raw_netuid is not None else -1
+            amount_raw = int(attrs.get("amount") or attrs.get("alpha_amount") or 0)
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if dest not in dest_addrs:
+        return None
+    # Wrong-subnet alpha would be mis-valued at our subnet's price — skip it
+    # (handled as a support case, never auto-credited at the wrong rate).
+    if want_netuid >= 0 and dest_netuid != want_netuid:
+        return None
+    return dest, amount_raw / 1e9, origin
+
+
+def scan_alpha(repo: BillingRepository) -> int:
+    """Scan Bittensor mainnet for SubtensorModule.StakeTransferred events that
+    move alpha to our deposit coldkey, and credit matching pending alpha
+    invoices. Mirrors scan_tao's cursor/reorg/dedup machinery; the only
+    differences are the event matched and the destination-netuid guard.
+    Returns invoices credited."""
+    try:
+        from substrateinterface import SubstrateInterface
+    except ImportError:
+        log.warning("watcher alpha: substrate-interface not installed — skipping")
+        return 0
+
+    rpc_url = (
+        os.environ.get("GREENCOMPUTE_SUBTENSOR_URL")
+        or os.environ.get("SUBTENSOR_URL")
+        or "wss://entrypoint-finney.opentensor.ai:443/"
+    )
+
+    # Bail early if there are no pending alpha invoices — don't churn RPC.
+    with session_scope(repo.session_factory) as session:
+        addrs = {
+            (r.deposit_address or "").strip()
+            for r in session.scalars(
+                select(CryptoInvoiceORM).where(
+                    CryptoInvoiceORM.currency == "alpha",
+                    CryptoInvoiceORM.status == "pending",
+                )
+            ).all()
+            if r.deposit_address
+        }
+    if not addrs:
+        return 0
+
+    # Same subnet the invoice was priced against (price_feed). Single source of
+    # truth so the credit netuid can never drift from the pricing netuid.
+    from greencompute_gateway.infrastructure.price_feed import _subnet_netuid
+    want_netuid = _subnet_netuid()
+
+    state_key = "watcher:alpha:last_block"
+    last_seen_str = _kv_get(repo, state_key)
+    substrate: SubstrateInterface | None = None
+    credited = 0
+    try:
+        substrate = SubstrateInterface(
+            url=rpc_url, ss58_format=42,
+            type_registry_preset="substrate-node-template",
+        )
+        head_hash = substrate.get_chain_head()
+        head_num = substrate.get_block_number(head_hash)
+        safe_head = head_num - 10  # reorg-safety buffer (Bittensor finalizes fast)
+        if safe_head <= 0:
+            return 0
+        from_block = int(last_seen_str) if last_seen_str else max(0, safe_head - 1800)  # ~6h
+        to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
+        if to_block <= from_block:
+            return 0
+
+        scanned_through = from_block
+        for block_num in range(from_block + 1, to_block + 1):
+            try:
+                block_hash = substrate.get_block_hash(block_num)
+                events = substrate.get_events(block_hash) or []
+            except Exception as exc:
+                log.warning(
+                    "watcher alpha: get_events block %d failed: %s — stopping; "
+                    "will resume here next tick", block_num, exc
+                )
+                break
+
+            for event_idx, ev in enumerate(events):
+                ev_obj = getattr(ev, "value", ev)
+                extracted = _extract_alpha_transfer(ev_obj, addrs, want_netuid)
+                if extracted is None:
+                    continue
+                dest, deposit_amount, _sender = extracted
+                tx_hash = str(
+                    ev_obj.get("extrinsic_hash")
+                    or ev_obj.get("extrinsic_idx")
+                    or f"block-{block_num}"
+                )
+                deposit_ref = f"alpha:{block_num}:{event_idx}"
+
+                invoices = _pending_invoices_for(repo, "alpha", dest)
+                if not invoices:
+                    continue
+                matched = _try_credit(
+                    repo, invoices, deposit_amount, tx_hash, deposit_ref
+                )
+                if matched is None:
+                    # A real transfer to us that fits no pending invoice amount
+                    # — log so over/underpayments surface for manual review.
+                    log.info(
+                        "watcher alpha: %s ALPHA -> %s (netuid %d) matched no "
+                        "pending invoice amount (ref=%s)",
+                        deposit_amount, dest, want_netuid, deposit_ref,
+                    )
+                    continue
+                inv, result = matched
+                log.info(
+                    "watcher alpha: invoice %s ref=%s amount=%s ALPHA -> %s",
+                    inv.invoice_id[:8], deposit_ref, deposit_amount,
+                    "credited" if result.get("credited")
+                    else "duplicate" if result.get("duplicate_deposit")
+                    else "already_confirmed",
+                )
+                if result.get("credited"):
+                    credited += 1
+
+            # Block fully read — safe to advance the cursor through it.
+            scanned_through = block_num
+
+        _kv_set(repo, state_key, str(scanned_through))
+    finally:
+        if substrate is not None:
+            try:
+                substrate.close()
+            except Exception:
+                pass
+    return credited
+
+
+# ---------------------------------------------------------------------------
 # Loop driver
 # ---------------------------------------------------------------------------
 
@@ -657,6 +837,12 @@ async def deposit_watcher_loop() -> None:
                         log.info("watcher tao: credited %d invoice(s) this tick", n)
                 except Exception:
                     log.exception("watcher tao tick failed")
+                try:
+                    n = await asyncio.to_thread(scan_alpha, repo)
+                    if n:
+                        log.info("watcher alpha: credited %d invoice(s) this tick", n)
+                except Exception:
+                    log.exception("watcher alpha tick failed")
             # Expiry sweep — always runs (DB-only).
             try:
                 expired = await asyncio.to_thread(

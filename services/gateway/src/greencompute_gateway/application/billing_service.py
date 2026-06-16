@@ -47,7 +47,11 @@ def _deposit_address_for(currency: str) -> str:
     if c == "tao":
         return os.environ.get("BILLING_DEPOSIT_TAO", "")
     if c == "alpha":
-        return os.environ.get("BILLING_DEPOSIT_ALPHA", "")
+        # Alpha (subnet token) is paid to the SAME coldkey as TAO — customers
+        # `transfer_stake` alpha to our deposit coldkey. Fall back to the TAO
+        # address so no separate env var is needed (override with
+        # BILLING_DEPOSIT_ALPHA only if alpha ever needs its own coldkey).
+        return os.environ.get("BILLING_DEPOSIT_ALPHA") or os.environ.get("BILLING_DEPOSIT_TAO", "")
     return ""
 
 
