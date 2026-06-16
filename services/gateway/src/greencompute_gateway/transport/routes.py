@@ -817,16 +817,35 @@ def create_deployment(
         ) from exc
 
 
+def _attach_owner_info(rows: list[dict], users_by_id: dict) -> list[dict]:
+    """Enrich admin deployment rows with the owner's email + username so a
+    sales/admin investigator can identify the customer behind each deployment.
+    owner_user_id (a UUID) is already on every row; this adds the
+    human-readable fields. Admin-only by caller — never attach owner identity
+    to a regular user's own-deployments list."""
+    for row in rows:
+        owner = users_by_id.get(row.get("owner_user_id"))
+        if owner is not None:
+            row["owner_email"] = owner.email
+            row["owner_username"] = owner.username
+    return rows
+
+
 @router.get("/platform/deployments")
 def list_deployments(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
     api_key = require_api_key(authorization, x_api_key)
-    return [
+    rows = [
         deployment.model_dump(mode="json")
         for deployment in service.list_deployments(user_id=api_key.user_id, admin=api_key.admin)
     ]
+    if api_key.admin:
+        # Batch-map users once so each row can show the customer behind it.
+        users_by_id = {u.user_id: u for u in service.list_users()}
+        _attach_owner_info(rows, users_by_id)
+    return rows
 
 
 @router.get("/platform/deployments/{deployment_id}")
