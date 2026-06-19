@@ -123,11 +123,29 @@ class ScoreEngine:
         )
         recent_sigs = {r.benchmark_signature for r in signed[-_FRAUD_SIGNATURE_WINDOW:]}
         signature_penalty = 0.75 if len(recent_sigs) > 1 else 1.0
-        proxy_penalty = 0.4 if any(result.proxy_suspected for result in results) else 1.0
+        proxy_penalty = self._proxy_penalty(results)
         consistency_penalty = self._consistency_penalty(results)
         readiness_penalty = max(0.2, 1.0 - (sum(result.readiness_failures for result in results) * 0.03))
         success_penalty = max(0.2, sum(1 for result in results if result.success) / len(results))
         return round(signature_penalty * proxy_penalty * consistency_penalty * readiness_penalty * success_penalty, 6)
+
+    @staticmethod
+    def _proxy_penalty(results: list[ProbeResult]) -> float:
+        """Rate-based anti-proxy penalty. A genuine proxy/cache fails the
+        nonce-echo on ~every probe; rare misses (a small model occasionally not
+        reproducing the random hex nonce) are model flakiness, not proxying. So
+        tolerate a small noise floor and only penalize at higher rates —
+        replacing the old binary 'any single flag → 0.4', which let 0.1%
+        flakiness cap fraud_penalty at 0.4. A real proxy (high rate) still
+        gets the full penalty, so detection is preserved."""
+        if not results:
+            return 1.0
+        proxy_rate = sum(1 for r in results if r.proxy_suspected) / len(results)
+        if proxy_rate <= settings.fraud_proxy_noise_floor:
+            return 1.0
+        if proxy_rate <= settings.fraud_proxy_high_threshold:
+            return 0.7
+        return 0.4
 
     def _consistency_penalty(self, results: list[ProbeResult]) -> float:
         successful = [result for result in results if result.success]

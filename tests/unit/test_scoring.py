@@ -88,3 +88,33 @@ def test_scoring_penalizes_proxy_suspicion_and_signature_drift():
     assert dirty.fraud_penalty < clean.fraud_penalty
     assert dirty.final_score < clean.final_score
 
+
+
+def _probe(success: bool, proxy: bool):
+    from greencompute_protocol import ProbeResult
+    from uuid import uuid4
+    return ProbeResult(
+        challenge_id=str(uuid4()), hotkey="hk", node_id="n1",
+        latency_ms=360.0, throughput=45.0, success=success, proxy_suspected=proxy,
+    )
+
+
+def test_proxy_penalty_tolerates_rare_misses():
+    # 2 in 1000 (0.2%) = model flakiness, not proxying → no penalty.
+    engine = ScoreEngine()
+    results = [_probe(True, False) for _ in range(998)] + [_probe(False, True) for _ in range(2)]
+    assert engine._proxy_penalty(results) == 1.0
+
+
+def test_proxy_penalty_full_penalty_when_consistent():
+    # A backend that ~never echoes the nonce = real proxy/cache → 0.4.
+    engine = ScoreEngine()
+    results = [_probe(False, True) for _ in range(50)] + [_probe(True, False) for _ in range(10)]
+    assert engine._proxy_penalty(results) == 0.4
+
+
+def test_proxy_penalty_moderate_band():
+    engine = ScoreEngine()
+    # ~10% proxy rate → moderate penalty.
+    results = [_probe(True, False) for _ in range(90)] + [_probe(False, True) for _ in range(10)]
+    assert engine._proxy_penalty(results) == 0.7
