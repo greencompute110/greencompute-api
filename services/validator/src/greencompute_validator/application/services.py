@@ -151,6 +151,15 @@ class ValidatorService:
         challenge = ProbeChallenge(hotkey=hotkey, node_id=node_id, kind=kind)
         return self.repository.save_challenge(challenge)
 
+    @staticmethod
+    def _score_window_start() -> datetime:
+        """Trailing cutoff for probe-based scoring. Probes older than this are
+        excluded so a recovered miner's score reflects recent behavior, not its
+        entire lifetime (see score_probe_lookback_days)."""
+        return datetime.now(UTC) - timedelta(
+            days=validator_settings.score_probe_lookback_days
+        )
+
     def submit_probe_result(self, result: ProbeResult) -> ScoreCard:
         challenge = self.repository.get_challenge(result.challenge_id)
         if challenge is None:
@@ -166,7 +175,11 @@ class ValidatorService:
 
         self.repository.add_result(result)
         flux = self._aggregate_flux_state(result.hotkey)
-        scorecard = self.scoring.compute_scorecard(capability, self.repository.list_results(result.hotkey), flux)
+        scorecard = self.scoring.compute_scorecard(
+            capability,
+            self.repository.list_results(result.hotkey, since=self._score_window_start()),
+            flux,
+        )
         saved = self.repository.save_scorecard(scorecard)
         self.bus.publish(
             "probe.result.recorded",
@@ -204,7 +217,7 @@ class ValidatorService:
             if validator_settings.whitelist_enabled and not self.repository.is_whitelisted(hotkey):
                 logger.info("skipping non-whitelisted miner %s", hotkey)
                 continue
-            results = self.repository.list_results(hotkey)
+            results = self.repository.list_results(hotkey, since=self._score_window_start())
             if not results:
                 continue
             # Synthesize a capability whose gpu_count * vram_gb_per_gpu

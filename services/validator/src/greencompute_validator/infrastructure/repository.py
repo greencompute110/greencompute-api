@@ -227,11 +227,17 @@ class ValidatorRepository:
             session.add(row)
         return result
 
-    def list_results(self, hotkey: str | None = None) -> list[ProbeResult]:
+    def list_results(
+        self, hotkey: str | None = None, since: datetime | None = None
+    ) -> list[ProbeResult]:
+        """Probe results, optionally filtered to a hotkey and to those observed
+        at/after `since` (the scoring window — see score_probe_lookback_days)."""
         with session_scope(self.session_factory) as session:
             stmt = select(ProbeResultORM)
             if hotkey is not None:
                 stmt = stmt.where(ProbeResultORM.hotkey == hotkey)
+            if since is not None:
+                stmt = stmt.where(ProbeResultORM.observed_at >= since)
             rows = session.scalars(stmt).all()
             return [
                 ProbeResult(

@@ -31,6 +31,11 @@ class Settings(BaseModel):
     score_gamma: float = Field(default=1.1, ge=0.0)
     score_delta: float = Field(default=0.8, ge=0.0)
     rental_revenue_bonus_cap: float = Field(default=0.1, ge=0.0)
+    # Reliability/performance/fraud are computed over probes in this trailing
+    # window only, not all-time — so a miner that had a rough bring-up but has
+    # been healthy recently isn't penalized forever. (The signature-fraud check
+    # already self-windows to the last N signed probes.)
+    score_probe_lookback_days: int = Field(default=7, ge=1)
     whitelist_enabled: bool = True
     flux_inference_floor_pct: float = Field(default=0.20, ge=0.0, le=1.0)
     flux_rental_floor_pct: float = Field(default=0.10, ge=0.0, le=1.0)
@@ -69,6 +74,7 @@ class Settings(BaseModel):
 settings = Settings(
     score_delta=_float("GREENCOMPUTE_SCORE_DELTA", "SCORE_DELTA", 0.8),
     rental_revenue_bonus_cap=_float("GREENCOMPUTE_RENTAL_REVENUE_BONUS_CAP", "RENTAL_REVENUE_BONUS_CAP", 0.1),
+    score_probe_lookback_days=_int("GREENCOMPUTE_SCORE_PROBE_LOOKBACK_DAYS", "SCORE_PROBE_LOOKBACK_DAYS", 7),
     whitelist_enabled=_bool("GREENCOMPUTE_WHITELIST_ENABLED", "WHITELIST_ENABLED", True),
     flux_inference_floor_pct=_float("GREENCOMPUTE_FLUX_INFERENCE_FLOOR_PCT", "FLUX_INFERENCE_FLOOR_PCT", 20.0) / 100.0,
     flux_rental_floor_pct=_float("GREENCOMPUTE_FLUX_RENTAL_FLOOR_PCT", "FLUX_RENTAL_FLOOR_PCT", 10.0) / 100.0,
