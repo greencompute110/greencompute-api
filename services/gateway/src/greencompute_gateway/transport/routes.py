@@ -831,6 +831,19 @@ def _attach_owner_info(rows: list[dict], users_by_id: dict) -> list[dict]:
     return rows
 
 
+def _attach_workload_info(rows: list[dict], workloads_by_id: dict) -> list[dict]:
+    """Enrich admin deployment rows with the workload's kind + display name so
+    the 'who is renting what' admin view can tell rentals (pod/vm) from model
+    deployments (inference) at a glance, and show a friendly name instead of
+    the workload UUID. Admin-only by caller."""
+    for row in rows:
+        wl = workloads_by_id.get(row.get("workload_id"))
+        if wl is not None:
+            row["workload_kind"] = getattr(wl.kind, "value", str(wl.kind))
+            row["workload_name"] = wl.display_name or wl.name
+    return rows
+
+
 @router.get("/platform/deployments")
 def list_deployments(
     authorization: str | None = Header(default=None),
@@ -842,9 +855,12 @@ def list_deployments(
         for deployment in service.list_deployments(user_id=api_key.user_id, admin=api_key.admin)
     ]
     if api_key.admin:
-        # Batch-map users once so each row can show the customer behind it.
+        # Batch-map users + workloads once so each row can show the customer
+        # behind it and whether it's a rental (pod/vm) or a model (inference).
         users_by_id = {u.user_id: u for u in service.list_users()}
         _attach_owner_info(rows, users_by_id)
+        workloads_by_id = {w.workload_id: w for w in service.list_workloads(admin=True)}
+        _attach_workload_info(rows, workloads_by_id)
     return rows
 
 
