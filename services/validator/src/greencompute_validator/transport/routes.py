@@ -350,6 +350,13 @@ async def submit_application(
                 status_code=400, detail=f"details must be valid JSON: {exc}"
             ) from exc
 
+    # Deterministic spec pre-filter (Phase 1 of automated onboarding). NON-
+    # BLOCKING: we record the assessment for the admin review queue but never
+    # auto-reject a public applicant on fuzzy free-text — the human still
+    # decides, and the running node's hardware attestation is the real gate.
+    from greencompute_validator.domain.spec_check import evaluate_provider_specs
+    parsed_details["_spec_assessment"] = evaluate_provider_specs(parsed_details)
+
     app = GreenEnergyApplication(
         hotkey=hotkey.strip(),
         signature=signature,
