@@ -50,9 +50,10 @@ def details(**over) -> dict:
         },
         "data_center_address": {"country": "United Kingdom", "city": "London"},
         "energy": {"sources": ["Solar"]},
-        "infrastructure": {"upload_speed": "10 Gbps", "download_speed": "10 Gbps"},
+        "infrastructure": {"upload_speed": "10 Gbps", "download_speed": "10 Gbps",
+                           "internet_type": "commercial"},
         "nodes": [{"gpu": "8x RTX 4090", "cpu": "Dual Xeon", "ram": "512GB",
-                   "storage": "8TB", "quantity": "8"}],
+                   "storage": "8TB", "quantity": "8", "pcie": "PCIe Gen 4"}],
         "notes": "",
     }
     d.update(over)

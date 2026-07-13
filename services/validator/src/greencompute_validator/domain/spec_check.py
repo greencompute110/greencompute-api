@@ -26,13 +26,14 @@ REQUIRED_STORAGE_TB = 8
 # decimal threshold — otherwise a genuine 8 TB drive ("8000 GB") false-fails.
 REQUIRED_STORAGE_GB = REQUIRED_STORAGE_TB * 1000
 REQUIRED_NET_GBPS = 10.0
+REQUIRED_PCIE_GEN = 4
 # GPUs that are recognizably NOT an RTX 4090/5090 — a confident fail even if the
 # text also name-drops "4090"/"5090".
 _DISALLOWED_GPU = re.compile(r"\b(3090|3080|3070|2080|1080|a100|h100|v100|a40|a6000|l40s?|t4|p100|titan)\b")
 
 SPEC_SUMMARY = (
-    "8x RTX 4090 or 8x RTX 5090 per node, dual enterprise CPUs, "
-    ">=512GB RAM, >=8TB storage/node, 10Gb symmetric connectivity"
+    "8x RTX 4090 or 8x RTX 5090 per node, dual enterprise CPUs, PCIe Gen 4+, "
+    ">=512GB RAM, >=8TB storage/node, 10Gb symmetric commercial connectivity"
 )
 
 PASS, FAIL, UNCLEAR = "pass", "fail", "unclear"
@@ -141,6 +142,7 @@ def _storage_check(node: dict) -> tuple[str, str | None]:
 
 
 def _network_check(details: dict) -> tuple[str, str | None]:
+    """10 Gbps symmetric on a commercial (not residential) line."""
     infra = details.get("infrastructure") or {}
     up = _to_gbps(str(infra.get("upload_speed", "")))
     down = _to_gbps(str(infra.get("download_speed", "")))
@@ -148,15 +150,43 @@ def _network_check(details: dict) -> tuple[str, str | None]:
         return UNCLEAR, "up/down link speed not parseable"
     if up < REQUIRED_NET_GBPS or down < REQUIRED_NET_GBPS:
         return FAIL, f"{up:g}/{down:g} Gbps < {REQUIRED_NET_GBPS:g} Gbps symmetric"
+    itype = str(infra.get("internet_type", "")).strip().lower()
+    if itype in {"residential", "home", "consumer"}:
+        return FAIL, "residential line, need a commercial connection"
+    if itype != "commercial":
+        return UNCLEAR, "commercial line type not confirmed"
     return PASS, None
+
+
+def _pcie_gen(text: str) -> int | None:
+    """Parse a declared PCIe generation. Handles 'Gen 4', 'Gen4', 'PCIe 4.0',
+    'PCIe Gen 5', 'Generation 4', bare '4.0'. Bounded to plausible gens 3-6."""
+    t = text.lower()
+    m = (
+        re.search(r"gen(?:eration)?\s*([3-6])\b", t)
+        or re.search(r"pcie\s*(?:gen\s*)?([3-6])(?:\.0)?\b", t)
+        or re.search(r"\b([3-6])\.0\b", t)
+    )
+    return int(m.group(1)) if m else None
+
+
+def _pcie_check(node: dict) -> tuple[str, str | None]:
+    raw = str(node.get("pcie", "")).strip()
+    if not raw:
+        return UNCLEAR, "PCIe generation not described"
+    gen = _pcie_gen(raw)
+    if gen is None:
+        return UNCLEAR, "PCIe generation unclear"
+    return (PASS, None) if gen >= REQUIRED_PCIE_GEN else (FAIL, f"PCIe Gen {gen} < Gen {REQUIRED_PCIE_GEN}")
 
 
 def evaluate_provider_specs(details: dict[str, Any]) -> dict[str, Any]:
     """Return a deterministic spec-conformance assessment of a provider
     application's declared specs. Never raises — malformed input degrades to
     'unclear'. Shape:
-      {"conformant": true|false|null, "checks": {gpu,cpu,ram,storage,network},
-       "flags": [...], "spec": SPEC_SUMMARY}
+      {"conformant": true|false|null,
+       "checks": {gpu,cpu,ram,storage,pcie,network}, "flags": [...],
+       "spec": SPEC_SUMMARY}
     conformant: True = every check passed; False = at least one confident fail;
     None = nothing failed but something is unclear (route to human)."""
     nodes = details.get("nodes") if isinstance(details, dict) else None
@@ -164,12 +194,18 @@ def evaluate_provider_specs(details: dict[str, Any]) -> dict[str, Any]:
     flags: list[str] = []
 
     if not isinstance(nodes, list) or not nodes:
-        checks = {k: UNCLEAR for k in ("gpu", "cpu", "ram", "storage")}
+        checks = {k: UNCLEAR for k in ("gpu", "cpu", "ram", "storage", "pcie")}
         flags.append("no node specs declared")
     else:
         # Aggregate per-node checks: the node dimension is FAIL if any node
         # fails, PASS only if all pass, else UNCLEAR.
-        for dim, fn in (("gpu", _gpu_check), ("cpu", _cpu_check), ("ram", _ram_check), ("storage", _storage_check)):
+        for dim, fn in (
+            ("gpu", _gpu_check),
+            ("cpu", _cpu_check),
+            ("ram", _ram_check),
+            ("storage", _storage_check),
+            ("pcie", _pcie_check),
+        ):
             verdicts = []
             for i, node in enumerate(nodes):
                 node = node if isinstance(node, dict) else {}

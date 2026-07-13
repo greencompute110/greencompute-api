@@ -6,11 +6,13 @@ from greencompute_validator.domain.spec_check import evaluate_provider_specs
 
 
 def _details(gpu="8x RTX 4090", cpu="Dual Intel Xeon Gold", ram="512GB",
-             storage="8TB NVMe", up="10 Gbps", down="10 Gbps"):
+             storage="8TB NVMe", up="10 Gbps", down="10 Gbps",
+             pcie="PCIe Gen 4", internet_type="commercial"):
     return {
         "nodes": [{"chassis": "Supermicro", "cpu": cpu, "ram": ram,
-                   "storage": storage, "gpu": gpu, "quantity": "1"}],
-        "infrastructure": {"upload_speed": up, "download_speed": down},
+                   "storage": storage, "gpu": gpu, "quantity": "1", "pcie": pcie}],
+        "infrastructure": {"upload_speed": up, "download_speed": down,
+                           "internet_type": internet_type},
     }
 
 
@@ -91,9 +93,11 @@ def test_never_raises_on_junk():
 
 
 def _node_details(**over):
-    node = {"gpu": "RTX 4090", "cpu": "Dual Xeon", "ram": "512GB", "storage": "8TB", "quantity": "8"}
+    node = {"gpu": "RTX 4090", "cpu": "Dual Xeon", "ram": "512GB", "storage": "8TB",
+            "quantity": "8", "pcie": "PCIe Gen 4"}
     node.update(over)
-    return {"nodes": [node], "infrastructure": {"upload_speed": "10 Gbps", "download_speed": "10 Gbps"}}
+    return {"nodes": [node], "infrastructure": {"upload_speed": "10 Gbps",
+            "download_speed": "10 Gbps", "internet_type": "commercial"}}
 
 
 def test_rtx_4090_with_quantity_field_passes():
@@ -127,3 +131,37 @@ def test_oversized_digit_run_does_not_raise():
     huge = "9" * 5000
     evaluate_provider_specs({"nodes": [{"gpu": huge + "x RTX 4090", "quantity": huge}],
                              "infrastructure": {}})  # must not raise
+
+
+# --- commercial line + PCIe gen (sales-requirement gates, 2026-07-13) ---------
+
+
+def test_residential_line_fails():
+    a = evaluate_provider_specs(_details(internet_type="residential"))
+    assert a["checks"]["network"] == "fail"
+    assert a["conformant"] is False
+    assert any("commercial" in f for f in a["flags"])
+
+
+def test_missing_line_type_is_unclear_not_fail():
+    a = evaluate_provider_specs(_details(internet_type=""))
+    assert a["checks"]["network"] == "unclear"
+    assert a["conformant"] is None  # never a confident fail on missing type
+
+
+def test_pcie_gen3_fails():
+    a = evaluate_provider_specs(_node_details(pcie="PCIe Gen 3"))
+    assert a["checks"]["pcie"] == "fail"
+    assert a["conformant"] is False
+
+
+def test_pcie_gen4_and_5_pass():
+    for phrasing in ["Gen 4", "Gen4", "PCIe 4.0", "PCIe Gen 5", "Generation 4", "5.0"]:
+        a = evaluate_provider_specs(_node_details(pcie=phrasing))
+        assert a["checks"]["pcie"] == "pass", phrasing
+
+
+def test_missing_pcie_is_unclear():
+    a = evaluate_provider_specs(_node_details(pcie=""))
+    assert a["checks"]["pcie"] == "unclear"
+    assert a["conformant"] is None
