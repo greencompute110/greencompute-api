@@ -109,3 +109,38 @@ def require_miner_request(
             detail=verification.reason or "invalid miner signature",
         )
     metrics.increment("auth.success.miner")
+
+
+def verify_application_signature(
+    hotkey: str,
+    body: bytes,
+    signature: str | None,
+    nonce: str | None,
+    timestamp: str | int | None,
+    auth_mode: str | None,
+) -> bool:
+    """Non-raising: does the applicant prove they control `hotkey` by signing
+    `body` (the raw `details` JSON) with their hotkey? Public applications must
+    be hotkey-signed (no shared secret exists for an unknown applicant). A wide
+    replay window accommodates the human paste-into-form flow. Returns True only
+    on a valid ed25519 signature over the exact body bytes."""
+    if not (isinstance(signature, str) and signature and isinstance(nonce, str) and nonce):
+        return False
+    try:
+        ts = int(timestamp) if timestamp is not None else None
+    except (TypeError, ValueError):
+        return False
+    if ts is None:
+        return False
+    if (auth_mode or "hotkey") != "hotkey":
+        return False
+    signed = SignedRequest(actor_id=hotkey, nonce=nonce, timestamp=ts, signature=signature, auth_mode="hotkey")
+    try:
+        result = verify_payload_hotkey(signed, body, replay_store, window_seconds=600)
+    except Exception:  # noqa: BLE001 — malformed input must never crash submit
+        return False
+    if result.valid:
+        metrics.increment("auth.success.application_signature")
+    else:
+        metrics.increment(f"auth.failure.application_{result.reason or 'invalid'}")
+    return result.valid
