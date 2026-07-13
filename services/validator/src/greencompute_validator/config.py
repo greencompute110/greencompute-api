@@ -76,6 +76,23 @@ class Settings(BaseModel):
     inference_canary_timeout_seconds: float = Field(default=30.0, ge=1.0)
     inference_canary_interval_seconds: float = Field(default=300.0, ge=30.0)
 
+    # --- Automated application review (Phase-1 automated onboarding) ---
+    # Kill-switch: when False (default) applications are stored for manual
+    # review exactly as before — nothing runs. Flip on once the signing helper
+    # + certificate calibration are ready.
+    review_enabled: bool = False
+    # Below this eligibility confidence the review fails closed (rejects).
+    review_confidence_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    review_timeout_seconds: float = Field(default=90.0, ge=1.0)
+    # OpenRouter (OpenAI-compatible) vision model that reads the certificates.
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # OpenRouter model slug — override per deployment. Any vision-capable model
+    # works; expensive/accurate is fine (review runs rarely).
+    review_model: str = "anthropic/claude-opus-4.8"
+    # Optional free Companies House key enables the UK company cross-check.
+    companies_house_api_key: str = ""
+
 
 settings = Settings(
     score_delta=_float("GREENCOMPUTE_SCORE_DELTA", "SCORE_DELTA", 0.8),
@@ -100,4 +117,11 @@ settings = Settings(
                               or _env("GREENCOMPUTE_ADMIN_API_KEY", "ADMIN_API_KEY", ""),
     inference_canary_timeout_seconds=_float("GREENCOMPUTE_INFERENCE_CANARY_TIMEOUT_SECONDS", "INFERENCE_CANARY_TIMEOUT_SECONDS", 30.0),
     inference_canary_interval_seconds=_float("GREENCOMPUTE_INFERENCE_CANARY_INTERVAL_SECONDS", "INFERENCE_CANARY_INTERVAL_SECONDS", 300.0),
+    review_enabled=_bool("GREENCOMPUTE_REVIEW_ENABLED", "REVIEW_ENABLED", False),
+    review_confidence_threshold=_float("GREENCOMPUTE_REVIEW_CONFIDENCE_THRESHOLD", "REVIEW_CONFIDENCE_THRESHOLD", 0.75),
+    review_timeout_seconds=_float("GREENCOMPUTE_REVIEW_TIMEOUT_SECONDS", "REVIEW_TIMEOUT_SECONDS", 90.0),
+    openrouter_api_key=_env("GREENCOMPUTE_OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
+    openrouter_base_url=_env("GREENCOMPUTE_OPENROUTER_BASE_URL", "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+    review_model=_env("GREENCOMPUTE_REVIEW_MODEL", "REVIEW_MODEL", "anthropic/claude-opus-4.8"),
+    companies_house_api_key=_env("GREENCOMPUTE_COMPANIES_HOUSE_API_KEY", "COMPANIES_HOUSE_API_KEY"),
 )

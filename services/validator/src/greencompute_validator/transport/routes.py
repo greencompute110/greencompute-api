@@ -1,4 +1,6 @@
 import base64
+import logging
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Header, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
@@ -20,10 +22,45 @@ from greencompute_validator.application.services import (
     UnknownProbeChallengeError,
     service,
 )
-from greencompute_validator.transport.security import require_admin_api_key, require_miner_request
+from greencompute_validator.transport.security import (
+    require_admin_api_key,
+    require_miner_request,
+    verify_application_signature,
+)
 
 router = APIRouter()
 metrics = get_metrics_store("greencompute-validator")
+logger = logging.getLogger(__name__)
+
+
+def _applicant_country(details: dict) -> str | None:
+    """Best-effort country for registry routing, from the business or DC address."""
+    if not isinstance(details, dict):
+        return None
+    for path in ("business", "data_center_address"):
+        node = details.get(path)
+        if isinstance(node, dict):
+            addr = node.get("address") if isinstance(node.get("address"), dict) else node
+            if isinstance(addr, dict) and addr.get("country"):
+                return str(addr["country"])
+    return None
+
+
+def _build_reviewer():
+    from greencompute_validator.infrastructure.openrouter import OpenRouterCertReviewer
+
+    return OpenRouterCertReviewer(
+        api_key=validator_settings.openrouter_api_key,
+        model=validator_settings.review_model,
+        base_url=validator_settings.openrouter_base_url,
+        timeout=validator_settings.review_timeout_seconds,
+    )
+
+
+def _build_registry():
+    from greencompute_validator.infrastructure.registry_verify import DefaultRegistryVerifier
+
+    return DefaultRegistryVerifier(companies_house_api_key=validator_settings.companies_house_api_key)
 
 
 @router.post("/validator/v1/capabilities", response_model=NodeCapability)
@@ -320,6 +357,13 @@ def remove_from_whitelist(
 # --- Green-energy applications (provider onboarding) ---
 
 
+# Server-side upload guard: cap per-file and total request bytes so the public
+# endpoint can't be used to exhaust memory / bloat the DB (files are buffered in
+# RAM and base64-inflated). Generous enough for real certificates + node photos.
+_MAX_FILE_BYTES = 15 * 1024 * 1024
+_MAX_TOTAL_UPLOAD_BYTES = 60 * 1024 * 1024
+
+
 @router.post("/validator/v1/applications", status_code=201)
 async def submit_application(
     hotkey: str = Form(...),
@@ -332,6 +376,12 @@ async def submit_application(
     # Optional for backwards compatibility — legacy clients sending just
     # the five top-level fields above keep working.
     details: str = Form(""),
+    # Applicant hotkey signature over the raw `details` bytes (proves the
+    # applicant controls the hotkey we may auto-whitelist). Optional for legacy
+    # clients; required to pass the automated review's identity check.
+    nonce: str = Form(""),
+    timestamp: str = Form(""),
+    auth_mode: str = Form("hotkey"),
     files: list[UploadFile] = File(default=[]),
 ) -> dict:
     """Public endpoint — providers submit green-energy proof here."""
@@ -350,12 +400,35 @@ async def submit_application(
                 status_code=400, detail=f"details must be valid JSON: {exc}"
             ) from exc
 
-    # Deterministic spec pre-filter (Phase 1 of automated onboarding). NON-
-    # BLOCKING: we record the assessment for the admin review queue but never
-    # auto-reject a public applicant on fuzzy free-text — the human still
-    # decides, and the running node's hardware attestation is the real gate.
+    # Deterministic spec pre-filter (Phase 1 of automated onboarding). Records
+    # an in-spec/flagged signal; consumed by the automated review below.
     from greencompute_validator.domain.spec_check import evaluate_provider_specs
     parsed_details["_spec_assessment"] = evaluate_provider_specs(parsed_details)
+
+    # Does the applicant prove they control the hotkey? (Signed over the exact
+    # `details` bytes.) Load-bearing once auto-approval is enabled.
+    signature_verified = verify_application_signature(
+        hotkey.strip(), details.encode(), signature, nonce, timestamp, auth_mode
+    )
+
+    # Buffer + size-guard the uploads once (used for both storage and review).
+    stored: list[tuple[str, str, bytes]] = []
+    total = 0
+    for f in files:
+        raw = await f.read()
+        total += len(raw)
+        if len(raw) > _MAX_FILE_BYTES or total > _MAX_TOTAL_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="uploaded files exceed the size limit")
+        stored.append((f.filename or "unnamed", f.content_type or "application/octet-stream", raw))
+
+    # Automated review (behind the review_enabled kill-switch). Produces a
+    # terminal decision (approve+whitelist / reject) or, on an infrastructure
+    # error, leaves the application pending for a human.
+    app_status, reviewer_notes, reviewed_at, do_whitelist = "pending", "", None, False
+    if validator_settings.review_enabled:
+        app_status, reviewer_notes, reviewed_at, do_whitelist = _run_automated_review(
+            parsed_details, organization, hotkey.strip(), description, signature_verified, stored
+        )
 
     app = GreenEnergyApplication(
         hotkey=hotkey.strip(),
@@ -364,21 +437,72 @@ async def submit_application(
         energy_source=energy_source,
         description=description,
         details=parsed_details,
+        status=app_status,
+        reviewer_notes=reviewer_notes,
+        reviewed_at=reviewed_at,
     )
     service.repository.create_application(app)
 
-    for f in files:
-        raw = await f.read()
+    for filename, content_type, raw in stored:
         att = GreenEnergyAttachment(
             application_id=app.application_id,
-            filename=f.filename or "unnamed",
-            content_type=f.content_type or "application/octet-stream",
+            filename=filename,
+            content_type=content_type,
             size_bytes=len(raw),
             data_b64=base64.b64encode(raw).decode(),
         )
         service.repository.add_attachment(att)
 
+    if do_whitelist and not service.repository.is_whitelisted(app.hotkey):
+        service.repository.add_whitelist_entry(
+            MinerWhitelistEntry(
+                hotkey=app.hotkey,
+                label=organization or app.hotkey[:16],
+                energy_source=energy_source,
+                notes=f"Auto-approved by automated review (application {app.application_id})",
+            )
+        )
+
     return app.model_dump(mode="json")
+
+
+def _run_automated_review(
+    parsed_details: dict,
+    organization: str,
+    hotkey: str,
+    description: str,
+    signature_verified: bool,
+    stored: list[tuple[str, str, bytes]],
+) -> tuple[str, str, "object", bool]:
+    """Run the automated review and map it to (status, notes, reviewed_at,
+    whitelist?). An infrastructure failure leaves the application pending for a
+    human — only a genuine content decision approves or rejects."""
+    from greencompute_validator.domain.application_review import ReviewAttachment, run_review
+
+    attachments = [ReviewAttachment(filename=n, content_type=c, data=d) for n, c, d in stored]
+    try:
+        decision = run_review(
+            details=parsed_details,
+            organization=organization,
+            description=description,
+            country=_applicant_country(parsed_details),
+            signature_verified=signature_verified,
+            attachments=attachments,
+            reviewer=_build_reviewer(),
+            registry=_build_registry(),
+            confidence_threshold=validator_settings.review_confidence_threshold,
+        )
+    except Exception as exc:  # noqa: BLE001 — infra failure → human queue, never crash submit
+        logger.warning("automated review errored for hotkey %s: %s", hotkey, exc)
+        parsed_details["_review"] = {"status": "error", "error": str(exc), "reviewed_via": "automated"}
+        metrics.increment("onboarding.review.error")
+        return "pending", "Automated review unavailable — queued for manual review.", None, False
+
+    decision.model = validator_settings.review_model
+    parsed_details["_review"] = decision.model_dump(mode="json")
+    metrics.increment(f"onboarding.review.{decision.decision}")
+    notes = ("Auto-approved. " if decision.approved else "Auto-rejected. ") + " | ".join(decision.reasons)
+    return ("approved" if decision.approved else "rejected"), notes.strip(), datetime.now(UTC), decision.approved
 
 
 @router.get("/validator/v1/applications/status/{hotkey}")

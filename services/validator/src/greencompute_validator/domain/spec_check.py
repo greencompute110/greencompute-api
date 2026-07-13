@@ -22,7 +22,13 @@ REQUIRED_GPU_MODELS = ("4090", "5090")
 REQUIRED_GPUS_PER_NODE = 8
 REQUIRED_RAM_GB = 512
 REQUIRED_STORAGE_TB = 8
+# Storage is marketed in decimal TB (8 TB = 8000 GB), so compare against the
+# decimal threshold — otherwise a genuine 8 TB drive ("8000 GB") false-fails.
+REQUIRED_STORAGE_GB = REQUIRED_STORAGE_TB * 1000
 REQUIRED_NET_GBPS = 10.0
+# GPUs that are recognizably NOT an RTX 4090/5090 — a confident fail even if the
+# text also name-drops "4090"/"5090".
+_DISALLOWED_GPU = re.compile(r"\b(3090|3080|3070|2080|1080|a100|h100|v100|a40|a6000|l40s?|t4|p100|titan)\b")
 
 SPEC_SUMMARY = (
     "8x RTX 4090 or 8x RTX 5090 per node, dual enterprise CPUs, "
@@ -69,24 +75,39 @@ def _to_gbps(text: str) -> float | None:
     return None  # unit unknown — don't guess
 
 
-def _gpu_check(node: dict) -> tuple[str, str | None]:
-    blob = " ".join(str(node.get(k, "")) for k in ("gpu", "chassis", "cpu")).lower()
-    model = next((m for m in REQUIRED_GPU_MODELS if m in blob), None)
-    # Count: prefer an explicit "8x"/"x8" in the GPU text, else the quantity
-    # field if it's a plain integer.
-    count: int | None = None
-    m = re.search(r"(\d+)\s*[x×]", blob) or re.search(r"[x×]\s*(\d+)", blob)
-    if m:
-        count = int(m.group(1))
-    elif str(node.get("quantity", "")).strip().isdigit():
-        count = int(str(node.get("quantity")).strip())
+def _gpu_count(gpu_text: str, model: str | None, node: dict) -> int | None:
+    """Extract the GPU-count multiplier from the GPU field only.
 
+    Guards against the two classic false-fails: the 'x' inside "RTX"/"GTX" being
+    read as a multiplier, and the model number ("4090") being read as the count.
+    Falls back to an explicit small integer `quantity` field.
+    """
+    text = gpu_text
+    if model:
+        text = text.replace(model, " ")  # so "RTX 4090" doesn't yield count=4090
+    text = re.sub(r"\b[rg]tx\b", " ", text)  # so the 'x' in rtx/gtx isn't a multiplier
+    # Bounded digits ({1,3}) so a hostile 4000-digit run can't raise on int().
+    m = re.search(r"(\d{1,3})\s*[x×]", text) or re.search(r"[x×]\s*(\d{1,3})", text)
+    if m:
+        return int(m.group(1))
+    q = str(node.get("quantity", "")).strip()
+    if q.isdigit() and len(q) <= 4:
+        return int(q)
+    return None
+
+
+def _gpu_check(node: dict) -> tuple[str, str | None]:
+    gpu_text = str(node.get("gpu", "")).lower()
+    # Word-boundary match so "4090"/"5090" only count as standalone tokens.
+    model = next((m for m in REQUIRED_GPU_MODELS if re.search(rf"\b{m}\b", gpu_text)), None)
+    # A disallowed GPU is a confident fail even if the text also mentions a
+    # required model (defeats "8x RTX 3090 (4090-class)" masquerading as in-spec).
+    disallowed = _DISALLOWED_GPU.search(gpu_text)
+    if disallowed:
+        return FAIL, f"GPU {disallowed.group(1).upper()} is not an RTX 4090/5090"
     if model is None:
-        # A recognizable-but-wrong GPU (e.g. 3090/A100/H100) is a confident fail;
-        # otherwise we can't tell.
-        if re.search(r"\b(3090|3080|2080|1080|a100|h100|v100|a40|a6000|l40|t4|p100|titan)\b", blob):
-            return FAIL, "GPU is not an RTX 4090/5090"
         return UNCLEAR, "GPU model not recognized"
+    count = _gpu_count(gpu_text, model, node)
     if count is not None and count != REQUIRED_GPUS_PER_NODE:
         return FAIL, f"declares {count} GPUs/node, need {REQUIRED_GPUS_PER_NODE}"
     if count is None:
@@ -116,8 +137,7 @@ def _storage_check(node: dict) -> tuple[str, str | None]:
     gb = _to_gb(str(node.get("storage", "")))
     if gb is None:
         return UNCLEAR, "storage not parseable"
-    tb = gb / 1024
-    return (PASS, None) if tb >= REQUIRED_STORAGE_TB else (FAIL, f"{tb:g}TB storage < {REQUIRED_STORAGE_TB}TB")
+    return (PASS, None) if gb >= REQUIRED_STORAGE_GB else (FAIL, f"{gb / 1000:g}TB storage < {REQUIRED_STORAGE_TB}TB")
 
 
 def _network_check(details: dict) -> tuple[str, str | None]:

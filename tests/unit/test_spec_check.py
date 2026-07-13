@@ -85,3 +85,45 @@ def test_missing_nodes_is_unclear():
 def test_never_raises_on_junk():
     for junk in [{}, {"nodes": "not-a-list"}, {"nodes": [None, 5]}, None if False else {"nodes": [{}]}]:
         evaluate_provider_specs(junk)  # must not raise
+
+
+# --- regressions for the confirmed spec_check defects (2026-07-13) ------------
+
+
+def _node_details(**over):
+    node = {"gpu": "RTX 4090", "cpu": "Dual Xeon", "ram": "512GB", "storage": "8TB", "quantity": "8"}
+    node.update(over)
+    return {"nodes": [node], "infrastructure": {"upload_speed": "10 Gbps", "download_speed": "10 Gbps"}}
+
+
+def test_rtx_4090_with_quantity_field_passes():
+    # The 'x' in "RTX" must NOT be read as the GPU-count multiplier.
+    a = evaluate_provider_specs(_node_details(gpu="RTX 4090", quantity="8"))
+    assert a["checks"]["gpu"] == "pass"
+    assert a["conformant"] is True
+
+
+def test_rtx_4090_x8_suffix_passes():
+    a = evaluate_provider_specs(_node_details(gpu="RTX 4090 x8", quantity=""))
+    assert a["checks"]["gpu"] == "pass"
+
+
+def test_dual_cpu_2x_does_not_bleed_into_gpu_count():
+    a = evaluate_provider_specs(_node_details(gpu="RTX 4090", cpu="2x AMD EPYC 9004", quantity="8"))
+    assert a["checks"]["gpu"] == "pass"
+    assert a["checks"]["cpu"] == "pass"
+
+
+def test_disallowed_gpu_masked_with_4090_still_fails():
+    a = evaluate_provider_specs(_details(gpu="8x RTX 3090 (near 4090-class)"))
+    assert a["checks"]["gpu"] == "fail"
+
+
+def test_8000gb_storage_is_treated_as_8tb():
+    assert evaluate_provider_specs(_details(storage="8000 GB"))["checks"]["storage"] == "pass"
+
+
+def test_oversized_digit_run_does_not_raise():
+    huge = "9" * 5000
+    evaluate_provider_specs({"nodes": [{"gpu": huge + "x RTX 4090", "quantity": huge}],
+                             "infrastructure": {}})  # must not raise
