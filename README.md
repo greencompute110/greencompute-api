@@ -43,6 +43,7 @@ Full architecture + setup docs: [../README.md](../README.md).
 - **Flux orchestrator**: fleet brain that allocates per-miner GPU slots between inference/rental, picks catalog models to host based on demand, writes `DeploymentORM` rows that miners consume via existing sync_leases.
 - Demand-reactive scaling: per-minute `inference_demand_stats` table + blended 10-min/1-hour EMA → `target_replicas` per catalog model with 5-min scale-down hysteresis.
 - **Audit publishing**: every Bittensor epoch (~360 blocks / 72 min, same tempo on netuid 110 mainnet + netuid 16 testnet), generates a signed audit report (probes + scorecards + weight snapshot + chain commit), SHA256-anchors the hash on-chain via `Commitments.set_commitment`, exposes publicly at `/validator/v1/audit/*`.
+- **Payouts — manual quarterly (accumulator model)**: whitelisted miners are scored every epoch but do **not** earn on-chain on approval. The validator sets **100% of its weight to one team accumulator hotkey** (`GREENCOMPUTE_PAYOUT_ACCUMULATOR_HOTKEY`, default `5FmpATto…4cXkwWKH`), which collects all alpha; the team distributes it off-chain each quarter proportional to `SUM(final_score)` per miner from `scorecard_history`. Full policy, formula, and the exact distribution query: [`docs/PAYOUTS.md`](docs/PAYOUTS.md). Set `GREENCOMPUTE_PAYOUT_ACCUMULATION_ENABLED=false` to distribute on-chain per-miner instead.
 
 ## audit endpoints (public, no auth)
 

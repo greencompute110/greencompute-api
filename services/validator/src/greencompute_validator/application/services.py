@@ -30,6 +30,7 @@ from greencompute_validator.domain.demand import (
 )
 from greencompute_validator.domain.flux import FluxOrchestrator
 from greencompute_validator.domain.metagraph import MetagraphCache
+from greencompute_validator.domain.payout import plan_chain_weights
 from greencompute_validator.domain.scoring import ScoreEngine
 from greencompute_validator.domain.wait_estimator import WaitEstimator
 from greencompute_validator.infrastructure.repository import ValidatorRepository
@@ -292,33 +293,61 @@ class ValidatorService:
         return saved
 
     def _commit_weights_to_chain(self, scorecards: dict[str, ScoreCard]) -> ChainWeightCommit | None:
-        """Convert scorecards to uid/weight vectors and call set_weights."""
+        """Push on-chain weights.
+
+        PAYOUT POLICY — manual quarterly distribution (default). Whitelisted
+        miners are probed and scored every epoch (the scorecards above), but
+        they must NOT earn on-chain the moment they're approved. So instead of
+        distributing weight across miners by score, the validator sets 100% of
+        its weight to ONE team-controlled accumulator hotkey
+        (settings.payout_accumulator_hotkey), which collects all alpha emission.
+        At quarter end the team distributes that alpha to miners MANUALLY,
+        proportional to the persisted performance scorecards. The full
+        distribution formula is documented in docs/PAYOUTS.md.
+
+        Note the deliberate divergence: the persisted WeightSnapshot + scorecards
+        remain the per-miner PERFORMANCE ledger (what the audit replays and what
+        drives the manual payout); the on-chain weight vector is the ACCUMULATION
+        routing. They are not meant to match while accumulation is enabled.
+
+        Set GREENCOMPUTE_PAYOUT_ACCUMULATION_ENABLED=false to switch to on-chain
+        per-miner distribution by final_score (the _commit_distributed_weights
+        path below)."""
         if not self._chain:
             logger.debug("[chain commit] no chain client, returning None")
             return None
-        logger.info(
-            "[chain commit] mapping %s scorecards to UIDs; metagraph_size=%s",
-            len(scorecards), self.metagraph.size,
+        accumulation = validator_settings.payout_accumulation_enabled
+        accumulator = validator_settings.payout_accumulator_hotkey
+        # Pure planner (domain/payout.py) decides the vector; this method keeps
+        # the logging, metrics, and the actual chain call.
+        plan = plan_chain_weights(
+            accumulation_enabled=accumulation,
+            accumulator_hotkey=accumulator,
+            scores={hk: sc.final_score for hk, sc in scorecards.items()},
+            hotkey_to_uid=self.metagraph.hotkey_to_uid,
         )
-        uids: list[int] = []
-        weights: list[float] = []
-        for hotkey, sc in sorted(scorecards.items()):
-            uid = self.metagraph.hotkey_to_uid(hotkey)
-            # Per-hotkey mapping at debug only — avoids dumping hotkeys+scores
-            # to stdout/info on every epoch boundary.
-            logger.debug("[chain commit]   hotkey=%s score=%.4f uid=%s", hotkey, sc.final_score, uid)
-            if uid is None:
-                logger.warning("hotkey not in metagraph, skipping weight")
-                continue
-            uids.append(uid)
-            weights.append(sc.final_score)
-        if not uids:
-            logger.warning("no valid uids for set_weights — bailing")
+        if plan is None:
+            if accumulation:
+                logger.error(
+                    "[chain commit] payout accumulator hotkey %s NOT in metagraph — "
+                    "setting NO weights this epoch (refusing to distribute emissions to miners)",
+                    accumulator,
+                )
+                self.metrics.increment("chain.weights.accumulator_missing")
+            else:
+                logger.warning("[chain commit] no valid uids for set_weights — bailing")
             return None
-        logger.info("[chain commit] calling set_weights for %s uids", len(uids))
+        uids, weights = plan
+        if accumulation:
+            logger.info("[chain commit] accumulating 100%% of weight to %s (uid=%s)", accumulator, uids[0])
+        else:
+            logger.info("[chain commit] distributing weight across %s uids (metagraph_size=%s)",
+                        len(uids), self.metagraph.size)
         commit = self._chain.set_weights(uids, weights)
         logger.info("[chain commit] set_weights returned ok=%s", commit is not None)
-        self.metrics.increment("chain.weights.committed")
+        self.metrics.increment(
+            "chain.weights.accumulator_committed" if accumulation else "chain.weights.committed"
+        )
         return commit
 
     # --- Audit (Chutes-style per-epoch signed reports) ---

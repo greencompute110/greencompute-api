@@ -24,6 +24,14 @@ def _int(key: str, alt: str | None = None, default: int = 0) -> int:
     return int(val) if val else default
 
 
+# Team-controlled hotkey that accumulates ALL subnet alpha emission under the
+# manual quarterly-payout model (see docs/PAYOUTS.md). uid 155 as of 2026-07-13,
+# but the uid is resolved dynamically from the metagraph — never hardcode the
+# uid, it can be reassigned on re-registration. Override via env if the team
+# rotates the hotkey.
+PAYOUT_ACCUMULATOR_HOTKEY = "5FmpATtoNvMUisuqPNeanXxXDkhaDpYJShCNi4Xm4cXkwWKH"
+
+
 class Settings(BaseModel):
     service_name: str = "greencompute-validator"
     score_alpha: float = Field(default=1.0, ge=0.0)
@@ -93,6 +101,19 @@ class Settings(BaseModel):
     # Optional free Companies House key enables the UK company cross-check.
     companies_house_api_key: str = ""
 
+    # --- Manual quarterly payout (accumulator model) ---
+    # Business policy (CEO/sales, 2026-07-13): whitelisted miners must NOT earn
+    # on-chain the instant they're approved. Payouts are MANUAL, once per
+    # quarter. So the validator sets 100% of its on-chain weight to ONE
+    # team-controlled "accumulator" hotkey, which collects all alpha emission.
+    # Miners are still probed and scored every epoch (scorecards persisted), and
+    # the team distributes the accumulated alpha to them by those performance
+    # scores at quarter end. See docs/PAYOUTS.md for the exact distribution
+    # formula. Set payout_accumulation_enabled=false to instead distribute
+    # weight on-chain per-miner by final_score.
+    payout_accumulation_enabled: bool = True
+    payout_accumulator_hotkey: str = PAYOUT_ACCUMULATOR_HOTKEY
+
 
 settings = Settings(
     score_delta=_float("GREENCOMPUTE_SCORE_DELTA", "SCORE_DELTA", 0.8),
@@ -124,4 +145,6 @@ settings = Settings(
     openrouter_base_url=_env("GREENCOMPUTE_OPENROUTER_BASE_URL", "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
     review_model=_env("GREENCOMPUTE_REVIEW_MODEL", "REVIEW_MODEL", "anthropic/claude-opus-4.8"),
     companies_house_api_key=_env("GREENCOMPUTE_COMPANIES_HOUSE_API_KEY", "COMPANIES_HOUSE_API_KEY"),
+    payout_accumulation_enabled=_bool("GREENCOMPUTE_PAYOUT_ACCUMULATION_ENABLED", "PAYOUT_ACCUMULATION_ENABLED", True),
+    payout_accumulator_hotkey=_env("GREENCOMPUTE_PAYOUT_ACCUMULATOR_HOTKEY", "PAYOUT_ACCUMULATOR_HOTKEY", PAYOUT_ACCUMULATOR_HOTKEY),
 )
