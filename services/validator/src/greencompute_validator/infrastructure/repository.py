@@ -658,6 +658,8 @@ class ValidatorRepository:
                     DeploymentORM.state,
                     DeploymentORM.updated_at,
                     WorkloadORM.metadata_json,
+                    DeploymentORM.node_id,
+                    DeploymentORM.multi_node,
                 )
                 .join(WorkloadORM, WorkloadORM.workload_id == DeploymentORM.workload_id)
                 .where(DeploymentORM.hotkey == hotkey)
@@ -668,7 +670,7 @@ class ValidatorRepository:
                 stmt = stmt.where(DeploymentORM.state != "terminated")
             rows = session.execute(stmt).all()
             out: list[dict] = []
-            for dep_id, wl_id, state, updated_at, meta in rows:
+            for dep_id, wl_id, state, updated_at, meta, node_id, multi_node in rows:
                 meta = meta or {}
                 if meta.get("managed_by") != "flux":
                     continue
@@ -678,6 +680,39 @@ class ValidatorRepository:
                     "model_id": meta.get("catalog_model_id"),
                     "state": state,
                     "updated_at": updated_at,
+                    "node_id": node_id,
+                    # Set only for one rank of a distributed replica; the
+                    # per-node reconciler skips these (they're owned by the
+                    # fleet-level distributed reconciler).
+                    "multi_node": multi_node,
+                })
+            return out
+
+    def list_distributed_replica_rows(self, model_id: str) -> list[dict]:
+        """Every live rank row of every distributed replica of one model,
+        across all nodes and operators."""
+        with session_scope(self.session_factory) as session:
+            stmt = (
+                select(
+                    DeploymentORM.deployment_id,
+                    DeploymentORM.hotkey,
+                    DeploymentORM.node_id,
+                    DeploymentORM.state,
+                    DeploymentORM.multi_node,
+                )
+                .where(DeploymentORM.state != "terminated")
+                .where(DeploymentORM.multi_node.is_not(None))
+            )
+            out: list[dict] = []
+            for dep_id, hotkey, node_id, state, multi_node in session.execute(stmt).all():
+                if (multi_node or {}).get("model_id") != model_id:
+                    continue
+                out.append({
+                    "deployment_id": dep_id,
+                    "hotkey": hotkey,
+                    "node_id": node_id,
+                    "state": state,
+                    "multi_node": multi_node,
                 })
             return out
 
