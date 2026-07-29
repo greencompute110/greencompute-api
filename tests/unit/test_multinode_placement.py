@@ -7,9 +7,14 @@ stragglers, and a slow fabric makes cross-node serving pointless.
 """
 from greencompute_protocol import MultiNodeConfig
 from greencompute_validator.domain.multinode import (
+    CREATE,
+    KEEP,
+    REBUILD,
     NodeCandidate,
     build_replica_rows,
+    group_by_replica,
     head_address,
+    replica_action,
     plan_multi_node_placement,
     replica_is_ready,
     teardown_order,
@@ -222,6 +227,57 @@ def test_teardown_drains_workers_before_the_head():
 
 def test_teardown_tolerates_single_node_rows():
     assert teardown_order([{"deployment_id": "d1"}]) == [{"deployment_id": "d1"}]
+
+
+# --- replica lifecycle decisions ---------------------------------------------
+
+
+def ranks(states, node_count=4, replica_id="r1"):
+    return [
+        {"deployment_id": f"d{i}", "state": s,
+         "multi_node": {"replica_id": replica_id, "rank": i, "role": "head" if i == 0 else "worker"}}
+        for i, s in enumerate(states)
+    ]
+
+
+def test_all_ranks_live_is_kept():
+    assert replica_action(ranks(["ready"] * 4), 4) == KEEP
+    assert replica_action(ranks(["ready", "starting", "ready", "scheduled"]), 4) == KEEP
+
+
+def test_no_rows_means_create():
+    assert replica_action([], 4) == CREATE
+
+
+def test_one_dead_rank_rebuilds_the_whole_replica():
+    # All-or-nothing: a dead rank leaves the head blocked forever on GPUs that
+    # will never arrive, while the survivors hold hardware.
+    assert replica_action(ranks(["ready", "ready", "failed", "ready"]), 4) == REBUILD
+
+
+def test_partial_placement_rebuilds():
+    assert replica_action(ranks(["ready", "ready"]), 4) == REBUILD
+
+
+def test_all_dead_rebuilds():
+    assert replica_action(ranks(["failed", "terminated"]), 4) == REBUILD
+
+
+def test_duplicate_or_missing_rank_numbers_rebuild():
+    rows = ranks(["ready"] * 4)
+    rows[2]["multi_node"]["rank"] = 1  # duplicate rank 1, no rank 2
+    assert replica_action(rows, 4) == REBUILD
+
+
+def test_groups_rows_by_replica():
+    rows = ranks(["ready"] * 2, replica_id="rA") + ranks(["ready"] * 2, replica_id="rB")
+    groups = group_by_replica(rows)
+    assert set(groups) == {"rA", "rB"}
+    assert len(groups["rA"]) == 2
+
+
+def test_rows_without_replica_id_are_ignored():
+    assert group_by_replica([{"deployment_id": "d1", "multi_node": None}]) == {}
 
 
 def test_kimi_k3_shape_needs_eight_nodes():

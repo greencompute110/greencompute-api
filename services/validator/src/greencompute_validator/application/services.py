@@ -5,6 +5,7 @@ import os
 import threading
 from datetime import UTC, datetime, timedelta
 from math import ceil
+from uuid import uuid4
 
 from greencompute_persistence import SubjectBus, WorkflowEventRepository, create_subject_bus, get_metrics_store
 from greencompute_persistence.runtime import load_runtime_settings
@@ -30,6 +31,19 @@ from greencompute_validator.domain.demand import (
 )
 from greencompute_validator.domain.flux import FluxOrchestrator
 from greencompute_validator.domain.metagraph import MetagraphCache
+from greencompute_validator.domain.multinode import (
+    CLUSTER_ADDRESS_LABEL,
+    KEEP,
+    REBUILD,
+    NodeCandidate,
+    build_replica_rows,
+    group_by_replica,
+    head_address,
+    plan_multi_node_placement,
+    replica_action,
+    teardown_order,
+    validate_topology,
+)
 from greencompute_validator.domain.scoring import ScoreEngine
 from greencompute_validator.domain.wait_estimator import WaitEstimator
 from greencompute_validator.infrastructure.repository import ValidatorRepository
@@ -754,6 +768,13 @@ class ValidatorService:
         # sibling node counted as 'existing' here. Pinning to target_node_id
         # makes each node reconcile only its own deficit/surplus.
         existing = self.repository.list_flux_deployments(hotkey, node_id=target_node_id)
+        # Distributed-replica ranks are NOT this loop's business. A replica of a
+        # too-large model spans several of the hotkey's nodes and is owned by
+        # _reconcile_distributed_replicas. Left in, the termination branch below
+        # would kill every rank sitting on a node whose own per-node
+        # inference_assignments don't list that model — which is most of them —
+        # tearing the replica down moments after it was placed.
+        existing = [d for d in existing if not d.get("multi_node")]
         # Only LIVE deployments count as "already serving" this model. A failed /
         # unhealthy replica is NOT serving, yet list_flux_deployments still returns
         # it (it isn't 'terminated'). Counting it as existing deadlocks recovery:
@@ -815,6 +836,155 @@ class ValidatorService:
                 "workload_id": workload_id,
             })
             self.metrics.increment("flux.replica.provisioned")
+
+    def _distributed_candidates(self) -> list[NodeCandidate]:
+        """Fleet nodes eligible to host a rank of a distributed replica."""
+        candidates: list[NodeCandidate] = []
+        for hotkey, nodes in self.repository.list_node_capabilities().items():
+            for cap in nodes:
+                candidates.append(NodeCandidate(
+                    hotkey=hotkey,
+                    node_id=cap.node_id,
+                    available_gpus=cap.available_gpus,
+                    vram_gb_per_gpu=cap.vram_gb_per_gpu,
+                    gpu_model=cap.gpu_model,
+                    labels=dict(cap.labels or {}),
+                ))
+        return candidates
+
+    def _teardown_replica(self, rank_rows: list[dict], reason: str) -> None:
+        """Terminate every rank of a replica, workers before the head."""
+        for row in teardown_order(rank_rows):
+            if self.repository.terminate_flux_deployment(row["deployment_id"]):
+                self.metrics.increment("flux.distributed.rank_terminated")
+        mn = (rank_rows[0].get("multi_node") or {}) if rank_rows else {}
+        logger.info(
+            "distributed replica %s torn down (%s)", mn.get("replica_id"), reason
+        )
+        self.bus.publish("flux.distributed.replica_terminated", {
+            "replica_id": mn.get("replica_id"),
+            "model_id": mn.get("model_id"),
+            "reason": reason,
+        })
+
+    def _reconcile_distributed_replicas(self) -> None:
+        """Fleet-level reconcile for models too large for a single node.
+
+        Deliberately separate from _reconcile_catalog_deployments, which is
+        per-(hotkey, node): a distributed replica is one logical unit spanning
+        several nodes, so it can only be planned and judged as a whole. The
+        placement rules guarantee every rank lives under ONE hotkey, so this
+        never splits a replica across operators (which would also break the
+        per-hotkey emission model).
+        """
+        entries = [
+            e for e in self.repository.list_catalog_entries()
+            if e.multi_node is not None and e.multi_node.is_distributed
+        ]
+        if not entries:
+            return
+
+        candidates = self._distributed_candidates()
+        for entry in entries:
+            config = entry.multi_node
+            problems = validate_topology(config)
+            if problems:
+                logger.error(
+                    "catalog model %s has an unservable multi-node topology: %s",
+                    entry.model_id, "; ".join(problems),
+                )
+                self.metrics.increment("flux.distributed.invalid_topology")
+                continue
+
+            rank_rows = self.repository.list_distributed_replica_rows(entry.model_id)
+            groups = group_by_replica(rank_rows)
+            healthy = 0
+            for replica_id, rows in groups.items():
+                action = replica_action(rows, config.node_count)
+                if action == KEEP:
+                    healthy += 1
+                elif action == REBUILD:
+                    self._teardown_replica(rows, f"incomplete replica {replica_id}")
+
+            if healthy >= max(entry.min_replicas, 1):
+                continue
+
+            workload_id = self.repository.get_catalog_workload_id(entry.model_id)
+            if workload_id is None:
+                logger.warning(
+                    "distributed model %s has no canonical workload (approved?)",
+                    entry.model_id,
+                )
+                continue
+
+            # Exclude nodes already hosting a rank of this model so a rebuild
+            # doesn't try to reuse hardware that hasn't been released yet.
+            busy = {(r["hotkey"], r["node_id"]) for r in rank_rows}
+            free = [c for c in candidates if (c.hotkey, c.node_id) not in busy]
+
+            plan = plan_multi_node_placement(
+                model_id=entry.model_id,
+                config=config,
+                candidates=free,
+                min_vram_gb=entry.min_vram_gb_per_gpu,
+            )
+            if plan is None:
+                logger.info(
+                    "no viable node group for distributed model %s (needs %dx%d GPUs, "
+                    ">=%.0fGbps, same operator+fabric)",
+                    entry.model_id, config.node_count, config.gpus_per_node,
+                    config.min_interconnect_gbps,
+                )
+                self.metrics.increment("flux.distributed.unplaceable")
+                continue
+
+            # Workers must be told where to dial. The validator can't infer a
+            # node's cluster address, so an unlabelled head makes the replica
+            # unstartable — refuse rather than provision ranks that can never
+            # find each other.
+            head_node = next(
+                (c for c in free
+                 if c.hotkey == plan.head.hotkey and c.node_id == plan.head.node_id),
+                None,
+            )
+            head_host = head_address(head_node) if head_node else ""
+            if not head_host:
+                logger.error(
+                    "head node %s/%s has no '%s' label — cannot start distributed "
+                    "model %s (workers would have no address to join)",
+                    plan.head.hotkey, plan.head.node_id, CLUSTER_ADDRESS_LABEL,
+                    entry.model_id,
+                )
+                self.metrics.increment("flux.distributed.missing_cluster_address")
+                continue
+
+            replica_id = f"{entry.model_id}-{uuid4().hex[:8]}"
+            rows = build_replica_rows(
+                plan=plan,
+                replica_id=replica_id,
+                head_host=head_host,
+                gpus_per_node=config.gpus_per_node,
+            )
+            # Head first — workers dial its address, so its lease must be in
+            # flight before theirs.
+            for row in rows:
+                self.repository.create_flux_deployment(
+                    hotkey=row["hotkey"],
+                    node_id=row["node_id"],
+                    workload_id=workload_id,
+                    multi_node=row["multi_node"],
+                )
+            logger.info(
+                "provisioned distributed replica %s for %s across %d nodes (head %s)",
+                replica_id, entry.model_id, len(rows), head_host,
+            )
+            self.metrics.increment("flux.distributed.replica_provisioned")
+            self.bus.publish("flux.distributed.replica_provisioned", {
+                "replica_id": replica_id,
+                "model_id": entry.model_id,
+                "node_count": len(rows),
+                "head_host": head_host,
+            })
 
     def rebalance_all_miners(self) -> dict[str, FluxState]:
         """Rebalance all tracked miners. Called from the worker loop.
@@ -900,6 +1070,14 @@ class ValidatorService:
                 new_state, _ = self.rebalance_miner(hotkey)
                 results[hotkey] = new_state
                 rebalanced_hotkeys.add(hotkey)
+            # Distributed replicas are planned across nodes, so they reconcile
+            # once per fleet pass — after the per-node rebalances have settled
+            # each node's available capacity. Never let a failure here break the
+            # ordinary catalog rebalance.
+            try:
+                self._reconcile_distributed_replicas()
+            except Exception:
+                logger.exception("distributed replica reconcile failed")
             return results
 
     def _update_demand_signals(self) -> None:

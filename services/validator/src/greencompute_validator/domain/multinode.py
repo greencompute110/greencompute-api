@@ -213,6 +213,45 @@ def teardown_order(rows: list[dict]) -> list[dict]:
     )
 
 
+KEEP, REBUILD, CREATE = "keep", "rebuild", "create"
+LIVE_STATES = {"ready", "starting", "scheduled", "provisioning", "pending"}
+
+
+def replica_action(rank_rows: list[dict], node_count: int) -> str:
+    """Decide what to do with a distributed replica's existing rank rows.
+
+    * CREATE  — no ranks exist; plan and provision one.
+    * KEEP    — every rank is present and live; leave it alone.
+    * REBUILD — the replica is incomplete or has a dead rank. A distributed
+      replica is all-or-nothing: one dead rank means the head is blocked
+      forever waiting for GPUs that will never arrive, and the surviving ranks
+      sit holding hardware. Tear the whole thing down so it can be re-planned
+      (possibly onto different nodes) rather than trying to patch one rank back
+      in — the Ray cluster can't absorb a replacement mid-flight anyway.
+    """
+    live = [r for r in rank_rows if r.get("state") in LIVE_STATES]
+    if not live:
+        return CREATE if not rank_rows else REBUILD
+    if len(live) != len(rank_rows):
+        return REBUILD  # some rank died while others live
+    if len(live) != node_count:
+        return REBUILD  # partial placement
+    ranks = sorted((r.get("multi_node") or {}).get("rank") for r in live)
+    if ranks != list(range(node_count)):
+        return REBUILD  # duplicate or missing rank numbers
+    return KEEP
+
+
+def group_by_replica(rows: list[dict]) -> dict[str, list[dict]]:
+    """Bucket rank rows by their replica_id."""
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        replica_id = (row.get("multi_node") or {}).get("replica_id")
+        if replica_id:
+            groups.setdefault(replica_id, []).append(row)
+    return groups
+
+
 def validate_topology(config: MultiNodeConfig) -> list[str]:
     """Return reasons the topology can't be served, empty if it's coherent.
 
