@@ -142,6 +142,77 @@ def plan_multi_node_placement(
     )
 
 
+# Node label carrying the address peers use to reach this box on the cluster
+# fabric. Operators set it because the validator cannot infer a node's private
+# cluster IP — the address it talks to a miner on is usually the public one,
+# which is the wrong path for inter-rank traffic.
+CLUSTER_ADDRESS_LABEL = "cluster_ip"
+
+
+def head_address(node: NodeCandidate) -> str:
+    """Address workers dial to join this node's Ray head."""
+    return str(node.labels.get(CLUSTER_ADDRESS_LABEL) or "").strip()
+
+
+def build_replica_rows(
+    *,
+    plan: MultiNodePlan,
+    replica_id: str,
+    head_host: str,
+    gpus_per_node: int,
+) -> list[dict]:
+    """Turn a placement into the per-rank deployment payloads to persist.
+
+    One row per rank, **head first** — workers need the head's address, so the
+    head's row must exist (and its container be coming up) before the workers
+    start dialling it. Each payload is what lands in `deployments.multi_node`
+    and is read by the node-agent's launcher.
+    """
+    rows: list[dict] = []
+    for assignment in sorted(plan.assignments, key=lambda a: a.rank):
+        rows.append({
+            "hotkey": assignment.hotkey,
+            "node_id": assignment.node_id,
+            "multi_node": {
+                "replica_id": replica_id,
+                "role": "head" if assignment.is_head else "worker",
+                "rank": assignment.rank,
+                "node_count": len(plan.assignments),
+                "gpus_per_node": gpus_per_node,
+                "tensor_parallel_size": plan.tensor_parallel_size,
+                "pipeline_parallel_size": plan.pipeline_parallel_size,
+                "head_host": head_host,
+                "model_id": plan.model_id,
+            },
+        })
+    return rows
+
+
+def replica_is_ready(rank_states: list[str]) -> bool:
+    """A distributed replica serves only when EVERY rank is up.
+
+    Unlike a single-node replica, a partially-live distributed replica serves
+    nothing — the head blocks waiting for the missing workers' GPUs. Treating it
+    as ready would route traffic into a hang.
+    """
+    if not rank_states:
+        return False
+    return all(state == "ready" for state in rank_states)
+
+
+def teardown_order(rows: list[dict]) -> list[dict]:
+    """Workers first, head last.
+
+    Killing the head first strands the workers in a cluster with no GCS; they
+    linger holding GPUs until their own teardown lands. Draining workers before
+    the head lets the Ray session close cleanly.
+    """
+    return sorted(
+        rows,
+        key=lambda r: 0 if (r.get("multi_node") or {}).get("role") == "worker" else 1,
+    )
+
+
 def validate_topology(config: MultiNodeConfig) -> list[str]:
     """Return reasons the topology can't be served, empty if it's coherent.
 

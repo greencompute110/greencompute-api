@@ -687,10 +687,15 @@ class ValidatorRepository:
         hotkey: str,
         node_id: str,
         workload_id: str,
+        multi_node: dict | None = None,
     ) -> str:
         """Insert a DeploymentORM + LeaseAssignmentORM pinned to this miner.
         The miner picks it up on its next list_leases poll. No owner_user_id
-        because catalog replicas are fleet-owned, not user-owned."""
+        because catalog replicas are fleet-owned, not user-owned.
+
+        `multi_node` is set only for one rank of a distributed replica (a model
+        served across several nodes); NULL for ordinary single-node catalog
+        replicas."""
         from datetime import UTC, datetime
         from uuid import uuid4
 
@@ -712,6 +717,7 @@ class ValidatorRepository:
                 deployment_fee_usd=0.0,
                 fee_acknowledged=True,
                 warmup_state="pending",
+                multi_node=multi_node,
                 created_at=now,
                 updated_at=now,
             ))

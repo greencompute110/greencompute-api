@@ -167,6 +167,15 @@ class DeploymentORM(Base):
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     retry_exhausted: Mapped[bool] = mapped_column(Boolean, default=False)
     health_check_failures: Mapped[int] = mapped_column(Integer, default=0)
+    # Distributed-replica membership. NULL for every ordinary single-node
+    # deployment. When set, this row is ONE RANK of a model served across
+    # several nodes as a single engine:
+    #   {"replica_id", "role": "head"|"worker", "rank", "node_count",
+    #    "gpus_per_node", "tensor_parallel_size", "pipeline_parallel_size",
+    #    "head_host"}
+    # The node-agent reads it to decide whether to bring up a Ray head + serve,
+    # or join the head and donate GPUs (see multinode_launch.py).
+    multi_node: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
