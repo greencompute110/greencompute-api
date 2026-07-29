@@ -655,8 +655,17 @@ def _ensure_catalog_workload(entry: ModelCatalogEntry) -> None:
     }
     image = default_images.get(entry.template, default_images["vllm"])
 
+    # For a distributed model the canonical workload describes ONE RANK, so the
+    # per-deployment GPU ask is gpus_per_node — not the replica's total. Using
+    # the total here would make each rank try to allocate the whole cluster's
+    # worth of GPUs on a single box and fail placement.
+    per_deployment_gpus = (
+        entry.multi_node.gpus_per_node
+        if entry.multi_node is not None and entry.multi_node.is_distributed
+        else entry.gpu_count
+    )
     requirements = {
-        "gpu_count": entry.gpu_count,
+        "gpu_count": per_deployment_gpus,
         "min_vram_gb_per_gpu": entry.min_vram_gb_per_gpu,
         "cpu_cores": 4,
         "memory_gb": 16,
@@ -714,6 +723,16 @@ def upsert_catalog_entry(
     """Admin — directly upsert a catalog entry (bypass submission flow)."""
     require_admin_api_key(authorization, x_api_key)
     payload.model_id = _validate_model_id(payload.model_id)
+    # Reject an incoherent distributed topology at admission rather than letting
+    # it sit in the catalog failing to place on every rebalance.
+    if payload.multi_node is not None and payload.multi_node.is_distributed:
+        from greencompute_validator.domain.multinode import validate_topology
+        problems = validate_topology(payload.multi_node)
+        if problems:
+            raise HTTPException(
+                status_code=400,
+                detail="invalid multi-node topology: " + "; ".join(problems),
+            )
     service.repository.upsert_catalog_entry(payload)
     _ensure_catalog_workload(payload)
     return payload.model_dump(mode="json")
