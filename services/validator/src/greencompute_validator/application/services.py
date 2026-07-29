@@ -41,6 +41,7 @@ from greencompute_validator.domain.multinode import (
     head_address,
     plan_multi_node_placement,
     replica_action,
+    replica_is_ready,
     teardown_order,
     validate_topology,
 )
@@ -836,6 +837,45 @@ class ValidatorService:
                 "workload_id": workload_id,
             })
             self.metrics.increment("flux.replica.provisioned")
+
+    def distributed_replica_status(self) -> list[dict]:
+        """Fleet view of every distributed replica and its per-rank health.
+
+        A distributed replica only serves when EVERY rank is ready, so the admin
+        view reports readiness at replica level (not per row) — a replica that
+        looks '7/8 ready' is serving nothing.
+        """
+        rows = self.repository.list_distributed_replica_rows()
+        out: list[dict] = []
+        for replica_id, ranks in sorted(group_by_replica(rows).items()):
+            ordered = sorted(ranks, key=lambda r: (r.get("multi_node") or {}).get("rank", 0))
+            first = (ordered[0].get("multi_node") or {}) if ordered else {}
+            expected = int(first.get("node_count") or len(ordered))
+            out.append({
+                "replica_id": replica_id,
+                "model_id": first.get("model_id"),
+                "hotkey": ordered[0].get("hotkey") if ordered else None,
+                "expected_ranks": expected,
+                "live_ranks": len(ordered),
+                "ready": replica_is_ready([r.get("state") for r in ordered])
+                         and len(ordered) == expected,
+                "action": replica_action(ordered, expected),
+                "head_host": first.get("head_host"),
+                "tensor_parallel_size": first.get("tensor_parallel_size"),
+                "pipeline_parallel_size": first.get("pipeline_parallel_size"),
+                "total_gpus": expected * int(first.get("gpus_per_node") or 0),
+                "ranks": [
+                    {
+                        "rank": (r.get("multi_node") or {}).get("rank"),
+                        "role": (r.get("multi_node") or {}).get("role"),
+                        "node_id": r.get("node_id"),
+                        "state": r.get("state"),
+                        "deployment_id": r.get("deployment_id"),
+                    }
+                    for r in ordered
+                ],
+            })
+        return out
 
     def _distributed_candidates(self) -> list[NodeCandidate]:
         """Fleet nodes eligible to host a rank of a distributed replica."""

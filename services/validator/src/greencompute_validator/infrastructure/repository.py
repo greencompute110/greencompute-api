@@ -688,9 +688,10 @@ class ValidatorRepository:
                 })
             return out
 
-    def list_distributed_replica_rows(self, model_id: str) -> list[dict]:
-        """Every live rank row of every distributed replica of one model,
-        across all nodes and operators."""
+    def list_distributed_replica_rows(self, model_id: str | None = None) -> list[dict]:
+        """Every live rank row of every distributed replica, across all nodes and
+        operators. Pass `model_id` to scope to one model; omit for the fleet-wide
+        view the admin dashboard uses."""
         with session_scope(self.session_factory) as session:
             stmt = (
                 select(
@@ -705,7 +706,7 @@ class ValidatorRepository:
             )
             out: list[dict] = []
             for dep_id, hotkey, node_id, state, multi_node in session.execute(stmt).all():
-                if (multi_node or {}).get("model_id") != model_id:
+                if model_id is not None and (multi_node or {}).get("model_id") != model_id:
                     continue
                 out.append({
                     "deployment_id": dep_id,

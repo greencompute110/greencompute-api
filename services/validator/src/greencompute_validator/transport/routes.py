@@ -738,6 +738,19 @@ def upsert_catalog_entry(
     return payload.model_dump(mode="json")
 
 
+@router.get("/validator/v1/flux/distributed")
+def list_distributed_replicas(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    """Admin — every distributed (multi-node) replica with per-rank health.
+
+    Readiness is reported per REPLICA: a replica missing any rank serves
+    nothing, because the head blocks waiting for the absent GPUs."""
+    require_admin_api_key(authorization, x_api_key)
+    return service.distributed_replica_status()
+
+
 @router.get("/validator/v1/catalog")
 def list_catalog(visibility: str | None = None) -> list[dict]:
     """Public — list catalog entries (optionally filter by visibility)."""
