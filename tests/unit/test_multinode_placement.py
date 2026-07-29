@@ -8,7 +8,11 @@ stragglers, and a slow fabric makes cross-node serving pointless.
 from greencompute_protocol import MultiNodeConfig
 from greencompute_validator.domain.multinode import (
     NodeCandidate,
+    build_replica_rows,
+    head_address,
     plan_multi_node_placement,
+    replica_is_ready,
+    teardown_order,
     validate_topology,
 )
 
@@ -155,6 +159,69 @@ def test_unknown_backend_is_flagged():
 
 
 # --- the K3 shape ------------------------------------------------------------
+
+
+# --- turning a plan into deployment rows -------------------------------------
+
+
+def rows_for(n=4):
+    p = plan([node(f"n{i}") for i in range(n)], config=cfg(node_count=n, pipeline_parallel_size=n))
+    return build_replica_rows(plan=p, replica_id="r1", head_host="10.0.0.1", gpus_per_node=8)
+
+
+def test_one_row_per_rank_head_first():
+    rows = rows_for()
+    assert len(rows) == 4
+    # Head must be first: workers dial its address, so it has to exist first.
+    assert rows[0]["multi_node"]["role"] == "head"
+    assert [r["multi_node"]["rank"] for r in rows] == [0, 1, 2, 3]
+    assert all(r["multi_node"]["role"] == "worker" for r in rows[1:])
+
+
+def test_every_rank_carries_the_head_address_and_topology():
+    for r in rows_for():
+        mn = r["multi_node"]
+        assert mn["head_host"] == "10.0.0.1"
+        assert mn["node_count"] == 4
+        assert mn["tensor_parallel_size"] == 8
+        assert mn["pipeline_parallel_size"] == 4
+        assert mn["replica_id"] == "r1"
+
+
+def test_rows_name_their_node_and_operator():
+    for r in rows_for():
+        assert r["hotkey"] == "5MINER_A"
+        assert r["node_id"].startswith("n")
+
+
+def test_head_address_read_from_the_cluster_label():
+    assert head_address(node("n0")) == ""  # not labelled
+    labelled = NodeCandidate(hotkey="5A", node_id="n0", available_gpus=8,
+                             vram_gb_per_gpu=32, gpu_model="rtx5090",
+                             labels={"cluster_ip": "10.0.0.7"})
+    assert head_address(labelled) == "10.0.0.7"
+
+
+# --- readiness + teardown ----------------------------------------------------
+
+
+def test_replica_ready_only_when_every_rank_is_ready():
+    assert replica_is_ready(["ready"] * 4) is True
+    # A partially-live distributed replica serves nothing — the head blocks on
+    # the missing GPUs, so routing traffic there would hang.
+    assert replica_is_ready(["ready", "ready", "starting", "ready"]) is False
+    assert replica_is_ready(["ready", "failed"]) is False
+    assert replica_is_ready([]) is False
+
+
+def test_teardown_drains_workers_before_the_head():
+    ordered = teardown_order(rows_for())
+    assert [r["multi_node"]["role"] for r in ordered][-1] == "head"
+    assert all(r["multi_node"]["role"] == "worker" for r in ordered[:-1])
+
+
+def test_teardown_tolerates_single_node_rows():
+    assert teardown_order([{"deployment_id": "d1"}]) == [{"deployment_id": "d1"}]
 
 
 def test_kimi_k3_shape_needs_eight_nodes():
