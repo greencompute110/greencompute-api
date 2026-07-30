@@ -893,9 +893,14 @@ class ValidatorService:
         return candidates
 
     def _teardown_replica(self, rank_rows: list[dict], reason: str) -> None:
-        """Terminate every rank of a replica, workers before the head."""
+        """Terminate every rank of a replica, workers before the head.
+
+        force=True because a replica is all-or-nothing: a rank already in
+        `failed` must still be retired, or it keeps its node marked busy and the
+        replica can never be re-placed (permanent rebuild deadlock).
+        """
         for row in teardown_order(rank_rows):
-            if self.repository.terminate_flux_deployment(row["deployment_id"]):
+            if self.repository.terminate_flux_deployment(row["deployment_id"], force=True):
                 self.metrics.increment("flux.distributed.rank_terminated")
         mn = (rank_rows[0].get("multi_node") or {}) if rank_rows else {}
         logger.info(
@@ -921,6 +926,22 @@ class ValidatorService:
             e for e in self.repository.list_catalog_entries()
             if e.multi_node is not None and e.multi_node.is_distributed
         ]
+
+        # Retire replicas whose model is no longer a distributed catalog entry
+        # (entry deleted, or edited back to single-node). This MUST run even when
+        # there are no distributed entries left — an early return here orphaned
+        # every rank of a deleted model: the containers kept running and holding
+        # GPUs with nothing left to reconcile them (observed on the fleet
+        # 2026-07-30). The single-node path has the equivalent sweep.
+        wanted = {e.model_id for e in entries}
+        for replica_id, rows in group_by_replica(
+            self.repository.list_distributed_replica_rows()
+        ).items():
+            model_id = (rows[0].get("multi_node") or {}).get("model_id")
+            if model_id not in wanted:
+                self._teardown_replica(rows, f"model {model_id} no longer a distributed entry")
+                self.metrics.increment("flux.distributed.orphan_reaped")
+
         if not entries:
             return
 

@@ -30,6 +30,7 @@ from greencompute_protocol import (
     GreenEnergyAttachment,
     MinerWhitelistEntry,
     ModelCatalogEntry,
+    MultiNodeConfig,
     NodeCapability,
     ProbeChallenge,
     ProbeResult,
@@ -497,6 +498,11 @@ class ValidatorRepository:
             max_replicas=row.max_replicas,
             admin_notes=row.admin_notes or "",
             created_by_hotkey=row.created_by_hotkey,
+            multi_node=(
+                MultiNodeConfig.model_validate(row.multi_node)
+                if isinstance(row.multi_node, dict) and row.multi_node
+                else None
+            ),
             created_at=row.created_at,
         )
 
@@ -536,6 +542,13 @@ class ValidatorRepository:
             row.max_replicas = entry.max_replicas
             row.admin_notes = entry.admin_notes
             row.created_by_hotkey = entry.created_by_hotkey
+            # Persist the distributed topology, or clear it when an entry is
+            # updated back to single-node.
+            row.multi_node = (
+                entry.multi_node.model_dump(mode="json")
+                if entry.multi_node is not None
+                else None
+            )
             session.add(row)
         return entry
 
@@ -857,12 +870,25 @@ class ValidatorRepository:
             )
             return result.rowcount or 0
 
-    def terminate_flux_deployment(self, deployment_id: str) -> bool:
+    def terminate_flux_deployment(self, deployment_id: str, *, force: bool = False) -> bool:
+        """Terminate a Flux-managed deployment.
+
+        By default a row already in `failed` is left alone, so the single-node
+        reconciler keeps it as a historical record. `force=True` retires it
+        anyway — required for distributed replicas: a replica is one logical
+        unit, so when we decide to rebuild it, EVERY rank row must actually
+        leave the active set. Otherwise the dead ranks keep their nodes marked
+        busy, placement can never find free hardware, and the replica is
+        deadlocked in a permanent rebuild loop (observed on the fleet
+        2026-07-30). The row still persists as `terminated`, so history is kept.
+        """
         from datetime import UTC, datetime
 
         with session_scope(self.session_factory) as session:
             dep = session.get(DeploymentORM, deployment_id)
-            if dep is None or dep.state in ("terminated", "failed"):
+            if dep is None or dep.state == "terminated":
+                return False
+            if dep.state == "failed" and not force:
                 return False
             dep.state = "terminated"
             dep.updated_at = datetime.now(UTC)
