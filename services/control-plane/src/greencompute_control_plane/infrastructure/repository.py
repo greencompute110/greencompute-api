@@ -673,13 +673,24 @@ class ControlPlaneRepository:
 
     def list_assignments(self, hotkey: str | None = None, statuses: list[str] | None = None) -> list[LeaseAssignment]:
         with session_scope(self.session_factory) as session:
-            stmt = select(LeaseAssignmentORM)
+            # Left-join the deployment so each lease carries its distributed-rank
+            # role (deployments.multi_node). The miner learns what work to run
+            # ONLY from its leases, so without this the node-agent never knows a
+            # deployment is one rank of a distributed replica and silently starts
+            # it as an ordinary single-node runtime.
+            stmt = select(LeaseAssignmentORM, DeploymentORM.multi_node).join(
+                DeploymentORM,
+                DeploymentORM.deployment_id == LeaseAssignmentORM.deployment_id,
+                isouter=True,
+            )
             if hotkey:
                 stmt = stmt.where(LeaseAssignmentORM.hotkey == hotkey)
             if statuses:
                 stmt = stmt.where(LeaseAssignmentORM.status.in_(statuses))
-            rows = session.scalars(stmt).all()
-            return [self._to_assignment(row) for row in rows]
+            return [
+                self._to_assignment(row, multi_node=multi_node)
+                for row, multi_node in session.execute(stmt).all()
+            ]
 
     def update_assignment_status(self, deployment_id: str, status: str, reason: str | None = None) -> LeaseAssignment | None:
         with session_scope(self.session_factory) as session:
@@ -1053,7 +1064,9 @@ class ControlPlaneRepository:
         )
 
     @staticmethod
-    def _to_assignment(row: LeaseAssignmentORM) -> LeaseAssignment:
+    def _to_assignment(
+        row: LeaseAssignmentORM, *, multi_node: dict | None = None
+    ) -> LeaseAssignment:
         return LeaseAssignment(
             assignment_id=row.assignment_id,
             deployment_id=row.deployment_id,
@@ -1063,6 +1076,7 @@ class ControlPlaneRepository:
             assigned_at=row.assigned_at,
             expires_at=row.expires_at,
             status=row.status,
+            multi_node=multi_node if isinstance(multi_node, dict) else None,
         )
 
     @staticmethod
