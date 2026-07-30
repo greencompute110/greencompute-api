@@ -30,6 +30,7 @@ from greencompute_protocol import (
     GreenEnergyAttachment,
     MinerWhitelistEntry,
     ModelCatalogEntry,
+    MultiNodeConfig,
     NodeCapability,
     ProbeChallenge,
     ProbeResult,
@@ -497,6 +498,11 @@ class ValidatorRepository:
             max_replicas=row.max_replicas,
             admin_notes=row.admin_notes or "",
             created_by_hotkey=row.created_by_hotkey,
+            multi_node=(
+                MultiNodeConfig.model_validate(row.multi_node)
+                if isinstance(row.multi_node, dict) and row.multi_node
+                else None
+            ),
             created_at=row.created_at,
         )
 
@@ -536,6 +542,13 @@ class ValidatorRepository:
             row.max_replicas = entry.max_replicas
             row.admin_notes = entry.admin_notes
             row.created_by_hotkey = entry.created_by_hotkey
+            # Persist the distributed topology, or clear it when an entry is
+            # updated back to single-node.
+            row.multi_node = (
+                entry.multi_node.model_dump(mode="json")
+                if entry.multi_node is not None
+                else None
+            )
             session.add(row)
         return entry
 

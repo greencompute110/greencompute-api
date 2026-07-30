@@ -640,6 +640,11 @@ class ModelCatalogORM(Base):
     max_replicas: Mapped[int | None] = mapped_column(Integer, nullable=True)
     admin_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by_hotkey: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Distributed-serving topology for a model too large for one node (see
+    # MultiNodeConfig). NULL for ordinary single-node catalog models, which is
+    # every existing row. `gpu_count` above stays the single-node ask; when this
+    # is set it is authoritative and describes the whole replica.
+    multi_node: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
