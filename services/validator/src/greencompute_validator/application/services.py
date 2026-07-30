@@ -893,9 +893,14 @@ class ValidatorService:
         return candidates
 
     def _teardown_replica(self, rank_rows: list[dict], reason: str) -> None:
-        """Terminate every rank of a replica, workers before the head."""
+        """Terminate every rank of a replica, workers before the head.
+
+        force=True because a replica is all-or-nothing: a rank already in
+        `failed` must still be retired, or it keeps its node marked busy and the
+        replica can never be re-placed (permanent rebuild deadlock).
+        """
         for row in teardown_order(rank_rows):
-            if self.repository.terminate_flux_deployment(row["deployment_id"]):
+            if self.repository.terminate_flux_deployment(row["deployment_id"], force=True):
                 self.metrics.increment("flux.distributed.rank_terminated")
         mn = (rank_rows[0].get("multi_node") or {}) if rank_rows else {}
         logger.info(

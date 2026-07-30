@@ -870,12 +870,25 @@ class ValidatorRepository:
             )
             return result.rowcount or 0
 
-    def terminate_flux_deployment(self, deployment_id: str) -> bool:
+    def terminate_flux_deployment(self, deployment_id: str, *, force: bool = False) -> bool:
+        """Terminate a Flux-managed deployment.
+
+        By default a row already in `failed` is left alone, so the single-node
+        reconciler keeps it as a historical record. `force=True` retires it
+        anyway — required for distributed replicas: a replica is one logical
+        unit, so when we decide to rebuild it, EVERY rank row must actually
+        leave the active set. Otherwise the dead ranks keep their nodes marked
+        busy, placement can never find free hardware, and the replica is
+        deadlocked in a permanent rebuild loop (observed on the fleet
+        2026-07-30). The row still persists as `terminated`, so history is kept.
+        """
         from datetime import UTC, datetime
 
         with session_scope(self.session_factory) as session:
             dep = session.get(DeploymentORM, deployment_id)
-            if dep is None or dep.state in ("terminated", "failed"):
+            if dep is None or dep.state == "terminated":
+                return False
+            if dep.state == "failed" and not force:
                 return False
             dep.state = "terminated"
             dep.updated_at = datetime.now(UTC)
