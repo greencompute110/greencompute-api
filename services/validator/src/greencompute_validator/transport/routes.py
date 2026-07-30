@@ -231,6 +231,25 @@ def run_inference_probe(
     return result.model_dump(mode="json")
 
 
+@router.get("/validator/v1/flux/distributed")
+def list_distributed_replicas(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    """Admin — every distributed (multi-node) replica with per-rank health.
+
+    Readiness is reported per REPLICA: a replica missing any rank serves
+    nothing, because the head blocks waiting for the absent GPUs.
+
+    MUST stay above /validator/v1/flux/{hotkey} — FastAPI matches routes in
+    definition order, so the catch-all would otherwise swallow "distributed"
+    as a hotkey (it did: the endpoint 404'd with 'no flux state for
+    hotkey=distributed' until this was moved).
+    """
+    require_admin_api_key(authorization, x_api_key)
+    return service.distributed_replica_status()
+
+
 @router.get("/validator/v1/flux/{hotkey}")
 def get_flux_state(
     hotkey: str,
@@ -736,19 +755,6 @@ def upsert_catalog_entry(
     service.repository.upsert_catalog_entry(payload)
     _ensure_catalog_workload(payload)
     return payload.model_dump(mode="json")
-
-
-@router.get("/validator/v1/flux/distributed")
-def list_distributed_replicas(
-    authorization: str | None = Header(default=None),
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-) -> list[dict]:
-    """Admin — every distributed (multi-node) replica with per-rank health.
-
-    Readiness is reported per REPLICA: a replica missing any rank serves
-    nothing, because the head blocks waiting for the absent GPUs."""
-    require_admin_api_key(authorization, x_api_key)
-    return service.distributed_replica_status()
 
 
 @router.get("/validator/v1/catalog")
