@@ -503,6 +503,7 @@ class ValidatorRepository:
                 if isinstance(row.multi_node, dict) and row.multi_node
                 else None
             ),
+            image_override=row.image_override,
             created_at=row.created_at,
         )
 
@@ -549,6 +550,7 @@ class ValidatorRepository:
                 if entry.multi_node is not None
                 else None
             )
+            row.image_override = entry.image_override
             session.add(row)
         return entry
 

@@ -117,3 +117,30 @@ def test_force_still_refuses_an_already_terminated_row():
     )
     assert repo.terminate_flux_deployment(dep, force=True) is True
     assert repo.terminate_flux_deployment(dep, force=True) is False  # idempotent
+
+
+# --- image pin must survive persistence too ------------------------------------
+
+
+def test_image_override_round_trips():
+    """Third instance of the same trap: field added to the pydantic model and
+    written into workload.runtime, but with no DB column it was silently
+    dropped on save, so the pin never reached the node and K3 would have loaded
+    on the stable image that cannot parse its architecture."""
+    repo = _repo()
+    repo.upsert_catalog_entry(ModelCatalogEntry(
+        model_id="kimi-k3", hf_repo="moonshotai/Kimi-K3",
+        image_override="vllm/vllm-openai:nightly", max_model_len=32768,
+    ))
+    loaded = repo.get_catalog_entry("kimi-k3")
+    assert loaded.image_override == "vllm/vllm-openai:nightly", "pin dropped on persist"
+    assert loaded.max_model_len == 32768
+    # and via the listing path the reconciler actually uses
+    entry = next(e for e in repo.list_catalog_entries() if e.model_id == "kimi-k3")
+    assert entry.image_override == "vllm/vllm-openai:nightly"
+
+
+def test_image_override_defaults_to_none():
+    repo = _repo()
+    repo.upsert_catalog_entry(ModelCatalogEntry(model_id="plain"))
+    assert repo.get_catalog_entry("plain").image_override is None

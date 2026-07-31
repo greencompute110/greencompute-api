@@ -645,6 +645,9 @@ class ModelCatalogORM(Base):
     # every existing row. `gpu_count` above stays the single-node ask; when this
     # is set it is authoritative and describes the whole replica.
     multi_node: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Pin a serving image for this model (some models load on exactly one vLLM
+    # build). NULL = the miner picks, which is every existing row.
+    image_override: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
