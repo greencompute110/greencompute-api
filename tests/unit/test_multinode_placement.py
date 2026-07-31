@@ -17,6 +17,7 @@ from greencompute_validator.domain.multinode import (
     replica_action,
     plan_multi_node_placement,
     replica_is_ready,
+    serves_ingress,
     teardown_order,
     validate_topology,
 )
@@ -290,3 +291,50 @@ def test_kimi_k3_shape_needs_eight_nodes():
     p = plan([node(f"n{i}", gbps=200.0) for i in range(8)], config=k3)
     assert p is not None and p.total_gpus == 64
     assert p.tensor_parallel_size == 8 and p.pipeline_parallel_size == 8
+
+
+# --- head must land where the gateway can reach it ----------------------------
+
+
+def ingress_node(node_id, **kw):
+    n = node(node_id, **kw)
+    return NodeCandidate(hotkey=n.hotkey, node_id=n.node_id, available_gpus=n.available_gpus,
+                         vram_gb_per_gpu=n.vram_gb_per_gpu, gpu_model=n.gpu_model,
+                         labels={**n.labels, "serves_ingress": "true"})
+
+
+def test_ingress_node_becomes_the_head():
+    """Only rank 0 serves an API, so a replica is unreachable unless its head is
+    on a gateway-reachable box. Ordering by node_id alone made a NAT-only node
+    the head — the replica ran fine but no request could reach it."""
+    # "z-node" sorts LAST by node_id, so only the ingress preference can pick it.
+    nodes = [node("a1"), node("a2"), node("a3"), ingress_node("z-node")]
+    p = plan(nodes)
+    assert p.head.node_id == "z-node"
+    assert [a.rank for a in p.assignments] == [0, 1, 2, 3]
+
+
+def test_placement_still_works_with_no_ingress_labels():
+    # A fleet that hasn't labelled anything must still place (just not routable).
+    p = plan([node(f"n{i}") for i in range(4)])
+    assert p is not None and p.head.node_id == "n0"
+
+
+def test_serves_ingress_parsing():
+    assert serves_ingress(ingress_node("x")) is True
+    assert serves_ingress(node("y")) is False
+
+
+# --- max_model_len must survive into the workload runtime ---------------------
+
+
+def test_runtime_config_preserves_max_model_len():
+    """It was silently dropped: the catalog wrote it into the workload runtime
+    but InferenceRuntimeConfig had no such field, so pydantic discarded it and
+    vLLM ran at the model's native context — fatal for a 1M-context model."""
+    from greencompute_protocol import InferenceRuntimeConfig
+    rc = InferenceRuntimeConfig.model_validate(
+        {"runtime_kind": "vllm", "model_identifier": "moonshotai/Kimi-K3", "max_model_len": 32768}
+    )
+    assert rc.max_model_len == 32768
+    assert InferenceRuntimeConfig().max_model_len is None

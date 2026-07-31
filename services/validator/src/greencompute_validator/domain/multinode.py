@@ -120,7 +120,14 @@ def plan_multi_node_placement(
 
     # Within the group, take the nodes with the most headroom first; node_id
     # breaks ties so rank assignment is reproducible across rebalances.
-    ordered = sorted(chosen_group, key=lambda n: (-n.available_gpus, n.node_id))
+    # Ingress-capable nodes sort first so rank 0 (the only rank that serves)
+    # lands somewhere the gateway can actually reach. If the group has none, we
+    # still place — the replica works, it just isn't gateway-routable, which is
+    # correct for a fleet that hasn't labelled anything yet.
+    ordered = sorted(
+        chosen_group,
+        key=lambda n: (not serves_ingress(n), -n.available_gpus, n.node_id),
+    )
     selected = ordered[: config.node_count]
 
     assignments = [
@@ -147,6 +154,16 @@ def plan_multi_node_placement(
 # cluster IP — the address it talks to a miner on is usually the public one,
 # which is the wrong path for inter-rank traffic.
 CLUSTER_ADDRESS_LABEL = "cluster_ip"
+# Node label marking a box the GATEWAY can reach (public IP / forwarded port).
+# Only rank 0 serves an API, so a replica is only routable if its head sits on
+# such a node. Without this the planner ordered purely by node_id and happily
+# made a NAT-only box the head, producing a replica that ran fine but no request
+# could ever reach (5090 cluster: only gc-013 has a public IP).
+INGRESS_LABEL = "serves_ingress"
+
+
+def serves_ingress(node: NodeCandidate) -> bool:
+    return str(node.labels.get(INGRESS_LABEL, "")).strip().lower() in {"1", "true", "yes"}
 
 
 def head_address(node: NodeCandidate) -> str:
