@@ -695,6 +695,9 @@ def _ensure_catalog_workload(entry: ModelCatalogEntry) -> None:
         "template": entry.template,
         "model_identifier": entry.hf_repo or entry.model_id,
         "max_model_len": entry.max_model_len,
+        # Pin the serving image when a model only loads on a specific vLLM
+        # build (e.g. Kimi K3 needs one that registers its architecture).
+        "image_override": entry.image_override,
     }
     metadata_json = {
         "managed_by": "flux",
