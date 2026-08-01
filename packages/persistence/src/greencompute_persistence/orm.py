@@ -648,6 +648,12 @@ class ModelCatalogORM(Base):
     # Pin a serving image for this model (some models load on exactly one vLLM
     # build). NULL = the miner picks, which is every existing row.
     image_override: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Per-model engine tuning appended to the vLLM argv / exported into the rank
+    # containers. NULL for every existing row. Kimi K3 on sm_120 needs
+    # `--moe-backend marlin`; modelling every such knob as a column would never
+    # keep up with the engine.
+    extra_engine_args: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    extra_env: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

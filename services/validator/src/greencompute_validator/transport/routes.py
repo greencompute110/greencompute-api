@@ -698,6 +698,10 @@ def _ensure_catalog_workload(entry: ModelCatalogEntry) -> None:
         # Pin the serving image when a model only loads on a specific vLLM
         # build (e.g. Kimi K3 needs one that registers its architecture).
         "image_override": entry.image_override,
+        # Long tail of per-model engine tuning (e.g. K3 on sm_120 needs
+        # `--moe-backend marlin` and raised distributed timeouts).
+        "extra_engine_args": list(entry.extra_engine_args),
+        "extra_env": dict(entry.extra_env),
     }
     metadata_json = {
         "managed_by": "flux",

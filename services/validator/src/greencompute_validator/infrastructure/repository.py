@@ -504,6 +504,8 @@ class ValidatorRepository:
                 else None
             ),
             image_override=row.image_override,
+            extra_engine_args=list(row.extra_engine_args or []),
+            extra_env=dict(row.extra_env or {}),
             created_at=row.created_at,
         )
 
@@ -551,6 +553,10 @@ class ValidatorRepository:
                 else None
             )
             row.image_override = entry.image_override
+            # Empty means "no tuning" — store NULL rather than [] / {} so the
+            # column reads the same for a fresh row and a cleared one.
+            row.extra_engine_args = list(entry.extra_engine_args) or None
+            row.extra_env = dict(entry.extra_env) or None
             session.add(row)
         return entry
 

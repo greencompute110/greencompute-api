@@ -144,3 +144,35 @@ def test_image_override_defaults_to_none():
     repo = _repo()
     repo.upsert_catalog_entry(ModelCatalogEntry(model_id="plain"))
     assert repo.get_catalog_entry("plain").image_override is None
+
+
+# --- fourth instance of the trap: engine-arg passthrough -----------------------
+
+
+def test_extra_engine_args_and_env_round_trip():
+    """K3 on sm_120 is unservable without `--moe-backend marlin`, so if these
+    are dropped on save the model silently loads down the DeepGEMM path and
+    hard-asserts. Same trap as multi_node / max_model_len / image_override."""
+    repo = _repo()
+    repo.upsert_catalog_entry(ModelCatalogEntry(
+        model_id="kimi-k3",
+        extra_engine_args=["--moe-backend", "marlin", "--enforce-eager"],
+        extra_env={"VLLM_USE_DEEP_GEMM": "0"},
+    ))
+    loaded = repo.get_catalog_entry("kimi-k3")
+    assert loaded.extra_engine_args == ["--moe-backend", "marlin", "--enforce-eager"]
+    assert loaded.extra_env == {"VLLM_USE_DEEP_GEMM": "0"}
+    # and via the listing path the reconciler actually uses
+    entry = next(e for e in repo.list_catalog_entries() if e.model_id == "kimi-k3")
+    assert entry.extra_engine_args[:2] == ["--moe-backend", "marlin"]
+
+
+def test_extra_args_default_empty_and_can_be_cleared():
+    repo = _repo()
+    repo.upsert_catalog_entry(ModelCatalogEntry(model_id="plain"))
+    assert repo.get_catalog_entry("plain").extra_engine_args == []
+    assert repo.get_catalog_entry("plain").extra_env == {}
+    repo.upsert_catalog_entry(ModelCatalogEntry(model_id="plain", extra_engine_args=["--x"]))
+    assert repo.get_catalog_entry("plain").extra_engine_args == ["--x"]
+    repo.upsert_catalog_entry(ModelCatalogEntry(model_id="plain"))
+    assert repo.get_catalog_entry("plain").extra_engine_args == [], "must clear"
