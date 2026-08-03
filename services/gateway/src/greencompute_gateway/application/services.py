@@ -1600,6 +1600,7 @@ class GatewayService:
             estimate = inference_cost_cents(
                 self._prompt_token_bound(request),
                 self._completion_token_bound(request),
+                model=request.model,
             )
             reserved = BillingRepository().reserve_inference_hold(user_id, estimate, reference_id)
         except Exception:
@@ -1696,7 +1697,7 @@ class GatewayService:
             BillingRepository,
         )
 
-        cents = inference_cost_cents(prompt_tokens, completion_tokens)
+        cents = inference_cost_cents(prompt_tokens, completion_tokens, model=model)
         billing = BillingRepository()
         try:
             result = billing.debit_user_to_floor(
