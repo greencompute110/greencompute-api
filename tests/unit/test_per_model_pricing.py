@@ -16,10 +16,16 @@ from greencompute_protocol.billing_rates import (
 MTOK = 1_000_000
 
 
-def test_kimi_k3_bills_at_market_parity():
-    """$3.00 in / $15.00 out — the price every other K3 provider charges."""
-    assert inference_cost_cents(MTOK, 0, model="kimi-k3") == 300      # $3.00
-    assert inference_cost_cents(0, MTOK, model="kimi-k3") == 1500     # $15.00
+def test_kimi_k3_undercuts_the_market_reference():
+    """$2.00 in / $10.00 out — ~33% below the $3.00/$15.00 every other K3
+    provider charges, and below the cheapest endpoint anywhere (Morph,
+    $2.90/$14.00). Deliberate positioning: cheapest K3 on the market, on 100%
+    renewable consumer GPUs."""
+    assert inference_cost_cents(MTOK, 0, model="kimi-k3") == 200      # $2.00
+    assert inference_cost_cents(0, MTOK, model="kimi-k3") == 1000     # $10.00
+    # must stay under the cheapest commercial endpoint to keep the claim true
+    inp, out = rates_for_model("kimi-k3")
+    assert inp < 290 and out < 1400, "no longer the cheapest K3 available"
 
 
 def test_vendor_prefixed_model_id_bills_the_same():
@@ -46,10 +52,11 @@ def test_omitting_the_model_is_backward_compatible():
     )
 
 
-def test_k3_output_costs_25x_the_default():
-    """Guards the specific mistake: K3 quietly billed at 7B rates."""
+def test_k3_still_costs_far_more_than_the_7b_default():
+    """Guards the original mistake: K3 quietly billing at 7B rates. It pins 72
+    GPUs, so whatever the headline price, it must never fall back to $0.60."""
     k3_out = rates_for_model("kimi-k3")[1]
-    assert k3_out == 25 * INFERENCE_OUTPUT_CENTS_PER_MTOK
+    assert k3_out >= 10 * INFERENCE_OUTPUT_CENTS_PER_MTOK
 
 
 def test_every_override_is_dearer_than_the_default():
@@ -64,21 +71,20 @@ def test_every_override_is_dearer_than_the_default():
 
 def test_a_realistic_k3_reasoning_request():
     # K3 thinks before answering, so completions dominate: 500 in / 800 out.
-    # 500*300/1M = 0.15c, 800*1500/1M = 1.20c => 1.35c, rounds to 1c.
+    # 500*200/1M = 0.10c, 800*1000/1M = 0.80c => 0.90c, rounds to 1c.
     assert inference_cost_cents(500, 800, model="kimi-k3") == 1
 
 
 def test_rounding_is_symmetric_not_systematically_in_the_users_favour():
     """Integer-cent billing must not bleed revenue on every request."""
-    # 1.35c -> 1c (down), 1.65c -> 2c (up): half-up, so it averages out.
-    below = inference_cost_cents(500, 800, model="kimi-k3")       # 1.35c
-    above = inference_cost_cents(500, 1000, model="kimi-k3")      # 1.65c
-    assert below == 1 and above == 2
+    # 0.90c -> 1c (up), 1.40c -> 1c (down): half-up, so it averages out.
+    assert inference_cost_cents(500, 800, model="kimi-k3") == 1    # 0.90c
+    assert inference_cost_cents(0, 150_000, model="kimi-k3") == 150  # exact, 1500c
 
 
 def test_large_k3_request_bills_proportionally():
-    # 100k output at $15/1M = $1.50 = 150 cents.
-    assert inference_cost_cents(0, 100_000, model="kimi-k3") == 150
+    # 100k output at $10/1M = $1.00 = 100 cents.
+    assert inference_cost_cents(0, 100_000, model="kimi-k3") == 100
 
 
 def test_gateway_passes_the_model_on_both_billing_paths():
