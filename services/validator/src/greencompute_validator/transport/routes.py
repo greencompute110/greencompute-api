@@ -863,14 +863,49 @@ def catalog_status() -> dict:
             running_by_model[model_id] = running_by_model.get(model_id, 0) + 1
             serving_miners_by_model.setdefault(model_id, []).append(state.hotkey)
 
+    # Distributed models are NOT in inference_assignments — those track
+    # single-node placements. A distributed replica is a set of rank rows in
+    # `deployments`, so without this a model served across 8 nodes reports
+    # running_replicas=0 and every UI shows it as cold/unavailable while it is
+    # happily answering requests.
+    distributed_by_model: dict[str, int] = {}
+    distributed_miners: dict[str, set[str]] = {}
+    try:
+        by_replica: dict[str, list[dict]] = {}
+        for row in service.repository.list_distributed_replica_rows():
+            mn = row.get("multi_node") or {}
+            replica_id = mn.get("replica_id")
+            if replica_id:
+                by_replica.setdefault(replica_id, []).append(row)
+        for ranks in by_replica.values():
+            # Only count a replica that is fully up: one dead rank means the
+            # whole replica cannot serve (there is no partial serving mode).
+            if not ranks or any(r.get("state") != "ready" for r in ranks):
+                continue
+            model_id = (ranks[0].get("multi_node") or {}).get("model_id")
+            if not model_id:
+                continue
+            distributed_by_model[model_id] = distributed_by_model.get(model_id, 0) + 1
+            for r in ranks:
+                if r.get("hotkey"):
+                    distributed_miners.setdefault(model_id, set()).add(r["hotkey"])
+    except Exception:  # never let status reporting break the public endpoint
+        logger.exception("catalog_status: distributed replica count failed")
+
     rows: list[dict] = []
     for entry in service.repository.list_catalog_entries(visibility="public"):
         windows = service.repository.read_demand_windows(entry.model_id)
         rows.append({
             "model_id": entry.model_id,
             "display_name": entry.display_name,
-            "running_replicas": running_by_model.get(entry.model_id, 0),
-            "serving_miners_count": len(serving_miners_by_model.get(entry.model_id, [])),
+            "running_replicas": (
+                running_by_model.get(entry.model_id, 0)
+                + distributed_by_model.get(entry.model_id, 0)
+            ),
+            "serving_miners_count": (
+                len(serving_miners_by_model.get(entry.model_id, []))
+                + len(distributed_miners.get(entry.model_id, set()))
+            ),
             "rpm_10m": round(windows["rpm_10m"], 2),
             "rpm_1h": round(windows["rpm_1h"], 2),
         })
