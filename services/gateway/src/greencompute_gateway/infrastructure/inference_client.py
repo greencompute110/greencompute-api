@@ -26,6 +26,31 @@ class InferenceBadResponseError(InferenceUpstreamError):
     pass
 
 
+#: Models that legitimately need longer than the 120s default.
+#:
+#: 120s suits 7B-class models. Reasoning models emit chain-of-thought before the
+#: answer, so one Kimi K3 completion runs 1-3 minutes and was being cut off at
+#: exactly 120.2s with a 502 no matter what timeout the caller set. Streaming hid
+#: it -- the socket keeps reading -- so only non-streaming calls, the shape most
+#: agent frameworks send, ever failed.
+#:
+#: Deliberately per-model rather than a global bump: /v1/chat/completions is a sync
+#: endpoint served from the anyio threadpool (40 threads), and K3 admits 32
+#: concurrent requests. A blanket 600s would let K3 alone pin 32 of those threads
+#: for ten minutes and starve every other model, so the long timeout is scoped to
+#: the models that need it. Keys are matched with the same normalisation as
+#: billing, so "moonshotai/Kimi-K3" and "kimi-k3" behave identically.
+MODEL_UPSTREAM_TIMEOUT_SECONDS: dict[str, float] = {
+    "kimi-k3": 600.0,
+}
+
+
+def _normalize_model_id(model: str | None) -> str:
+    if not model:
+        return ""
+    return model.rsplit("/", 1)[-1].strip().lower()
+
+
 class HttpInferenceClient:
     def __init__(
         self,
@@ -40,6 +65,12 @@ class HttpInferenceClient:
             os.getenv("GREENCOMPUTE_HEALTH_TIMEOUT_SECONDS", "2.0")
         )
         self.miner_auth_secret = miner_auth_secret or os.getenv("GREENCOMPUTE_INFERENCE_AUTH_SECRET") or None
+
+    def _timeout_for(self, payload: ChatCompletionRequest) -> float:
+        """Upstream timeout for this request, widened for slow reasoning models."""
+        override = MODEL_UPSTREAM_TIMEOUT_SECONDS.get(_normalize_model_id(getattr(payload, "model", None)))
+        # An explicitly-configured timeout still wins, so operators keep the final say.
+        return max(override, self.upstream_timeout_seconds) if override else self.upstream_timeout_seconds
 
     def _base_headers(self, request_id: str | None) -> dict[str, str]:
         h: dict[str, str] = {"content-type": "application/json"}
@@ -88,7 +119,7 @@ class HttpInferenceClient:
             method="POST",
         )
         try:
-            with request.urlopen(upstream, timeout=self.upstream_timeout_seconds) as response:  # noqa: S310
+            with request.urlopen(upstream, timeout=self._timeout_for(payload)) as response:  # noqa: S310
                 body = json.loads(response.read().decode())
         except (TimeoutError, socket.timeout) as exc:
             raise InferenceTimeoutError(
@@ -141,7 +172,7 @@ class HttpInferenceClient:
             method="POST",
         )
         try:
-            with request.urlopen(upstream, timeout=self.upstream_timeout_seconds) as response:  # noqa: S310
+            with request.urlopen(upstream, timeout=self._timeout_for(payload)) as response:  # noqa: S310
                 while True:
                     line = response.readline()
                     if not line:
