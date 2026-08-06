@@ -10,7 +10,7 @@ changing two lines.
 | **Model ID** | `kimi-k3` |
 | **Auth** | `Authorization: Bearer <YOUR_KEY>` |
 | **Price** | **$2.00 / 1M input · $10.00 / 1M output** |
-| **Context** | 8,192 tokens |
+| **Context** | 32,768 tokens |
 
 At $2/$10 this is the cheapest Kimi K3 available anywhere — the reference price
 across other providers is $3/$15, and the next cheapest endpoint is $2.90/$14.
@@ -82,12 +82,27 @@ A 300-token reply takes roughly 12 seconds; a long reasoning answer can take
 client = OpenAI(base_url="...", api_key="...", timeout=600.0)
 ```
 
-### 3. Concurrency is capped at 32 in-flight requests
+### 3. Concurrency is capped at 8 in-flight requests
 
 Beyond that, requests queue. If you are fanning out an agent swarm, keep a
-semaphore at or below 32 rather than letting the queue absorb it.
+semaphore at or below 8 rather than letting the queue absorb it.
 
-### 4. Tool calling works — the parsers are enabled
+### 4. Long prompts cost prefill time on top of generation
+
+The ~25 tok/s above is *decode* speed and is independent of prompt size, but a
+large prompt must be read before generation starts. Measured end-to-end with a
+short answer:
+
+| prompt | total |
+|---|---|
+| ~1.4k tokens | ~14 s |
+| ~15k tokens | ~23 s |
+| ~27k tokens | ~28 s |
+
+So a long-context request is dominated by prefill, and a long *answer* is
+dominated by decode. Budget for both.
+
+### 5. Tool calling works — the parsers are enabled
 
 `--tool-call-parser kimi_k3` and `--enable-auto-tool-choice` are on, so
 standard OpenAI-style `tools` / `tool_choice` work. (Without those the model
@@ -176,7 +191,12 @@ A request against an empty balance returns **HTTP 402**.
 |---|---|---|
 | `402` | No balance | Top up |
 | `409` | Model temporarily unavailable | Retry with backoff — the replica may be rebuilding (~20–40 min after a node fault) |
-| `502` | Upstream timeout | Lower `max_tokens` or retry |
+| `502` | Upstream timeout | Retry. K3 requests are allowed 600s, so this is rare |
+
+`no healthy deployment available` is occasionally returned for a few seconds
+immediately after a replica finishes rebuilding, even though the model is up. It
+fails fast (~3s) rather than hanging, and a single retry succeeds — so treat it
+as retryable rather than as an outage.
 
 **On availability, honestly:** K3 runs as a single replica across 72 GPUs with
 no redundancy. A node fault takes it offline and it self-heals, but recovery
