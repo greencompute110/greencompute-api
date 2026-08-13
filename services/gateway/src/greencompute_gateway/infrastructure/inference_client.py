@@ -40,8 +40,13 @@ class InferenceBadResponseError(InferenceUpstreamError):
 #: for ten minutes and starve every other model, so the long timeout is scoped to
 #: the models that need it. Keys are matched with the same normalisation as
 #: billing, so "moonshotai/Kimi-K3" and "kimi-k3" behave identically.
+#: 1800s, not 600s, because K3 now serves up to 115k-token prompts. Prefill on a
+#: ~104k prompt alone ran past 340s across 9 pipeline stages before generation
+#: starts, so 600s would cut off exactly the long-context requests the larger
+#: max_model_len exists to serve. Bounded blast radius: K3 admits 8 concurrent
+#: requests, so at worst 8 of the ~40 threadpool threads are held.
 MODEL_UPSTREAM_TIMEOUT_SECONDS: dict[str, float] = {
-    "kimi-k3": 600.0,
+    "kimi-k3": 1800.0,
 }
 
 

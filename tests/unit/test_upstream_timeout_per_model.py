@@ -22,8 +22,10 @@ def _client(**kw):
 
 
 def test_k3_gets_long_enough_to_finish_thinking():
-    """A K3 completion runs 1-3 minutes; 120s guarantees a 502."""
-    assert _client()._timeout_for(_Payload("kimi-k3")) == 600.0
+    """A K3 completion runs 1-3 minutes; 120s guarantees a 502. Long-context
+    requests are far slower still -- a ~104k-token prefill alone exceeded 340s --
+    so the budget has to cover prefill AND generation, not just generation."""
+    assert _client()._timeout_for(_Payload("kimi-k3")) == 1800.0
 
 
 def test_vendor_prefixed_id_gets_the_same_timeout():
@@ -31,8 +33,8 @@ def test_vendor_prefixed_id_gets_the_same_timeout():
     missed the table, the identical request would 502 purely because of how the
     caller spelled the model -- the same normalisation bug already fixed in billing."""
     c = _client()
-    assert c._timeout_for(_Payload("moonshotai/Kimi-K3")) == 600.0
-    assert c._timeout_for(_Payload("MoonshotAI/KIMI-K3")) == 600.0
+    assert c._timeout_for(_Payload("moonshotai/Kimi-K3")) == 1800.0
+    assert c._timeout_for(_Payload("MoonshotAI/KIMI-K3")) == 1800.0
 
 
 def test_other_models_keep_the_short_default():
@@ -46,8 +48,8 @@ def test_other_models_keep_the_short_default():
 def test_operator_configured_timeout_is_never_shortened():
     """An operator who sets a longer global timeout keeps it -- the per-model
     entry raises the floor, it does not cap."""
-    assert _client(upstream_timeout_seconds=900.0)._timeout_for(_Payload("kimi-k3")) == 900.0
-    assert _client(upstream_timeout_seconds=900.0)._timeout_for(_Payload("qwen2.5-7b")) == 900.0
+    assert _client(upstream_timeout_seconds=2400.0)._timeout_for(_Payload("kimi-k3")) == 2400.0
+    assert _client(upstream_timeout_seconds=2400.0)._timeout_for(_Payload("qwen2.5-7b")) == 2400.0
 
 
 def test_health_checks_stay_fast():
