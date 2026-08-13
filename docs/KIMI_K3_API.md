@@ -10,7 +10,7 @@ changing two lines.
 | **Model ID** | `kimi-k3` |
 | **Auth** | `Authorization: Bearer <YOUR_KEY>` |
 | **Price** | **$2.00 / 1M input · $10.00 / 1M output** |
-| **Context** | 32,768 tokens |
+| **Context** | 49,152 tokens |
 
 At $2/$10 this is the cheapest Kimi K3 available anywhere — the reference price
 across other providers is $3/$15, and the next cheapest endpoint is $2.90/$14.
@@ -74,12 +74,13 @@ thinking = getattr(msg, "reasoning", None)   # usually hide this
 A 300-token reply takes roughly 12 seconds; a long reasoning answer can take
 1–2 minutes. This is a 2.8T model on consumer GPUs — the trade for the price.
 
-- **Set a generous client timeout (600s).** The default 30–60s in most SDKs
-  and agent frameworks will abort mid-generation.
+- **Set a generous client timeout (1800s).** The default 30–60s in most SDKs
+  and agent frameworks will abort mid-generation, and a large prompt can spend
+  over a minute in prefill before the first token appears.
 - **Stream** if a human is waiting, so they see progress.
 
 ```python
-client = OpenAI(base_url="...", api_key="...", timeout=600.0)
+client = OpenAI(base_url="...", api_key="...", timeout=1800.0)
 ```
 
 ### 3. Concurrency is capped at 8 in-flight requests
@@ -90,19 +91,33 @@ semaphore at or below 8 rather than letting the queue absorb it.
 ### 4. Long prompts cost prefill time on top of generation
 
 The ~25 tok/s above is *decode* speed and is independent of prompt size, but a
-large prompt must be read before generation starts. Measured end-to-end with a
-short answer:
+large prompt must be read before generation starts, and prefill cost grows
+faster than linearly. Measured end-to-end with a short answer:
 
 | prompt | total |
 |---|---|
 | ~1.4k tokens | ~14 s |
-| ~15k tokens | ~23 s |
-| ~27k tokens | ~28 s |
+| ~25k tokens | ~80 s |
+| ~40k tokens | ~60–90 s |
 
-So a long-context request is dominated by prefill, and a long *answer* is
+Timings vary run to run by roughly 2× at the top of the range, so treat these as
+rough. A long-context request is dominated by prefill; a long *answer* is
 dominated by decode. Budget for both.
 
-### 5. Tool calling works — the parsers are enabled
+### 5. For large documents, chunk rather than sending one huge prompt
+
+Splitting a large input into ~40k-token chunks and combining the results is
+faster end-to-end than one maximal request, uses all 8 concurrent slots instead
+of serialising on one, and keeps any single failure small. Because prefill grows
+super-linearly, two 40k requests finish sooner than one 80k request would.
+
+A prompt over the 49,152-token limit is rejected in well under a second, so it
+costs you nothing to retry smaller — but note the error text currently reads
+`upstream connection failed` rather than naming the real cause, so a rejection
+that returns instantly almost always means "prompt too long", not a network
+fault.
+
+### 6. Tool calling works — the parsers are enabled
 
 `--tool-call-parser kimi_k3` and `--enable-auto-tool-choice` are on, so
 standard OpenAI-style `tools` / `tool_choice` work. (Without those the model
@@ -144,7 +159,7 @@ llm = ChatOpenAI(
     model="kimi-k3",
     base_url="https://api.green-compute.com/v1",
     api_key="YOUR_KEY",
-    timeout=600,
+    timeout=1800,
     max_tokens=600,
 )
 ```
@@ -191,7 +206,7 @@ A request against an empty balance returns **HTTP 402**.
 |---|---|---|
 | `402` | No balance | Top up |
 | `409` | Model temporarily unavailable | Retry with backoff — the replica may be rebuilding (~20–40 min after a node fault) |
-| `502` | Upstream timeout | Retry. K3 requests are allowed 600s, so this is rare |
+| `502` | Upstream timeout | Retry. K3 requests are allowed 1800s, so this is rare |
 
 `no healthy deployment available` is occasionally returned for a few seconds
 immediately after a replica finishes rebuilding, even though the model is up. It
