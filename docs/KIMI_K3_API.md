@@ -220,6 +220,36 @@ a fallback model if your agent needs guaranteed uptime.
 
 ---
 
+## Cursor
+
+Cursor can use K3 as a custom OpenAI-compatible model.
+
+1. **Settings → Models → OpenAI API Key**
+2. Paste your GreenCompute key
+3. Enable **Override OpenAI Base URL** and set it to `https://api.green-compute.com/v1`
+4. Under **Model Names**, add `kimi-k3`
+5. Click **Verify**
+
+What works and what does not, honestly:
+
+| | |
+|---|---|
+| Chat / Ask | ✅ |
+| Agent tool calls | ✅ |
+| Tab autocomplete | ❌ — uses Cursor's own models, a custom base URL cannot change it |
+| Codebase indexing | ❌ — same reason |
+
+**Context is the real constraint.** K3 accepts 49,152 tokens; Cursor's own models
+run far larger and it will happily attach more of your codebase than that. Keep
+`@`-references tight — a few files, not whole folders — or requests will be
+rejected for length.
+
+**Expect it to feel slow.** ~25 tok/s decode, and a reasoning model thinks before
+answering, so a substantial edit runs a minute or more. Fine for "explain this",
+"review this function", or a tricky bug; frustrating for rapid back-and-forth.
+
+---
+
 ## Other models
 
 The same key and base URL serve the rest of the catalog at $0.20 / 1M input and
@@ -232,5 +262,6 @@ curl https://validator.green-compute.com/validator/v1/catalog-status
 ```
 `running_replicas: 0` means that model is not currently being served.
 
-> Note: the gateway does not implement `GET /v1/models`. Clients that probe it
-> for discovery will 404 — set the model name explicitly instead.
+`GET /v1/models` returns the servable models in OpenAI format, so tools that
+discover models from the endpoint (Cursor, aider, Continue) work without extra
+configuration.
