@@ -1432,6 +1432,13 @@ def list_models(
     for workload in service.control_plane.list_workloads():
         if getattr(workload, "kind", None) is not None and str(workload.kind).lower().rsplit(".", 1)[-1] != "inference":
             continue
+        # `public` is the same visibility flag the model catalog uses. Without it
+        # this endpoint published every inference workload ever created -- 21 of
+        # 25 were internal test artifacts (ssrf-poc-workload, sqli-test2,
+        # file-env-leak...), which would have appeared in every customer's model
+        # picker in Cursor.
+        if not getattr(workload, "public", False):
+            continue
         name = (workload.name or "").strip()
         if not name or name in seen:
             continue

@@ -49,3 +49,11 @@ def test_ids_are_deduplicated_and_stable():
     src = _source()
     assert "in seen" in src
     assert "sorted(seen)" in src
+
+
+def test_only_public_workloads_are_listed():
+    """Without this, /v1/models published every inference workload ever created:
+    21 of 25 were internal test artifacts (ssrf-poc-workload, sqli-test2,
+    file-env-leak...) that would show up in every customer's Cursor model picker.
+    `public` is the same flag the catalog uses for visibility."""
+    assert '"public", False' in _source()
