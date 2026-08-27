@@ -57,3 +57,10 @@ def test_only_public_workloads_are_listed():
     file-env-leak...) that would show up in every customer's Cursor model picker.
     `public` is the same flag the catalog uses for visibility."""
     assert '"public", False' in _source()
+
+
+def test_external_models_appear_in_discovery():
+    """Externally-hosted models have no workload row. Without an explicit add,
+    discovery-driven clients (Cursor, aider) never list them and report the
+    endpoint as not offering the model, even though inference works."""
+    assert "_external_model_upstreams" in _source()

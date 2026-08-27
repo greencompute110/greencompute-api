@@ -1445,6 +1445,13 @@ def list_models(
         created = getattr(workload, "created_at", None)
         seen[name] = int(created.timestamp()) if created is not None else 0
 
+    # Externally-hosted models have no workload row, so they must be added
+    # explicitly or discovery-driven clients (Cursor, aider) never see them and
+    # report the endpoint as not offering the model.
+    from greencompute_gateway.application.services import _external_model_upstreams
+    for model_id in _external_model_upstreams():
+        seen.setdefault(model_id, 0)
+
     return {
         "object": "list",
         "data": [
