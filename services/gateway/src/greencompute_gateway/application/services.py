@@ -1555,7 +1555,7 @@ class GatewayService:
         if not self._is_external(deployment):
             self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
         else:
-            logger.warning("external upstream failed model=%s: %s", routing.get("model"), exc)
+            log.warning("external upstream failed model=%s: %s", routing.get("model"), exc)
         self.repository.record_routing_decision(
             {
                 **routing,
