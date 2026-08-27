@@ -1,6 +1,7 @@
 import base64
 import logging
 import os
+from time import monotonic
 from urllib import request as urlrequest
 from datetime import UTC, datetime
 
@@ -872,14 +873,37 @@ def _external_upstreams() -> dict[str, str]:
     return out
 
 
-def _external_is_healthy(url: str) -> bool:
-    """Cheap liveness probe. Short timeout: this is a public, unauthenticated
-    status endpoint and must never hang on a wedged upstream."""
+#: model_id -> (checked_at_monotonic, healthy). Probes are CACHED because
+#: catalog-status is polled by every open browser tab (10s interval) and the
+#: upstream runs max_running_requests=1: probing per request queued health checks
+#: behind each other and behind real inference, so the badge flapped
+#: hot/cold/hot. One probe per TTL is both stable and far kinder to the upstream.
+_EXTERNAL_HEALTH_TTL_S = 30.0
+_external_health_cache: dict[str, tuple[float, bool]] = {}
+
+
+def _external_is_healthy(url: str, model_id: str = "") -> bool:
+    """Cached liveness probe.
+
+    Timeout is 8s, not 3s: the upstream's /health takes ~1.1s idle and can queue
+    behind an in-flight generation, and a 3s ceiling turned a busy-but-healthy
+    model into a 'cold' badge. Never raises -- this endpoint is public and
+    unauthenticated, so a wedged upstream must not hang or 500 it.
+    """
+    key = model_id or url
+    now = monotonic()
+    cached = _external_health_cache.get(key)
+    if cached is not None and (now - cached[0]) < _EXTERNAL_HEALTH_TTL_S:
+        return cached[1]
     try:
-        with urlrequest.urlopen(f"{url}/health", timeout=3) as resp:  # noqa: S310
-            return 200 <= getattr(resp, "status", 200) < 300
+        with urlrequest.urlopen(f"{url}/health", timeout=8) as resp:  # noqa: S310
+            healthy = 200 <= getattr(resp, "status", 200) < 300
     except Exception:
-        return False
+        # Keep the last good answer for one TTL rather than flapping to cold on
+        # a single slow probe; only a sustained failure flips the badge.
+        healthy = False if cached is None else (cached[1] and (now - cached[0]) < _EXTERNAL_HEALTH_TTL_S * 2)
+    _external_health_cache[key] = (now, healthy)
+    return healthy
 
 
 @router.get("/validator/v1/catalog-status")
@@ -933,7 +957,7 @@ def catalog_status() -> dict:
         windows = service.repository.read_demand_windows(entry.model_id)
         ext_url = external.get(entry.model_id.lower())
         if ext_url is not None and entry.model_id not in external_health:
-            external_health[entry.model_id] = _external_is_healthy(ext_url)
+            external_health[entry.model_id] = _external_is_healthy(ext_url, entry.model_id)
         ext_running = 1 if external_health.get(entry.model_id) else 0
         rows.append({
             "model_id": entry.model_id,

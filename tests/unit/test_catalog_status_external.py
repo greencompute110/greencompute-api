@@ -52,13 +52,23 @@ def test_parses_the_same_format_as_the_gateway():
     assert _with(f, "garbage") == {}
 
 
-def test_health_probe_is_short_and_never_raises():
+def test_health_probe_never_raises_and_is_bounded():
     """catalog-status is public and unauthenticated: a wedged upstream must not
-    hang it or 500 it."""
-    f = _load("_external_is_healthy")["_external_is_healthy"]
+    hang it or 500 it. 8s, not 3s -- the upstream's /health takes ~1.1s idle and
+    queues behind in-flight generation, and 3s turned busy-but-healthy into
+    'cold'."""
     src = _source_of("_external_is_healthy")
-    assert "timeout=3" in src
-    assert f("http://127.0.0.1:9") is False
+    assert "timeout=8" in src
+    assert "except Exception" in src
+
+
+def test_health_probe_is_cached_to_stop_badge_flapping():
+    """catalog-status is polled by every open browser tab every 10s and the
+    upstream serves ONE request at a time. Probing per call queued health checks
+    behind real inference and the badge flapped hot/cold/hot."""
+    src = _source_of("_external_is_healthy")
+    assert "_external_health_cache" in src
+    assert "_EXTERNAL_HEALTH_TTL_S" in src
 
 
 def test_status_counts_external_models_and_flags_them():
