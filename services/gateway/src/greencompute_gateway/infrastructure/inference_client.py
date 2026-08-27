@@ -47,6 +47,9 @@ class InferenceBadResponseError(InferenceUpstreamError):
 #: requests, so at worst 8 of the ~40 threadpool threads are held.
 MODEL_UPSTREAM_TIMEOUT_SECONDS: dict[str, float] = {
     "kimi-k3": 1800.0,
+    # A 1M-token prefill measured ~1476s to first token, so the ceiling has to
+    # clear that with room for generation on top.
+    "k3-coder": 3600.0,
 }
 
 

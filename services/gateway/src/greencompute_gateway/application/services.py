@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import secrets
 from collections.abc import Iterator
@@ -64,6 +65,32 @@ from greencompute_gateway.infrastructure.inference_client import (
 )
 from greencompute_gateway.infrastructure.repository import GatewayRepository
 from greencompute_gateway.transport.security import metrics as gateway_metrics
+
+
+def _external_model_upstreams() -> dict[str, str]:
+    """model_id -> base URL for models served OUTSIDE the miner fleet.
+
+    Some models run on hardware the platform does not manage (e.g. a 48-GPU
+    SGLang cluster with its own distributed runtime). They still belong on the
+    public OpenAI-compatible surface so callers select them by `model` exactly
+    like any catalog model -- one base URL, many models, rather than a bespoke
+    path or subdomain per deployment.
+
+    Configured as GREENCOMPUTE_EXTERNAL_MODEL_UPSTREAMS="id=url,id2=url2".
+    Routing them here rather than through a separate proxy keeps API-key auth,
+    the balance gate, per-token billing and the streaming path identical.
+    """
+    raw = os.getenv("GREENCOMPUTE_EXTERNAL_MODEL_UPSTREAMS", "")
+    out: dict[str, str] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        model_id, _, url = item.partition("=")
+        model_id, url = model_id.strip().lower(), url.strip().rstrip("/")
+        if model_id and url:
+            out[model_id] = url
+    return out
 
 
 class InsufficientBalanceForRentalError(Exception):
@@ -1357,6 +1384,24 @@ class GatewayService:
         admin: bool = False,
     ) -> tuple[list[DeploymentRecord], dict]:
         """Return all healthy deployments in round-robin order, plus routing metadata."""
+        # Externally-hosted models resolve to a synthetic record before any
+        # workload lookup: there is no miner, deployment row, or health probe
+        # behind them. Everything downstream (billing, streaming, per-model
+        # timeouts) treats them like any other deployment because it only ever
+        # reads `.endpoint`.
+        external = _external_model_upstreams().get((request.model or "").strip().lower())
+        if external:
+            record = DeploymentRecord(
+                workload_id=f"external:{request.model}",
+                state=DeploymentState.READY,
+                ready_instances=1,
+                endpoint=external,
+            )
+            return [record], {
+                "matched_by": "external_upstream",
+                "model": request.model,
+                "host": self._normalize_host(routed_host),
+            }
         workload, routing = self.resolve_workload_reference(request.model, routed_host=routed_host)
         # Authorization: a caller may only invoke a workload they own, one shared
         # with them, or a public one. Otherwise report it as an unknown model so
