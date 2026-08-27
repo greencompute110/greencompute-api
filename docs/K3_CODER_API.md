@@ -76,22 +76,29 @@ print(resp.choices[0].message.content)
 
 ## Read this before wiring up an agent
 
-### 1. K3 is a reasoning model — budget `max_tokens` generously
+### 1. It is a reasoning model — `max_tokens` must cover thinking AND the answer
 
-K3 *thinks* before it answers. That thinking is generated as tokens, and if
-`max_tokens` cuts it off mid-thought you get **no answer at all** — `content`
-comes back holding raw chain-of-thought and `reasoning` comes back empty.
+The model thinks before it answers, and the thinking is generated as tokens that
+count against `max_tokens`. If the budget runs out mid-thought you get
+`finish_reason: "length"` and **completely empty `content`** — the model never
+reached the answer. Measured: a 700-token budget on a simple "write an LRU cache"
+request produced 2,867 characters of reasoning and **zero** characters of answer.
 
-- **Use `max_tokens` ≥ 600.** At 220 the model never finished thinking.
-- The response splits cleanly when it completes:
-  - `message.content` → the final answer
-  - `message.reasoning` → the chain of thought
+- **Use `max_tokens` ≥ 2000.** Lower values routinely return nothing at all.
+- The thinking arrives in **`reasoning_content`**, not `reasoning`:
 
 ```python
 msg = resp.choices[0].message
-answer = msg.content              # show this to the user
-thinking = getattr(msg, "reasoning", None)   # usually hide this
+answer   = msg.content                                  # may be EMPTY if truncated
+thinking = getattr(msg, "reasoning_content", None)      # usually hide this
+
+if not answer and resp.choices[0].finish_reason == "length":
+    ...  # raise max_tokens and retry — it ran out while thinking
 ```
+
+**Always check for empty `content` with `finish_reason: "length"`.** In an editor
+or agent loop this looks like the model stalling or repeating itself, when it is
+simply never getting far enough to answer.
 
 ### 2. Expect ~15 tokens/sec, so plan for slow responses
 
@@ -282,6 +289,16 @@ own models regardless of this setting.
 
 **It serves one request at a time.** If your editor fires a second call while one
 is running, it queues behind it.
+
+**Raise Cursor's max-tokens if you can.** The model spends tokens thinking before
+it answers, so a small budget returns empty completions that look like stalling or
+repetition. See section 1.
+
+**Start a fresh chat when a conversation gets long.** Context is cached, so a long
+session is cheap to resend — but decode slows sharply as occupancy grows. Measured
+on a real session: ~16 tok/s early, **~2.9 tok/s once the conversation reached
+~519,000 tokens**. A slow model plus a thinking budget that runs out is exactly the
+combination that produces empty or truncated answers.
 
 ---
 
