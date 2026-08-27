@@ -1,5 +1,7 @@
 import base64
 import logging
+import os
+from urllib import request as urlrequest
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Header, HTTPException, UploadFile, File, Form
@@ -849,6 +851,37 @@ def get_audit_hotkey() -> dict:
     return {"ss58_address": hotkey}
 
 
+def _external_upstreams() -> dict[str, str]:
+    """model_id -> base URL for models hosted outside the miner fleet.
+
+    Mirrors the gateway's map (same env var). The validator needs it so the
+    public catalog can show these models as available: they have no flux
+    assignment and no deployment rows, so without this they report
+    running_replicas=0 and every UI paints them cold while they serve fine.
+    """
+    raw = os.getenv("GREENCOMPUTE_EXTERNAL_MODEL_UPSTREAMS", "")
+    out: dict[str, str] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        mid, _, url = item.partition("=")
+        mid, url = mid.strip().lower(), url.strip().rstrip("/")
+        if mid and url:
+            out[mid] = url
+    return out
+
+
+def _external_is_healthy(url: str) -> bool:
+    """Cheap liveness probe. Short timeout: this is a public, unauthenticated
+    status endpoint and must never hang on a wedged upstream."""
+    try:
+        with urlrequest.urlopen(f"{url}/health", timeout=3) as resp:  # noqa: S310
+            return 200 <= getattr(resp, "status", 200) < 300
+    except Exception:
+        return False
+
+
 @router.get("/validator/v1/catalog-status")
 def catalog_status() -> dict:
     """Public — running replica counts + recent demand per catalog entry.
@@ -892,15 +925,24 @@ def catalog_status() -> dict:
     except Exception:  # never let status reporting break the public endpoint
         logger.exception("catalog_status: distributed replica count failed")
 
+    external = _external_upstreams()
+    external_health: dict[str, bool] = {}
+
     rows: list[dict] = []
     for entry in service.repository.list_catalog_entries(visibility="public"):
         windows = service.repository.read_demand_windows(entry.model_id)
+        ext_url = external.get(entry.model_id.lower())
+        if ext_url is not None and entry.model_id not in external_health:
+            external_health[entry.model_id] = _external_is_healthy(ext_url)
+        ext_running = 1 if external_health.get(entry.model_id) else 0
         rows.append({
             "model_id": entry.model_id,
             "display_name": entry.display_name,
+            "externally_hosted": ext_url is not None,
             "running_replicas": (
                 running_by_model.get(entry.model_id, 0)
                 + distributed_by_model.get(entry.model_id, 0)
+                + ext_running
             ),
             "serving_miners_count": (
                 len(serving_miners_by_model.get(entry.model_id, []))
