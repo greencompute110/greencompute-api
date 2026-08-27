@@ -1502,8 +1502,16 @@ class GatewayService:
     def _rewrite_model_for_upstream(
         self,
         request: ChatCompletionRequest,
+        deployment: DeploymentRecord | None = None,
     ) -> ChatCompletionRequest:
-        """Rewrite request.model from workload name to the actual HF model identifier."""
+        """Rewrite request.model from workload name to the actual HF model identifier.
+
+        External upstreams are exempt: they have no workload row, and the id the
+        caller sent is already the name their server publishes. Resolving them
+        here raised NoReadyDeploymentError("unknown model=...") on every call.
+        """
+        if deployment is not None and self._is_external(deployment):
+            return request
         workload, _ = self.resolve_workload_reference(request.model)
         if workload.runtime and workload.runtime.model_identifier:
             return request.model_copy(update={"model": workload.runtime.model_identifier})
@@ -1516,7 +1524,7 @@ class GatewayService:
         *,
         request_id: str,
     ):
-        upstream_request = self._rewrite_model_for_upstream(request)
+        upstream_request = self._rewrite_model_for_upstream(request, deployment)
         return self.inference_client.invoke_chat_completion(deployment, upstream_request, request_id=request_id)
 
     def _invoke_upstream_stream(
@@ -1526,7 +1534,7 @@ class GatewayService:
         *,
         request_id: str,
     ) -> Iterator[str]:
-        upstream_request = self._rewrite_model_for_upstream(request)
+        upstream_request = self._rewrite_model_for_upstream(request, deployment)
         return self.inference_client.stream_chat_completion(deployment, upstream_request, request_id=request_id)
 
     @staticmethod
