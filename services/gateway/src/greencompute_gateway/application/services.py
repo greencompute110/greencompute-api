@@ -1529,8 +1529,17 @@ class GatewayService:
         upstream_request = self._rewrite_model_for_upstream(request)
         return self.inference_client.stream_chat_completion(deployment, upstream_request, request_id=request_id)
 
+    @staticmethod
+    def _is_external(deployment: DeploymentRecord) -> bool:
+        """External upstreams have no deployment row, so per-deployment health
+        bookkeeping must be skipped -- otherwise the control plane raises
+        KeyError on a synthetic id and that masks the REAL upstream error
+        behind a 500."""
+        return str(getattr(deployment, "workload_id", "") or "").startswith("external:")
+
     def _handle_upstream_success(self, deployment: DeploymentRecord, routing: dict) -> None:
-        self.control_plane.clear_deployment_health_failures(deployment.deployment_id)
+        if not self._is_external(deployment):
+            self.control_plane.clear_deployment_health_failures(deployment.deployment_id)
         self.repository.record_routing_decision(
             {
                 **routing,
@@ -1543,7 +1552,10 @@ class GatewayService:
 
     def _handle_upstream_failure(self, deployment: DeploymentRecord, routing: dict, exc: RuntimeError) -> None:
         failure_class = self._classify_inference_error(exc)
-        self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
+        if not self._is_external(deployment):
+            self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
+        else:
+            logger.warning("external upstream failed model=%s: %s", routing.get("model"), exc)
         self.repository.record_routing_decision(
             {
                 **routing,
