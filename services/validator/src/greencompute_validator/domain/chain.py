@@ -55,6 +55,27 @@ def _restore_logging() -> None:
         root.propagate = False
 
 
+def _silence_bittensor_logging(bt) -> None:
+    """Quieten the SDK across major versions.
+
+    bittensor < 11 exposed ``bt.logging.off()``. v11 REMOVED it and raises on
+    attribute access ("bittensor.logging was removed in v11"). That exception
+    propagated out of every validator worker-loop iteration, which silently
+    stopped audit-report publishing for ~30 hours: the loop catches per-iteration
+    errors, so /healthz stayed "ok" and only `worker_last_error` on /readyz
+    showed anything wrong.
+
+    bittensor is not version-pinned, so a rebuild can move this under us again --
+    hence feature detection rather than a version check.
+    """
+    try:
+        bt.logging.off()
+    except Exception:  # noqa: BLE001 - any failure just means "no legacy API"
+        # v11+: the SDK logs through the standard 'bittensor' logger namespace.
+        logging.getLogger("bittensor").setLevel(logging.CRITICAL)
+        logging.getLogger("bittensor").propagate = False
+
+
 class BittensorChainClient:
     """Wraps substrate-interface calls to the Bittensor chain.
 
@@ -83,7 +104,7 @@ class BittensorChainClient:
         if self._bt is not None:
             return self._bt
         import bittensor as bt  # noqa: PLC0415
-        bt.logging.off()
+        _silence_bittensor_logging(bt)
         _restore_logging()
         self._bt = bt
         return self._bt
