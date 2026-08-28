@@ -167,7 +167,13 @@ class BittensorChainClient:
         treat a None return as 'skip this tick, try again'."""
         subtensor = self._get_subtensor()
         try:
-            block = subtensor.get_current_block()
+            # bittensor v11 dropped Subtensor.get_current_block() in favour of the
+            # `.block` property. Feature-detect rather than version-gate: the SDK
+            # is range-pinned, not exact, and this call failing returns None --
+            # which the audit hook treats as "skip this tick", so a rename here
+            # silently stops audit-report publishing with nothing in the logs.
+            getter = getattr(subtensor, "get_current_block", None)
+            block = getter() if callable(getter) else getattr(subtensor, "block", None)
             return int(block) if block is not None else None
         except Exception:
             logger.exception("failed to fetch current block number")
