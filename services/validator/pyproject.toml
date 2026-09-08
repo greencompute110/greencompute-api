@@ -8,6 +8,10 @@ dependencies = [
   "uvicorn>=0.32,<1.0",
   "pydantic>=2.9,<3.0",
   "python-multipart>=0.0.9",
+  # Custodied provider-wallet mnemonics are sealed with AES-256-GCM
+  # (infrastructure/secretbox.py). Without this the validator refuses to
+  # provision managed wallets rather than storing keys in plaintext.
+  "cryptography>=43,<51",
   "greencompute-protocol",
   "greencompute-persistence",
 ]

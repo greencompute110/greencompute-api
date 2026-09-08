@@ -55,6 +55,17 @@ class Settings(BaseModel):
     bittensor_netuid: int = 16
     bittensor_wallet_path: str | None = None
     metagraph_sync_interval_seconds: float = Field(default=60.0, ge=5.0)
+    # --- Platform-managed provider wallets ---
+    # KILL-SWITCH, default OFF. When false the validator never generates a
+    # keypair, never burns a provider's TAO and never moves alpha, so the
+    # feature can ship dark and be enabled deliberately. Turning it on with no
+    # GREENCOMPUTE_WALLET_MASTER_KEY set fails loudly at construction rather
+    # than storing mnemonics in plaintext.
+    managed_wallets_enabled: bool = False
+    # How often the funding/registration/payout ticks run. Registration and
+    # payout submit extrinsics, so this is deliberately slow — nothing here is
+    # latency-sensitive and a tight loop just burns RPC quota.
+    managed_wallet_tick_interval_seconds: float = Field(default=300.0, ge=30.0)
     # Phase 2I — demand-reactive Flux
     # Target invocations/minute served by one replica; above this Flux
     # provisions more replicas of the model.
@@ -109,6 +120,8 @@ settings = Settings(
     bittensor_netuid=_int("GREENCOMPUTE_BITTENSOR_NETUID", "BITTENSOR_NETUID", 16),
     bittensor_wallet_path=_env("GREENCOMPUTE_BITTENSOR_WALLET_PATH", "BITTENSOR_WALLET_PATH") or None,
     metagraph_sync_interval_seconds=_float("GREENCOMPUTE_BITTENSOR_METAGRAPH_SYNC_INTERVAL", "BITTENSOR_METAGRAPH_SYNC_INTERVAL", 60.0),
+    managed_wallets_enabled=_bool("GREENCOMPUTE_MANAGED_WALLETS_ENABLED", "MANAGED_WALLETS_ENABLED", False),
+    managed_wallet_tick_interval_seconds=_float("GREENCOMPUTE_MANAGED_WALLET_TICK_INTERVAL_SECONDS", "MANAGED_WALLET_TICK_INTERVAL_SECONDS", 300.0),
     target_rpm_per_replica=_float("GREENCOMPUTE_FLUX_TARGET_RPM_PER_REPLICA", "FLUX_TARGET_RPM_PER_REPLICA", 30.0),
     flux_cooldown_seconds=_float("GREENCOMPUTE_FLUX_COOLDOWN_SECONDS", "FLUX_COOLDOWN_SECONDS", 300.0),
     node_inventory_timeout_seconds=_float("GREENCOMPUTE_NODE_INVENTORY_TIMEOUT_SECONDS", "NODE_INVENTORY_TIMEOUT_SECONDS", 900.0),
