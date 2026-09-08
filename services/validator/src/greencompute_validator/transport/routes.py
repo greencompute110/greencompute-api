@@ -25,6 +25,10 @@ from greencompute_validator.application.services import (
     UnknownProbeChallengeError,
     service,
 )
+from greencompute_validator.application.managed_wallet_factory import (
+    get_managed_wallet_service,
+)
+from greencompute_validator.domain.managed_wallet import is_valid_ss58
 from greencompute_validator.transport.security import (
     require_admin_api_key,
     require_miner_request,
@@ -388,7 +392,13 @@ _MAX_TOTAL_UPLOAD_BYTES = 60 * 1024 * 1024
 
 @router.post("/validator/v1/applications", status_code=201)
 async def submit_application(
-    hotkey: str = Form(...),
+    # Exactly one of `hotkey` or `payout_address` identifies the applicant:
+    #   * hotkey         — self-custody: they already registered their own neuron.
+    #   * payout_address — managed wallet: the platform creates and holds the
+    #     keys, registers the neuron, and forwards alpha to this address. This
+    #     is the path for providers who do not use Bittensor directly.
+    hotkey: str = Form(""),
+    payout_address: str = Form(""),
     signature: str = Form(""),
     organization: str = Form(""),
     energy_source: str = Form(""),
@@ -407,8 +417,30 @@ async def submit_application(
     files: list[UploadFile] = File(default=[]),
 ) -> dict:
     """Public endpoint — providers submit green-energy proof here."""
-    if not hotkey.strip():
-        raise HTTPException(status_code=400, detail="hotkey is required")
+    hotkey, payout_address = hotkey.strip(), payout_address.strip()
+    if not hotkey and not payout_address:
+        raise HTTPException(
+            status_code=400,
+            detail="either hotkey (self-custody) or payout_address (managed wallet) is required",
+        )
+    if hotkey and payout_address:
+        # Ambiguous: we would not know whether to register a neuron for them or
+        # whitelist the one they already have. Fail rather than guess.
+        raise HTTPException(
+            status_code=400, detail="provide either hotkey or payout_address, not both",
+        )
+    # Validate the payout address at the door. It is the only field the provider
+    # types by hand, and base58 has no redundancy — a single wrong character
+    # still looks like an address but sends their earnings somewhere
+    # unrecoverable. The blake2b checksum is what actually catches that.
+    if payout_address and not is_valid_ss58(payout_address):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "payout_address is not a valid Bittensor (SS58) address — "
+                "check for a mistyped or missing character"
+            ),
+        )
 
     parsed_details: dict = {}
     if details:
@@ -430,7 +462,7 @@ async def submit_application(
     # Does the applicant prove they control the hotkey? (Signed over the exact
     # `details` bytes.) Load-bearing once auto-approval is enabled.
     signature_verified = verify_application_signature(
-        hotkey.strip(), details.encode(), signature, nonce, timestamp, auth_mode
+        hotkey, details.encode(), signature, nonce, timestamp, auth_mode
     )
 
     # Buffer + size-guard the uploads once (used for both storage and review).
@@ -449,11 +481,12 @@ async def submit_application(
     app_status, reviewer_notes, reviewed_at, do_whitelist = "pending", "", None, False
     if validator_settings.review_enabled:
         app_status, reviewer_notes, reviewed_at, do_whitelist = _run_automated_review(
-            parsed_details, organization, hotkey.strip(), description, signature_verified, stored
+            parsed_details, organization, hotkey, description, signature_verified, stored
         )
 
     app = GreenEnergyApplication(
-        hotkey=hotkey.strip(),
+        hotkey=hotkey,
+        payout_address=payout_address or None,
         signature=signature,
         organization=organization,
         energy_source=energy_source,
@@ -604,7 +637,39 @@ def approve_application(
     if app is None:
         raise HTTPException(status_code=404, detail="application not found")
 
-    # Auto-add to whitelist
+    # Managed-wallet applicant: they have no hotkey to whitelist yet. Provision
+    # a custodied keypair and hand back the funding address. The hotkey is
+    # whitelisted later by the registration tick, once the neuron actually has
+    # a uid — whitelisting sooner would put a hotkey in the weight vector that
+    # _commit_weights_to_chain silently skips, so the provider would look
+    # onboarded and earn nothing.
+    if app.payout_address and not app.hotkey:
+        managed = get_managed_wallet_service()
+        if managed is None:
+            raise HTTPException(
+                status_code=503,
+                detail="managed wallets are not enabled on this validator",
+            )
+        try:
+            wallet = managed.provision_for_application(application_id, app.payout_address)
+        except Exception as exc:
+            logger.exception("wallet provisioning failed for application %s", application_id)
+            raise HTTPException(
+                status_code=502, detail=f"could not provision wallet: {exc}"
+            ) from exc
+        return {
+            "status": "approved",
+            "application_id": application_id,
+            "wallet_id": wallet.wallet_id,
+            "funding_address": wallet.coldkey_ss58,
+            "required_funding_tao": wallet.required_funding_tao,
+            "next_step": (
+                f"Send {wallet.required_funding_tao:.4f} TAO to {wallet.coldkey_ss58} "
+                "to cover neuron registration. Mining starts automatically once it arrives."
+            ),
+        }
+
+    # Self-custody applicant: whitelist the hotkey they registered themselves.
     entry = MinerWhitelistEntry(
         hotkey=app.hotkey,
         label=app.organization or app.hotkey[:16],
@@ -1093,3 +1158,121 @@ def reject_catalog_submission(
     if sub is None:
         raise HTTPException(status_code=404, detail="submission not found")
     return {"status": "rejected", "submission_id": submission_id}
+
+
+# --- Platform-managed provider wallets -------------------------------------
+#
+# The provider-facing half of custodied onboarding. A provider who applied with
+# a payout address (no Bittensor wallet of their own) uses these to learn where
+# to send their registration TAO and to watch their neuron come up.
+#
+# NOTE none of these ever return a mnemonic or ciphertext — `wallet_status`
+# builds an explicit read model rather than dumping the row.
+
+
+@router.get("/validator/v1/managed-wallets/status/{application_id}")
+def managed_wallet_status(application_id: str) -> dict:
+    """Public — funding address, amount outstanding, and mining state.
+
+    Keyed on application_id, which the applicant already knows from their
+    submission, so a provider can check progress without an API key. It exposes
+    only public addresses and amounts.
+    """
+    managed = get_managed_wallet_service()
+    if managed is None:
+        raise HTTPException(
+            status_code=503, detail="managed wallets are not enabled on this validator"
+        )
+    status = managed.wallet_status(application_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="no managed wallet for this application")
+    return status
+
+
+@router.get("/validator/v1/managed-wallets/{application_id}/payouts")
+def managed_wallet_payouts(application_id: str) -> list[dict]:
+    """Public — this provider's alpha payout history.
+
+    A provider must be able to reconcile what we sent against what arrived,
+    without asking us. Each row carries the on-chain extrinsic hash so they can
+    verify it independently.
+    """
+    managed = get_managed_wallet_service()
+    if managed is None:
+        raise HTTPException(
+            status_code=503, detail="managed wallets are not enabled on this validator"
+        )
+    wallet = service.repository.get_managed_wallet_by_application(application_id)
+    if wallet is None:
+        raise HTTPException(status_code=404, detail="no managed wallet for this application")
+    return [
+        {
+            "alpha_amount": p["alpha_amount"],
+            "destination": p["destination"],
+            "status": p["status"],
+            "extrinsic_hash": p["extrinsic_hash"],
+            "failure_reason": p["failure_reason"],
+            "created_at": p["created_at"].isoformat() if p["created_at"] else None,
+            "confirmed_at": p["confirmed_at"].isoformat() if p["confirmed_at"] else None,
+        }
+        for p in service.repository.list_managed_payouts(wallet.wallet_id)
+    ]
+
+
+@router.get("/validator/v1/managed-wallets")
+def list_managed_wallets(
+    state: str | None = None,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    """Admin — every managed wallet, or just those in one state.
+
+    Operational view for "who is stuck?". Summary fields only; the mnemonic
+    columns are never read here.
+    """
+    require_admin_api_key(authorization, x_api_key)
+    from greencompute_validator.domain.managed_wallet import WalletState
+
+    states = [state] if state else [s.value for s in WalletState]
+    out: list[dict] = []
+    for s in states:
+        for w in service.repository.list_managed_wallets_in_state(s):
+            out.append({
+                "wallet_id": w.wallet_id,
+                "application_id": w.application_id,
+                "state": str(w.state),
+                "funding_address": w.coldkey_ss58,
+                "hotkey": w.hotkey_ss58,
+                "uid": w.uid,
+                "payout_address": w.payout_address,
+                "required_funding_tao": w.required_funding_tao,
+                "funded_tao": w.funded_tao,
+                "total_paid_alpha": w.total_paid_alpha,
+                "failure_reason": w.failure_reason,
+                "created_at": w.created_at.isoformat() if w.created_at else None,
+            })
+    return out
+
+
+@router.post("/validator/v1/managed-wallets/tick")
+def managed_wallet_tick(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — run the three lifecycle ticks now instead of waiting.
+
+    Useful for onboarding a provider who has just funded their coldkey, and for
+    verifying the feature end-to-end after a deploy. Same code path as the
+    worker, so it is safe to call at any time.
+    """
+    require_admin_api_key(authorization, x_api_key)
+    managed = get_managed_wallet_service()
+    if managed is None:
+        raise HTTPException(
+            status_code=503, detail="managed wallets are not enabled on this validator"
+        )
+    return {
+        "funded": managed.tick_funding(),
+        "registered": managed.tick_registration(),
+        "paid": managed.tick_payouts(),
+    }

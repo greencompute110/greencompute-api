@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+import logging
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 
@@ -13,6 +14,8 @@ from greencompute_persistence.orm import (
     GreenEnergyApplicationORM,
     GreenEnergyAttachmentORM,
     LeaseAssignmentORM,
+    ManagedWalletORM,
+    ManagedWalletPayoutORM,
     MinerWhitelistORM,
     ModelCatalogORM,
     ProbeChallengeORM,
@@ -22,6 +25,11 @@ from greencompute_persistence.orm import (
     ValidatorCapabilityORM,
     WeightSnapshotORM,
     WorkloadORM,
+)
+from greencompute_validator.domain.managed_wallet import (
+    ManagedWallet,
+    WalletState,
+    can_transition,
 )
 from greencompute_protocol import (
     AuditReport,
@@ -37,6 +45,9 @@ from greencompute_protocol import (
     ScoreCard,
     WeightSnapshot,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class ValidatorRepository:
@@ -376,6 +387,7 @@ class ValidatorRepository:
         return GreenEnergyApplication(
             application_id=row.application_id,
             hotkey=row.hotkey,
+            payout_address=row.payout_address,
             signature=row.signature,
             organization=row.organization,
             energy_source=row.energy_source,
@@ -403,6 +415,7 @@ class ValidatorRepository:
             row = GreenEnergyApplicationORM(
                 application_id=app.application_id,
                 hotkey=app.hotkey,
+                payout_address=app.payout_address,
                 signature=app.signature,
                 organization=app.organization,
                 energy_source=app.energy_source,
@@ -1064,5 +1077,218 @@ class ValidatorRepository:
                     weights=r.weights,
                     created_at=r.created_at,
                 )
+                for r in rows
+            ]
+
+    # --- Platform-managed provider wallets -------------------------------
+    #
+    # Rows here hold custodied coldkey/hotkey mnemonics as ciphertext. Two rules
+    # apply to everything below:
+    #   * Never widen a return type to include the *_mnemonic_enc columns unless
+    #     the caller is about to sign an extrinsic. `list_wallets_in_state` is
+    #     deliberately the summary view because it feeds routes and logs.
+    #   * State changes go through `advance_wallet_state`, which enforces the
+    #     domain's transition table inside the transaction. A worker that writes
+    #     `state` directly can strand a funded wallet or re-pay a provider.
+
+    def _wallet_from_row(self, row: ManagedWalletORM) -> ManagedWallet:
+        return ManagedWallet(
+            wallet_id=row.wallet_id,
+            application_id=row.application_id,
+            coldkey_ss58=row.coldkey_ss58,
+            hotkey_ss58=row.hotkey_ss58,
+            coldkey_mnemonic_enc=row.coldkey_mnemonic_enc,
+            hotkey_mnemonic_enc=row.hotkey_mnemonic_enc,
+            payout_address=row.payout_address,
+            state=WalletState(row.state),
+            netuid=row.netuid,
+            required_funding_tao=row.required_funding_tao,
+            funded_tao=row.funded_tao,
+            uid=row.uid,
+            total_paid_alpha=row.total_paid_alpha,
+            created_at=row.created_at,
+            funded_at=row.funded_at,
+            registered_at=row.registered_at,
+            last_payout_at=row.last_payout_at,
+            failure_reason=row.failure_reason,
+        )
+
+    def create_managed_wallet(self, wallet: ManagedWallet) -> ManagedWallet:
+        with session_scope(self.session_factory) as session:
+            session.add(ManagedWalletORM(
+                wallet_id=wallet.wallet_id,
+                application_id=wallet.application_id,
+                coldkey_ss58=wallet.coldkey_ss58,
+                hotkey_ss58=wallet.hotkey_ss58,
+                coldkey_mnemonic_enc=wallet.coldkey_mnemonic_enc,
+                hotkey_mnemonic_enc=wallet.hotkey_mnemonic_enc,
+                payout_address=wallet.payout_address,
+                state=str(wallet.state),
+                netuid=wallet.netuid,
+                required_funding_tao=wallet.required_funding_tao,
+                funded_tao=wallet.funded_tao,
+                uid=wallet.uid,
+                total_paid_alpha=wallet.total_paid_alpha,
+                created_at=wallet.created_at,
+            ))
+        return wallet
+
+    def get_managed_wallet(self, wallet_id: str) -> ManagedWallet | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(ManagedWalletORM, wallet_id)
+            return self._wallet_from_row(row) if row else None
+
+    def get_managed_wallet_by_application(self, application_id: str) -> ManagedWallet | None:
+        with session_scope(self.session_factory) as session:
+            row = session.scalars(
+                select(ManagedWalletORM)
+                .where(ManagedWalletORM.application_id == application_id)
+                .order_by(ManagedWalletORM.created_at.desc())
+            ).first()
+            return self._wallet_from_row(row) if row else None
+
+    def list_managed_wallets_in_state(self, state: str) -> list[ManagedWallet]:
+        """Wallets a worker should act on this tick."""
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(ManagedWalletORM)
+                .where(ManagedWalletORM.state == str(state))
+                .order_by(ManagedWalletORM.created_at.asc())
+            ).all()
+            return [self._wallet_from_row(r) for r in rows]
+
+    def advance_managed_wallet(
+        self,
+        wallet_id: str,
+        target: WalletState,
+        *,
+        funded_tao: float | None = None,
+        uid: int | None = None,
+        failure_reason: str | None = None,
+        required_funding_tao: float | None = None,
+        now: datetime | None = None,
+    ) -> ManagedWallet | None:
+        """Move a wallet to ``target``, refusing illegal transitions.
+
+        The guard lives inside the transaction rather than in the worker so two
+        workers racing on the same row cannot both act — the loser reads the
+        already-advanced state and its transition is rejected. Returns None if
+        the wallet is gone or the edge is illegal; callers must treat None as
+        "someone else handled it", not as an error.
+        """
+        stamp = now or datetime.now(UTC)
+        with session_scope(self.session_factory) as session:
+            row = session.get(ManagedWalletORM, wallet_id)
+            if row is None:
+                return None
+            current = WalletState(row.state)
+            if not can_transition(current, target):
+                logger.warning(
+                    "refusing illegal managed-wallet transition %s -> %s for %s",
+                    current, target, wallet_id,
+                )
+                return None
+            row.state = str(target)
+            if funded_tao is not None:
+                row.funded_tao = funded_tao
+            if required_funding_tao is not None:
+                row.required_funding_tao = required_funding_tao
+            if uid is not None:
+                row.uid = uid
+            # Clear a stale reason on any successful forward move, so an
+            # operator reading the row isn't misled by a resolved failure.
+            row.failure_reason = failure_reason
+            if target is WalletState.FUNDED and row.funded_at is None:
+                row.funded_at = stamp
+            if target is WalletState.REGISTERED and row.registered_at is None:
+                row.registered_at = stamp
+            session.add(row)
+            return self._wallet_from_row(row)
+
+    def record_managed_payout(
+        self,
+        *,
+        payout_id: str,
+        wallet_id: str,
+        destination: str,
+        alpha_amount: float,
+        netuid: int,
+        status: str,
+        extrinsic_hash: str | None = None,
+        failure_reason: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Append a payout attempt to the ledger.
+
+        Written BEFORE the extrinsic is submitted (status="submitting") and
+        updated after, so a crash mid-flight leaves evidence that something was
+        in flight rather than silence.
+        """
+        stamp = now or datetime.now(UTC)
+        with session_scope(self.session_factory) as session:
+            row = session.get(ManagedWalletPayoutORM, payout_id)
+            if row is None:
+                row = ManagedWalletPayoutORM(
+                    payout_id=payout_id,
+                    wallet_id=wallet_id,
+                    destination=destination,
+                    alpha_amount=alpha_amount,
+                    netuid=netuid,
+                    created_at=stamp,
+                )
+            row.status = status
+            row.extrinsic_hash = extrinsic_hash
+            row.failure_reason = failure_reason
+            if status == "confirmed" and row.confirmed_at is None:
+                row.confirmed_at = stamp
+            session.add(row)
+
+    def credit_managed_payout(
+        self, wallet_id: str, alpha_amount: float, *, now: datetime | None = None
+    ) -> None:
+        """Add a CONFIRMED payout to the wallet's running total."""
+        stamp = now or datetime.now(UTC)
+        with session_scope(self.session_factory) as session:
+            row = session.get(ManagedWalletORM, wallet_id)
+            if row is None:
+                return
+            row.total_paid_alpha = (row.total_paid_alpha or 0.0) + alpha_amount
+            row.last_payout_at = stamp
+            session.add(row)
+
+    def has_inflight_payout(self, wallet_id: str) -> bool:
+        """Whether a payout for this wallet was submitted but never resolved.
+
+        The payout worker refuses to start a second transfer while one is
+        unresolved. Without this, a worker restart between submit and confirm
+        would read the same accrued alpha and pay it out twice — the on-chain
+        `extrinsic_hash` unique index catches an identical resubmission, but two
+        *distinct* extrinsics for the same accrual would both succeed.
+        """
+        with session_scope(self.session_factory) as session:
+            return session.scalars(
+                select(ManagedWalletPayoutORM)
+                .where(ManagedWalletPayoutORM.wallet_id == wallet_id)
+                .where(ManagedWalletPayoutORM.status == "submitting")
+            ).first() is not None
+
+    def list_managed_payouts(self, wallet_id: str) -> list[dict]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(ManagedWalletPayoutORM)
+                .where(ManagedWalletPayoutORM.wallet_id == wallet_id)
+                .order_by(ManagedWalletPayoutORM.created_at.desc())
+            ).all()
+            return [
+                {
+                    "payout_id": r.payout_id,
+                    "destination": r.destination,
+                    "alpha_amount": r.alpha_amount,
+                    "status": r.status,
+                    "extrinsic_hash": r.extrinsic_hash,
+                    "failure_reason": r.failure_reason,
+                    "created_at": r.created_at,
+                    "confirmed_at": r.confirmed_at,
+                }
                 for r in rows
             ]
