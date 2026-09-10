@@ -903,17 +903,27 @@ def get_audit_commitment(epoch_id: str) -> dict:
 def get_audit_hotkey() -> dict:
     """Public — the validator's SS58 hotkey address. Auditors use this to
     verify the ed25519 signature on each audit report. Same hotkey also
-    signs set_weights and set_commitment on-chain."""
+    signs set_weights and set_commitment on-chain.
+
+    MUST load the wallet with `_load_keypair_from_wallet_file`, matching how
+    `generate_audit_report` signs. `Keypair.create_from_uri(path)` derives a
+    keypair from the PATH TEXT instead of opening the wallet, and this endpoint
+    previously did exactly that — advertising 5H1gEPqV… while the chain knew us
+    as 5CCf21ie… (uid 0). Signature checks still passed because the signing side
+    was wrong in the same way, so the two must ALWAYS be changed together:
+    fixing only one silently breaks every auditor's verification."""
     hotkey = ""
     try:
         chain = getattr(service, "_chain", None)
         wallet_path = getattr(chain, "wallet_path", None) if chain else None
         if wallet_path:
-            from substrateinterface import Keypair as _Keypair
-            kp = _Keypair.create_from_uri(wallet_path)
+            from greencompute_validator.domain.chain import (
+                _load_keypair_from_wallet_file,
+            )
+            kp = _load_keypair_from_wallet_file(wallet_path)
             hotkey = kp.ss58_address
     except Exception:
-        pass
+        logger.exception("failed to resolve the validator audit hotkey")
     return {"ss58_address": hotkey}
 
 
