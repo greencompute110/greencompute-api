@@ -38,6 +38,16 @@ jobs:
         continue-on-error: true
         run: uvx ruff check .
 
+      # tests/unit covers more than the gateway — it also exercises validator
+      # and persistence code — but the gateway package is what hosts the test
+      # environment, so anything those tests need must be listed here too.
+      # `cryptography` backs the AES-256-GCM sealing of custodied provider
+      # wallet mnemonics; it is declared by greencompute-validator, whose
+      # dependency tree `--package greencompute-gateway` never resolves.
+      #
+      # Deliberately NOT guarded with a skipif in the test module: these tests
+      # protect the encryption of keys that control real funds, so a missing
+      # dependency must fail CI loudly rather than silently skip the suite.
       - name: Unit tests
         working-directory: greencompute-api
-        run: uv run --package greencompute-gateway --with pytest pytest tests/unit -q
+        run: uv run --package greencompute-gateway --with pytest --with cryptography pytest tests/unit -q
