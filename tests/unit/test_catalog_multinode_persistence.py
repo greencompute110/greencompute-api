@@ -117,3 +117,110 @@ def test_force_still_refuses_an_already_terminated_row():
     )
     assert repo.terminate_flux_deployment(dep, force=True) is True
     assert repo.terminate_flux_deployment(dep, force=True) is False  # idempotent
+
+
+# --- image pin must survive persistence too ------------------------------------
+
+
+def test_image_override_round_trips():
+    """Third instance of the same trap: field added to the pydantic model and
+    written into workload.runtime, but with no DB column it was silently
+    dropped on save, so the pin never reached the node and K3 would have loaded
+    on the stable image that cannot parse its architecture."""
+    repo = _repo()
+    repo.upsert_catalog_entry(ModelCatalogEntry(
+        model_id="kimi-k3", hf_repo="moonshotai/Kimi-K3",
+        image_override="vllm/vllm-openai:nightly", max_model_len=32768,
+    ))
+    loaded = repo.get_catalog_entry("kimi-k3")
+    assert loaded.image_override == "vllm/vllm-openai:nightly", "pin dropped on persist"
+    assert loaded.max_model_len == 32768
+    # and via the listing path the reconciler actually uses
+    entry = next(e for e in repo.list_catalog_entries() if e.model_id == "kimi-k3")
+    assert entry.image_override == "vllm/vllm-openai:nightly"
+
+
+def test_image_override_defaults_to_none():
+    repo = _repo()
+    repo.upsert_catalog_entry(ModelCatalogEntry(model_id="plain"))
+    assert repo.get_catalog_entry("plain").image_override is None
+
+
+# --- fourth instance of the trap: engine-arg passthrough -----------------------
+
+
+def test_extra_engine_args_and_env_round_trip():
+    """K3 on sm_120 is unservable without `--moe-backend marlin`, so if these
+    are dropped on save the model silently loads down the DeepGEMM path and
+    hard-asserts. Same trap as multi_node / max_model_len / image_override."""
+    repo = _repo()
+    repo.upsert_catalog_entry(ModelCatalogEntry(
+        model_id="kimi-k3",
+        extra_engine_args=["--moe-backend", "marlin", "--enforce-eager"],
+        extra_env={"VLLM_USE_DEEP_GEMM": "0"},
+    ))
+    loaded = repo.get_catalog_entry("kimi-k3")
+    assert loaded.extra_engine_args == ["--moe-backend", "marlin", "--enforce-eager"]
+    assert loaded.extra_env == {"VLLM_USE_DEEP_GEMM": "0"}
+    # and via the listing path the reconciler actually uses
+    entry = next(e for e in repo.list_catalog_entries() if e.model_id == "kimi-k3")
+    assert entry.extra_engine_args[:2] == ["--moe-backend", "marlin"]
+
+
+def test_extra_args_default_empty_and_can_be_cleared():
+    repo = _repo()
+    repo.upsert_catalog_entry(ModelCatalogEntry(model_id="plain"))
+    assert repo.get_catalog_entry("plain").extra_engine_args == []
+    assert repo.get_catalog_entry("plain").extra_env == {}
+    repo.upsert_catalog_entry(ModelCatalogEntry(model_id="plain", extra_engine_args=["--x"]))
+    assert repo.get_catalog_entry("plain").extra_engine_args == ["--x"]
+    repo.upsert_catalog_entry(ModelCatalogEntry(model_id="plain"))
+    assert repo.get_catalog_entry("plain").extra_engine_args == [], "must clear"
+
+
+# --- catalog-status must see distributed replicas (2026-08-03) ---------------
+
+
+def test_distributed_replica_counts_toward_running_replicas():
+    """A model served across 8 nodes reported running_replicas=0, so every UI
+    showed it 'cold / unavailable' while it was answering requests. Only
+    single-node inference_assignments were counted."""
+    repo = _repo()
+    wl = _flux_workload(repo, "kimi-k3")
+    ids = []
+    for rank in range(4):
+        ids.append(repo.create_flux_deployment(
+            hotkey="5A", node_id=f"n{rank}", workload_id=wl,
+            multi_node={"replica_id": "r1", "role": "head" if rank == 0 else "worker",
+                        "rank": rank, "model_id": "kimi-k3"},
+        ))
+    from greencompute_persistence import session_scope
+    from greencompute_persistence.orm import DeploymentORM
+    with session_scope(repo.session_factory) as s:
+        for d in ids:
+            s.get(DeploymentORM, d).state = "ready"
+
+    rows = repo.list_distributed_replica_rows("kimi-k3")
+    assert len(rows) == 4 and all(r["state"] == "ready" for r in rows)
+    replicas = {r["multi_node"]["replica_id"] for r in rows}
+    assert replicas == {"r1"}, "all ranks belong to one replica -> counts as 1"
+
+
+def test_a_replica_with_one_dead_rank_is_not_running():
+    """There is no partial serving mode: one dead rank means the replica cannot
+    answer, so it must NOT be advertised as running."""
+    repo = _repo()
+    wl = _flux_workload(repo, "m3")
+    ids = [repo.create_flux_deployment(
+        hotkey="5A", node_id=f"n{r}", workload_id=wl,
+        multi_node={"replica_id": "r9", "role": "head" if r == 0 else "worker",
+                    "rank": r, "model_id": "m3"},
+    ) for r in range(3)]
+    from greencompute_persistence import session_scope
+    from greencompute_persistence.orm import DeploymentORM
+    with session_scope(repo.session_factory) as s:
+        s.get(DeploymentORM, ids[0]).state = "ready"
+        s.get(DeploymentORM, ids[1]).state = "ready"
+        s.get(DeploymentORM, ids[2]).state = "failed"
+    rows = repo.list_distributed_replica_rows("m3")
+    assert any(r["state"] != "ready" for r in rows), "must be detectable as not-all-ready"

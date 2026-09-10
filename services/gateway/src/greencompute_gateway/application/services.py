@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import secrets
 from collections.abc import Iterator
@@ -64,6 +65,32 @@ from greencompute_gateway.infrastructure.inference_client import (
 )
 from greencompute_gateway.infrastructure.repository import GatewayRepository
 from greencompute_gateway.transport.security import metrics as gateway_metrics
+
+
+def _external_model_upstreams() -> dict[str, str]:
+    """model_id -> base URL for models served OUTSIDE the miner fleet.
+
+    Some models run on hardware the platform does not manage (e.g. a 48-GPU
+    SGLang cluster with its own distributed runtime). They still belong on the
+    public OpenAI-compatible surface so callers select them by `model` exactly
+    like any catalog model -- one base URL, many models, rather than a bespoke
+    path or subdomain per deployment.
+
+    Configured as GREENCOMPUTE_EXTERNAL_MODEL_UPSTREAMS="id=url,id2=url2".
+    Routing them here rather than through a separate proxy keeps API-key auth,
+    the balance gate, per-token billing and the streaming path identical.
+    """
+    raw = os.getenv("GREENCOMPUTE_EXTERNAL_MODEL_UPSTREAMS", "")
+    out: dict[str, str] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        model_id, _, url = item.partition("=")
+        model_id, url = model_id.strip().lower(), url.strip().rstrip("/")
+        if model_id and url:
+            out[model_id] = url
+    return out
 
 
 class InsufficientBalanceForRentalError(Exception):
@@ -1357,6 +1384,24 @@ class GatewayService:
         admin: bool = False,
     ) -> tuple[list[DeploymentRecord], dict]:
         """Return all healthy deployments in round-robin order, plus routing metadata."""
+        # Externally-hosted models resolve to a synthetic record before any
+        # workload lookup: there is no miner, deployment row, or health probe
+        # behind them. Everything downstream (billing, streaming, per-model
+        # timeouts) treats them like any other deployment because it only ever
+        # reads `.endpoint`.
+        external = _external_model_upstreams().get((request.model or "").strip().lower())
+        if external:
+            record = DeploymentRecord(
+                workload_id=f"external:{request.model}",
+                state=DeploymentState.READY,
+                ready_instances=1,
+                endpoint=external,
+            )
+            return [record], {
+                "matched_by": "external_upstream",
+                "model": request.model,
+                "host": self._normalize_host(routed_host),
+            }
         workload, routing = self.resolve_workload_reference(request.model, routed_host=routed_host)
         # Authorization: a caller may only invoke a workload they own, one shared
         # with them, or a public one. Otherwise report it as an unknown model so
@@ -1457,8 +1502,16 @@ class GatewayService:
     def _rewrite_model_for_upstream(
         self,
         request: ChatCompletionRequest,
+        deployment: DeploymentRecord | None = None,
     ) -> ChatCompletionRequest:
-        """Rewrite request.model from workload name to the actual HF model identifier."""
+        """Rewrite request.model from workload name to the actual HF model identifier.
+
+        External upstreams are exempt: they have no workload row, and the id the
+        caller sent is already the name their server publishes. Resolving them
+        here raised NoReadyDeploymentError("unknown model=...") on every call.
+        """
+        if deployment is not None and self._is_external(deployment):
+            return request
         workload, _ = self.resolve_workload_reference(request.model)
         if workload.runtime and workload.runtime.model_identifier:
             return request.model_copy(update={"model": workload.runtime.model_identifier})
@@ -1471,7 +1524,7 @@ class GatewayService:
         *,
         request_id: str,
     ):
-        upstream_request = self._rewrite_model_for_upstream(request)
+        upstream_request = self._rewrite_model_for_upstream(request, deployment)
         return self.inference_client.invoke_chat_completion(deployment, upstream_request, request_id=request_id)
 
     def _invoke_upstream_stream(
@@ -1481,11 +1534,20 @@ class GatewayService:
         *,
         request_id: str,
     ) -> Iterator[str]:
-        upstream_request = self._rewrite_model_for_upstream(request)
+        upstream_request = self._rewrite_model_for_upstream(request, deployment)
         return self.inference_client.stream_chat_completion(deployment, upstream_request, request_id=request_id)
 
+    @staticmethod
+    def _is_external(deployment: DeploymentRecord) -> bool:
+        """External upstreams have no deployment row, so per-deployment health
+        bookkeeping must be skipped -- otherwise the control plane raises
+        KeyError on a synthetic id and that masks the REAL upstream error
+        behind a 500."""
+        return str(getattr(deployment, "workload_id", "") or "").startswith("external:")
+
     def _handle_upstream_success(self, deployment: DeploymentRecord, routing: dict) -> None:
-        self.control_plane.clear_deployment_health_failures(deployment.deployment_id)
+        if not self._is_external(deployment):
+            self.control_plane.clear_deployment_health_failures(deployment.deployment_id)
         self.repository.record_routing_decision(
             {
                 **routing,
@@ -1498,7 +1560,10 @@ class GatewayService:
 
     def _handle_upstream_failure(self, deployment: DeploymentRecord, routing: dict, exc: RuntimeError) -> None:
         failure_class = self._classify_inference_error(exc)
-        self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
+        if not self._is_external(deployment):
+            self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
+        else:
+            log.warning("external upstream failed model=%s: %s", routing.get("model"), exc)
         self.repository.record_routing_decision(
             {
                 **routing,
@@ -1600,6 +1665,7 @@ class GatewayService:
             estimate = inference_cost_cents(
                 self._prompt_token_bound(request),
                 self._completion_token_bound(request),
+                model=request.model,
             )
             reserved = BillingRepository().reserve_inference_hold(user_id, estimate, reference_id)
         except Exception:
@@ -1696,7 +1762,7 @@ class GatewayService:
             BillingRepository,
         )
 
-        cents = inference_cost_cents(prompt_tokens, completion_tokens)
+        cents = inference_cost_cents(prompt_tokens, completion_tokens, model=model)
         billing = BillingRepository()
         try:
             result = billing.debit_user_to_floor(

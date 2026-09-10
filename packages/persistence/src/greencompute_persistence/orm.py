@@ -589,6 +589,70 @@ class MinerWhitelistORM(Base):
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+# --- Platform-managed miner wallets ---
+
+
+class ManagedWalletORM(Base):
+    """A coldkey/hotkey pair the platform created and custodies for a provider.
+
+    Lets a GPU operator mine without ever touching btcli: they apply with a
+    payout address, we generate the keys, register the neuron on netuid 110 and
+    forward their alpha emissions to the address they gave us.
+
+    The two `*_mnemonic_enc` columns hold AES-256-GCM ciphertext from
+    `infrastructure.secretbox` — NEVER plaintext, and never returned by any
+    public route. `payout_address` is the provider's own address and is the one
+    field here they control; it is SS58-checksum-validated before any transfer.
+    """
+
+    __tablename__ = "managed_wallets"
+
+    wallet_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    application_id: Mapped[str] = mapped_column(String(64), index=True)
+    # Unique: one managed neuron per hotkey, and re-provisioning must never
+    # produce two rows racing to register the same identity.
+    coldkey_ss58: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    hotkey_ss58: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    coldkey_mnemonic_enc: Mapped[str] = mapped_column(Text)
+    hotkey_mnemonic_enc: Mapped[str] = mapped_column(Text)
+    payout_address: Mapped[str] = mapped_column(String(128))
+    state: Mapped[str] = mapped_column(String(32), index=True)
+    netuid: Mapped[int] = mapped_column(Integer, default=110)
+    required_funding_tao: Mapped[float] = mapped_column(Float, default=0.0)
+    funded_tao: Mapped[float] = mapped_column(Float, default=0.0)
+    uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_paid_alpha: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    funded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    registered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_payout_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ManagedWalletPayoutORM(Base):
+    """One alpha transfer from a managed coldkey to its provider.
+
+    An append-only ledger, separate from the wallet row's running total, because
+    `total_paid_alpha` alone cannot answer "did the transfer we submitted before
+    the crash actually land?". `extrinsic_hash` is the on-chain receipt and is
+    unique, so a retry that re-submits the same extrinsic cannot be recorded —
+    or paid — twice.
+    """
+
+    __tablename__ = "managed_wallet_payouts"
+
+    payout_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    wallet_id: Mapped[str] = mapped_column(String(64), index=True)
+    destination: Mapped[str] = mapped_column(String(128))
+    alpha_amount: Mapped[float] = mapped_column(Float)
+    netuid: Mapped[int] = mapped_column(Integer, default=110)
+    extrinsic_hash: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 # --- Green-energy applications ---
 
 
@@ -596,7 +660,13 @@ class GreenEnergyApplicationORM(Base):
     __tablename__ = "green_energy_applications"
 
     application_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    hotkey: Mapped[str] = mapped_column(String(128), index=True)
+    # Empty for managed-wallet applicants: they have no hotkey until the
+    # platform provisions one for them. Kept non-nullable so the legacy
+    # self-custody flow (applicant brings their own hotkey) is unchanged.
+    hotkey: Mapped[str] = mapped_column(String(128), index=True, default="")
+    # Managed-wallet flow: the provider's OWN address, where their alpha is
+    # sent. Set instead of `hotkey` when the platform custodies the keys.
+    payout_address: Mapped[str | None] = mapped_column(String(128), nullable=True)
     signature: Mapped[str] = mapped_column(Text, default="")
     organization: Mapped[str] = mapped_column(String(255), default="")
     energy_source: Mapped[str] = mapped_column(String(128), default="")
@@ -645,6 +715,15 @@ class ModelCatalogORM(Base):
     # every existing row. `gpu_count` above stays the single-node ask; when this
     # is set it is authoritative and describes the whole replica.
     multi_node: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Pin a serving image for this model (some models load on exactly one vLLM
+    # build). NULL = the miner picks, which is every existing row.
+    image_override: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Per-model engine tuning appended to the vLLM argv / exported into the rank
+    # containers. NULL for every existing row. Kimi K3 on sm_120 needs
+    # `--moe-backend marlin`; modelling every such knob as a column would never
+    # keep up with the engine.
+    extra_engine_args: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    extra_env: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

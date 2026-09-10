@@ -1409,6 +1409,58 @@ def delete_provider_server(
     return {"deleted": True, "server_id": deleted.server_id}
 
 
+@router.get("/v1/models")
+def list_models(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """OpenAI-compatible model listing.
+
+    Not decorative: OpenAI-compatible clients (Cursor, aider, Continue, LibreChat)
+    call this to discover models and to validate a custom base URL. Returning 404
+    made those tools report the endpoint as broken even though inference worked
+    perfectly -- the failure looked like "your API is down", not "discovery is
+    unimplemented".
+
+    Lists inference workloads the gateway can actually route to, so a client that
+    picks an id from here can use it verbatim as `model`.
+    """
+    api_key = require_api_key(authorization, x_api_key)
+    enforce_rate_limit("list_models", api_key.key_id, limit=60, window_seconds=60)
+
+    seen: dict[str, int] = {}
+    for workload in service.control_plane.list_workloads():
+        if getattr(workload, "kind", None) is not None and str(workload.kind).lower().rsplit(".", 1)[-1] != "inference":
+            continue
+        # `public` is the same visibility flag the model catalog uses. Without it
+        # this endpoint published every inference workload ever created -- 21 of
+        # 25 were internal test artifacts (ssrf-poc-workload, sqli-test2,
+        # file-env-leak...), which would have appeared in every customer's model
+        # picker in Cursor.
+        if not getattr(workload, "public", False):
+            continue
+        name = (workload.name or "").strip()
+        if not name or name in seen:
+            continue
+        created = getattr(workload, "created_at", None)
+        seen[name] = int(created.timestamp()) if created is not None else 0
+
+    # Externally-hosted models have no workload row, so they must be added
+    # explicitly or discovery-driven clients (Cursor, aider) never see them and
+    # report the endpoint as not offering the model.
+    from greencompute_gateway.application.services import _external_model_upstreams
+    for model_id in _external_model_upstreams():
+        seen.setdefault(model_id, 0)
+
+    return {
+        "object": "list",
+        "data": [
+            {"id": name, "object": "model", "created": seen[name], "owned_by": "greencompute"}
+            for name in sorted(seen)
+        ],
+    }
+
+
 @router.post("/v1/chat/completions")
 def chat_completions(
     payload: ChatCompletionRequest,

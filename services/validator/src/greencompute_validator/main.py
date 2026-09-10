@@ -51,6 +51,14 @@ async def _validator_worker_loop() -> None:
     # epoch boundaries promptly without spamming the subtensor RPC.
     audit_check_every = max(1, int(60.0 / settings.worker_poll_interval_seconds))
     _audit_counter = 0
+    # Managed provider wallets: funding -> registration -> payout. Deliberately
+    # infrequent (default 5 min) — two of the three ticks submit extrinsics, and
+    # nothing here is latency-sensitive.
+    managed_wallet_every = max(1, int(
+        service_settings.managed_wallet_tick_interval_seconds
+        / settings.worker_poll_interval_seconds
+    ))
+    _managed_wallet_counter = 0
 
     # Eager initial metagraph sync — without this the in-memory cache stays
     # empty until the first tick fires, and any /weights call in that window
@@ -113,6 +121,24 @@ async def _validator_worker_loop() -> None:
                                 _last_audited_epoch_end = end_block
                 except Exception:
                     logging.getLogger(__name__).exception("audit-epoch tick failed")
+            # Managed provider wallets. Wrapped separately: this moves real
+            # money, and a failure here must not stop weight publishing or
+            # audit reports — the validator's chain duties outrank onboarding.
+            _managed_wallet_counter += 1
+            if _managed_wallet_counter >= managed_wallet_every:
+                _managed_wallet_counter = 0
+                try:
+                    from greencompute_validator.application.managed_wallet_factory import (
+                        get_managed_wallet_service,
+                    )
+                    managed = get_managed_wallet_service()
+                    if managed is not None:
+                        managed.tick_funding()
+                        managed.tick_registration()
+                        managed.tick_payouts()
+                except Exception:
+                    logging.getLogger(__name__).exception("managed-wallet tick failed")
+
             _worker_state["last_successful_iteration"] = asyncio.get_running_loop().time()
             _worker_state["last_error"] = None
         except Exception as exc:
