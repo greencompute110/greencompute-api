@@ -464,16 +464,30 @@ class ValidatorService:
         canonical = json.dumps(report_json, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         report_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-        # Sign the canonical bytes with the validator's hotkey. Reuse the
-        # existing auth.sign_payload_hotkey machinery if wallet is loaded;
-        # otherwise skip signing (not fatal — auditors can still verify via
-        # on-chain SHA256 anchor, signature is an extra convenience).
+        # Sign the canonical bytes with the validator's REAL hotkey.
+        #
+        # This must use `_load_keypair_from_wallet_file`, never
+        # `Keypair.create_from_uri(path)`. create_from_uri treats the string as
+        # an sr25519 derivation URI (like "//Alice") and mints a fresh keypair
+        # from the PATH TEXT without ever opening the wallet — the same trap
+        # that already had to be fixed once in domain/chain.py, where the
+        # loader's docstring documents it.
+        #
+        # Live consequence before this fix: every audit report was signed by
+        # 5H1gEPqV… (derived from "/root/.bittensor/wallets/green-owner/
+        # hotkeys/default"), which is not a registered neuron on netuid 110,
+        # while set_weights and set_commitment correctly used 5CCf21ie… (uid 0).
+        # The on-chain SHA256 anchor was therefore always valid, but the
+        # signature and signer_hotkey fields were unverifiable against our real
+        # validator identity — to an auditor, an unknown signer.
         signature = ""
         signer_hotkey = ""
         if self._chain and validator_settings.bittensor_wallet_path:
             try:
-                from substrateinterface import Keypair as _Keypair
-                kp = _Keypair.create_from_uri(validator_settings.bittensor_wallet_path)
+                from greencompute_validator.domain.chain import (
+                    _load_keypair_from_wallet_file,
+                )
+                kp = _load_keypair_from_wallet_file(validator_settings.bittensor_wallet_path)
                 signature = kp.sign(canonical.encode("utf-8")).hex()
                 signer_hotkey = kp.ss58_address
             except Exception:
