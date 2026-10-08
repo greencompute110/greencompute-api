@@ -8,6 +8,19 @@ from greencompute_protocol import LeaseAssignment, NodeCapability, WorkloadSpec
 logger = logging.getLogger(__name__)
 
 
+def normalize_gpu_model(raw: str | None) -> str:
+    """Canonical GPU id: lower-case, separators stripped.
+
+    Requests and nodes spell the same card differently ("rtx-4090", "RTX 4090",
+    "rtx_4090", "rtx4090"). An exact string compare here made every request
+    using the hyphenated form -- the spelling /platform/nodes/supported used to
+    advertise -- silently match zero nodes. Billing already normalises this way
+    (greencompute_protocol.billing_rates._normalize_gpu_model); scheduling must
+    agree with it or a GPU can be priced but never placed.
+    """
+    return "".join(ch for ch in (raw or "").lower() if ch.isalnum())
+
+
 @dataclass(frozen=True)
 class RankedNode:
     node: NodeCapability
@@ -72,7 +85,8 @@ class PlacementPolicy:
                 continue
             if (
                 workload.requirements.supported_gpu_models
-                and node.gpu_model not in workload.requirements.supported_gpu_models
+                and normalize_gpu_model(node.gpu_model)
+                not in {normalize_gpu_model(m) for m in workload.requirements.supported_gpu_models}
             ):
                 logger.debug("node %s: skip gpu_model (need %s, has %s)",
                              node.node_id, workload.requirements.supported_gpu_models, node.gpu_model)

@@ -155,6 +155,7 @@ class ControlPlaneService:
             save_on_exhaustion=payload.save_on_exhaustion,
             deployment_fee_usd=self._estimate_deployment_fee(workload, payload.requested_instances),
             fee_acknowledged=payload.accept_fee,
+            hourly_rate_cents=self._quoted_hourly_rate_cents(workload),
         )
         self.repository.create_deployment(deployment)
         self.bus.publish(
@@ -476,13 +477,39 @@ class ControlPlaneService:
 
     @staticmethod
     def _estimate_deployment_fee(workload: WorkloadSpec, requested_instances: int) -> float:
-        # Quoted for ONE instance — the scheduler places exactly one per
-        # deployment and metering bills the placed instance, so quoting
-        # requested_instances× would advertise a charge that never happens.
-        del requested_instances
-        gpu_count = workload.requirements.gpu_count
-        base_hourly = 0.1 * gpu_count
-        return round(base_hourly * 3, 4)
+        # There is no deployment fee. This used to return `0.1 * gpu_count * 3`
+        # -- three hours at the retired flat $0.10/hr -- and the result was shown
+        # on every deployment as `deployment_fee_usd: 0.3` while nothing ever
+        # debited it. An agent reading the API budgets from that number, so a
+        # phantom charge is a real bug. Kept as a method (returning 0) so the
+        # field stays in the schema for existing clients.
+        del workload, requested_instances
+        return 0.0
+
+    @staticmethod
+    def _quoted_hourly_rate_cents(workload: WorkloadSpec) -> int:
+        """Per-GPU-hour rate to show from the moment a deployment is created.
+
+        Placement is asynchronous, so the exact card isn't known yet. Previously
+        the record carried the model default of 10 cents until placement locked
+        the real rate (40 for a 4090), so the creation response said $0.10/hr and
+        the bill said $0.40/hr -- an external tester saw this on all 18 of their
+        deployments. Quote the most this deployment can cost instead:
+
+          * one allowed GPU model  -> exactly its rate (the common case);
+          * several allowed models -> the highest of them;
+          * no constraint          -> the highest public rate.
+
+        Placement still overwrites this with the exact rate of the card granted,
+        which can only be equal or lower. It matches the balance pre-check in
+        the gateway, so the quote and the 402 threshold agree.
+        """
+        from greencompute_protocol import GPU_RATE_CENTS_PER_HOUR, rate_for_gpu
+
+        allowed = workload.requirements.supported_gpu_models or []
+        if allowed:
+            return max(rate_for_gpu(m) for m in allowed)
+        return max(GPU_RATE_CENTS_PER_HOUR.values())
 
     def list_ready_deployments(self, workload_id: str) -> list[DeploymentRecord]:
         routable: list[DeploymentRecord] = []

@@ -781,13 +781,24 @@ def list_workload_shares(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
+#: Never serialised into a deployment object. A pod's SSH private key used to
+#: ride along on create/get/list/update/delete, so anything that logged API
+#: responses -- agent transcripts, proxies, CI output -- ended up storing
+#: long-lived credentials (reported by an external tester, 2026-10). The key is
+#: still available, deliberately, from GET /platform/deployments/{id}/ssh, which
+#: is owner/admin-gated and audit-logged per access.
+DEPLOYMENT_SECRET_FIELDS = {"ssh_private_key"}
+
 @router.post("/platform/deployments")
 def create_deployment(
     payload: DeploymentCreateRequest,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    from greencompute_gateway.application.services import InsufficientBalanceForRentalError
+    from greencompute_gateway.application.services import (
+        InsufficientBalanceForRentalError,
+        UnsupportedGPUError,
+    )
 
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("create_deployment", api_key.key_id, limit=30, window_seconds=60)
@@ -796,11 +807,22 @@ def create_deployment(
             payload,
             user_id=api_key.user_id,
             admin=api_key.admin,
-        ).model_dump(mode="json")
+        ).model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except UnsupportedGPUError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "none of the requested GPU models are available to rent",
+                "requested": exc.requested,
+                "available": exc.available,
+                "hint": "set supported_gpu_models to one of `available` (any spelling); "
+                        "see GET /platform/pricing",
+            },
+        ) from exc
     except InsufficientBalanceForRentalError as exc:
         # 402 Payment Required — UI reads the numeric fields to render a
         # friendly "Add $X to start" prompt.
@@ -851,7 +873,7 @@ def list_deployments(
 ) -> list[dict]:
     api_key = require_api_key(authorization, x_api_key)
     rows = [
-        deployment.model_dump(mode="json")
+        deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
         for deployment in service.list_deployments(user_id=api_key.user_id, admin=api_key.admin)
     ]
     if api_key.admin:
@@ -874,7 +896,7 @@ def get_deployment(
     deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=api_key.admin)
     if deployment is None:
         raise HTTPException(status_code=404, detail="deployment not found")
-    return deployment.model_dump(mode="json")
+    return deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
 
 
 @router.get("/platform/deployments/{deployment_id}/ssh")
@@ -996,7 +1018,7 @@ def update_deployment(
             payload,
             actor_user_id=api_key.user_id,
             admin=api_key.admin,
-        ).model_dump(mode="json")
+        ).model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1015,7 +1037,7 @@ def terminate_deployment(
             deployment_id,
             actor_user_id=api_key.user_id,
             admin=api_key.admin,
-        ).model_dump(mode="json")
+        ).model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1043,7 +1065,7 @@ def resume_deployment(
             deployment_id,
             user_id=api_key.user_id,
             admin=api_key.admin,
-        ).model_dump(mode="json")
+        ).model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1578,35 +1600,83 @@ def embeddings(
     }
 
 
-SUPPORTED_GPU_MODELS = [
-    "a100",
-    "a100-80gb",
-    "h100",
-    "h100-80gb",
-    "a10",
-    "a10g",
-    "l40",
-    "l40s",
-    "rtx-4090",
-    "rtx-4080",
-    "rtx-3090",
-    "rtx-3080",
-    "v100",
-    "v100-32gb",
-    "t4",
-    "t4g",
-    "m60",
-    "k80",
-]
+from greencompute_gateway.domain.gpu_catalog import public_gpu_models as _public_gpu_models
 
 
 @router.get("/platform/nodes/supported")
-def list_supported_gpus(
-    authorization: str | None = Header(default=None),
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-) -> list[str]:
-    require_api_key(authorization, x_api_key)
-    return SUPPORTED_GPU_MODELS
+def list_supported_gpus() -> list[str]:
+    """Public -- the GPU ids accepted in `supported_gpu_models`.
+
+    No API key required: an agent needs this to decide whether to sign up at
+    all. Any spelling is accepted on input ("RTX 4090", "rtx-4090"); these are
+    the canonical forms.
+    """
+    return _public_gpu_models()
+
+
+@router.get("/platform/pricing")
+def public_pricing() -> dict:
+    """Public, machine-readable price list. No API key required.
+
+    Agents budget from the API, not the marketing page, so this must be the
+    numbers billing actually charges: GPU rates come from the same table that
+    locks onto a deployment at placement, and model rates are resolved through
+    the same `rates_for_model` the inference meter uses, for exactly the models
+    /v1/models currently lists.
+    """
+    from greencompute_protocol import (
+        GPU_RATE_CENTS_PER_HOUR,
+        GPU_VRAM_GB,
+        INFERENCE_MIN_CHARGE_CENTS,
+        rates_for_model,
+    )
+
+    gpus = [
+        {
+            "gpu_model": m,
+            "vram_gb": GPU_VRAM_GB.get(m),
+            "cents_per_gpu_hour": GPU_RATE_CENTS_PER_HOUR[m],
+            "usd_per_gpu_hour": round(GPU_RATE_CENTS_PER_HOUR[m] / 100, 2),
+        }
+        for m in _public_gpu_models()
+    ]
+    models = []
+    for name in sorted(_public_inference_model_names()):
+        cin, cout = rates_for_model(name)
+        models.append({
+            "model": name,
+            "usd_per_million_input_tokens": round(cin / 100, 2),
+            "usd_per_million_output_tokens": round(cout / 100, 2),
+        })
+    return {
+        "currency": "USD",
+        "gpu_rental": {
+            "billing": "per minute while running, per GPU",
+            "deployment_fee_usd": 0,
+            "gpus": gpus,
+        },
+        "inference": {
+            "billing": "per token; minimum charge per request",
+            "minimum_charge_usd": round(INFERENCE_MIN_CHARGE_CENTS / 100, 2),
+            "models": models,
+        },
+        "docs": "https://www.green-compute.com/docs",
+    }
+
+
+def _public_inference_model_names() -> list[str]:
+    """Names of the public inference workloads -- the same filter /v1/models uses."""
+    names = []
+    for workload in service.control_plane.list_workloads():
+        kind = getattr(workload, "kind", None)
+        if kind is not None and str(kind).lower().rsplit(".", 1)[-1] != "inference":
+            continue
+        if not getattr(workload, "public", False):
+            continue
+        name = (workload.name or "").strip()
+        if name:
+            names.append(name)
+    return list(dict.fromkeys(names))
 
 
 @router.get("/platform/v1/debug/route/{model}")
@@ -1627,7 +1697,7 @@ def debug_route(
             "workload_id": workload_id,
             "workload_alias": workload.workload_alias,
             "ingress_host": workload.ingress_host,
-            "deployment": deployment.model_dump(mode="json") if deployment else None,
+            "deployment": deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS) if deployment else None,
         }
     except NoReadyDeploymentError as exc:
         return {"model": model, "host": host, "error": str(exc), "deployment": None}
