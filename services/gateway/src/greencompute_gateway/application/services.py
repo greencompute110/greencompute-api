@@ -93,6 +93,21 @@ def _external_model_upstreams() -> dict[str, str]:
     return out
 
 
+class UnsupportedGPUError(ValueError):
+    """None of the GPU models a deployment allows exist in the public fleet.
+
+    Raised before the balance check so the caller learns *what* to ask for in
+    one round trip, instead of a deployment that sits pending forever.
+    """
+
+    def __init__(self, requested: list[str], available: list[str]) -> None:
+        self.requested = requested
+        self.available = available
+        super().__init__(
+            f"no rentable GPU matches {requested}; available: {available}"
+        )
+
+
 class InsufficientBalanceForRentalError(Exception):
     """Raised by GatewayService.create_deployment when the caller doesn't
     have enough credits to cover ≥ 1 hour of the requested workload at the
@@ -315,13 +330,17 @@ class GatewayService:
         builds = self.builder.list_builds()
         if admin:
             return builds
-        return [build for build in builds if build.public or build.owner_user_id == user_id]
+        # Own builds only. `public` used to expose every user's self-flagged
+        # image to every API key with no review step -- an external tester found
+        # a probing image ("dnslog-...") in the shared listing. Until there is a
+        # curated/reviewed catalog, a user's images are visible to that user.
+        return [build for build in builds if build.owner_user_id == user_id]
 
     def get_build(self, build_id: str, user_id: str | None = None, *, admin: bool = False) -> BuildRecord | None:
         build = self.builder.get_build(build_id)
         if build is None:
             return None
-        if admin or build.public or build.owner_user_id == user_id:
+        if admin or build.owner_user_id == user_id:
             return build
         return None
 
@@ -383,7 +402,11 @@ class GatewayService:
         builds = self.builder.list_image_history(image)
         if admin:
             return builds
-        return [build for build in builds if build.public or build.owner_user_id == user_id]
+        # Own builds only. `public` used to expose every user's self-flagged
+        # image to every API key with no review step -- an external tester found
+        # a probing image ("dnslog-...") in the shared listing. Until there is a
+        # curated/reviewed catalog, a user's images are visible to that user.
+        return [build for build in builds if build.owner_user_id == user_id]
 
     def list_failed_builds(self) -> list[BuildRecord]:
         return [build for build in self.builder.list_builds() if build.status == "failed"]
@@ -461,6 +484,22 @@ class GatewayService:
             raise KeyError(f"workload not found: {payload.workload_id}")
         if not admin and not self._user_can_access_workload(workload, user_id):
             raise PermissionError(f"workload access denied: {payload.workload_id}")
+
+        # Fail fast on a GPU we don't have. Without this the deployment is
+        # accepted and then never schedules, which an agent can only discover by
+        # polling until it gives up. Spelling is normalised the same way the
+        # scheduler and billing do, so "RTX 4090" / "rtx-4090" are fine.
+        if not admin:
+            requested = list(workload.requirements.supported_gpu_models or [])
+            if requested:
+                from greencompute_gateway.domain.gpu_catalog import (
+                    matches_public_gpu,
+                    public_gpu_models,
+                )
+
+                available = public_gpu_models()
+                if not matches_public_gpu(requested):
+                    raise UnsupportedGPUError(requested, available)
 
         # Pre-flight balance check: require enough credits for at least 1 hour
         # of runtime at the highest possible rate among the user's requested

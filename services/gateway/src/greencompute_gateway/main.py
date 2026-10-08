@@ -49,7 +49,18 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="GreenCompute Gateway", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="Green Compute API",
+    version="0.1.0",
+    lifespan=lifespan,
+    description=(
+        "GPU rentals (RTX 4090 / 5090) and OpenAI-compatible inference on Bittensor "
+        "subnet 110. Auth: `Authorization: Bearer <key>` (create one at "
+        "https://www.green-compute.com/settings). Guides for humans and agents: "
+        "https://www.green-compute.com/docs  ·  machine index: "
+        "https://www.green-compute.com/llms.txt  ·  prices: GET /platform/pricing"
+    ),
+)
 
 # Browser clients (Next.js, etc.) need CORS. Comma-separated origins in GREENCOMPUTE_CORS_ALLOW_ORIGINS.
 # If unset, default to local Next.js dev URLs so the gateway never runs without CORS (avoids silent browser blocks).
@@ -81,6 +92,26 @@ async def _stash_client_ip(request, call_next):
 
 
 app.include_router(router)
+
+
+@app.get("/")
+def api_index() -> dict:
+    """What an agent sees when it opens the API host with no path.
+
+    It used to be a bare 404, so the only way in was guessing /docs. Every link
+    here is public and needs no key.
+    """
+    return {
+        "name": "Green Compute API",
+        "docs": "https://www.green-compute.com/docs",
+        "llms_txt": "https://www.green-compute.com/llms.txt",
+        "openapi": "https://api.green-compute.com/openapi.json",
+        "interactive_docs": "https://api.green-compute.com/docs",
+        "pricing": "https://api.green-compute.com/platform/pricing",
+        "gpu_models": "https://api.green-compute.com/platform/nodes/supported",
+        "inference_base_url": "https://api.green-compute.com/v1",
+        "auth": "Authorization: Bearer <api key> -- create one at https://www.green-compute.com/settings",
+    }
 
 
 @app.get("/healthz")

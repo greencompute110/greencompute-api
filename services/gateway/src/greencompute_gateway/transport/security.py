@@ -117,6 +117,20 @@ def extract_api_key_secret(authorization: str | None, x_api_key: str | None) -> 
     return None
 
 
+# A 401 is often the very first response an agent gets from us, so it has to
+# say how to fix itself. The detail stays a plain string starting with the old
+# text ("missing api key" / "invalid api key") so nothing matching on it breaks.
+_AUTH_HELP = (
+    ". Send `Authorization: Bearer <key>`. Create a key at "
+    "https://www.green-compute.com/settings ; docs: https://www.green-compute.com/docs"
+)
+_AUTH_HEADERS = {
+    "WWW-Authenticate": 'Bearer realm="green-compute"',
+    "Link": '<https://www.green-compute.com/docs>; rel="help", '
+            '<https://www.green-compute.com/llms.txt>; rel="describedby"',
+}
+
+
 def require_api_key(
     authorization: str | None,
     x_api_key: str | None,
@@ -128,7 +142,11 @@ def require_api_key(
     if not secret:
         metrics.increment("auth.failure.missing_api_key")
         _check_auth_failure_throttle(client_ip)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing api key")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing api key" + _AUTH_HELP,
+            headers=_AUTH_HEADERS,
+        )
     # Env-var master admin key — break-glass auth that survives DB wipes.
     # Checked BEFORE the DB lookup so it works even when the api_keys table
     # is unreachable (e.g. during incident recovery). Constant-time compare so
@@ -141,7 +159,11 @@ def require_api_key(
     if api_key is None:
         metrics.increment("auth.failure.invalid_api_key")
         _check_auth_failure_throttle(client_ip)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid api key" + _AUTH_HELP,
+            headers=_AUTH_HEADERS,
+        )
     if admin_required and not api_key.admin:
         metrics.increment("auth.failure.admin_required")
         _check_auth_failure_throttle(client_ip)
@@ -183,7 +205,11 @@ def require_provision_or_admin(
     if not secret:
         metrics.increment("auth.failure.missing_api_key")
         _check_auth_failure_throttle(client_ip)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing api key")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing api key" + _AUTH_HELP,
+            headers=_AUTH_HEADERS,
+        )
     # 1) Server-side provision secret — non-admin provisioning principal.
     provision = _provision_secret()
     if provision and _ct_eq(secret, provision):
@@ -199,7 +225,11 @@ def require_provision_or_admin(
     if api_key is None:
         metrics.increment("auth.failure.invalid_api_key")
         _check_auth_failure_throttle(client_ip)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid api key" + _AUTH_HELP,
+            headers=_AUTH_HEADERS,
+        )
     if not api_key.admin:
         metrics.increment("auth.failure.admin_required")
         _check_auth_failure_throttle(client_ip)
