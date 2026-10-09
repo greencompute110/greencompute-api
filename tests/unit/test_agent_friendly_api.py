@@ -178,6 +178,7 @@ def test_pricing_endpoint_matches_what_billing_charges(monkeypatch):
 
     monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
     monkeypatch.setattr(routes, "_public_inference_model_names", lambda: [])
+    monkeypatch.setattr(routes, "_rentable_now", lambda: ["rtx4090"])
     body = public_pricing()
     gpus = {g["gpu_model"]: g for g in body["gpu_rental"]["gpus"]}
     assert set(gpus) == {"rtx4090", "rtx5090"}
@@ -186,3 +187,118 @@ def test_pricing_endpoint_matches_what_billing_charges(monkeypatch):
         assert g["usd_per_gpu_hour"] == rate_for_gpu(name) / 100
     assert body["gpu_rental"]["deployment_fee_usd"] == 0
     assert body["currency"] == "USD"
+
+
+# --- 6. Only GPUs a LIVE node has are rentable (cold-agent test, 2026-10-09) --
+#
+# The RTX 5090 cluster stopped reporting 47+ days earlier, but the price table
+# still listed the 5090 and an admin capacity override advertised 8 free. A
+# 5090 request passed validation and would have sat `pending` forever.
+
+
+def _live_node(gpu, stale=False):
+    return SimpleNamespace(gpu_model=gpu, stale=stale)
+
+
+def _is_stale(n):
+    return n.stale
+
+
+def test_a_priced_gpu_with_only_stale_nodes_is_not_rentable(monkeypatch):
+    from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models
+
+    monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
+    nodes = [_live_node("rtx4090"), _live_node("rtx5090", stale=True), _live_node("RTX 5090", stale=True)]
+    assert rentable_gpu_models(nodes, _is_stale) == ["rtx4090"]
+
+
+def test_a_live_node_makes_its_gpu_rentable_whatever_the_spelling(monkeypatch):
+    from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models
+
+    monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
+    nodes = [_live_node("RTX-4090"), _live_node("rtx 5090")]
+    assert rentable_gpu_models(nodes, _is_stale) == ["rtx4090", "rtx5090"]
+
+
+def test_excluding_a_family_hides_it_even_with_live_nodes(monkeypatch):
+    # "Pause RTX 5090 rentals" is a config switch, independent of liveness.
+    from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models
+
+    monkeypatch.setenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", "4090")
+    nodes = [_live_node("rtx4090"), _live_node("rtx5090")]
+    assert rentable_gpu_models(nodes, _is_stale) == ["rtx4090"]
+
+
+def test_internal_only_hardware_is_never_rentable_publicly(monkeypatch):
+    from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models
+
+    monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
+    assert rentable_gpu_models([_live_node("a4000")], _is_stale) == []
+
+
+def _gateway_stub(nodes, supported):
+    workload = _workload(supported)
+    cp = SimpleNamespace(
+        repository=SimpleNamespace(get_workload=lambda wid: workload, list_nodes=lambda: nodes),
+        _is_node_stale=_is_stale,
+        create_deployment=lambda body: pytest.fail("must be rejected before reaching the control-plane"),
+    )
+    return SimpleNamespace(control_plane=cp, _user_can_access_workload=lambda w, u: True), workload
+
+
+def test_a_stale_only_gpu_is_rejected_up_front_with_what_is_available(monkeypatch):
+    from greencompute_gateway.application.services import UnsupportedGPUError
+
+    monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
+    stub, wl = _gateway_stub([_live_node("rtx4090"), _live_node("rtx5090", stale=True)], ["rtx5090"])
+    with pytest.raises(UnsupportedGPUError) as exc:
+        GatewayService.create_deployment(stub, {"workload_id": wl.workload_id}, user_id="u1")
+    assert exc.value.available == ["rtx4090"]
+
+
+def test_unconstrained_quote_uses_the_priciest_live_gpu_not_the_table():
+    # No live 5090 -> quoting 70 cents would overstate the cost by 75%.
+    assert ControlPlaneService._quoted_hourly_rate_cents(_workload([]), ["rtx4090"]) == 40
+    assert ControlPlaneService._quoted_hourly_rate_cents(_workload([]), ["rtx4090", "rtx5090"]) == 70
+
+
+def test_supported_endpoint_lists_only_rentable_gpus(monkeypatch):
+    import greencompute_gateway.transport.routes as routes
+
+    monkeypatch.setattr(routes, "_rentable_now", lambda: ["rtx4090"])
+    assert routes.list_supported_gpus() == ["rtx4090"]
+
+
+def test_pricing_flags_which_gpus_are_available_now(monkeypatch):
+    import greencompute_gateway.transport.routes as routes
+
+    monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
+    monkeypatch.setattr(routes, "_public_inference_model_names", lambda: [])
+    monkeypatch.setattr(routes, "_rentable_now", lambda: ["rtx4090"])
+    gpus = {g["gpu_model"]: g for g in routes.public_pricing()["gpu_rental"]["gpus"]}
+    assert gpus["rtx4090"]["available_now"] is True
+    assert gpus["rtx5090"]["available_now"] is False
+
+
+# --- 7. Deleting a workload keeps the evidence behind its charges ------------
+
+
+def test_deleting_a_workload_keeps_its_usage_records():
+    from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
+    from greencompute_protocol import UsageRecord
+
+    repo = ControlPlaneRepository(database_url="sqlite+pysqlite:///:memory:", bootstrap=True)
+    wl = repo.upsert_workload(_workload(["rtx4090"]))
+    dep = repo.create_deployment(DeploymentRecord(workload_id=wl.workload_id))
+    repo.add_usage_record(UsageRecord(deployment_id=dep.deployment_id, workload_id=wl.workload_id, hotkey="m"))
+
+    repo.delete_workload(wl.workload_id)
+
+    assert repo.get_deployment(dep.deployment_id) is None  # history row goes...
+    from greencompute_persistence.orm import UsageRecordORM
+    from greencompute_persistence import session_scope
+    from sqlalchemy import select
+
+    with session_scope(repo.session_factory) as s:
+        kept = s.scalars(select(UsageRecordORM).where(UsageRecordORM.deployment_id == dep.deployment_id)).all()
+        assert len(kept) == 1  # ...but the usage behind the charge stays

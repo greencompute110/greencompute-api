@@ -45,3 +45,20 @@ def matches_public_gpu(requested: list[str]) -> bool:
     """True if at least one requested model is rentable (any spelling)."""
     wanted = {normalize_gpu_model(m) for m in requested}
     return bool(wanted & {normalize_gpu_model(m) for m in public_gpu_models()})
+
+
+def rentable_gpu_models(nodes, is_stale) -> list[str]:
+    """Public GPU models that at least one LIVE node is reporting right now.
+
+    `public_gpu_models` answers "what do we sell"; this answers "what can
+    actually be placed". They diverged in production: the RTX 5090 cluster had
+    stopped reporting 47+ days earlier, but the price table still listed the
+    5090, so a 5090 request passed validation and then sat `pending` forever --
+    found by a cold AI agent test, 2026-10-09. A stale node can't host anything,
+    so it doesn't count.
+
+    Free GPUs are deliberately NOT required: a full but live fleet is a queue,
+    not an impossibility, and the scheduler handles that.
+    """
+    live = {normalize_gpu_model(n.gpu_model) for n in nodes if not is_stale(n)}
+    return [m for m in public_gpu_models() if normalize_gpu_model(m) in live]
