@@ -95,13 +95,15 @@ def test_tao_payment_credits_despite_stale_cursor(monkeypatch):
 
 def test_alpha_payment_credits_despite_stale_cursor(monkeypatch):
     paid_at = HEAD - 12
-    # StakeTransferred(origin_coldkey, destination_coldkey, hotkey,
-    #                  origin_netuid, destination_netuid, amount_rao)
-    transfer = {
-        "module_id": "SubtensorModule", "event_id": "StakeTransferred",
-        "attributes": ["5Payer", ADDR, "5Hotkey", 110, 110, 985_006_000],
-    }
-    repo, invoice_id = _setup(monkeypatch, "alpha", 0.985006, {paid_at: [transfer]})
+    # transfer_stake emits StakeAdded (alpha received) and StakeTransferred
+    # (whose amount is the TAO value).
+    events = [
+        {"module_id": "SubtensorModule", "event_id": "StakeAdded", "extrinsic_idx": 3,
+         "attributes": [ADDR, "5Hotkey", 16_486_440, 985_006_000, 110, 0]},
+        {"module_id": "SubtensorModule", "event_id": "StakeTransferred", "extrinsic_idx": 3,
+         "attributes": ["5Payer", ADDR, "5Hotkey", 110, 110, 16_486_440]},
+    ]
+    repo, invoice_id = _setup(monkeypatch, "alpha", 0.985006, {paid_at: events})
 
     credited = sum(dw.scan_alpha(repo) for _ in range(3))
 
