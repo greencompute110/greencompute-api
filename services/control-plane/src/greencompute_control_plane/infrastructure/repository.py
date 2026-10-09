@@ -442,10 +442,11 @@ class ControlPlaneRepository:
                     session.delete(lh)
                 for de in session.scalars(select(DeploymentEventORM).where(DeploymentEventORM.deployment_id == dep_id)).all():
                     session.delete(de)
-                for ur in session.scalars(select(UsageRecordORM).where(UsageRecordORM.deployment_id == dep_id)).all():
-                    session.delete(ur)
-                for inv in session.scalars(select(InvocationRecordORM).where(InvocationRecordORM.deployment_id == dep_id)).all():
-                    session.delete(inv)
+                # usage_records and invocation records are deliberately KEPT:
+                # they are the evidence behind a customer's charges. Deleting a
+                # workload used to erase them along with everything else, so a
+                # billing question about a deleted rental had no answer. Neither
+                # table has a foreign key to deployments, so keeping them is safe.
                 # Release the deployment's GPU reservation(s). Without this the
                 # active hold survives the deployment row that owned it, so the
                 # GPUs are subtracted from schedulable capacity forever (no

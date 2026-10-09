@@ -1601,17 +1601,24 @@ def embeddings(
 
 
 from greencompute_gateway.domain.gpu_catalog import public_gpu_models as _public_gpu_models
+from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models as _rentable_gpu_models
+
+
+def _rentable_now() -> list[str]:
+    cp = service.control_plane
+    return _rentable_gpu_models(cp.repository.list_nodes(), cp._is_node_stale)
 
 
 @router.get("/platform/nodes/supported")
 def list_supported_gpus() -> list[str]:
-    """Public -- the GPU ids accepted in `supported_gpu_models`.
+    """Public -- the GPU ids you can rent RIGHT NOW (a live node reports them).
 
     No API key required: an agent needs this to decide whether to sign up at
     all. Any spelling is accepted on input ("RTX 4090", "rtx-4090"); these are
-    the canonical forms.
+    the canonical forms. A GPU we price but have no live node for is omitted --
+    advertising it made agents create deployments that could never schedule.
     """
-    return _public_gpu_models()
+    return _rentable_now()
 
 
 @router.get("/platform/pricing")
@@ -1631,9 +1638,11 @@ def public_pricing() -> dict:
         rates_for_model,
     )
 
+    rentable = set(_rentable_now())
     gpus = [
         {
             "gpu_model": m,
+            "available_now": m in rentable,
             "vram_gb": GPU_VRAM_GB.get(m),
             "cents_per_gpu_hour": GPU_RATE_CENTS_PER_HOUR[m],
             "usd_per_gpu_hour": round(GPU_RATE_CENTS_PER_HOUR[m] / 100, 2),

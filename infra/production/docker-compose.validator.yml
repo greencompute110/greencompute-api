@@ -40,6 +40,10 @@ services:
       - ../../:/app/api
       - ${PROTOCOL_DIR:-../../../greencompute/protocol}:/app/protocol
     environment:
+      # GPU families offered for public rental (substring match on gpu_model).
+      # Gateway and control-plane must agree. Set PUBLIC_RENTAL_GPU_FAMILIES=4090
+      # to pause RTX 5090 rentals without touching the price table.
+      GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES: ${PUBLIC_RENTAL_GPU_FAMILIES:-4090,5090}
       GREENCOMPUTE_CORS_ALLOW_ORIGINS: ${GREENCOMPUTE_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:${POSTGRES_PASSWORD:-greencompute123}@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
@@ -88,6 +92,10 @@ services:
       - ../../:/app/api
       - ${PROTOCOL_DIR:-../../../greencompute/protocol}:/app/protocol
     environment:
+      # GPU families offered for public rental (substring match on gpu_model).
+      # Gateway and control-plane must agree. Set PUBLIC_RENTAL_GPU_FAMILIES=4090
+      # to pause RTX 5090 rentals without touching the price table.
+      GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES: ${PUBLIC_RENTAL_GPU_FAMILIES:-4090,5090}
       GREENCOMPUTE_CORS_ALLOW_ORIGINS: ${GREENCOMPUTE_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:${POSTGRES_PASSWORD:-greencompute123}@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"

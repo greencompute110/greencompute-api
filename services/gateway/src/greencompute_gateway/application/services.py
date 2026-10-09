@@ -96,8 +96,9 @@ def _external_model_upstreams() -> dict[str, str]:
 class UnsupportedGPUError(ValueError):
     """None of the GPU models a deployment allows exist in the public fleet.
 
-    Raised before the balance check so the caller learns *what* to ask for in
-    one round trip, instead of a deployment that sits pending forever.
+    Covers both a GPU we don't sell and one we sell but have no live node for
+    right now. Raised before the balance check so the caller learns *what* to
+    ask for in one round trip, instead of a deployment that sits pending forever.
     """
 
     def __init__(self, requested: list[str], available: list[str]) -> None:
@@ -493,12 +494,16 @@ class GatewayService:
             requested = list(workload.requirements.supported_gpu_models or [])
             if requested:
                 from greencompute_gateway.domain.gpu_catalog import (
-                    matches_public_gpu,
-                    public_gpu_models,
+                    normalize_gpu_model,
+                    rentable_gpu_models,
                 )
 
-                available = public_gpu_models()
-                if not matches_public_gpu(requested):
+                available = rentable_gpu_models(
+                    self.control_plane.repository.list_nodes(),
+                    self.control_plane._is_node_stale,
+                )
+                wanted = {normalize_gpu_model(m) for m in requested}
+                if not wanted & {normalize_gpu_model(m) for m in available}:
                     raise UnsupportedGPUError(requested, available)
 
         # Pre-flight balance check: require enough credits for at least 1 hour
@@ -516,11 +521,21 @@ class GatewayService:
                     (rate_for_gpu(m) for m in supported), default=10
                 )
             else:
-                # No GPU constraint set — be conservative and use the top rate
-                # in our table so users need balance for the priciest option.
+                # No GPU constraint: the most it can cost is the priciest GPU
+                # that can actually be placed right now. Using the whole price
+                # table here demanded balance for an RTX 5090 that no live node
+                # could provide. Must agree with the control-plane's creation
+                # quote (`_quoted_hourly_rate_cents`).
                 from greencompute_protocol import GPU_RATE_CENTS_PER_HOUR, LEGACY_FALLBACK_CENTS_PER_HOUR
+                from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models
+
+                rentable = rentable_gpu_models(
+                    self.control_plane.repository.list_nodes(),
+                    self.control_plane._is_node_stale,
+                )
                 max_rate_cents_per_hour = max(
-                    list(GPU_RATE_CENTS_PER_HOUR.values()) + [LEGACY_FALLBACK_CENTS_PER_HOUR]
+                    [rate_for_gpu(m) for m in rentable]
+                    or list(GPU_RATE_CENTS_PER_HOUR.values()) + [LEGACY_FALLBACK_CENTS_PER_HOUR]
                 )
 
             gpu_count = workload.requirements.gpu_count or 1

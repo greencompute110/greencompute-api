@@ -155,7 +155,7 @@ class ControlPlaneService:
             save_on_exhaustion=payload.save_on_exhaustion,
             deployment_fee_usd=self._estimate_deployment_fee(workload, payload.requested_instances),
             fee_acknowledged=payload.accept_fee,
-            hourly_rate_cents=self._quoted_hourly_rate_cents(workload),
+            hourly_rate_cents=self._quoted_hourly_rate_cents(workload, self._live_public_gpu_models()),
         )
         self.repository.create_deployment(deployment)
         self.bus.publish(
@@ -486,8 +486,28 @@ class ControlPlaneService:
         del workload, requested_instances
         return 0.0
 
+    def _live_public_gpu_models(self) -> list[str]:
+        """Normalised GPU models with at least one live node, within the public
+        rental families. Mirrors the gateway's `rentable_gpu_models`; kept here so
+        the control-plane needn't import gateway code."""
+        import os
+
+        from greencompute_control_plane.domain.scheduler import normalize_gpu_model
+
+        families = [
+            f.strip().lower()
+            for f in os.getenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", "4090,5090").split(",")
+            if f.strip()
+        ]
+        live = {
+            normalize_gpu_model(n.gpu_model)
+            for n in self.repository.list_nodes()
+            if not self._is_node_stale(n)
+        }
+        return sorted(m for m in live if m and (not families or any(f in m for f in families)))
+
     @staticmethod
-    def _quoted_hourly_rate_cents(workload: WorkloadSpec) -> int:
+    def _quoted_hourly_rate_cents(workload: WorkloadSpec, live_models: list[str] | None = None) -> int:
         """Per-GPU-hour rate to show from the moment a deployment is created.
 
         Placement is asynchronous, so the exact card isn't known yet. Previously
@@ -498,7 +518,7 @@ class ControlPlaneService:
 
           * one allowed GPU model  -> exactly its rate (the common case);
           * several allowed models -> the highest of them;
-          * no constraint          -> the highest public rate.
+          * no constraint          -> the highest rate among GPUs a live node has.
 
         Placement still overwrites this with the exact rate of the card granted,
         which can only be equal or lower. It matches the balance pre-check in
@@ -509,6 +529,10 @@ class ControlPlaneService:
         allowed = workload.requirements.supported_gpu_models or []
         if allowed:
             return max(rate_for_gpu(m) for m in allowed)
+        # Unconstrained: the priciest card that can actually be placed now,
+        # not the priciest in the table (that quoted a 5090 nobody could get).
+        if live_models:
+            return max(rate_for_gpu(m) for m in live_models)
         return max(GPU_RATE_CENTS_PER_HOUR.values())
 
     def list_ready_deployments(self, workload_id: str) -> list[DeploymentRecord]:

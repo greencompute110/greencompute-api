@@ -892,4 +892,10 @@ def gpu_pool() -> list[dict]:
         for b in buckets.values()
         if any(fam in (b["gpu_model"] or "").lower() for fam in families)
     ]
+    # An override can advertise contracted hardware with no live node (sales
+    # pre-advertising). That's fine for a human browsing the rentals page, but
+    # an agent reading "8 available" will try to rent and wait forever. Say
+    # plainly whether a live node exists; `available_gpus` alone can't.
+    for b in public:
+        b["rentable_now"] = b["node_count"] > 0
     return sorted(public, key=lambda b: -b["available_gpus"])
