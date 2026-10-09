@@ -2083,22 +2083,31 @@ def billing_topup_crypto(
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
     currency = payload.get("currency", "").lower()
     allowed = (
-        "usdt", "usdc",                           # legacy — single address for either chain
-        "usdt-eth", "usdt-base",                  # chain-qualified
-        "usdc-eth", "usdc-base",                  # chain-qualified
+        "usdt-eth", "usdt-base",
+        "usdc-eth", "usdc-base",
         "tao",
         # Alpha (subnet token) — auto-credited by scan_alpha in the deposit
         # watcher, which matches SubtensorModule.StakeTransferred events to our
         # deposit coldkey on the configured netuid. Priced via price_feed.
         "alpha",
     )
+    if currency in ("usdt", "usdc"):
+        # A bare stablecoin code names no chain. The deposit watcher only
+        # credits chain-qualified invoices, so this one could never be paid.
+        raise HTTPException(
+            status_code=400,
+            detail=f"{currency} needs a chain: use {currency}-base or {currency}-eth",
+        )
     if currency not in allowed:
         raise HTTPException(
             status_code=400,
             detail=f"currency must be one of: {', '.join(allowed)}",
         )
     amount_usd = _validate_topup_amount(payload.get("amount_usd"))
-    return _get_billing().create_crypto_invoice(api_key.user_id, currency, amount_usd)
+    try:
+        return _get_billing().create_crypto_invoice(api_key.user_id, currency, amount_usd)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.post("/platform/billing/webhook/stripe")
