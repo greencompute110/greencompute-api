@@ -203,6 +203,56 @@ def _pending_invoices_for(
     ]
 
 
+# Bittensor produces one block every 12 seconds.
+BITTENSOR_BLOCK_SECONDS = 12
+
+# How far before the oldest pending invoice a Bittensor scan may start (~1h).
+# Covers clock skew between our database and the chain.
+INVOICE_LOOKBACK_BLOCKS = 300
+
+
+def _pending_bittensor_invoices(
+    repo: BillingRepository, currency: str
+) -> tuple[set[str], datetime | None]:
+    """Deposit addresses of pending `currency` invoices, and when the oldest
+    of them was created (None when nothing is pending)."""
+    with session_scope(repo.session_factory) as session:
+        rows = session.scalars(
+            select(CryptoInvoiceORM).where(
+                CryptoInvoiceORM.currency == currency,
+                CryptoInvoiceORM.status == "pending",
+            )
+        ).all()
+        addrs = {(r.deposit_address or "").strip() for r in rows if r.deposit_address}
+        created = [r.created_at for r in rows if r.created_at is not None]
+    oldest = min(created, default=None)
+    if oldest is not None and oldest.tzinfo is None:
+        oldest = oldest.replace(tzinfo=UTC)  # SQLite drops the timezone
+    return addrs, oldest
+
+
+def _bittensor_scan_start(
+    last_seen: int | None,
+    safe_head: int,
+    oldest_pending_at: datetime | None,
+    now: datetime,
+) -> int:
+    """The last block already handled; the scan resumes at the next one.
+
+    The TAO and alpha scanners only run while an invoice is pending, so after
+    a quiet spell the stored cursor can be months behind the chain. Replaying
+    from there at MAX_BLOCKS_PER_TICK per tick took days, long after the
+    invoice had expired, so payments were never credited. Nothing sent before
+    the oldest pending invoice existed can be matched to it, so skip straight
+    to that invoice's block (estimated from its age), minus a margin.
+    """
+    start = last_seen if last_seen is not None else max(0, safe_head - 1800)  # ~6h
+    if oldest_pending_at is None:
+        return start
+    age_blocks = max(0, int((now - oldest_pending_at).total_seconds()) // BITTENSOR_BLOCK_SECONDS)
+    return max(start, safe_head - age_blocks - INVOICE_LOOKBACK_BLOCKS)
+
+
 def _amount_matches(deposit_amount: float, invoice_amount: float) -> bool:
     """Accept the invoice amount exactly OR up to 5% overpayment.
     Tighter than 'send anything' so an unrelated transfer to the same
@@ -463,17 +513,7 @@ def scan_tao(repo: BillingRepository) -> int:
 
     # Pull pending TAO invoices first — bail early if there's nothing to
     # do, so we don't churn the chain RPC.
-    with session_scope(repo.session_factory) as session:
-        addrs = {
-            (r.deposit_address or "").strip()
-            for r in session.scalars(
-                select(CryptoInvoiceORM).where(
-                    CryptoInvoiceORM.currency == "tao",
-                    CryptoInvoiceORM.status == "pending",
-                )
-            ).all()
-            if r.deposit_address
-        }
+    addrs, oldest_pending_at = _pending_bittensor_invoices(repo, "tao")
     if not addrs:
         return 0
 
@@ -492,7 +532,10 @@ def scan_tao(repo: BillingRepository) -> int:
         safe_head = head_num - 10
         if safe_head <= 0:
             return 0
-        from_block = int(last_seen_str) if last_seen_str else max(0, safe_head - 1800)  # ~6h
+        from_block = _bittensor_scan_start(
+            int(last_seen_str) if last_seen_str else None,
+            safe_head, oldest_pending_at, datetime.now(UTC),
+        )
         to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
         if to_block <= from_block:
             return 0
@@ -652,17 +695,7 @@ def scan_alpha(repo: BillingRepository) -> int:
     )
 
     # Bail early if there are no pending alpha invoices — don't churn RPC.
-    with session_scope(repo.session_factory) as session:
-        addrs = {
-            (r.deposit_address or "").strip()
-            for r in session.scalars(
-                select(CryptoInvoiceORM).where(
-                    CryptoInvoiceORM.currency == "alpha",
-                    CryptoInvoiceORM.status == "pending",
-                )
-            ).all()
-            if r.deposit_address
-        }
+    addrs, oldest_pending_at = _pending_bittensor_invoices(repo, "alpha")
     if not addrs:
         return 0
 
@@ -685,7 +718,10 @@ def scan_alpha(repo: BillingRepository) -> int:
         safe_head = head_num - 10  # reorg-safety buffer (Bittensor finalizes fast)
         if safe_head <= 0:
             return 0
-        from_block = int(last_seen_str) if last_seen_str else max(0, safe_head - 1800)  # ~6h
+        from_block = _bittensor_scan_start(
+            int(last_seen_str) if last_seen_str else None,
+            safe_head, oldest_pending_at, datetime.now(UTC),
+        )
         to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
         if to_block <= from_block:
             return 0
