@@ -317,7 +317,13 @@ class BillingService:
             price = get_price(base)
             amount_crypto = round(amount_usd / price, 6) if price > 0 else 0.0
 
+        # Never hand out an invoice that can't be paid: no address to send to,
+        # or no price to say how much.
         deposit_address = _deposit_address_for(currency)
+        if not deposit_address:
+            raise RuntimeError(f"{currency} deposits are not available right now")
+        if amount_crypto <= 0:
+            raise RuntimeError(f"no {base.upper()} price available right now, try again shortly")
         invoice = CryptoInvoice(
             user_id=user_id,
             currency=currency,

@@ -11,7 +11,8 @@ overlapping ticks or restarts.
 - **TAO** (Bittensor mainnet) — Substrate `Balances.Transfer` events.
 - **Alpha** (Bittensor subnet token) — `SubtensorModule.StakeTransferred`
   events to our deposit coldkey on the configured netuid (customers pay by
-  `transfer_stake`-ing alpha to the same address as TAO).
+  `transfer_stake`-ing alpha to the same address as TAO), valued by the
+  alpha amount in the `StakeAdded` event of the same extrinsic.
 - **USDT-ETH, USDC-ETH** — ERC-20 `Transfer` logs via JSON-RPC `eth_getLogs`.
 - **USDT-BASE, USDC-BASE** — same, against Base mainnet RPC.
 
@@ -201,6 +202,56 @@ def _pending_invoices_for(
         r for r in rows
         if (r.deposit_address or "").strip().lower() == addr_lower
     ]
+
+
+# Bittensor produces one block every 12 seconds.
+BITTENSOR_BLOCK_SECONDS = 12
+
+# How far before the oldest pending invoice a Bittensor scan may start (~1h).
+# Covers clock skew between our database and the chain.
+INVOICE_LOOKBACK_BLOCKS = 300
+
+
+def _pending_bittensor_invoices(
+    repo: BillingRepository, currency: str
+) -> tuple[set[str], datetime | None]:
+    """Deposit addresses of pending `currency` invoices, and when the oldest
+    of them was created (None when nothing is pending)."""
+    with session_scope(repo.session_factory) as session:
+        rows = session.scalars(
+            select(CryptoInvoiceORM).where(
+                CryptoInvoiceORM.currency == currency,
+                CryptoInvoiceORM.status == "pending",
+            )
+        ).all()
+        addrs = {(r.deposit_address or "").strip() for r in rows if r.deposit_address}
+        created = [r.created_at for r in rows if r.created_at is not None]
+    oldest = min(created, default=None)
+    if oldest is not None and oldest.tzinfo is None:
+        oldest = oldest.replace(tzinfo=UTC)  # SQLite drops the timezone
+    return addrs, oldest
+
+
+def _bittensor_scan_start(
+    last_seen: int | None,
+    safe_head: int,
+    oldest_pending_at: datetime | None,
+    now: datetime,
+) -> int:
+    """The last block already handled; the scan resumes at the next one.
+
+    The TAO and alpha scanners only run while an invoice is pending, so after
+    a quiet spell the stored cursor can be months behind the chain. Replaying
+    from there at MAX_BLOCKS_PER_TICK per tick took days, long after the
+    invoice had expired, so payments were never credited. Nothing sent before
+    the oldest pending invoice existed can be matched to it, so skip straight
+    to that invoice's block (estimated from its age), minus a margin.
+    """
+    start = last_seen if last_seen is not None else max(0, safe_head - 1800)  # ~6h
+    if oldest_pending_at is None:
+        return start
+    age_blocks = max(0, int((now - oldest_pending_at).total_seconds()) // BITTENSOR_BLOCK_SECONDS)
+    return max(start, safe_head - age_blocks - INVOICE_LOOKBACK_BLOCKS)
 
 
 def _amount_matches(deposit_amount: float, invoice_amount: float) -> bool:
@@ -463,17 +514,7 @@ def scan_tao(repo: BillingRepository) -> int:
 
     # Pull pending TAO invoices first — bail early if there's nothing to
     # do, so we don't churn the chain RPC.
-    with session_scope(repo.session_factory) as session:
-        addrs = {
-            (r.deposit_address or "").strip()
-            for r in session.scalars(
-                select(CryptoInvoiceORM).where(
-                    CryptoInvoiceORM.currency == "tao",
-                    CryptoInvoiceORM.status == "pending",
-                )
-            ).all()
-            if r.deposit_address
-        }
+    addrs, oldest_pending_at = _pending_bittensor_invoices(repo, "tao")
     if not addrs:
         return 0
 
@@ -492,7 +533,10 @@ def scan_tao(repo: BillingRepository) -> int:
         safe_head = head_num - 10
         if safe_head <= 0:
             return 0
-        from_block = int(last_seen_str) if last_seen_str else max(0, safe_head - 1800)  # ~6h
+        from_block = _bittensor_scan_start(
+            int(last_seen_str) if last_seen_str else None,
+            safe_head, oldest_pending_at, datetime.now(UTC),
+        )
         to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
         if to_block <= from_block:
             return 0
@@ -582,46 +626,50 @@ def scan_tao(repo: BillingRepository) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _event_values(ev_obj: dict) -> list | None:
+    """An event's attributes as a positional list (they decode as a list for
+    subtensor's unnamed tuple events; a dict keeps the same order)."""
+    attrs = ev_obj.get("attributes")
+    if isinstance(attrs, (list, tuple)):
+        return list(attrs)
+    if isinstance(attrs, dict):
+        return list(attrs.values())
+    return None
+
+
+def _is_event(ev_obj: object, module: str, event: str) -> bool:
+    return (
+        isinstance(ev_obj, dict)
+        and (ev_obj.get("module_id") or "").lower() == module
+        and (ev_obj.get("event_id") or "").lower() == event
+    )
+
+
 def _extract_alpha_transfer(
     ev_obj: object, dest_addrs: set[str], want_netuid: int
-) -> tuple[str, float, str] | None:
+) -> tuple[str, str] | None:
     """Decode a SubtensorModule.StakeTransferred event into
-    (destination_coldkey, alpha_amount, origin_coldkey) when it credits one of
-    our deposit addresses on the expected subnet — else None.
+    (destination_coldkey, origin_coldkey) when it moves stake to one of our
+    deposit addresses on the expected subnet — else None.
 
     Customers top up with alpha by `transfer_stake`-ing it to our deposit
-    coldkey, which emits (subtensor pallet, unnamed 6-tuple):
+    coldkey, which emits:
 
         StakeTransferred(origin_coldkey, destination_coldkey, hotkey,
-                         origin_netuid, destination_netuid, amount_rao)
+                         origin_netuid, destination_netuid, tao_moved)
 
-    We match on destination_coldkey and REQUIRE destination_netuid == the
-    subnet we priced the invoice against — alpha of another subnet has a
-    different TAO value, so crediting it at our price would be wrong. amount is
-    alpha RAO (9 decimals, like TAO)."""
-    if not isinstance(ev_obj, dict):
+    The last field is the TAO value of the stake, NOT the alpha amount; the
+    alpha we received is in the StakeAdded event of the same extrinsic (see
+    _alpha_deposits). We REQUIRE destination_netuid == the subnet we priced
+    the invoice against — alpha of another subnet has a different TAO value,
+    so crediting it at our price would be wrong."""
+    if not _is_event(ev_obj, "subtensormodule", "staketransferred"):
         return None
-    module = (ev_obj.get("module_id") or "").lower()
-    event = (ev_obj.get("event_id") or "").lower()
-    if module != "subtensormodule" or event != "staketransferred":
+    vals = _event_values(ev_obj)
+    if not vals or len(vals) < 6:
         return None
-    attrs = ev_obj.get("attributes")
     try:
-        if isinstance(attrs, (list, tuple)):
-            if len(attrs) < 6:
-                return None
-            origin = str(attrs[0])
-            dest = str(attrs[1])
-            dest_netuid = int(attrs[4])
-            amount_raw = int(attrs[5])
-        elif isinstance(attrs, dict):
-            origin = str(attrs.get("origin_coldkey") or attrs.get("coldkey") or "")
-            dest = str(attrs.get("destination_coldkey") or attrs.get("dest") or "")
-            raw_netuid = attrs.get("destination_netuid")
-            dest_netuid = int(raw_netuid) if raw_netuid is not None else -1
-            amount_raw = int(attrs.get("amount") or attrs.get("alpha_amount") or 0)
-        else:
-            return None
+        origin, dest, dest_netuid = str(vals[0]), str(vals[1]), int(vals[4])
     except (TypeError, ValueError):
         return None
     if dest not in dest_addrs:
@@ -630,7 +678,63 @@ def _extract_alpha_transfer(
     # (handled as a support case, never auto-credited at the wrong rate).
     if want_netuid >= 0 and dest_netuid != want_netuid:
         return None
-    return dest, amount_raw / 1e9, origin
+    return dest, origin
+
+
+def _extract_stake_added(ev_obj: object) -> tuple[str, int, float] | None:
+    """Decode SubtensorModule.StakeAdded(coldkey, hotkey, tao_amount,
+    alpha_amount, netuid, fee) into (coldkey, netuid, alpha). Alpha has 9
+    decimals, like TAO."""
+    if not _is_event(ev_obj, "subtensormodule", "stakeadded"):
+        return None
+    vals = _event_values(ev_obj)
+    if not vals or len(vals) < 5:
+        return None
+    try:
+        return str(vals[0]), int(vals[4]), int(vals[3]) / 1e9
+    except (TypeError, ValueError):
+        return None
+
+
+def _alpha_deposits(
+    events: list, dest_addrs: set[str], want_netuid: int
+) -> list[tuple[int, str, float, str]]:
+    """Alpha transfers to our deposit addresses in one block, as
+    (event_idx, our_address, alpha_received, sender).
+
+    The amount comes from the StakeAdded event that the same extrinsic emits
+    for our coldkey on our subnet. A transfer with no such companion event
+    can't be valued, so it is logged and left for manual review."""
+    by_extrinsic: dict[object, list[tuple[str, int, float]]] = {}
+    transfers: list[tuple[int, object, str, str]] = []
+    for idx, ev in enumerate(events):
+        ev_obj = getattr(ev, "value", ev)
+        if not isinstance(ev_obj, dict):
+            continue
+        xidx = ev_obj.get("extrinsic_idx")
+        added = _extract_stake_added(ev_obj)
+        if added is not None:
+            by_extrinsic.setdefault(xidx, []).append(added)
+            continue
+        moved = _extract_alpha_transfer(ev_obj, dest_addrs, want_netuid)
+        if moved is not None:
+            transfers.append((idx, xidx, moved[0], moved[1]))
+
+    deposits = []
+    for idx, xidx, dest, origin in transfers:
+        alpha = next(
+            (a for coldkey, netuid, a in by_extrinsic.get(xidx, [])
+             if coldkey == dest and netuid == want_netuid),
+            None,
+        )
+        if alpha is None:
+            log.warning(
+                "watcher alpha: stake transfer to %s (event %d) has no StakeAdded "
+                "for our coldkey — can't value it, needs manual review", dest, idx,
+            )
+            continue
+        deposits.append((idx, dest, alpha, origin))
+    return deposits
 
 
 def scan_alpha(repo: BillingRepository) -> int:
@@ -652,17 +756,7 @@ def scan_alpha(repo: BillingRepository) -> int:
     )
 
     # Bail early if there are no pending alpha invoices — don't churn RPC.
-    with session_scope(repo.session_factory) as session:
-        addrs = {
-            (r.deposit_address or "").strip()
-            for r in session.scalars(
-                select(CryptoInvoiceORM).where(
-                    CryptoInvoiceORM.currency == "alpha",
-                    CryptoInvoiceORM.status == "pending",
-                )
-            ).all()
-            if r.deposit_address
-        }
+    addrs, oldest_pending_at = _pending_bittensor_invoices(repo, "alpha")
     if not addrs:
         return 0
 
@@ -685,7 +779,10 @@ def scan_alpha(repo: BillingRepository) -> int:
         safe_head = head_num - 10  # reorg-safety buffer (Bittensor finalizes fast)
         if safe_head <= 0:
             return 0
-        from_block = int(last_seen_str) if last_seen_str else max(0, safe_head - 1800)  # ~6h
+        from_block = _bittensor_scan_start(
+            int(last_seen_str) if last_seen_str else None,
+            safe_head, oldest_pending_at, datetime.now(UTC),
+        )
         to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
         if to_block <= from_block:
             return 0
@@ -702,12 +799,10 @@ def scan_alpha(repo: BillingRepository) -> int:
                 )
                 break
 
-            for event_idx, ev in enumerate(events):
-                ev_obj = getattr(ev, "value", ev)
-                extracted = _extract_alpha_transfer(ev_obj, addrs, want_netuid)
-                if extracted is None:
-                    continue
-                dest, deposit_amount, _sender = extracted
+            for event_idx, dest, deposit_amount, _sender in _alpha_deposits(
+                events, addrs, want_netuid
+            ):
+                ev_obj = getattr(events[event_idx], "value", events[event_idx])
                 tx_hash = str(
                     ev_obj.get("extrinsic_hash")
                     or ev_obj.get("extrinsic_idx")
