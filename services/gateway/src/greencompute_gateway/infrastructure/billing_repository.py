@@ -931,6 +931,23 @@ class BillingRepository:
                 )
             )
 
+    def find_user_id(self, identifier: str) -> str | None:
+        """A user's id from their id, username or email (case-insensitive);
+        None when nothing or more than one account matches."""
+        ident = (identifier or "").strip()
+        if not ident:
+            return None
+        with session_scope(self.session_factory) as session:
+            if session.get(UserORM, ident) is not None:
+                return ident
+            ids = session.scalars(
+                select(UserORM.user_id).where(
+                    (func.lower(UserORM.username) == ident.lower())
+                    | (func.lower(UserORM.email) == ident.lower())
+                )
+            ).all()
+            return ids[0] if len(ids) == 1 else None
+
     def get_username(self, user_id: str) -> str | None:
         with session_scope(self.session_factory) as session:
             row = session.get(UserORM, user_id)

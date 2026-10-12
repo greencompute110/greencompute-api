@@ -476,3 +476,13 @@ def test_deposits_route_shows_only_the_callers_credited_deposits(api, svc):
     rows = api.call("billing_crypto_deposits")
     assert [r["deposit_ref"] for r in rows] == ["tao:9:1"]
     assert "user_id" not in rows[0]
+
+
+def test_admin_assigns_by_username_or_email(api, svc, monkeypatch):
+    svc.resolve_deposit(deposit("usdc-base:0x9:0", amount_raw=4_000_000))
+    svc.resolve_deposit(deposit("usdc-base:0x9:1", amount_raw=6_000_000))
+    assert api.call("billing_admin_assign_deposit", "usdc-base:0x9:0", {"user": "Carol"})["credited"]
+    assert api.call("billing_admin_assign_deposit", "usdc-base:0x9:1", {"user": "bob@x.io"})["credited"]
+    assert (balance(svc, "carol"), balance(svc, "bob")) == (400, 600)
+    assert api.status("billing_admin_assign_deposit", "usdc-base:0x9:1", {"user": "bob"}) == 409
+    assert api.status("billing_admin_assign_deposit", "usdc-base:0x9:1", {"user": "nobody"}) == 404

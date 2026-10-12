@@ -2488,15 +2488,17 @@ def billing_admin_assign_deposit(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     """Admin — credit an unmatched deposit to a user, at its value when it
-    arrived. Refuses a deposit that was already credited."""
+    arrived. Body: {"user": user id, username or email}. Refuses a deposit
+    that was already credited."""
     require_api_key(authorization, x_api_key, admin_required=True)
-    user_id = (payload.get("user_id") or "").strip()
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id required")
-    try:
-        result = _get_billing().assign_deposit(deposit_ref, user_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="user not found") from exc
+    ident = str(payload.get("user") or payload.get("user_id") or "").strip()
+    if not ident:
+        raise HTTPException(status_code=400, detail="user required (id, username or email)")
+    billing = _get_billing()
+    user_id = billing.repo.find_user_id(ident)
+    if user_id is None:
+        raise HTTPException(status_code=404, detail=f"no single account matches {ident!r}")
+    result = billing.assign_deposit(deposit_ref, user_id)
     if result is None:
         raise HTTPException(status_code=404, detail="deposit not found")
     if result.get("already_credited"):
