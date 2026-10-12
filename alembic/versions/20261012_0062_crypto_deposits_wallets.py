@@ -12,6 +12,8 @@ the amount alone. Two users opening $20 invoices were both told to send exactly
   an admin.
 - verified_wallets: wallets whose owner proved control by signing a message;
   payments from them are credited to that owner. One owner per wallet.
+- crypto_invoices.review_*: a user's request to have a payment checked by
+  hand when it wasn't credited, with the transaction they reported.
 
 Strictly additive, reversible.
 
@@ -32,6 +34,12 @@ PENDING_WITH_UNITS = "status = 'pending' AND amount_units IS NOT NULL"
 
 def upgrade() -> None:
     op.add_column("crypto_invoices", sa.Column("amount_units", sa.BigInteger(), nullable=True))
+    op.add_column("crypto_invoices", sa.Column("review_status", sa.String(16), nullable=True))
+    op.add_column("crypto_invoices", sa.Column("review_note", sa.Text(), nullable=True))
+    op.add_column(
+        "crypto_invoices", sa.Column("review_requested_at", sa.DateTime(timezone=True), nullable=True)
+    )
+    op.create_index("ix_crypto_invoices_review_status", "crypto_invoices", ["review_status"])
     op.create_index(
         "uq_crypto_invoices_pending_amount",
         "crypto_invoices",
@@ -88,4 +96,6 @@ def downgrade() -> None:
         op.drop_index(f"ix_crypto_deposits_{ix}", table_name="crypto_deposits")
     op.drop_table("crypto_deposits")
     op.drop_index("uq_crypto_invoices_pending_amount", table_name="crypto_invoices")
-    op.drop_column("crypto_invoices", "amount_units")
+    op.drop_index("ix_crypto_invoices_review_status", table_name="crypto_invoices")
+    for column in ("review_requested_at", "review_note", "review_status", "amount_units"):
+        op.drop_column("crypto_invoices", column)

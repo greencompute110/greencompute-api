@@ -856,6 +856,11 @@ class CryptoInvoiceORM(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # A user's request to have a payment for this invoice checked by hand:
+    # "open", then "resolved" or "dismissed". tx_hash holds what they reported.
+    review_status: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class CryptoDepositORM(Base):

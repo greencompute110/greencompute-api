@@ -86,6 +86,11 @@ class WalletProofError(ValueError):
     """The wallet-link request doesn't prove control of the wallet."""
 
 
+class ReviewError(ValueError):
+    """A review can't be resolved that way (not open, deposit already
+    credited, unknown action...)."""
+
+
 def format_units(units: int) -> str:
     """Exact decimal string for an amount in millionths, e.g. 20003817 ->
     "20.003817". Agents should send this string, never a re-rounded float."""
@@ -531,6 +536,64 @@ class BillingService:
         self.repo.mark_deposit(deposit["deposit_ref"], status="credited")
         return "seen"
 
+    # --- Payment reviews ---
+
+    def resolve_review(self, invoice_id: str, action: str, deposit_ref: str | None = None) -> dict:
+        """Admin: close a user's review request.
+
+        - "credit_deposit": credit the logged deposit `deposit_ref` to the
+          invoice's owner, at what actually arrived (bonus included).
+        - "confirm_invoice": credit the invoice's own amount against the
+          reported transaction, even if the invoice expired meanwhile.
+        - "dismiss": close it without crediting anything.
+        """
+        review = self.repo.get_invoice_review(invoice_id)
+        if review is None:
+            raise KeyError(invoice_id)
+        if review["review_status"] != "open":
+            raise ReviewError("this review is not open")
+
+        if action == "dismiss":
+            self.repo.set_review_status(invoice_id, "dismissed")
+            return {"invoice_id": invoice_id, "review_status": "dismissed"}
+
+        if action == "credit_deposit":
+            dep = self.repo.get_deposit(deposit_ref or "")
+            if dep is None:
+                raise ReviewError("deposit not found")
+            result = self.assign_deposit(dep["deposit_ref"], review["user_id"])
+            if not result or not result.get("credited"):
+                raise ReviewError("that deposit was already credited")
+            self.repo.set_review_status(invoice_id, "resolved", paid_tx=dep["tx_hash"] or "")
+            return {"invoice_id": invoice_id, "review_status": "resolved", "credited_cents": result["amount_cents"]}
+
+        if action == "confirm_invoice":
+            tx_hash = review["tx_hash"] or ""
+            result = self.repo.confirm_and_credit_invoice(
+                invoice_id=invoice_id,
+                tx_hash=tx_hash,
+                description=(
+                    f"Crypto deposit {review['currency'].upper()} ${review['amount_usd']:.2f} "
+                    f"(+{int(round(review['bonus_pct'] * 100))}% bonus, after review)"
+                ),
+                # Same key as a manual admin confirm, so the watcher and wallet
+                # links treat this transaction as already credited.
+                deposit_ref=f"manual:{review['currency']}:{tx_hash}" if tx_hash else None,
+                allow_expired=True,
+            )
+            if not result or not result.get("credited"):
+                raise ReviewError("not credited: the invoice or this transaction was already credited")
+            if tx_hash:
+                self.repo.mark_deposits_by_tx(
+                    None, tx_hash, status="credited", matched_by="admin",
+                    invoice_id=invoice_id, user_id=review["user_id"],
+                    credited_cents=review["total_credits"],
+                )
+            self.repo.set_review_status(invoice_id, "resolved")
+            return {"invoice_id": invoice_id, "review_status": "resolved", "credited_cents": review["total_credits"]}
+
+        raise ReviewError("action must be credit_deposit, confirm_invoice or dismiss")
+
     # --- Verified wallets ---
 
     def wallet_challenge(self, user_id: str, chain: str, address: str) -> dict:
@@ -637,7 +700,7 @@ class BillingService:
             return None
         if result.get("credited") and tx_hash:
             self.repo.mark_deposits_by_tx(
-                invoice.currency, tx_hash, status="credited", matched_by="admin",
+                None, tx_hash, status="credited", matched_by="admin",
                 invoice_id=invoice_id, user_id=invoice.user_id,
                 credited_cents=invoice.total_credits,
             )

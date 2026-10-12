@@ -486,3 +486,69 @@ def test_admin_assigns_by_username_or_email(api, svc, monkeypatch):
     assert (balance(svc, "carol"), balance(svc, "bob")) == (400, 600)
     assert api.status("billing_admin_assign_deposit", "usdc-base:0x9:1", {"user": "bob"}) == 409
     assert api.status("billing_admin_assign_deposit", "usdc-base:0x9:1", {"user": "nobody"}) == 404
+
+
+# --- payment reviews ----------------------------------------------------------------
+
+
+def _expire(svc, invoice_id):
+    with session_scope(svc.repo.session_factory) as s:
+        s.get(CryptoInvoiceORM, invoice_id).status = "expired"
+
+
+def test_user_requests_review_on_an_expired_invoice(api, svc):
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    _expire(svc, inv["invoice_id"])
+    res = api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xpaid", "note": "sent 20 from Binance"})
+    assert res["review_status"] == "open"
+    listed = {i["invoice_id"]: i for i in api.call("billing_list_crypto_invoices")}
+    assert listed[inv["invoice_id"]]["review_status"] == "open"
+
+
+def test_review_request_guards(api, svc):
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    assert api.status("billing_request_review", inv["invoice_id"], {"tx_hash": ""}) == 400
+    api.who["user"] = "bob"
+    assert api.status("billing_request_review", inv["invoice_id"], {"tx_hash": "0x1"}) == 404
+    api.who["user"] = "alice"
+    svc.resolve_deposit(deposit("usdc-base:0xok:0", amount_raw=invoice_units(svc, inv["invoice_id"])))
+    assert api.status("billing_request_review", inv["invoice_id"], {"tx_hash": "0x1"}) == 409  # already confirmed
+
+
+def test_admin_credits_the_logged_deposit_behind_a_review(api, svc):
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    # Alice rounds up to 21.5 USDC, more than 5% over: nobody is credited.
+    svc.resolve_deposit(deposit("usdc-base:0xpaid:0", amount_raw=21_500_000, tx="0xPAID"))
+    _expire(svc, inv["invoice_id"])
+    api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xpaid"})
+
+    [review] = api.call("billing_admin_list_reviews")
+    assert review["username"] == "alice"
+    assert [(d["deposit_ref"], d["status"], d["amount"]) for d in review["deposits"]] == [("usdc-base:0xpaid:0", "unmatched", 21.5)]
+
+    res = api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "credit_deposit", "deposit_ref": "usdc-base:0xpaid:0"})
+    assert res["credited_cents"] == 2150 and balance(svc, "alice") == 2150  # what actually arrived
+    assert status_of(svc, inv["invoice_id"]) == "confirmed"
+    assert api.call("billing_admin_list_reviews") == []
+    assert api.status("billing_admin_resolve_review", inv["invoice_id"], {"action": "dismiss"}) == 409
+
+
+def test_admin_confirms_an_expired_invoice_after_review_and_nothing_pays_twice(api, svc):
+    payer = Keypair.create_from_uri("//AliceExchangeLater")
+    inv = svc.create_crypto_invoice("alice", "tao", 30)
+    _expire(svc, inv["invoice_id"])
+    api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xLATE"})
+    res = api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "confirm_invoice"})
+    assert res["credited_cents"] == 3000 and balance(svc, "alice") == 3000
+    # The watcher logs the same transfer afterwards, from a wallet Alice then verifies.
+    assert svc.resolve_deposit(deposit("tao:5:1", "tao", 100_000_000, sender=payer.ss58_address, tx="0xlate")) == "seen"
+    assert _link(svc, "alice", payer)["credited"] == []
+    assert balance(svc, "alice") == 3000
+
+
+def test_dismissed_review_credits_nothing(api, svc):
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xnope"})
+    assert api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "dismiss"})["review_status"] == "dismissed"
+    assert balance(svc, "alice") == 0
+    assert api.status("billing_admin_resolve_review", inv["invoice_id"], {"action": "confirm_invoice"}) == 409

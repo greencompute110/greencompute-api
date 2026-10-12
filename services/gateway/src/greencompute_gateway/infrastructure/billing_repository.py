@@ -417,6 +417,7 @@ class BillingRepository:
         tx_hash: str,
         description: str,
         deposit_ref: str | None = None,
+        allow_expired: bool = False,
     ) -> dict | None:
         """Atomically confirm an invoice and credit the owning user.
 
@@ -456,7 +457,9 @@ class BillingRepository:
             # caller.) An admin who genuinely needs to credit a late-but-real
             # payment re-opens the invoice first, rather than this silently
             # overriding the terminal state.
-            if inv.status in ("rejected", "expired"):
+            # A user's review request is that re-opening: resolving it may
+            # credit an invoice that expired before the payment was matched.
+            if inv.status == "rejected" or (inv.status == "expired" and not allow_expired):
                 return {
                     "refused": True,
                     "invoice_id": invoice_id,
@@ -602,6 +605,111 @@ class BillingRepository:
             row.tx_hash = tx_hash
             session.add(row)
             return self._to_crypto_invoice(row)
+
+    def request_invoice_review(
+        self, invoice_id: str, user_id: str, tx_hash: str, note: str | None = None
+    ) -> dict | None:
+        """User-side: ask for a payment against this invoice to be checked by
+        hand, giving its transaction hash. Only the invoice's owner can, and
+        only while it is pending or expired. Returns None if the invoice isn't
+        theirs, {"refused": status} if it is confirmed or rejected."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(CryptoInvoiceORM, invoice_id)
+            if row is None or row.user_id != user_id:
+                return None
+            if row.status not in ("pending", "expired"):
+                return {"refused": True, "invoice_id": invoice_id, "status": row.status}
+            row.tx_hash = tx_hash
+            row.review_status = "open"
+            row.review_note = (note or "").strip()[:1000] or None
+            row.review_requested_at = datetime.now(UTC)
+            return {
+                "invoice_id": invoice_id,
+                "status": row.status,
+                "tx_hash": tx_hash,
+                "review_status": "open",
+            }
+
+    def invoice_review_statuses(self, user_id: str) -> dict[str, str]:
+        with session_scope(self.session_factory) as session:
+            rows = session.execute(
+                select(CryptoInvoiceORM.invoice_id, CryptoInvoiceORM.review_status).where(
+                    CryptoInvoiceORM.user_id == user_id,
+                    CryptoInvoiceORM.review_status.is_not(None),
+                )
+            ).all()
+            return {invoice_id: status for invoice_id, status in rows}
+
+    def get_invoice_review(self, invoice_id: str) -> dict | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(CryptoInvoiceORM, invoice_id)
+            if row is None:
+                return None
+            return {
+                "invoice_id": row.invoice_id,
+                "user_id": row.user_id,
+                "currency": row.currency,
+                "amount_usd": float(row.amount_usd),
+                "bonus_pct": float(row.bonus_pct or 0.0),
+                "total_credits": row.total_credits,
+                "status": row.status,
+                "tx_hash": row.tx_hash,
+                "review_status": row.review_status,
+            }
+
+    def set_review_status(self, invoice_id: str, review_status: str, *, paid_tx: str | None = None) -> None:
+        """Close a review. With `paid_tx`, also mark the invoice confirmed:
+        its payment has been credited (possibly at a different amount)."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(CryptoInvoiceORM, invoice_id)
+            if row is None:
+                return
+            row.review_status = review_status
+            if paid_tx is not None and row.status != "confirmed":
+                row.status = "confirmed"
+                row.tx_hash = paid_tx or row.tx_hash
+                row.confirmed_at = datetime.now(UTC)
+
+    def list_open_reviews(self, limit: int = 200) -> list[dict]:
+        """Admin: open review requests, oldest first, each with the account and
+        any logged deposit carrying the reported transaction hash."""
+        with session_scope(self.session_factory) as session:
+            rows = session.execute(
+                select(CryptoInvoiceORM, UserORM)
+                .join(UserORM, UserORM.user_id == CryptoInvoiceORM.user_id)
+                .where(CryptoInvoiceORM.review_status == "open")
+                .order_by(CryptoInvoiceORM.review_requested_at.asc())
+                .limit(limit)
+            ).all()
+            out = []
+            for inv, user in rows:
+                deposits = []
+                if inv.tx_hash:
+                    deposits = [
+                        self._deposit_dict(d)
+                        for d in session.scalars(
+                            select(CryptoDepositORM).where(
+                                func.lower(CryptoDepositORM.tx_hash) == inv.tx_hash.strip().lower()
+                            )
+                        ).all()
+                    ]
+                out.append({
+                    "invoice_id": inv.invoice_id,
+                    "user_id": inv.user_id,
+                    "username": user.username,
+                    "email": user.email,
+                    "currency": inv.currency,
+                    "amount_crypto": inv.amount_crypto,
+                    "amount_usd": inv.amount_usd,
+                    "total_credits": inv.total_credits,
+                    "status": inv.status,
+                    "tx_hash": inv.tx_hash,
+                    "review_note": inv.review_note,
+                    "review_requested_at": inv.review_requested_at.isoformat() if inv.review_requested_at else None,
+                    "created_at": inv.created_at.isoformat() if inv.created_at else None,
+                    "deposits": deposits,
+                })
+            return out
 
     def list_crypto_invoices(self, user_id: str) -> list[CryptoInvoice]:
         with session_scope(self.session_factory) as session:
@@ -750,23 +858,27 @@ class BillingRepository:
 
     @staticmethod
     def _manual_credit_row(session, currency: str, tx_hash: str | None):
+        # Any currency: the user may have paid in a different token than the
+        # invoice they were credited for. Hashes are hex, so LIKE is safe.
         if not tx_hash:
             return None
-        ref = f"manual:{currency}:{tx_hash}".lower()
         return session.scalar(
-            select(LedgerEntryORM).where(func.lower(LedgerEntryORM.deposit_ref) == ref)
+            select(LedgerEntryORM).where(
+                func.lower(LedgerEntryORM.deposit_ref).like(f"manual:%:{tx_hash.strip().lower()}")
+            )
         )
 
-    def mark_deposits_by_tx(self, currency: str, tx_hash: str, **fields) -> int:
+    def mark_deposits_by_tx(self, currency: str | None, tx_hash: str, **fields) -> int:
         """After an admin confirm: mark the logged transfer(s) of this
-        transaction credited, so linking the wallet can't claim them again."""
+        transaction credited, so linking the wallet can't claim them again.
+        `currency` None matches any currency."""
         with session_scope(self.session_factory) as session:
-            rows = session.scalars(
-                select(CryptoDepositORM).where(
-                    CryptoDepositORM.currency == currency,
-                    func.lower(CryptoDepositORM.tx_hash) == (tx_hash or "").lower(),
-                )
-            ).all()
+            q = select(CryptoDepositORM).where(
+                func.lower(CryptoDepositORM.tx_hash) == (tx_hash or "").strip().lower()
+            )
+            if currency:
+                q = q.where(CryptoDepositORM.currency == currency)
+            rows = session.scalars(q).all()
             for row in rows:
                 for key, value in fields.items():
                     setattr(row, key, value)
