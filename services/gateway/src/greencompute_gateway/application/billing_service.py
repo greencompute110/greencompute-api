@@ -94,13 +94,12 @@ def format_units(units: int) -> str:
 
 def wallet_link_message(username: str, user_id: str, address: str, issued_at: str) -> str:
     """The text a user signs to link a wallet. It names the account so a
-    signature can't be replayed to link the wallet to anyone else."""
+    signature can't be replayed to link the wallet to anyone else. One line,
+    so it passes cleanly to `btcli wallet sign --message` and survives copy
+    and paste."""
     return (
-        "Green Compute: link this wallet to my account\n"
-        f"Account: {username} ({user_id})\n"
-        f"Wallet: {address}\n"
-        f"Issued: {issued_at}\n"
-        "Payments from this wallet will be credited to this account."
+        f"Green Compute: link wallet {address} to account {username} ({user_id}). "
+        f"Issued {issued_at}. Payments from this wallet will be credited to this account."
     )
 
 
