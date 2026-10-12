@@ -2086,7 +2086,7 @@ def billing_topup_crypto(
         "usdt-eth", "usdt-base",
         "usdc-eth", "usdc-base",
         "tao",
-        # Alpha (subnet token) — auto-credited by scan_alpha in the deposit
+        # Alpha (subnet token) — auto-credited by scan_bittensor in the deposit
         # watcher, which matches SubtensorModule.StakeTransferred events to our
         # deposit coldkey on the configured netuid. Priced via price_feed.
         "alpha",

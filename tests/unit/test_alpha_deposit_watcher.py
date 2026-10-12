@@ -11,7 +11,7 @@ StakeTransferred's amount is TAO, not alpha, so the credit must come from
 StakeAdded. The fixtures below are the real events of a $5 alpha top-up on
 mainnet (block 9174691, 2026-09-29) that was never credited because the
 scanner read the TAO figure. (The credit/dedup machinery is shared with
-scan_tao and covered by test_deposit_double_credit.)
+scan_bittensor and covered by test_crypto_deposits.)
 """
 from greencompute_gateway.infrastructure.deposit_watcher import (
     _alpha_deposits,
