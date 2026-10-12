@@ -100,7 +100,7 @@ def _feature_disabled(feature: str) -> None:
     )
 
 
-@router.post("/platform/api-keys")
+@router.post("/platform/api-keys", include_in_schema=False)
 def create_api_key(
     payload: APIKeyCreateRequest,
     authorization: str | None = Header(default=None),
@@ -207,7 +207,7 @@ def delete_api_key(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
-@router.post("/platform/register")
+@router.post("/platform/register", include_in_schema=False)
 def register_user(
     payload: UserRegistrationRequest,
     authorization: str | None = Header(default=None),
@@ -220,7 +220,7 @@ def register_user(
     return service.register_user(payload).model_dump(mode="json")
 
 
-@router.get("/platform/users")
+@router.get("/platform/users", include_in_schema=False)
 def list_users(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -351,7 +351,7 @@ def get_build(
     return build.model_dump(mode="json")
 
 
-@router.get("/platform/builds/{build_id}/context")
+@router.get("/platform/builds/{build_id}/context", include_in_schema=False)
 def get_build_context(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -364,7 +364,7 @@ def get_build_context(
     return context.model_dump(mode="json")
 
 
-@router.get("/platform/builds/{build_id}/events")
+@router.get("/platform/builds/{build_id}/events", include_in_schema=False)
 def get_build_events(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -374,7 +374,7 @@ def get_build_events(
     return [event.model_dump(mode="json") for event in service.list_build_events(build_id)]
 
 
-@router.get("/platform/builds/{build_id}/attempts")
+@router.get("/platform/builds/{build_id}/attempts", include_in_schema=False)
 def get_build_attempts(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -384,7 +384,7 @@ def get_build_attempts(
     return service.build_attempts(build_id)
 
 
-@router.get("/platform/builds/{build_id}/jobs")
+@router.get("/platform/builds/{build_id}/jobs", include_in_schema=False)
 def get_build_jobs(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -394,7 +394,7 @@ def get_build_jobs(
     return [job.model_dump(mode="json") for job in service.list_build_jobs(build_id)]
 
 
-@router.get("/platform/builds/{build_id}/jobs/latest")
+@router.get("/platform/builds/{build_id}/jobs/latest", include_in_schema=False)
 def get_latest_build_job(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -407,7 +407,7 @@ def get_latest_build_job(
     return job.model_dump(mode="json")
 
 
-@router.get("/platform/builds/{build_id}/jobs/latest/timeline")
+@router.get("/platform/builds/{build_id}/jobs/latest/timeline", include_in_schema=False)
 def get_latest_build_job_timeline(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -419,7 +419,7 @@ def get_latest_build_job_timeline(
     return [entry.model_dump(mode="json") for entry in service.latest_build_job_timeline(build_id)]
 
 
-@router.post("/platform/builds/{build_id}/jobs/latest/cancel")
+@router.post("/platform/builds/{build_id}/jobs/latest/cancel", include_in_schema=False)
 def cancel_latest_build_job(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -432,7 +432,7 @@ def cancel_latest_build_job(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/platform/builds/{build_id}/jobs/latest/restart")
+@router.post("/platform/builds/{build_id}/jobs/latest/restart", include_in_schema=False)
 def restart_latest_build_job(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -447,7 +447,7 @@ def restart_latest_build_job(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.get("/platform/builds/recovery/status")
+@router.get("/platform/builds/recovery/status", include_in_schema=False)
 def build_recovery_status(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -456,7 +456,7 @@ def build_recovery_status(
     return service.build_recovery_status()
 
 
-@router.post("/platform/builds/recovery")
+@router.post("/platform/builds/recovery", include_in_schema=False)
 def recover_build_jobs(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -465,7 +465,7 @@ def recover_build_jobs(
     return service.recover_build_jobs()
 
 
-@router.get("/platform/builds/{build_id}/recovery-summary")
+@router.get("/platform/builds/{build_id}/recovery-summary", include_in_schema=False)
 def build_recovery_summary(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -478,7 +478,7 @@ def build_recovery_summary(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/platform/builds/{build_id}/attempts/{attempt}")
+@router.get("/platform/builds/{build_id}/attempts/{attempt}", include_in_schema=False)
 def get_build_attempt(
     build_id: str,
     attempt: int,
@@ -492,7 +492,7 @@ def get_build_attempt(
     return record.model_dump(mode="json")
 
 
-@router.get("/platform/builds/{build_id}/logs")
+@router.get("/platform/builds/{build_id}/logs", include_in_schema=False)
 def get_build_logs(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -502,7 +502,7 @@ def get_build_logs(
     return [log.model_dump(mode="json") for log in service.list_build_logs(build_id)]
 
 
-@router.get("/platform/builds/{build_id}/logs/stream")
+@router.get("/platform/builds/{build_id}/logs/stream", include_in_schema=False)
 def stream_build_logs(
     build_id: str,
     follow: bool = False,
@@ -517,7 +517,7 @@ def stream_build_logs(
     )
 
 
-@router.post("/platform/builds/{build_id}/retry")
+@router.post("/platform/builds/{build_id}/retry", include_in_schema=False)
 def retry_build(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -530,7 +530,7 @@ def retry_build(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/platform/builds/{build_id}/cleanup")
+@router.post("/platform/builds/{build_id}/cleanup", include_in_schema=False)
 def cleanup_build(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -543,7 +543,7 @@ def cleanup_build(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/platform/builds/{build_id}/cancel")
+@router.post("/platform/builds/{build_id}/cancel", include_in_schema=False)
 def cancel_build(
     build_id: str,
     authorization: str | None = Header(default=None),
@@ -917,23 +917,34 @@ def get_deployment_ssh(
     host_port = parts[-1].rsplit(":", 1)
     host = host_port[0]
     port = int(host_port[1]) if len(host_port) == 2 else 22
-    # Audit: a long-lived SSH private key is being handed out. Authz already
-    # passed (owner/admin), but record WHO pulled it.
-    metrics.increment("secret_access.deployment_ssh")
-    log.info(
-        "secret_access event=deployment_ssh_key deployment_id=%s key_id=%s user_id=%s ip=%s",
-        deployment_id,
-        api_key.key_id,
-        api_key.user_id,
-        _audit_client_ip(),
-    )
+    private_key = None if _workload_has_own_ssh_keys(deployment.workload_id) else deployment.ssh_private_key
+    if private_key:
+        # Audit: a long-lived SSH private key is being handed out. Authz
+        # already passed (owner/admin), but record WHO pulled it.
+        metrics.increment("secret_access.deployment_ssh")
+        log.info(
+            "secret_access event=deployment_ssh_key deployment_id=%s key_id=%s user_id=%s ip=%s",
+            deployment_id,
+            api_key.key_id,
+            api_key.user_id,
+            _audit_client_ip(),
+        )
     return {
         "ssh_host": host,
         "ssh_port": port,
         "ssh_username": user,
         "ssh_command": f"ssh {user}@{host} -p {port}",
-        "private_key": deployment.ssh_private_key,
+        "private_key": private_key,
     }
+
+
+def _workload_has_own_ssh_keys(workload_id: str) -> bool:
+    """Did the workload bring its own SSH public keys? Then the platform's
+    generated key is only for clients that didn't, and is never returned:
+    handing it out would be a second root key to the pod nobody asked for."""
+    workload = service.get_workload(workload_id, admin=True)
+    keys = ((workload.metadata or {}) if workload else {}).get("ssh_public_keys") or []
+    return any(isinstance(k, str) and k.strip() for k in keys)
 
 
 def _control_plane_base() -> str:
@@ -1166,7 +1177,7 @@ def create_commercial_inquiry(
     return {"inquiry_id": inquiry.inquiry_id, "status": inquiry.status}
 
 
-@router.get("/platform/sales/inquiries")
+@router.get("/platform/sales/inquiries", include_in_schema=False)
 def list_commercial_inquiries(
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
@@ -1183,7 +1194,7 @@ def list_commercial_inquiries(
     ]
 
 
-@router.patch("/platform/sales/inquiries/{inquiry_id}")
+@router.patch("/platform/sales/inquiries/{inquiry_id}", include_in_schema=False)
 def update_commercial_inquiry(
     inquiry_id: str,
     body: dict,
@@ -1241,7 +1252,7 @@ def create_bare_metal_inquiry(
     return {"inquiry_id": inquiry.inquiry_id, "status": inquiry.status}
 
 
-@router.get("/platform/sales/bare-metal-inquiries")
+@router.get("/platform/sales/bare-metal-inquiries", include_in_schema=False)
 def list_bare_metal_inquiries(
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
@@ -1258,7 +1269,7 @@ def list_bare_metal_inquiries(
     ]
 
 
-@router.patch("/platform/sales/bare-metal-inquiries/{inquiry_id}")
+@router.patch("/platform/sales/bare-metal-inquiries/{inquiry_id}", include_in_schema=False)
 def update_bare_metal_inquiry(
     inquiry_id: str,
     body: dict,
@@ -1295,7 +1306,7 @@ def update_bare_metal_inquiry(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/platform/admin/capacity-overrides")
+@router.get("/platform/admin/capacity-overrides", include_in_schema=False)
 def list_capacity_overrides(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -1306,7 +1317,7 @@ def list_capacity_overrides(
     ]
 
 
-@router.put("/platform/admin/capacity-overrides/{gpu_model}")
+@router.put("/platform/admin/capacity-overrides/{gpu_model}", include_in_schema=False)
 def upsert_capacity_override(
     gpu_model: str,
     body: dict,
@@ -1334,7 +1345,7 @@ def upsert_capacity_override(
     return saved.model_dump(mode="json")
 
 
-@router.delete("/platform/admin/capacity-overrides/{gpu_model}")
+@router.delete("/platform/admin/capacity-overrides/{gpu_model}", include_in_schema=False)
 def delete_capacity_override(
     gpu_model: str,
     authorization: str | None = Header(default=None),
@@ -1688,7 +1699,7 @@ def _public_inference_model_names() -> list[str]:
     return list(dict.fromkeys(names))
 
 
-@router.get("/platform/v1/debug/route/{model}")
+@router.get("/platform/v1/debug/route/{model}", include_in_schema=False)
 def debug_route(
     model: str,
     host: str | None = None,
@@ -1712,7 +1723,7 @@ def debug_route(
         return {"model": model, "host": host, "error": str(exc), "deployment": None}
 
 
-@router.get("/platform/v1/debug/routing-decisions")
+@router.get("/platform/v1/debug/routing-decisions", include_in_schema=False)
 def debug_routing_decisions(
     limit: int = 50,
     authorization: str | None = Header(default=None),
@@ -1722,7 +1733,7 @@ def debug_routing_decisions(
     return service.list_routing_decisions(limit=limit)
 
 
-@router.get("/platform/v1/metrics")
+@router.get("/platform/v1/metrics", include_in_schema=False)
 def platform_metrics(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -1731,7 +1742,7 @@ def platform_metrics(
     return metrics.snapshot()
 
 
-@router.get("/platform/v1/payment/summary")
+@router.get("/platform/v1/payment/summary", include_in_schema=False)
 def payment_summary(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -1740,7 +1751,7 @@ def payment_summary(
     return service.payment_summary()
 
 
-@router.get("/platform/v1/invocations")
+@router.get("/platform/v1/invocations", include_in_schema=False)
 def list_invocations(
     limit: int = 100,
     authorization: str | None = Header(default=None),
@@ -1750,7 +1761,7 @@ def list_invocations(
     return [record.model_dump(mode="json") for record in service.list_invocations(limit=limit)]
 
 
-@router.get("/platform/v1/invocations/exports/recent")
+@router.get("/platform/v1/invocations/exports/recent", include_in_schema=False)
 def export_recent_invocations(
     limit: int = 50,
     authorization: str | None = Header(default=None),
@@ -1828,7 +1839,7 @@ def delete_model_alias(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
-@router.get("/platform/v1/invocations/{invocation_id}")
+@router.get("/platform/v1/invocations/{invocation_id}", include_in_schema=False)
 def get_invocation(
     invocation_id: str,
     authorization: str | None = Header(default=None),
@@ -1841,7 +1852,7 @@ def get_invocation(
     return record.model_dump(mode="json")
 
 
-@router.get("/platform/v1/debug/invocation-failures")
+@router.get("/platform/v1/debug/invocation-failures", include_in_schema=False)
 def debug_invocation_failures(
     limit: int = 100,
     authorization: str | None = Header(default=None),
@@ -1922,7 +1933,7 @@ def list_bounties(
     _feature_disabled("bounties")
 
 
-@router.post("/audit/miner_data")
+@router.post("/audit/miner_data", include_in_schema=False)
 def audit_miner_data(
     payload: dict,
     authorization: str | None = Header(default=None),
@@ -1932,7 +1943,7 @@ def audit_miner_data(
     _feature_disabled("audit")
 
 
-@router.get("/audit/")
+@router.get("/audit/", include_in_schema=False)
 def list_audit(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -1941,7 +1952,7 @@ def list_audit(
     _feature_disabled("audit")
 
 
-@router.get("/audit/download")
+@router.get("/audit/download", include_in_schema=False)
 def audit_download(
     path: str = Query(""),
     authorization: str | None = Header(default=None),
@@ -2012,7 +2023,7 @@ def e2e_invoke(
     _feature_disabled("e2e_invoke")
 
 
-@router.get("/platform/v1/debug/build-failures")
+@router.get("/platform/v1/debug/build-failures", include_in_schema=False)
 def debug_build_failures(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -2110,7 +2121,7 @@ def billing_topup_crypto(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@router.post("/platform/billing/webhook/stripe")
+@router.post("/platform/billing/webhook/stripe", include_in_schema=False)
 async def billing_stripe_webhook(request: Request) -> dict:
     """Stripe webhook — called by Stripe when a checkout session completes,
     or when a charge is refunded / disputed (BILL-M1 Part B)."""
@@ -2243,7 +2254,7 @@ def billing_report_crypto_tx(
     }
 
 
-@router.post("/platform/billing/crypto/{invoice_id}/confirm")
+@router.post("/platform/billing/crypto/{invoice_id}/confirm", include_in_schema=False)
 def billing_confirm_crypto(
     invoice_id: str,
     payload: dict,
@@ -2266,7 +2277,7 @@ def billing_confirm_crypto(
     return result
 
 
-@router.post("/platform/billing/crypto/{invoice_id}/reject")
+@router.post("/platform/billing/crypto/{invoice_id}/reject", include_in_schema=False)
 def billing_reject_crypto(
     invoice_id: str,
     authorization: str | None = Header(default=None),
@@ -2306,7 +2317,7 @@ def billing_list_crypto_invoices(
     ]
 
 
-@router.get("/platform/billing/admin/crypto/invoices")
+@router.get("/platform/billing/admin/crypto/invoices", include_in_schema=False)
 def billing_admin_list_crypto_invoices(
     status: str | None = None,
     limit: int = 100,
@@ -2323,7 +2334,7 @@ def billing_admin_list_crypto_invoices(
     )
 
 
-@router.get("/platform/billing/admin/miner-revenue")
+@router.get("/platform/billing/admin/miner-revenue", include_in_schema=False)
 def billing_admin_miner_revenue(
     window_hours: int = 168,
     authorization: str | None = Header(default=None),
@@ -2369,7 +2380,7 @@ def _analytics_repo():
     return AnalyticsRepository()
 
 
-@router.get("/platform/admin/analytics/revenue-by-miner")
+@router.get("/platform/admin/analytics/revenue-by-miner", include_in_schema=False)
 def analytics_revenue_by_miner(
     days: int = Query(default=7, ge=1, le=365),
     limit: int = Query(default=100, ge=1, le=500),
@@ -2385,7 +2396,7 @@ def analytics_revenue_by_miner(
     }
 
 
-@router.get("/platform/admin/analytics/top-renters")
+@router.get("/platform/admin/analytics/top-renters", include_in_schema=False)
 def analytics_top_renters(
     days: int = Query(default=30, ge=1, le=365),
     limit: int = Query(default=25, ge=1, le=200),
@@ -2401,7 +2412,7 @@ def analytics_top_renters(
     }
 
 
-@router.get("/platform/admin/analytics/gross-revenue")
+@router.get("/platform/admin/analytics/gross-revenue", include_in_schema=False)
 def analytics_gross_revenue(
     days: int = Query(default=30, ge=1, le=365),
     authorization: str | None = Header(default=None),
@@ -2411,7 +2422,7 @@ def analytics_gross_revenue(
     return _analytics_repo().gross_revenue(days=days)
 
 
-@router.get("/platform/admin/analytics/active-rentals")
+@router.get("/platform/admin/analytics/active-rentals", include_in_schema=False)
 def analytics_active_rentals(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -2420,7 +2431,7 @@ def analytics_active_rentals(
     return _analytics_repo().active_rentals()
 
 
-@router.post("/platform/billing/admin/credit")
+@router.post("/platform/billing/admin/credit", include_in_schema=False)
 def billing_admin_credit(
     payload: dict,
     authorization: str | None = Header(default=None),
@@ -2452,7 +2463,7 @@ def billing_admin_credit(
     }
 
 
-@router.post("/platform/billing/admin/debit")
+@router.post("/platform/billing/admin/debit", include_in_schema=False)
 def billing_admin_debit(
     payload: dict,
     authorization: str | None = Header(default=None),
