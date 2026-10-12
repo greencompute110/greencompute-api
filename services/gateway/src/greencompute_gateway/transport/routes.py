@@ -2483,7 +2483,7 @@ def billing_admin_list_crypto_invoices(
     )
 
 
-@router.get("/platform/billing/admin/crypto/deposits")
+@router.get("/platform/billing/admin/crypto/deposits", include_in_schema=False)
 def billing_admin_list_deposits(
     status: str | None = None,
     limit: int = 200,
@@ -2496,7 +2496,7 @@ def billing_admin_list_deposits(
     return _get_billing().repo.list_deposits_for_admin(status=status, limit=max(1, min(limit, 500)))
 
 
-@router.get("/platform/billing/admin/crypto/reviews")
+@router.get("/platform/billing/admin/crypto/reviews", include_in_schema=False)
 def billing_admin_list_reviews(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -2507,7 +2507,7 @@ def billing_admin_list_reviews(
     return _get_billing().repo.list_open_reviews()
 
 
-@router.post("/platform/billing/admin/crypto/reviews/{invoice_id}/resolve")
+@router.post("/platform/billing/admin/crypto/reviews/{invoice_id}/resolve", include_in_schema=False)
 def billing_admin_resolve_review(
     invoice_id: str,
     payload: dict,
@@ -2529,7 +2529,7 @@ def billing_admin_resolve_review(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.post("/platform/billing/admin/crypto/deposits/{deposit_ref}/assign")
+@router.post("/platform/billing/admin/crypto/deposits/{deposit_ref}/assign", include_in_schema=False)
 def billing_admin_assign_deposit(
     deposit_ref: str,
     payload: dict,
