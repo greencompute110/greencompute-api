@@ -147,6 +147,31 @@ class InsufficientBalanceForInferenceError(Exception):
         )
 
 
+# A deployed model can get its own hostname, <name>.<zone>, and requests sent
+# there are routed to it by the Host header. Hostnames are confined to this one
+# zone: a workload allowed to claim any host -- the API's own included -- would
+# capture every request sent to it, whatever model the caller asked for.
+_INGRESS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$")
+
+
+def model_ingress_zone() -> str:
+    zone = os.environ.get("GREENCOMPUTE_MODEL_INGRESS_DOMAIN") or "models.green-compute.com"
+    return zone.strip().lower().strip(".")
+
+
+def validate_ingress_host(host: str) -> str:
+    """Normalise a requested ingress host, or raise ValueError unless it is a
+    single label directly under the model ingress zone."""
+    zone = model_ingress_zone()
+    normalized = (host or "").strip().lower().rstrip(".")
+    label, dot, rest = normalized.partition(".")
+    if not dot or rest != zone or not _INGRESS_LABEL.match(label):
+        raise ValueError(
+            f"ingress_host must be <name>.{zone}, where <name> is 3-40 lowercase letters, digits or hyphens"
+        )
+    return normalized
+
+
 class GatewayService:
     def __init__(
         self,
@@ -414,6 +439,8 @@ class GatewayService:
 
     def create_workload(self, request: WorkloadCreateRequest, owner_user_id: str | None = None) -> WorkloadSpec:
         workload = WorkloadSpec(**request.model_dump(), owner_user_id=owner_user_id)
+        if workload.ingress_host is not None:
+            workload.ingress_host = self._claim_ingress_host(workload.ingress_host, workload.workload_id)
         return self.control_plane.upsert_workload(workload)
 
     def get_workload(self, workload_id: str, user_id: str | None = None, *, admin: bool = False) -> WorkloadSpec | None:
@@ -450,7 +477,7 @@ class GatewayService:
         elif request.workload_alias is not None:
             workload.workload_alias = request.workload_alias
         if request.ingress_host is not None:
-            workload.ingress_host = request.ingress_host
+            workload.ingress_host = self._claim_ingress_host(request.ingress_host, workload.workload_id)
         if request.pricing_class is not None:
             workload.pricing_class = request.pricing_class
         if request.public is not None:
@@ -1392,9 +1419,18 @@ class GatewayService:
             status=status,
         )
 
+    def _claim_ingress_host(self, host: str, workload_id: str) -> str:
+        normalized = validate_ingress_host(host)
+        holder = self.control_plane.find_workload_by_ingress_host(normalized)
+        if holder is not None and holder.workload_id != workload_id:
+            raise ValueError(f"ingress_host {normalized} is already taken")
+        return normalized
+
     def resolve_workload_reference(self, model: str, routed_host: str | None = None) -> tuple[WorkloadSpec, dict]:
         normalized_host = self._normalize_host(routed_host)
-        if normalized_host:
+        # Only hosts in the model ingress zone route by hostname, so a stored
+        # value outside it (e.g. the API's own name) can never take traffic.
+        if normalized_host and normalized_host.endswith("." + model_ingress_zone()):
             hosted = self.control_plane.find_workload_by_ingress_host(normalized_host)
             if hosted is not None:
                 return hosted, {
