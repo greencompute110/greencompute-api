@@ -155,7 +155,7 @@ _INGRESS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$")
 
 
 def model_ingress_zone() -> str:
-    zone = os.environ.get("GREENCOMPUTE_MODEL_INGRESS_DOMAIN") or "models.green-compute.com"
+    zone = os.environ.get("GREENCOMPUTE_MODEL_INGRESS_DOMAIN") or "inference.green-compute.com"
     return zone.strip().lower().strip(".")
 
 

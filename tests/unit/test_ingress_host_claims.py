@@ -27,10 +27,10 @@ def _create(svc, owner, **fields):
     "control.green-compute.com",
     "127.0.0.1",
     "evil.example.com",
-    "models.green-compute.com",
-    "a.b.models.green-compute.com",
-    "x.models.green-compute.com.evil.com",
-    "-bad-.models.green-compute.com",
+    "inference.green-compute.com",
+    "a.b.inference.green-compute.com",
+    "x.inference.green-compute.com.evil.com",
+    "-bad-.inference.green-compute.com",
 ])
 def test_hosts_outside_the_model_zone_are_refused(svc, host):
     with pytest.raises(ValueError):
@@ -38,16 +38,16 @@ def test_hosts_outside_the_model_zone_are_refused(svc, host):
 
 
 def test_a_name_in_the_model_zone_is_accepted_and_routes(svc):
-    wl = _create(svc, "alice", name="llama", ingress_host="Alice-Llama.models.green-compute.com")
-    assert wl.ingress_host == "alice-llama.models.green-compute.com"
-    resolved, routing = svc.resolve_workload_reference("anything", routed_host="alice-llama.models.green-compute.com:443")
+    wl = _create(svc, "alice", name="llama", ingress_host="Alice-Llama.inference.green-compute.com")
+    assert wl.ingress_host == "alice-llama.inference.green-compute.com"
+    resolved, routing = svc.resolve_workload_reference("anything", routed_host="alice-llama.inference.green-compute.com:443")
     assert resolved.workload_id == wl.workload_id and routing["matched_by"] == "ingress_host"
 
 
 def test_a_taken_name_cannot_be_claimed_again(svc):
-    _create(svc, "alice", name="a", ingress_host="shared.models.green-compute.com")
+    _create(svc, "alice", name="a", ingress_host="shared.inference.green-compute.com")
     with pytest.raises(ValueError, match="already taken"):
-        _create(svc, "bob", name="b", ingress_host="shared.models.green-compute.com")
+        _create(svc, "bob", name="b", ingress_host="shared.inference.green-compute.com")
 
 
 def test_update_is_validated_too(svc):
@@ -73,4 +73,4 @@ def test_zone_is_configurable(monkeypatch):
     monkeypatch.setenv("GREENCOMPUTE_MODEL_INGRESS_DOMAIN", "inference.example.org")
     assert validate_ingress_host("my-model.inference.example.org") == "my-model.inference.example.org"
     with pytest.raises(ValueError):
-        validate_ingress_host("my-model.models.green-compute.com")
+        validate_ingress_host("my-model.inference.green-compute.com")
