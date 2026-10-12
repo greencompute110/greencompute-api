@@ -4,8 +4,17 @@ import logging
 import os
 from datetime import UTC, datetime, timedelta
 
+import random
+
+from sqlalchemy.exc import IntegrityError
+
 from greencompute_protocol import CryptoInvoice, LedgerEntry, StripeSession
 from greencompute_gateway.infrastructure.billing_repository import BillingRepository, InsufficientBalanceError
+from greencompute_gateway.infrastructure.wallet_signatures import (
+    CURRENCY_CHAIN,
+    normalize_address,
+    verify_signature,
+)
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +62,61 @@ def _deposit_address_for(currency: str) -> str:
         # BILLING_DEPOSIT_ALPHA only if alpha ever needs its own coldkey).
         return os.environ.get("BILLING_DEPOSIT_ALPHA") or os.environ.get("BILLING_DEPOSIT_TAO", "")
     return ""
+
+
+# Invoice amounts are kept in millionths of the currency (6 decimals).
+UNITS_PER_TOKEN = 1_000_000
+
+# A user can have this many unpaid invoices open at once. Keeps one account
+# from reserving lots of amounts in the hope of catching someone else's
+# mistyped payment.
+MAX_PENDING_INVOICES_PER_USER = 5
+
+# How long a wallet-link challenge stays valid, and how far back linking a
+# wallet reaches to credit its earlier unmatched payments.
+WALLET_CHALLENGE_TTL = timedelta(minutes=15)
+WALLET_LINK_LOOKBACK = timedelta(days=30)
+
+
+class TooManyOpenInvoices(Exception):
+    pass
+
+
+class WalletProofError(ValueError):
+    """The wallet-link request doesn't prove control of the wallet."""
+
+
+def format_units(units: int) -> str:
+    """Exact decimal string for an amount in millionths, e.g. 20003817 ->
+    "20.003817". Agents should send this string, never a re-rounded float."""
+    return f"{units // UNITS_PER_TOKEN}.{units % UNITS_PER_TOKEN:06d}"
+
+
+def wallet_link_message(username: str, user_id: str, address: str, issued_at: str) -> str:
+    """The text a user signs to link a wallet. It names the account so a
+    signature can't be replayed to link the wallet to anyone else."""
+    return (
+        "Green Compute: link this wallet to my account\n"
+        f"Account: {username} ({user_id})\n"
+        f"Wallet: {address}\n"
+        f"Issued: {issued_at}\n"
+        "Payments from this wallet will be credited to this account."
+    )
+
+
+def _exact_amount(invoice: dict, deposit: dict) -> bool:
+    """Does the deposit pay exactly what this invoice asked for?
+
+    ERC-20 amounts are exact integers, so stablecoins must match to the unit.
+    TAO and alpha have 9 decimals; wallets that convert a typed decimal through
+    a float can be a few rao off, so allow ±100 rao, far below the 1000 rao
+    (one millionth) that separates two invoices."""
+    units = invoice.get("amount_units")
+    if units is None:
+        return False
+    scale = 10 ** (deposit["decimals"] - 6)
+    tolerance = 100 if deposit["decimals"] >= 9 else 0
+    return abs(deposit["amount_raw"] - units * scale) <= tolerance
 
 
 def _base_currency(currency: str) -> str:
@@ -324,27 +388,218 @@ class BillingService:
             raise RuntimeError(f"{currency} deposits are not available right now")
         if amount_crypto <= 0:
             raise RuntimeError(f"no {base.upper()} price available right now, try again shortly")
-        invoice = CryptoInvoice(
-            user_id=user_id,
-            currency=currency,
-            amount_crypto=amount_crypto,
-            amount_usd=amount_usd,
-            bonus_pct=bonus_pct,
-            total_credits=total_credits,
-            deposit_address=deposit_address,
-            expires_at=datetime.now(UTC) + timedelta(minutes=30),
-        )
-        self.repo.create_crypto_invoice(invoice)
+        if self.repo.count_pending_invoices(user_id) >= MAX_PENDING_INVOICES_PER_USER:
+            raise TooManyOpenInvoices(user_id)
+
+        # The deposit address is shared, so the amount is how the watcher tells
+        # whose payment it is. Add a few millionths (worth under a cent) so no
+        # two open invoices at this address ask for exactly the same amount;
+        # the partial unique index enforces it against concurrent creates.
+        usd_per_token = 1.0 if base in ("usdt", "usdc") else amount_usd / amount_crypto
+        base_units = int(round(amount_crypto * UNITS_PER_TOKEN))
+        max_extra = max(20, min(9_999, int(0.01 / usd_per_token * UNITS_PER_TOKEN)))
+        for _attempt in range(8):
+            taken = self.repo.pending_invoice_units(currency, deposit_address)
+            free = [e for e in range(1, max_extra + 1) if base_units + e not in taken]
+            extra = random.choice(free) if free else max_extra + 1 + len(taken)
+            amount_units = base_units + extra
+            invoice = CryptoInvoice(
+                user_id=user_id,
+                currency=currency,
+                amount_crypto=amount_units / UNITS_PER_TOKEN,
+                amount_usd=amount_usd,
+                bonus_pct=bonus_pct,
+                total_credits=total_credits,
+                deposit_address=deposit_address,
+                expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            )
+            try:
+                self.repo.create_crypto_invoice(invoice, amount_units=amount_units)
+                break
+            except IntegrityError:
+                continue  # another request took that amount a moment ago
+        else:
+            raise RuntimeError("could not reserve a unique amount, try again")
         return {
             "invoice_id": invoice.invoice_id,
             "currency": currency,
-            "amount_crypto": amount_crypto,
+            "amount_crypto": invoice.amount_crypto,
+            "amount_to_send": format_units(amount_units),
             "amount_usd": amount_usd,
             "bonus_pct": bonus_pct,
             "total_credits": total_credits,
             "deposit_address": deposit_address,
             "expires_at": invoice.expires_at.isoformat(),
         }
+
+    # --- On-chain deposits ---
+
+    def deposit_value_cents(self, currency: str, amount: float, usd_price: float | None) -> int:
+        """Credits for a deposit of `amount` tokens, bonus included."""
+        base = _base_currency(currency)
+        if usd_price is None:
+            if base in ("usdt", "usdc"):
+                usd_price = 1.0
+            else:
+                from greencompute_gateway.infrastructure.price_feed import get_price
+                usd_price = get_price(base)
+        cents = int(round(amount * usd_price * 100))
+        return cents + int(round(cents * BONUS_RATES.get(base, 0.0)))
+
+    def resolve_deposit(self, deposit: dict) -> str:
+        """Decide whose a transfer to one of our deposit addresses is, and
+        credit them. Called by the deposit watcher for every transfer it sees;
+        safe to call again for the same transfer.
+
+        In order:
+          1. an open invoice asking for exactly this amount;
+          2. the sender is a verified wallet: credit its owner the value sent;
+          3. exactly one open invoice this could be an overpayment of (up to
+             5% over), the rule from before amounts were unique;
+          4. otherwise it stays unmatched, to be claimed by linking the
+             sending wallet or assigned by an admin.
+
+        Returns how it was resolved."""
+        ref = deposit["deposit_ref"]
+        status = self.repo.record_deposit(deposit)
+        if status != "unmatched":
+            return "seen"
+        currency = deposit["currency"]
+        manual = self.repo.manual_credit_for_tx(currency, deposit.get("tx_hash"))
+        if manual:
+            # An admin already confirmed an invoice against this transaction.
+            self.repo.mark_deposit(
+                ref, status="credited", matched_by="admin", invoice_id=manual["invoice_id"],
+                user_id=manual["user_id"], credited_cents=manual["amount_cents"],
+            )
+            return "seen"
+        amount = deposit["amount_raw"] / (10 ** deposit["decimals"])
+        invoices = self.repo.pending_invoices(currency, deposit["deposit_address"])
+
+        exact = [inv for inv in invoices if _exact_amount(inv, deposit)]
+        for inv in exact:
+            outcome = self._credit_invoice(inv, deposit, "invoice")
+            if outcome:
+                return outcome
+
+        chain = CURRENCY_CHAIN.get(currency)
+        owner = self.repo.wallet_owner(chain, deposit["sender"]) if chain else None
+        if owner:
+            cents = self.deposit_value_cents(currency, amount, deposit.get("usd_price"))
+            if cents >= 1:
+                result = self.repo.credit_deposit(
+                    ref, owner, cents,
+                    f"Crypto deposit {currency.upper()} {amount:g} from verified wallet",
+                    "wallet",
+                )
+                return "wallet" if result and result.get("credited") else "seen"
+
+        overpaid = [
+            inv for inv in invoices
+            if inv["amount_crypto"] <= amount <= inv["amount_crypto"] * 1.05
+            and not _exact_amount(inv, deposit)
+        ]
+        if len(overpaid) == 1:
+            outcome = self._credit_invoice(overpaid[0], deposit, "invoice_overpay")
+            if outcome:
+                return outcome
+
+        if self.deposit_value_cents(currency, amount, deposit.get("usd_price")) < 1:
+            self.repo.mark_deposit(ref, status="ignored")
+            return "ignored"
+        return "unmatched"
+
+    def _credit_invoice(self, inv: dict, deposit: dict, how: str) -> str | None:
+        result = self.repo.confirm_and_credit_invoice(
+            invoice_id=inv["invoice_id"],
+            tx_hash=deposit.get("tx_hash") or deposit["deposit_ref"],
+            description=(
+                f"Crypto deposit {inv['currency'].upper()} ${inv['amount_usd']:.2f} "
+                f"(+{int(round((inv['bonus_pct'] or 0) * 100))}% bonus)"
+            ),
+            deposit_ref=deposit["deposit_ref"],
+        )
+        if not result or result.get("refused"):
+            return None  # invoice closed in the meantime; try the next rule
+        if result.get("credited"):
+            self.repo.mark_deposit(
+                deposit["deposit_ref"], status="credited", matched_by=how,
+                invoice_id=inv["invoice_id"], user_id=inv["user_id"],
+                credited_cents=result["total_credits"],
+            )
+            return how
+        # Already credited by an earlier tick.
+        self.repo.mark_deposit(deposit["deposit_ref"], status="credited")
+        return "seen"
+
+    # --- Verified wallets ---
+
+    def wallet_challenge(self, user_id: str, chain: str, address: str) -> dict:
+        address = normalize_address(chain, address)
+        username = self.repo.get_username(user_id) or user_id
+        issued_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return {
+            "chain": chain,
+            "address": address,
+            "issued_at": issued_at,
+            "message": wallet_link_message(username, user_id, address, issued_at),
+        }
+
+    def link_wallet(
+        self, user_id: str, chain: str, address: str, issued_at: str, signature: str
+    ) -> dict:
+        """Verify the signed challenge and link the wallet; then credit any
+        unmatched payments it sent in the last 30 days."""
+        address = normalize_address(chain, address)
+        try:
+            issued = datetime.fromisoformat(issued_at.replace("Z", "+00:00"))
+        except (AttributeError, ValueError) as exc:
+            raise WalletProofError("issued_at must be the value from the challenge") from exc
+        age = datetime.now(UTC) - issued
+        if age > WALLET_CHALLENGE_TTL or age < -timedelta(minutes=1):
+            raise WalletProofError("challenge expired, request a new one")
+        username = self.repo.get_username(user_id) or user_id
+        message = wallet_link_message(username, user_id, address, issued_at)
+        if not verify_signature(chain, address, message, signature):
+            raise WalletProofError("signature does not match this wallet and message")
+        wallet, created = self.repo.add_verified_wallet(user_id, chain, address)
+        return {**wallet, "newly_linked": created, "credited": self.claim_wallet_deposits(user_id, chain, address)}
+
+    def claim_wallet_deposits(self, user_id: str, chain: str, address: str) -> list[dict]:
+        currencies = tuple(c for c, ch in CURRENCY_CHAIN.items() if ch == chain)
+        since = datetime.now(UTC) - WALLET_LINK_LOOKBACK
+        credited = []
+        for dep in self.repo.unmatched_deposits_from(address, currencies, since):
+            cents = self.deposit_value_cents(dep["currency"], dep["amount"], dep["usd_price"])
+            if cents < 1:
+                continue
+            result = self.repo.credit_deposit(
+                dep["deposit_ref"], user_id, cents,
+                f"Crypto deposit {dep['currency'].upper()} {dep['amount']:g} "
+                f"(claimed by linking wallet {address[:10]})",
+                "wallet_link",
+            )
+            if result and result.get("credited"):
+                credited.append({
+                    "deposit_ref": dep["deposit_ref"],
+                    "currency": dep["currency"],
+                    "amount": dep["amount"],
+                    "tx_hash": dep["tx_hash"],
+                    "credited_cents": cents,
+                })
+        return credited
+
+    def assign_deposit(self, deposit_ref: str, user_id: str) -> dict | None:
+        """Admin: credit an unmatched deposit to a user."""
+        dep = self.repo.get_deposit(deposit_ref)
+        if dep is None:
+            return None
+        cents = self.deposit_value_cents(dep["currency"], dep["amount"], dep["usd_price"])
+        return self.repo.credit_deposit(
+            deposit_ref, user_id, cents,
+            f"Crypto deposit {dep['currency'].upper()} {dep['amount']:g} (assigned by admin)",
+            "admin",
+        )
 
     def confirm_crypto_deposit(self, invoice_id: str, tx_hash: str) -> dict | None:
         """Admin confirms a crypto deposit. Credits user with bonus.
@@ -381,6 +636,12 @@ class BillingService:
         )
         if result is None:
             return None
+        if result.get("credited") and tx_hash:
+            self.repo.mark_deposits_by_tx(
+                invoice.currency, tx_hash, status="credited", matched_by="admin",
+                invoice_id=invoice_id, user_id=invoice.user_id,
+                credited_cents=invoice.total_credits,
+            )
         if result.get("credited"):
             log.info(
                 "Crypto deposit confirmed: user=%s invoice=%s credits=%d",

@@ -45,11 +45,13 @@ def _additive_migrations(engine: Engine) -> None:
         statements.append(
             "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS port_mappings JSON DEFAULT '{}'::json"
         )
+        statements.append("ALTER TABLE crypto_invoices ADD COLUMN IF NOT EXISTS amount_units BIGINT")
     elif dialect == "sqlite":
         # SQLite lacks IF NOT EXISTS on ADD COLUMN; we probe and ignore duplicate errors.
         statements.append(
             "ALTER TABLE deployments ADD COLUMN port_mappings JSON DEFAULT '{}'"
         )
+        statements.append("ALTER TABLE crypto_invoices ADD COLUMN amount_units BIGINT")
     for stmt in statements:
         try:
             with engine.begin() as conn:
