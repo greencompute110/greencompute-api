@@ -127,12 +127,18 @@ def create_api_key(
         if exc.status_code not in (401, 403):
             raise
         api_key = require_api_key(authorization, x_api_key)
-        return service.create_api_key(
-            payload,
-            caller_user_id=api_key.user_id,
-            allow_user_id_override=False,  # bound to own user_id
-            allow_admin_grant=False,
-        ).model_dump(mode="json")
+        try:
+            return service.create_api_key(
+                payload,
+                caller_user_id=api_key.user_id,
+                allow_user_id_override=False,  # bound to own user_id
+                allow_admin_grant=False,
+                caller_scopes=list(api_key.scopes or []),
+            ).model_dump(mode="json")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
     # Privileged caller. Both the env master admin AND the provision secret may
     # bind the key to an explicit user_id (the UI provisions a key for the
     # newly-registered user). Only the master admin may grant admin=true.
@@ -191,6 +197,12 @@ def delete_api_key(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     api_key = require_api_key(authorization, x_api_key)
+    if api_key.scopes and not api_key.admin:
+        # A scoped key may only remove keys no broader than itself, so a
+        # leaked one can't lock the owner out by deleting their full keys.
+        target = service.get_api_key(key_id, user_id=api_key.user_id, admin=False)
+        if target is not None and (not target.scopes or not set(target.scopes) <= set(api_key.scopes)):
+            raise HTTPException(status_code=403, detail="a scoped key can't delete a key broader than itself")
     try:
         deleted = service.delete_api_key(key_id, user_id=api_key.user_id, admin=api_key.admin)
         return APIKeySummary(

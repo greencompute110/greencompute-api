@@ -7,7 +7,7 @@ from fastapi.responses import PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 
 from greencompute_persistence import database_ready, load_runtime_settings, render_prometheus_text
-from greencompute_gateway.transport.security import current_client_ip
+from greencompute_gateway.transport.security import current_client_ip, current_request_route
 from greencompute_gateway.transport.security import metrics as gateway_metrics
 from greencompute_gateway.transport.routes import router
 
@@ -85,9 +85,11 @@ async def _stash_client_ip(request, call_next):
     apply a per-IP auth-failure rate limit without threading `request` through
     every handler."""
     token = current_client_ip.set(_client_ip_from_request(request))
+    route_token = current_request_route.set((request.method, request.url.path))
     try:
         return await call_next(request)
     finally:
+        current_request_route.reset(route_token)
         current_client_ip.reset(token)
 
 

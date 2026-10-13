@@ -31,6 +31,37 @@ AUTH_FAILURE_WINDOW_SECONDS = 60
 current_client_ip: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "gateway_current_client_ip", default=None
 )
+# The request's (method, path), also set by that middleware, so the auth check
+# can enforce a key's scopes without each route declaring what it needs.
+current_request_route: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "gateway_current_request_route", default=None
+)
+
+
+def _check_scopes(api_key) -> None:
+    """Refuse a scoped key a request its scopes don't cover. Keys with no
+    scopes (full access) and admin keys are not restricted; outside a request
+    (tests, in-process callers) there is nothing to check against."""
+    if api_key.admin or not api_key.scopes:
+        return
+    route = current_request_route.get()
+    if route is None:
+        return
+    from greencompute_gateway.domain.scopes import required_scope
+
+    method, path = route
+    needed = required_scope(method, path)
+    if needed is None or needed not in api_key.scopes:
+        metrics.increment("auth.failure.scope")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "this API key's scopes don't allow this request",
+                "required_scope": needed or "full access",
+                "key_scopes": list(api_key.scopes),
+                "hint": "use a key with that scope, or create one under Settings or POST /platform/api-keys",
+            },
+        )
 
 
 def _resolve_client_ip(explicit: str | None) -> str | None:
@@ -168,6 +199,7 @@ def require_api_key(
         metrics.increment("auth.failure.admin_required")
         _check_auth_failure_throttle(client_ip)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin api key required")
+    _check_scopes(api_key)
     metrics.increment("auth.success")
     return api_key
 
