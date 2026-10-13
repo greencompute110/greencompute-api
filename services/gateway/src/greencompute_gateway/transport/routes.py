@@ -665,7 +665,11 @@ def _create_workload(payload_data: dict, api_key) -> dict:
         # Template builders raise ValueError (e.g. "model must be org/model
         # format"); without this it would surface as a 500.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _redact_workload(service.create_workload(request, api_key.user_id).model_dump(mode="json"))
+    try:
+        workload = service.create_workload(request, api_key.user_id)
+    except ValueError as exc:  # e.g. an ingress_host outside the model zone
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _redact_workload(workload.model_dump(mode="json"))
 
 
 def _is_secret_meta_key(key: str) -> bool:
@@ -732,6 +736,8 @@ def update_workload(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/platform/workloads/{workload_id}/shares")
