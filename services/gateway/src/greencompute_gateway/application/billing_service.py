@@ -77,6 +77,11 @@ MAX_PENDING_INVOICES_PER_USER = 5
 WALLET_CHALLENGE_TTL = timedelta(minutes=15)
 WALLET_LINK_LOOKBACK = timedelta(days=30)
 
+# A payment of an invoice's exact amount that arrives after the invoice
+# expired is still that invoice's for this long, credited at the price when it
+# arrived. New invoices don't reuse those amounts in the meantime.
+LATE_PAYMENT_WINDOW = timedelta(hours=24)
+
 
 class TooManyOpenInvoices(Exception):
     pass
@@ -121,6 +126,19 @@ def _exact_amount(invoice: dict, deposit: dict) -> bool:
     scale = 10 ** (deposit["decimals"] - 6)
     tolerance = 100 if deposit["decimals"] >= 9 else 0
     return abs(deposit["amount_raw"] - units * scale) <= tolerance
+
+
+def _value_at_invoice_rate(invoice: dict, amount: float) -> int:
+    """Credits for `amount` tokens at the rate the invoice was quoted at,
+    bonus included. Stablecoins count at exactly $1: the invoice's amount
+    includes the few millionths that make it unique, which would otherwise
+    shave a cent off the rate."""
+    if _base_currency(invoice["currency"]) in ("usdt", "usdc"):
+        rate = 1.0
+    else:
+        rate = invoice["amount_usd"] / invoice["amount_crypto"] if invoice["amount_crypto"] else 0.0
+    cents = int(round(amount * rate * 100))
+    return cents + int(round(cents * (invoice.get("bonus_pct") or 0.0)))
 
 
 def _base_currency(currency: str) -> str:
@@ -403,7 +421,9 @@ class BillingService:
         base_units = int(round(amount_crypto * UNITS_PER_TOKEN))
         max_extra = max(20, min(9_999, int(0.01 / usd_per_token * UNITS_PER_TOKEN)))
         for _attempt in range(8):
-            taken = self.repo.pending_invoice_units(currency, deposit_address)
+            taken = self.repo.reserved_invoice_units(
+                currency, deposit_address, datetime.now(UTC) - LATE_PAYMENT_WINDOW
+            )
             free = [e for e in range(1, max_extra + 1) if base_units + e not in taken]
             extra = random.choice(free) if free else max_extra + 1 + len(taken)
             amount_units = base_units + extra
@@ -457,11 +477,13 @@ class BillingService:
 
         In order:
           1. an open invoice asking for exactly this amount;
-          2. the sender is a verified wallet: credit its owner the value sent;
-          3. exactly one open invoice this could be an overpayment of (up to
-             5% over), the rule from before amounts were unique;
-          4. otherwise it stays unmatched, to be claimed by linking the
-             sending wallet or assigned by an admin.
+          2. an invoice that asked for exactly this amount and expired within
+             LATE_PAYMENT_WINDOW: credited at the value when it arrived;
+          3. the sender is a verified wallet: credit its owner the value sent;
+          4. exactly one open invoice this could be an overpayment of (up to
+             5% over): credit the full value received at the invoice's rate;
+          5. otherwise it stays unmatched, to be claimed by linking the
+             sending wallet or assigned by an admin, and the team is alerted.
 
         Returns how it was resolved."""
         ref = deposit["deposit_ref"]
@@ -486,6 +508,21 @@ class BillingService:
             if outcome:
                 return outcome
 
+        late = [
+            inv for inv in self.repo.recently_expired_invoices(
+                currency, deposit["deposit_address"], datetime.now(UTC) - LATE_PAYMENT_WINDOW
+            )
+            if _exact_amount(inv, deposit)
+        ]
+        if len(late) == 1:  # two would mean the amount can't say whose it is
+            outcome = self._credit_invoice(
+                late[0], deposit, "invoice_late",
+                credit_cents=self.deposit_value_cents(currency, amount, deposit.get("usd_price")),
+                allow_expired=True,
+            )
+            if outcome:
+                return outcome
+
         chain = CURRENCY_CHAIN.get(currency)
         owner = self.repo.wallet_owner(chain, deposit["sender"]) if chain else None
         if owner:
@@ -504,24 +541,52 @@ class BillingService:
             and not _exact_amount(inv, deposit)
         ]
         if len(overpaid) == 1:
-            outcome = self._credit_invoice(overpaid[0], deposit, "invoice_overpay")
+            inv = overpaid[0]
+            outcome = self._credit_invoice(
+                inv, deposit, "invoice_overpay", credit_cents=_value_at_invoice_rate(inv, amount),
+            )
             if outcome:
                 return outcome
 
         if self.deposit_value_cents(currency, amount, deposit.get("usd_price")) < 1:
             self.repo.mark_deposit(ref, status="ignored")
             return "ignored"
+        from greencompute_gateway.infrastructure.alerts import send_payment_alert
+
+        send_payment_alert(
+            f"Unmatched payment: {amount:g} {currency.upper()} from {deposit['sender']} "
+            f"(tx {deposit.get('tx_hash') or ref}). Nobody was credited; assign it under "
+            "Billing admin > Unmatched deposits, or wait for the payer to verify the wallet."
+        )
         return "unmatched"
 
-    def _credit_invoice(self, inv: dict, deposit: dict, how: str) -> str | None:
+    def _credit_invoice(
+        self,
+        inv: dict,
+        deposit: dict,
+        how: str,
+        *,
+        credit_cents: int | None = None,
+        allow_expired: bool = False,
+    ) -> str | None:
+        """Credit `inv` for this transfer: the invoice's own amount, or
+        `credit_cents` when what arrived is worth something else."""
+        if credit_cents is None:
+            description = (
+                f"Crypto deposit {inv['currency'].upper()} ${inv['amount_usd']:.2f} "
+                f"(+{int(round((inv['bonus_pct'] or 0) * 100))}% bonus)"
+            )
+        else:
+            amount = deposit["amount_raw"] / (10 ** deposit["decimals"])
+            note = "paid after the invoice expired" if how == "invoice_late" else "more than invoiced"
+            description = f"Crypto deposit {inv['currency'].upper()} {amount:g} ({note})"
         result = self.repo.confirm_and_credit_invoice(
             invoice_id=inv["invoice_id"],
             tx_hash=deposit.get("tx_hash") or deposit["deposit_ref"],
-            description=(
-                f"Crypto deposit {inv['currency'].upper()} ${inv['amount_usd']:.2f} "
-                f"(+{int(round((inv['bonus_pct'] or 0) * 100))}% bonus)"
-            ),
+            description=description,
             deposit_ref=deposit["deposit_ref"],
+            allow_expired=allow_expired,
+            credit_cents=credit_cents,
         )
         if not result or result.get("refused"):
             return None  # invoice closed in the meantime; try the next rule

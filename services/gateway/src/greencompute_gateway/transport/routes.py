@@ -2246,6 +2246,13 @@ def _request_review(invoice_id: str, user_id: str, tx_hash: str, note: str | Non
         raise HTTPException(
             status_code=409, detail=f"invoice is {result['status']}; there is nothing to review"
         )
+    from greencompute_gateway.infrastructure.alerts import send_payment_alert
+
+    username = _get_billing().repo.get_username(user_id) or user_id
+    send_payment_alert(
+        f"Payment review requested by {username}: invoice {invoice_id[:8]} ({result['status']}), "
+        f"tx {tx_hash}. Resolve it under Billing admin > Review requests."
+    )
     return result
 
 

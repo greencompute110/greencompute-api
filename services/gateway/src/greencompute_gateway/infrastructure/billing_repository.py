@@ -418,6 +418,7 @@ class BillingRepository:
         description: str,
         deposit_ref: str | None = None,
         allow_expired: bool = False,
+        credit_cents: int | None = None,
     ) -> dict | None:
         """Atomically confirm an invoice and credit the owning user.
 
@@ -503,18 +504,21 @@ class BillingRepository:
             if user is None:
                 raise KeyError(f"user {inv.user_id} not found for invoice {invoice_id}")
 
+            # What arrived may be worth more than the invoice (an overpayment)
+            # or be valued at a later price (a late payment).
+            credited = inv.total_credits if credit_cents is None else credit_cents
             # 1. flip invoice
             inv.status = "confirmed"
             inv.tx_hash = tx_hash
             inv.confirmed_at = datetime.now(UTC)
             # 2. credit user
-            user.balance_credits += inv.total_credits
+            user.balance_credits += credited
             # 3. ledger entry (explicit created_at — see credit_user comment)
             session.add(
                 LedgerEntryORM(
                     entry_id=str(uuid4()),
                     user_id=inv.user_id,
-                    amount_cents=inv.total_credits,
+                    amount_cents=credited,
                     balance_after=user.balance_credits,
                     kind="topup",
                     reference_id=invoice_id,
@@ -538,7 +542,7 @@ class BillingRepository:
             return {
                 "credited": True,
                 "invoice_id": invoice_id,
-                "total_credits": inv.total_credits,
+                "total_credits": credited,
             }
 
     def expire_stale_pending_invoices(self, grace_seconds: int) -> int:
@@ -766,11 +770,14 @@ class BillingRepository:
 
     def pending_invoices(self, currency: str, deposit_address: str) -> list[dict]:
         """Open invoices for this currency at this address, oldest first."""
+        return self._invoices_where(currency, deposit_address, CryptoInvoiceORM.status == "pending")
+
+    def _invoices_where(self, currency: str, deposit_address: str, condition) -> list[dict]:
         addr = (deposit_address or "").strip().lower()
         with session_scope(self.session_factory) as session:
             rows = session.scalars(
                 select(CryptoInvoiceORM)
-                .where(CryptoInvoiceORM.currency == currency, CryptoInvoiceORM.status == "pending")
+                .where(CryptoInvoiceORM.currency == currency, condition)
                 .order_by(CryptoInvoiceORM.created_at.asc())
             ).all()
             return [
@@ -789,19 +796,37 @@ class BillingRepository:
                 if (r.deposit_address or "").strip().lower() == addr
             ]
 
-    def pending_invoice_units(self, currency: str, deposit_address: str) -> set[int]:
-        """Exact amounts already promised to open invoices at this address."""
+    def reserved_invoice_units(
+        self, currency: str, deposit_address: str, expired_since: datetime
+    ) -> set[int]:
+        """Exact amounts a new invoice must not reuse: those of open invoices,
+        and of invoices that expired after `expired_since`, whose late payment
+        is still matched to them by amount."""
         with session_scope(self.session_factory) as session:
             return set(
                 session.scalars(
                     select(CryptoInvoiceORM.amount_units).where(
                         CryptoInvoiceORM.currency == currency,
                         CryptoInvoiceORM.deposit_address == deposit_address,
-                        CryptoInvoiceORM.status == "pending",
                         CryptoInvoiceORM.amount_units.is_not(None),
+                        (CryptoInvoiceORM.status == "pending")
+                        | (
+                            (CryptoInvoiceORM.status == "expired")
+                            & (CryptoInvoiceORM.expires_at >= expired_since)
+                        ),
                     )
                 ).all()
             )
+
+    def recently_expired_invoices(
+        self, currency: str, deposit_address: str, expired_since: datetime
+    ) -> list[dict]:
+        """Expired invoices for this currency and address whose expiry is after
+        `expired_since`, oldest first, shaped like pending_invoices()."""
+        return self._invoices_where(
+            currency, deposit_address,
+            (CryptoInvoiceORM.status == "expired") & (CryptoInvoiceORM.expires_at >= expired_since),
+        )
 
     def count_pending_invoices(self, user_id: str) -> int:
         with session_scope(self.session_factory) as session:

@@ -171,7 +171,7 @@ def test_verified_wallet_wins_over_someone_elses_overpay_window(svc):
 def test_overpay_credits_only_when_unambiguous(svc):
     svc.create_crypto_invoice("alice", "usdc-base", 20)
     assert svc.resolve_deposit(deposit("usdc-base:0x1:0", amount_raw=20_300_000)) == "invoice_overpay"
-    assert balance(svc, "alice") == 2000
+    assert balance(svc, "alice") == 2030  # the full 20.3 USDC, not just the $20 invoiced
 
     svc.create_crypto_invoice("bob", "usdc-base", 20)
     svc.create_crypto_invoice("carol", "usdc-base", 20)
@@ -552,3 +552,80 @@ def test_dismissed_review_credits_nothing(api, svc):
     assert api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "dismiss"})["review_status"] == "dismissed"
     assert balance(svc, "alice") == 0
     assert api.status("billing_admin_resolve_review", inv["invoice_id"], {"action": "confirm_invoice"}) == 409
+
+
+
+# --- late payments, overpayments, alerts -----------------------------------------
+
+
+def test_exact_payment_after_the_invoice_expired_is_still_credited(svc):
+    inv = svc.create_crypto_invoice("alice", "tao", 30)  # 0.1 TAO at $300
+    _expire(svc, inv["invoice_id"])
+    PRICES["tao"] = 250.0  # TAO fell before the late payment arrived
+    try:
+        d = deposit("tao:8:1", "tao", invoice_units(svc, inv["invoice_id"]) * 1000)
+        d["usd_price"] = 250.0
+        assert svc.resolve_deposit(d) == "invoice_late"
+    finally:
+        PRICES["tao"] = 300.0
+    # Credited at the price when it arrived: the invoice's exact amount at $250.
+    assert balance(svc, "alice") == round(invoice_units(svc, inv["invoice_id"]) / 1e6 * 250 * 100)
+    assert status_of(svc, inv["invoice_id"]) == "confirmed"
+
+
+def test_late_matching_ends_after_24_hours(svc):
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    with session_scope(svc.repo.session_factory) as s:
+        row = s.get(CryptoInvoiceORM, inv["invoice_id"])
+        row.status = "expired"
+        row.expires_at = datetime.now(UTC) - timedelta(hours=25)
+    assert svc.resolve_deposit(deposit("usdc-base:0x1:0", amount_raw=invoice_units(svc, inv["invoice_id"]))) == "unmatched"
+
+
+def test_new_invoices_do_not_reuse_an_amount_still_reserved_for_a_late_payment(svc, monkeypatch):
+    first = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    _expire(svc, first["invoice_id"])
+    reserved = invoice_units(svc, first["invoice_id"])
+    # Force the random pick towards the reserved amount: it must still be skipped.
+    monkeypatch.setattr(bs.random, "choice", lambda free: min(free, key=lambda e: abs(20_000_000 + e - reserved)))
+    second = svc.create_crypto_invoice("bob", "usdc-base", 20)
+    assert invoice_units(svc, second["invoice_id"]) != reserved
+
+
+def test_alerts_go_to_slack_and_telegram_when_configured(monkeypatch):
+    from greencompute_gateway.infrastructure import alerts
+
+    sent = []
+    monkeypatch.setattr(alerts, "_post", lambda url, body: sent.append((url, body)))
+    monkeypatch.setattr(alerts.threading, "Thread", lambda target, args, **kw: types.SimpleNamespace(start=lambda: target(*args)))
+    monkeypatch.setenv("GREENCOMPUTE_ALERT_SLACK_WEBHOOK_URL", "https://hooks.slack.test/T/B/x")
+    monkeypatch.setenv("GREENCOMPUTE_ALERT_TELEGRAM_BOT_TOKEN", "123:abc")
+    monkeypatch.setenv("GREENCOMPUTE_ALERT_TELEGRAM_CHAT_ID", "-10042")
+    alerts.send_payment_alert("Unmatched payment: 7 USDC")
+    assert sent == [
+        ("https://hooks.slack.test/T/B/x", {"text": "Unmatched payment: 7 USDC"}),
+        ("https://api.telegram.org/bot123:abc/sendMessage",
+         {"chat_id": "-10042", "text": "Unmatched payment: 7 USDC", "disable_web_page_preview": True}),
+    ]
+
+
+def test_unmatched_payment_and_review_request_alert_the_team(api, svc, monkeypatch):
+    from greencompute_gateway.infrastructure import alerts
+
+    texts = []
+    monkeypatch.setattr(alerts, "send_payment_alert", lambda text: texts.append(text))
+    svc.resolve_deposit(deposit("usdc-base:0xstray:0", amount_raw=7_000_000))
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xmine"})
+    assert len(texts) == 2
+    assert "Unmatched payment: 7 USDC-BASE" in texts[0]
+    assert "review requested by alice" in texts[1] and "0xmine" in texts[1]
+
+
+def test_no_alert_channel_configured_is_silent(monkeypatch):
+    from greencompute_gateway.infrastructure import alerts
+
+    for name in ("GREENCOMPUTE_ALERT_SLACK_WEBHOOK_URL", "GREENCOMPUTE_ALERT_TELEGRAM_BOT_TOKEN",
+                 "GREENCOMPUTE_ALERT_TELEGRAM_CHAT_ID"):
+        monkeypatch.delenv(name, raising=False)
+    assert alerts._requests("x") == []
