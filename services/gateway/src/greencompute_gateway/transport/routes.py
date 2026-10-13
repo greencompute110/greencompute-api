@@ -136,6 +136,7 @@ def create_api_key(
                 allow_user_id_override=False,  # bound to own user_id
                 allow_admin_grant=False,
                 caller_scopes=list(api_key.scopes or []),
+                caller_limits=api_key,
             ).model_dump(mode="json")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -166,6 +167,8 @@ def list_api_keys(
             user_id=k.user_id,
             admin=k.admin,
             scopes=k.scopes,
+            max_active_rentals=k.max_active_rentals,
+            daily_spend_limit_usd=k.daily_spend_limit_usd,
             created_at=k.created_at,
         ).model_dump(mode="json")
         for k in keys
@@ -188,6 +191,8 @@ def get_api_key(
         user_id=key.user_id,
         admin=key.admin,
         scopes=key.scopes,
+        max_active_rentals=key.max_active_rentals,
+        daily_spend_limit_usd=key.daily_spend_limit_usd,
         created_at=key.created_at,
     ).model_dump(mode="json")
 
@@ -213,6 +218,8 @@ def delete_api_key(
             user_id=deleted.user_id,
             admin=deleted.admin,
             scopes=deleted.scopes,
+            max_active_rentals=deleted.max_active_rentals,
+            daily_spend_limit_usd=deleted.daily_spend_limit_usd,
             created_at=deleted.created_at,
         ).model_dump(mode="json")
     except KeyError as exc:
@@ -572,6 +579,45 @@ def cancel_build(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+def _enforce_key_limits(api_key, *, starting_rental: bool = False) -> None:
+    """Refuse a request once its API key is at one of its limits: rentals
+    running at once (when starting a rental) or spend in the last 24 hours
+    (rentals and inference). Keys without limits, and admin keys, pass."""
+    max_active = getattr(api_key, "max_active_rentals", None)
+    daily_limit = getattr(api_key, "daily_spend_limit_usd", None)
+    if getattr(api_key, "admin", False) or (max_active is None and daily_limit is None):
+        return
+    from greencompute_persistence.key_limits import key_active_rentals, key_spend_cents
+
+    session_factory = service.repository.session_factory
+    if starting_rental and max_active is not None:
+        active = key_active_rentals(session_factory, api_key.key_id)
+        if active >= max_active:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "this API key already has as many rentals running as it is allowed",
+                    "code": "key_limit",
+                    "max_active_rentals": max_active,
+                    "active_rentals": active,
+                    "hint": "stop one with DELETE /platform/deployments/{id}, or use a key with a higher limit",
+                },
+            )
+    if daily_limit is not None:
+        spent = key_spend_cents(session_factory, api_key.key_id)
+        if spent >= round(daily_limit * 100):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "this API key has reached its spend limit for the last 24 hours",
+                    "code": "key_limit",
+                    "daily_spend_limit_usd": daily_limit,
+                    "spent_last_24h_usd": round(spent / 100, 2),
+                    "hint": "wait for earlier spending to fall out of the 24-hour window, or use a key with a higher limit",
+                },
+            )
+
+
 def _with_idempotency(api_key, endpoint: str, idempotency_key: str | None, body: dict, response: Response, run) -> dict:
     """Run a create at most once per account, endpoint and Idempotency-Key.
 
@@ -882,11 +928,13 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         UnsupportedGPUError,
     )
 
+    _enforce_key_limits(api_key, starting_rental=True)
     try:
         return service.create_deployment(
             payload,
             user_id=api_key.user_id,
             admin=api_key.admin,
+            created_by_key_id=api_key.key_id,
         ).model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1598,6 +1646,7 @@ def chat_completions(
 
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("chat_completions", api_key.key_id, limit=60, window_seconds=60)
+    _enforce_key_limits(api_key)
 
     # Pre-flight balance gate: require any positive balance. Per-request cost
     # is fractions of a cent for small prompts, so we don't need a large
@@ -1694,6 +1743,7 @@ def embeddings(
 ) -> dict:
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("embeddings", api_key.key_id, limit=60, window_seconds=60)
+    _enforce_key_limits(api_key)
     text = payload.get("input", "")
     vector = [round(((ord(char) % 32) / 31.0), 6) for char in str(text)[:16]]
     return {

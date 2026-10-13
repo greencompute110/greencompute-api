@@ -313,6 +313,7 @@ class GatewayService:
         allow_user_id_override: bool | None = None,
         allow_admin_grant: bool = False,
         caller_scopes: list[str] | None = None,
+        caller_limits: APIKeyRecord | None = None,
     ) -> APIKeyRecord:
         """Mint an api key, deriving privilege from the authenticated caller
         rather than trusting the wire.
@@ -367,12 +368,30 @@ class GatewayService:
                     f"a key with scopes {sorted(caller_scopes)} can only create keys with some of those scopes"
                 )
             admin = False
+            # Limits are inherited and can only get tighter: a limited key
+            # can't mint itself an unlimited one.
+            max_active = request.max_active_rentals
+            daily_limit = request.daily_spend_limit_usd
+            if caller_limits is not None:
+                if caller_limits.max_active_rentals is not None:
+                    if max_active is not None and max_active > caller_limits.max_active_rentals:
+                        raise PermissionError("a new key can't allow more running rentals than the key creating it")
+                    max_active = caller_limits.max_active_rentals if max_active is None else max_active
+                if caller_limits.daily_spend_limit_usd is not None:
+                    if daily_limit is not None and daily_limit > caller_limits.daily_spend_limit_usd:
+                        raise PermissionError("a new key can't have a higher spend limit than the key creating it")
+                    daily_limit = caller_limits.daily_spend_limit_usd if daily_limit is None else daily_limit
+        if allow_user_id_override is not False:
+            max_active = request.max_active_rentals
+            daily_limit = request.daily_spend_limit_usd
         api_key = APIKeyRecord(
             name=request.name,
             user_id=user_id,
             admin=admin,
             scopes=scopes,
             secret=f"gk_{secrets.token_urlsafe(24)}",
+            max_active_rentals=max_active,
+            daily_spend_limit_usd=daily_limit,
         )
         return self.repository.save_api_key(api_key)
 
@@ -562,6 +581,7 @@ class GatewayService:
         *,
         user_id: str | None = None,
         admin: bool = False,
+        created_by_key_id: str | None = None,
     ) -> DeploymentRecord:
         payload = request if isinstance(request, DeploymentCreateRequest) else DeploymentCreateRequest(**request)
         workload = self.control_plane.repository.get_workload(payload.workload_id)
@@ -649,6 +669,7 @@ class GatewayService:
                 "save_on_exhaustion": payload.save_on_exhaustion,
                 "max_runtime_minutes": payload.max_runtime_minutes,
                 "owner_user_id": user_id,
+                "created_by_key_id": created_by_key_id,
             }
         )
 

@@ -51,6 +51,9 @@ class APIKeyORM(Base):
     scopes: Mapped[list[str]] = mapped_column(JSON)
     secret: Mapped[str] = mapped_column(String(255), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Optional limits: rentals running at once, and spend in any 24 hours.
+    max_active_rentals: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    daily_spend_limit_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 class HeartbeatORM(Base):
@@ -146,6 +149,8 @@ class DeploymentORM(Base):
     # automatic stop after that many minutes.
     ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     max_runtime_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The API key that created it, so that key's limits apply.
+    created_by_key_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     hourly_rate_cents: Mapped[int] = mapped_column(Integer, default=10)
     metering_remainder_mcents: Mapped[int] = mapped_column(Integer, default=0)
     # Credit-exhaustion lifecycle (opt-in "save my pod").
