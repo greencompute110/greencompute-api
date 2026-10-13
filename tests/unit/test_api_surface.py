@@ -72,3 +72,25 @@ def test_ssh_does_not_return_the_platform_key_to_clients_with_their_own(monkeypa
 def test_ssh_returns_the_platform_key_when_no_key_was_supplied(monkeypatch):
     assert _ssh(monkeypatch, [])["private_key"].startswith("-----BEGIN")
     assert _ssh(monkeypatch, ["  "])["private_key"].startswith("-----BEGIN")
+
+
+def test_main_agent_endpoints_declare_their_response_shapes():
+    """Agents generate clients from /openapi.json; "any object" told them nothing."""
+    app = FastAPI()
+    app.include_router(routes.router)
+    spec = app.openapi()
+    paths, schemas = spec["paths"], spec["components"]["schemas"]
+
+    def body(path, method):
+        return paths[path][method]["responses"]["200"]["content"]["application/json"]["schema"]
+
+    deployment = body("/platform/deployments/{deployment_id}", "get")
+    assert deployment == {"$ref": "#/components/schemas/Deployment"}
+    fields = schemas["Deployment"]["properties"]
+    assert {"deployment_id", "workload_id", "state", "ready_at", "hourly_rate_cents"} <= set(fields)
+    assert "ssh_private_key" not in fields
+    assert body("/platform/deployments", "get")["items"] == {"$ref": "#/components/schemas/Deployment"}
+    assert body("/platform/deployments/{deployment_id}/ssh", "get") == {"$ref": "#/components/schemas/SSHAccess"}
+    assert body("/platform/billing/balance", "get") == {"$ref": "#/components/schemas/Balance"}
+    assert body("/platform/pricing", "get") == {"$ref": "#/components/schemas/Pricing"}
+    assert "amount_to_send" in schemas["CryptoInvoiceCreated"]["properties"]

@@ -37,6 +37,8 @@ from greencompute_gateway.infrastructure.inference_client import (
     InferenceTimeoutError,
     InferenceUpstreamError,
 )
+from greencompute_gateway.transport import schemas
+from greencompute_gateway.transport.schemas import ok
 from greencompute_gateway.transport.security import (
     current_client_ip,
     enforce_rate_limit,
@@ -657,7 +659,7 @@ def _with_idempotency(api_key, endpoint: str, idempotency_key: str | None, body:
     return result
 
 
-@router.post("/platform/workloads")
+@router.post("/platform/workloads", response_model=None, responses=ok(schemas.Workload, "The new workload"))
 def create_workload(
     payload: WorkloadCreateRequest | dict,
     response: Response,
@@ -753,7 +755,7 @@ def _redact_workload(d: dict) -> dict:
     return d
 
 
-@router.get("/platform/workloads")
+@router.get("/platform/workloads", response_model=None, responses=ok(list[schemas.Workload]))
 def list_workloads(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -765,7 +767,7 @@ def list_workloads(
     ]
 
 
-@router.get("/platform/workloads/{workload_id}")
+@router.get("/platform/workloads/{workload_id}", response_model=None, responses=ok(schemas.Workload))
 def get_workload(
     workload_id: str,
     authorization: str | None = Header(default=None),
@@ -906,7 +908,7 @@ def list_workload_shares(
 #: is owner/admin-gated and audit-logged per access.
 DEPLOYMENT_SECRET_FIELDS = {"ssh_private_key"}
 
-@router.post("/platform/deployments")
+@router.post("/platform/deployments", response_model=None, responses=ok(schemas.Deployment, "The new deployment"))
 def create_deployment(
     payload: DeploymentCreateRequest,
     response: Response,
@@ -994,7 +996,7 @@ def _attach_workload_info(rows: list[dict], workloads_by_id: dict) -> list[dict]
     return rows
 
 
-@router.get("/platform/deployments")
+@router.get("/platform/deployments", response_model=None, responses=ok(list[schemas.Deployment], "Your deployments, including stopped ones"))
 def list_deployments(
     state: str | None = Query(
         default=None,
@@ -1026,7 +1028,7 @@ def list_deployments(
     return rows
 
 
-@router.get("/platform/deployments/{deployment_id}")
+@router.get("/platform/deployments/{deployment_id}", response_model=None, responses=ok(schemas.Deployment))
 def get_deployment(
     deployment_id: str,
     authorization: str | None = Header(default=None),
@@ -1039,7 +1041,7 @@ def get_deployment(
     return deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
 
 
-@router.get("/platform/deployments/{deployment_id}/ssh")
+@router.get("/platform/deployments/{deployment_id}/ssh", response_model=None, responses=ok(schemas.SSHAccess))
 def get_deployment_ssh(
     deployment_id: str,
     authorization: str | None = Header(default=None),
@@ -1176,7 +1178,7 @@ def update_deployment(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
-@router.delete("/platform/deployments/{deployment_id}")
+@router.delete("/platform/deployments/{deployment_id}", response_model=None, responses=ok(schemas.Deployment, "The deployment, now terminated"))
 def terminate_deployment(
     deployment_id: str,
     authorization: str | None = Header(default=None),
@@ -1762,7 +1764,7 @@ def _rentable_now() -> list[str]:
     return _rentable_gpu_models(cp.repository.list_nodes(), cp._is_node_stale)
 
 
-@router.get("/platform/nodes/supported")
+@router.get("/platform/nodes/supported", response_model=None, responses=ok(list[str], "GPU ids you can rent right now"))
 def list_supported_gpus() -> list[str]:
     """Public -- the GPU ids you can rent RIGHT NOW (a live node reports them).
 
@@ -1774,7 +1776,7 @@ def list_supported_gpus() -> list[str]:
     return _rentable_now()
 
 
-@router.get("/platform/pricing")
+@router.get("/platform/pricing", response_model=None, responses=ok(schemas.Pricing))
 def public_pricing() -> dict:
     """Public, machine-readable price list. No API key required.
 
@@ -2184,7 +2186,7 @@ def _get_billing():
     return get_billing_service()
 
 
-@router.get("/platform/billing/balance")
+@router.get("/platform/billing/balance", response_model=None, responses=ok(schemas.Balance))
 def billing_balance(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -2195,7 +2197,7 @@ def billing_balance(
     return _get_billing().get_balance(api_key.user_id)
 
 
-@router.get("/platform/billing/ledger")
+@router.get("/platform/billing/ledger", response_model=None, responses=ok(list[schemas.LedgerItem], "Top-ups and charges, newest first"))
 def billing_ledger(
     limit: int = 50,
     offset: int = 0,
@@ -2225,7 +2227,7 @@ def billing_topup_stripe(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@router.post("/platform/billing/topup/crypto")
+@router.post("/platform/billing/topup/crypto", response_model=None, responses=ok(schemas.CryptoInvoiceCreated))
 def billing_topup_crypto(
     payload: dict,
     authorization: str | None = Header(default=None),
@@ -2471,7 +2473,7 @@ def billing_reject_crypto(
     return {"rejected": True, "invoice_id": result.invoice_id}
 
 
-@router.get("/platform/billing/crypto/invoices")
+@router.get("/platform/billing/crypto/invoices", response_model=None, responses=ok(list[schemas.CryptoInvoiceListed]))
 def billing_list_crypto_invoices(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
