@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import deque
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
 from greencompute_persistence.db import needs_bootstrap
 from greencompute_persistence.orm import (
+    KeyValueStateORM,
     APIKeyORM,
     BareMetalInquiryORM,
     CommercialInquiryORM,
@@ -593,3 +598,73 @@ class GatewayRepository:
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
+
+    # --- Idempotency keys -----------------------------------------------------
+    # A client that times out on a create can resend it with the same
+    # Idempotency-Key and get the first result back instead of creating a
+    # second rental. Records live in key_value_state for IDEMPOTENCY_TTL.
+
+    IDEMPOTENCY_TTL = timedelta(hours=24)
+    # A "pending" record older than this belongs to a request that died
+    # mid-flight; a retry may take it over.
+    IDEMPOTENCY_STALE = timedelta(minutes=2)
+
+    @staticmethod
+    def _idempotency_row_key(scope: str, endpoint: str, idempotency_key: str) -> str:
+        digest = hashlib.sha256(f"{scope}|{endpoint}|{idempotency_key}".encode()).hexdigest()
+        return f"idem:{digest[:48]}"
+
+    def idempotency_begin(
+        self, scope: str, endpoint: str, idempotency_key: str, request_hash: str
+    ) -> tuple[str, dict | None]:
+        """Claim a key before running the request. Returns ("new", None) to go
+        ahead, ("replay", response) when it already succeeded with the same
+        body, ("mismatch", None) when the key was used with a different body,
+        or ("in_progress", None) while a first attempt is still running."""
+        key = self._idempotency_row_key(scope, endpoint, idempotency_key)
+        now = datetime.now(UTC)
+        pending = json.dumps({"state": "pending", "request_hash": request_hash, "at": now.isoformat()})
+        with session_scope(self.session_factory) as session:
+            row = session.get(KeyValueStateORM, key, with_for_update=True)
+            if row is None:
+                session.add(KeyValueStateORM(key=key, value=pending, updated_at=now))
+                try:
+                    session.flush()
+                except IntegrityError:
+                    session.rollback()
+                    return "in_progress", None
+                return "new", None
+            record = json.loads(row.value or "{}")
+            at = datetime.fromisoformat(record.get("at") or now.isoformat())
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=UTC)
+            age = now - at
+            if age > self.IDEMPOTENCY_TTL or (record.get("state") == "pending" and age > self.IDEMPOTENCY_STALE):
+                row.value, row.updated_at = pending, now
+                return "new", None
+            if record.get("request_hash") != request_hash:
+                return "mismatch", None
+            if record.get("state") == "done":
+                return "replay", record.get("response")
+            return "in_progress", None
+
+    def idempotency_complete(self, scope: str, endpoint: str, idempotency_key: str, request_hash: str, response: dict) -> None:
+        key = self._idempotency_row_key(scope, endpoint, idempotency_key)
+        now = datetime.now(UTC)
+        with session_scope(self.session_factory) as session:
+            row = session.get(KeyValueStateORM, key) or KeyValueStateORM(key=key)
+            row.value = json.dumps(
+                {"state": "done", "request_hash": request_hash, "at": now.isoformat(), "response": response},
+                default=str,
+            )
+            row.updated_at = now
+            session.add(row)
+
+    def idempotency_release(self, scope: str, endpoint: str, idempotency_key: str) -> None:
+        """Forget a key whose request failed, so a retry runs it again."""
+        key = self._idempotency_row_key(scope, endpoint, idempotency_key)
+        with session_scope(self.session_factory) as session:
+            row = session.get(KeyValueStateORM, key)
+            if row is not None:
+                session.delete(row)
+

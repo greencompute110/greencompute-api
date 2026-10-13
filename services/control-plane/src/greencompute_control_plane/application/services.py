@@ -153,6 +153,7 @@ class ControlPlaneService:
             owner_user_id=owner_user_id,
             requested_instances=payload.requested_instances,
             save_on_exhaustion=payload.save_on_exhaustion,
+            max_runtime_minutes=payload.max_runtime_minutes,
             deployment_fee_usd=self._estimate_deployment_fee(workload, payload.requested_instances),
             fee_acknowledged=payload.accept_fee,
             hourly_rate_cents=self._quoted_hourly_rate_cents(workload, self._live_public_gpu_models()),
@@ -366,6 +367,8 @@ class ControlPlaneService:
             deployment.health_check_failures = 0
             deployment.retry_exhausted = False
             deployment.warmup_state = "ready"
+            if deployment.ready_at is None:
+                deployment.ready_at = datetime.now(UTC)
         elif update.state in {DeploymentState.PULLING, DeploymentState.STARTING}:
             deployment.warmup_state = "warming"
         elif update.state in {DeploymentState.FAILED, DeploymentState.TERMINATED}:
@@ -1941,6 +1944,35 @@ class ControlPlaneService:
             except Exception as exc:
                 logger.error("Failed to reap deployment %s: %s", deployment.deployment_id, exc)
         return reaped
+
+
+    def stop_expired_runtimes(self, now: datetime | None = None) -> list[str]:
+        """Terminate ready deployments that have run for their
+        max_runtime_minutes since ready_at, so a crashed or forgotten client
+        stops paying. Returns the stopped deployment ids."""
+        observed_at = now or datetime.now(UTC)
+        stopped: list[str] = []
+        for deployment in self.repository.list_deployments_by_state(DeploymentState.READY):
+            if not deployment.max_runtime_minutes or deployment.ready_at is None:
+                continue
+            ran = (observed_at - self._ensure_utc(deployment.ready_at)).total_seconds()
+            if ran < deployment.max_runtime_minutes * 60:
+                continue
+            reason = f"stopped automatically after max_runtime_minutes={deployment.max_runtime_minutes}"
+            try:
+                self.update_deployment_status(
+                    DeploymentStatusUpdate(
+                        deployment_id=deployment.deployment_id,
+                        state=DeploymentState.TERMINATED,
+                        error=reason,
+                    )
+                )
+                self.metrics.increment("deployment.stopped.max_runtime")
+                stopped.append(deployment.deployment_id)
+                logger.info("Stopped deployment %s: %s", deployment.deployment_id, reason)
+            except Exception as exc:
+                logger.error("Failed to stop deployment %s at its runtime cap: %s", deployment.deployment_id, exc)
+        return stopped
 
 
 service = ControlPlaneService()

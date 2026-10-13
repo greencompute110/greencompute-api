@@ -77,6 +77,14 @@ async def _control_plane_worker_loop() -> None:
                         "reaper cycle failed: %s", reap_exc
                     )
                     _worker_state["last_error"] = f"reaper: {reap_exc}"
+                try:
+                    service.stop_expired_runtimes()
+                except Exception as cap_exc:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "runtime-cap cycle failed: %s", cap_exc
+                    )
+                    _worker_state["last_error"] = f"runtime cap: {cap_exc}"
                 # Reclaim GPU reservations orphaned by a delete/terminate that
                 # didn't release them — keeps leaked holds from permanently
                 # shrinking schedulable capacity. Isolated try/except.

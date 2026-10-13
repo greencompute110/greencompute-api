@@ -46,6 +46,8 @@ def _additive_migrations(engine: Engine) -> None:
             "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS port_mappings JSON DEFAULT '{}'::json"
         )
         statements.append("ALTER TABLE crypto_invoices ADD COLUMN IF NOT EXISTS amount_units BIGINT")
+        statements.append("ALTER TABLE deployments ADD COLUMN IF NOT EXISTS ready_at TIMESTAMP WITH TIME ZONE")
+        statements.append("ALTER TABLE deployments ADD COLUMN IF NOT EXISTS max_runtime_minutes INTEGER")
         statements.append("ALTER TABLE crypto_invoices ADD COLUMN IF NOT EXISTS review_status VARCHAR(16)")
         statements.append("ALTER TABLE crypto_invoices ADD COLUMN IF NOT EXISTS review_note TEXT")
         statements.append(
@@ -57,6 +59,8 @@ def _additive_migrations(engine: Engine) -> None:
             "ALTER TABLE deployments ADD COLUMN port_mappings JSON DEFAULT '{}'"
         )
         statements.append("ALTER TABLE crypto_invoices ADD COLUMN amount_units BIGINT")
+        statements.append("ALTER TABLE deployments ADD COLUMN ready_at TIMESTAMP")
+        statements.append("ALTER TABLE deployments ADD COLUMN max_runtime_minutes INTEGER")
         statements.append("ALTER TABLE crypto_invoices ADD COLUMN review_status VARCHAR(16)")
         statements.append("ALTER TABLE crypto_invoices ADD COLUMN review_note TEXT")
         statements.append("ALTER TABLE crypto_invoices ADD COLUMN review_requested_at TIMESTAMP")

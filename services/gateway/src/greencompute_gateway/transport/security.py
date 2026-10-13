@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextvars
 import hmac
+import math
 import os
+import time
 
 from fastapi import HTTPException, status
 
@@ -242,7 +244,16 @@ def enforce_rate_limit(subject: str, key: str, *, limit: int, window_seconds: in
     result = rate_limiter.check(subject, key, limit=limit, window_seconds=window_seconds)
     if not result.allowed:
         metrics.increment(f"rate_limit.hit.{subject}")
+        retry_after = max(1, math.ceil(result.reset_at - time.time()))
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={"message": "rate limit exceeded", "subject": subject, "reset_at": result.reset_at},
+            detail={
+                "message": "rate limit exceeded",
+                "subject": subject,
+                "limit": limit,
+                "window_seconds": window_seconds,
+                "retry_after_seconds": retry_after,
+                "reset_at": result.reset_at,
+            },
+            headers={"Retry-After": str(retry_after)},
         )

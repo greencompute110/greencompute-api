@@ -142,6 +142,10 @@ class DeploymentORM(Base):
     endpoint: Mapped[str | None] = mapped_column(String(512), nullable=True)
     ssh_private_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     port_mappings: Mapped[dict[int, int]] = mapped_column(JSON, default=dict)
+    # When the deployment first became ready (billing start), and the optional
+    # automatic stop after that many minutes.
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    max_runtime_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     hourly_rate_cents: Mapped[int] = mapped_column(Integer, default=10)
     metering_remainder_mcents: Mapped[int] = mapped_column(Integer, default=0)
     # Credit-exhaustion lifecycle (opt-in "save my pod").
