@@ -85,6 +85,14 @@ async def _control_plane_worker_loop() -> None:
                         "runtime-cap cycle failed: %s", cap_exc
                     )
                     _worker_state["last_error"] = f"runtime cap: {cap_exc}"
+                try:
+                    service.stop_rentals_over_key_limits()
+                except Exception as limit_exc:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "key-limit cycle failed: %s", limit_exc
+                    )
+                    _worker_state["last_error"] = f"key limits: {limit_exc}"
                 # Reclaim GPU reservations orphaned by a delete/terminate that
                 # didn't release them — keeps leaked holds from permanently
                 # shrinking schedulable capacity. Isolated try/except.

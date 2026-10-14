@@ -144,6 +144,7 @@ class ControlPlaneService:
 
     def create_deployment(self, request: DeploymentCreateRequest | dict) -> DeploymentRecord:
         owner_user_id = request.get("owner_user_id") if isinstance(request, dict) else None
+        created_by_key_id = request.get("created_by_key_id") if isinstance(request, dict) else None
         payload = request if isinstance(request, DeploymentCreateRequest) else DeploymentCreateRequest(**request)
         workload = self.repository.get_workload(payload.workload_id)
         if workload is None:
@@ -154,6 +155,7 @@ class ControlPlaneService:
             requested_instances=payload.requested_instances,
             save_on_exhaustion=payload.save_on_exhaustion,
             max_runtime_minutes=payload.max_runtime_minutes,
+            created_by_key_id=created_by_key_id,
             deployment_fee_usd=self._estimate_deployment_fee(workload, payload.requested_instances),
             fee_acknowledged=payload.accept_fee,
             hourly_rate_cents=self._quoted_hourly_rate_cents(workload, self._live_public_gpu_models()),
@@ -1945,6 +1947,44 @@ class ControlPlaneService:
                 logger.error("Failed to reap deployment %s: %s", deployment.deployment_id, exc)
         return reaped
 
+
+    def stop_rentals_over_key_limits(self) -> list[str]:
+        """Terminate running rentals started by an API key that has reached
+        its spend limit for the last 24 hours, so the limit actually stops
+        spending rather than only blocking new rentals. Returns the stopped
+        deployment ids."""
+        from greencompute_persistence.key_limits import key_spend_cents, keys_with_spend_limits
+
+        limits = keys_with_spend_limits(self.repository.session_factory)
+        if not limits:
+            return []
+        spent: dict[str, int] = {}
+        stopped: list[str] = []
+        for deployment in self.repository.list_deployments_by_state(DeploymentState.READY):
+            key_id = deployment.created_by_key_id
+            if key_id not in limits:
+                continue
+            if key_id not in spent:
+                spent[key_id] = key_spend_cents(self.repository.session_factory, key_id)
+            if spent[key_id] < limits[key_id]:
+                continue
+            reason = (
+                f"stopped: its API key reached its spend limit of ${limits[key_id] / 100:.2f} for the last 24 hours"
+            )
+            try:
+                self.update_deployment_status(
+                    DeploymentStatusUpdate(
+                        deployment_id=deployment.deployment_id,
+                        state=DeploymentState.TERMINATED,
+                        error=reason,
+                    )
+                )
+                self.metrics.increment("deployment.stopped.key_limit")
+                stopped.append(deployment.deployment_id)
+                logger.info("Stopped deployment %s: %s", deployment.deployment_id, reason)
+            except Exception as exc:
+                logger.error("Failed to stop deployment %s at its key's limit: %s", deployment.deployment_id, exc)
+        return stopped
 
     def stop_expired_runtimes(self, now: datetime | None = None) -> list[str]:
         """Terminate ready deployments that have run for their

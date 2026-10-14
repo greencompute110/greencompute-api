@@ -96,6 +96,10 @@ class GatewayRepository:
             row.scopes = api_key.scopes
             row.secret = api_key.secret
             row.created_at = api_key.created_at
+            row.max_active_rentals = api_key.max_active_rentals
+            row.daily_spend_limit_cents = (
+                round(api_key.daily_spend_limit_usd * 100) if api_key.daily_spend_limit_usd is not None else None
+            )
             session.add(row)
         return api_key
 
@@ -460,6 +464,8 @@ class GatewayRepository:
             scopes=row.scopes,
             secret=row.secret,
             created_at=row.created_at,
+            max_active_rentals=row.max_active_rentals,
+            daily_spend_limit_usd=(row.daily_spend_limit_cents / 100 if row.daily_spend_limit_cents is not None else None),
         )
 
     @staticmethod

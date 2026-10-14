@@ -80,7 +80,7 @@ def test_runtime_cap_is_validated():
 def created(monkeypatch):
     calls = []
 
-    def fake_create(payload, *, user_id=None, admin=False):
+    def fake_create(payload, *, user_id=None, admin=False, created_by_key_id=None):
         calls.append(payload)
         return DeploymentRecord(workload_id=payload.workload_id, owner_user_id=user_id)
 

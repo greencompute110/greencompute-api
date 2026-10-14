@@ -35,4 +35,6 @@ class CredentialStore:
                 scopes=row.scopes,
                 secret=row.secret,
                 created_at=row.created_at,
+                max_active_rentals=row.max_active_rentals,
+                daily_spend_limit_usd=(row.daily_spend_limit_cents / 100 if row.daily_spend_limit_cents is not None else None),
             )
