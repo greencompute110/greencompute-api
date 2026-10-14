@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
 from greencompute_persistence.db import needs_bootstrap
 from greencompute_persistence.orm import (
+    CryptoDepositORM,
     CryptoInvoiceORM,
     InferenceBalanceHoldORM,
     InferenceDemandStatsORM,
@@ -16,12 +17,24 @@ from greencompute_persistence.orm import (
     MinerPayoutAccrualORM,
     StripeSessionORM,
     UserORM,
+    VerifiedWalletORM,
 )
 from greencompute_protocol import CryptoInvoice, LedgerEntry, StripeSession
 
 
 class InsufficientBalanceError(Exception):
     pass
+
+
+class WalletLinkedElsewhere(Exception):
+    """The wallet is already verified by a different account."""
+
+
+class TooManyWallets(Exception):
+    pass
+
+
+MAX_WALLETS_PER_USER = 10
 
 
 class BillingRepository:
@@ -356,13 +369,19 @@ class BillingRepository:
 
     # --- Crypto invoices ---
 
-    def create_crypto_invoice(self, invoice: CryptoInvoice) -> CryptoInvoice:
+    def create_crypto_invoice(
+        self, invoice: CryptoInvoice, amount_units: int | None = None
+    ) -> CryptoInvoice:
+        """Insert an invoice. With `amount_units`, raises IntegrityError when
+        another pending invoice at the same address already asks for exactly
+        that amount; the caller picks another amount and retries."""
         with session_scope(self.session_factory) as session:
             row = CryptoInvoiceORM(
                 invoice_id=invoice.invoice_id,
                 user_id=invoice.user_id,
                 currency=invoice.currency,
                 amount_crypto=invoice.amount_crypto,
+                amount_units=amount_units,
                 amount_usd=invoice.amount_usd,
                 bonus_pct=invoice.bonus_pct,
                 total_credits=invoice.total_credits,
@@ -398,6 +417,8 @@ class BillingRepository:
         tx_hash: str,
         description: str,
         deposit_ref: str | None = None,
+        allow_expired: bool = False,
+        credit_cents: int | None = None,
     ) -> dict | None:
         """Atomically confirm an invoice and credit the owning user.
 
@@ -437,7 +458,9 @@ class BillingRepository:
             # caller.) An admin who genuinely needs to credit a late-but-real
             # payment re-opens the invoice first, rather than this silently
             # overriding the terminal state.
-            if inv.status in ("rejected", "expired"):
+            # A user's review request is that re-opening: resolving it may
+            # credit an invoice that expired before the payment was matched.
+            if inv.status == "rejected" or (inv.status == "expired" and not allow_expired):
                 return {
                     "refused": True,
                     "invoice_id": invoice_id,
@@ -481,18 +504,21 @@ class BillingRepository:
             if user is None:
                 raise KeyError(f"user {inv.user_id} not found for invoice {invoice_id}")
 
+            # What arrived may be worth more than the invoice (an overpayment)
+            # or be valued at a later price (a late payment).
+            credited = inv.total_credits if credit_cents is None else credit_cents
             # 1. flip invoice
             inv.status = "confirmed"
             inv.tx_hash = tx_hash
             inv.confirmed_at = datetime.now(UTC)
             # 2. credit user
-            user.balance_credits += inv.total_credits
+            user.balance_credits += credited
             # 3. ledger entry (explicit created_at — see credit_user comment)
             session.add(
                 LedgerEntryORM(
                     entry_id=str(uuid4()),
                     user_id=inv.user_id,
-                    amount_cents=inv.total_credits,
+                    amount_cents=credited,
                     balance_after=user.balance_credits,
                     kind="topup",
                     reference_id=invoice_id,
@@ -516,7 +542,7 @@ class BillingRepository:
             return {
                 "credited": True,
                 "invoice_id": invoice_id,
-                "total_credits": inv.total_credits,
+                "total_credits": credited,
             }
 
     def expire_stale_pending_invoices(self, grace_seconds: int) -> int:
@@ -584,6 +610,111 @@ class BillingRepository:
             session.add(row)
             return self._to_crypto_invoice(row)
 
+    def request_invoice_review(
+        self, invoice_id: str, user_id: str, tx_hash: str, note: str | None = None
+    ) -> dict | None:
+        """User-side: ask for a payment against this invoice to be checked by
+        hand, giving its transaction hash. Only the invoice's owner can, and
+        only while it is pending or expired. Returns None if the invoice isn't
+        theirs, {"refused": status} if it is confirmed or rejected."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(CryptoInvoiceORM, invoice_id)
+            if row is None or row.user_id != user_id:
+                return None
+            if row.status not in ("pending", "expired"):
+                return {"refused": True, "invoice_id": invoice_id, "status": row.status}
+            row.tx_hash = tx_hash
+            row.review_status = "open"
+            row.review_note = (note or "").strip()[:1000] or None
+            row.review_requested_at = datetime.now(UTC)
+            return {
+                "invoice_id": invoice_id,
+                "status": row.status,
+                "tx_hash": tx_hash,
+                "review_status": "open",
+            }
+
+    def invoice_review_statuses(self, user_id: str) -> dict[str, str]:
+        with session_scope(self.session_factory) as session:
+            rows = session.execute(
+                select(CryptoInvoiceORM.invoice_id, CryptoInvoiceORM.review_status).where(
+                    CryptoInvoiceORM.user_id == user_id,
+                    CryptoInvoiceORM.review_status.is_not(None),
+                )
+            ).all()
+            return {invoice_id: status for invoice_id, status in rows}
+
+    def get_invoice_review(self, invoice_id: str) -> dict | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(CryptoInvoiceORM, invoice_id)
+            if row is None:
+                return None
+            return {
+                "invoice_id": row.invoice_id,
+                "user_id": row.user_id,
+                "currency": row.currency,
+                "amount_usd": float(row.amount_usd),
+                "bonus_pct": float(row.bonus_pct or 0.0),
+                "total_credits": row.total_credits,
+                "status": row.status,
+                "tx_hash": row.tx_hash,
+                "review_status": row.review_status,
+            }
+
+    def set_review_status(self, invoice_id: str, review_status: str, *, paid_tx: str | None = None) -> None:
+        """Close a review. With `paid_tx`, also mark the invoice confirmed:
+        its payment has been credited (possibly at a different amount)."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(CryptoInvoiceORM, invoice_id)
+            if row is None:
+                return
+            row.review_status = review_status
+            if paid_tx is not None and row.status != "confirmed":
+                row.status = "confirmed"
+                row.tx_hash = paid_tx or row.tx_hash
+                row.confirmed_at = datetime.now(UTC)
+
+    def list_open_reviews(self, limit: int = 200) -> list[dict]:
+        """Admin: open review requests, oldest first, each with the account and
+        any logged deposit carrying the reported transaction hash."""
+        with session_scope(self.session_factory) as session:
+            rows = session.execute(
+                select(CryptoInvoiceORM, UserORM)
+                .join(UserORM, UserORM.user_id == CryptoInvoiceORM.user_id)
+                .where(CryptoInvoiceORM.review_status == "open")
+                .order_by(CryptoInvoiceORM.review_requested_at.asc())
+                .limit(limit)
+            ).all()
+            out = []
+            for inv, user in rows:
+                deposits = []
+                if inv.tx_hash:
+                    deposits = [
+                        self._deposit_dict(d)
+                        for d in session.scalars(
+                            select(CryptoDepositORM).where(
+                                func.lower(CryptoDepositORM.tx_hash) == inv.tx_hash.strip().lower()
+                            )
+                        ).all()
+                    ]
+                out.append({
+                    "invoice_id": inv.invoice_id,
+                    "user_id": inv.user_id,
+                    "username": user.username,
+                    "email": user.email,
+                    "currency": inv.currency,
+                    "amount_crypto": inv.amount_crypto,
+                    "amount_usd": inv.amount_usd,
+                    "total_credits": inv.total_credits,
+                    "status": inv.status,
+                    "tx_hash": inv.tx_hash,
+                    "review_note": inv.review_note,
+                    "review_requested_at": inv.review_requested_at.isoformat() if inv.review_requested_at else None,
+                    "created_at": inv.created_at.isoformat() if inv.created_at else None,
+                    "deposits": deposits,
+                })
+            return out
+
     def list_crypto_invoices(self, user_id: str) -> list[CryptoInvoice]:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(
@@ -636,6 +767,328 @@ class BillingRepository:
             return out
 
     # --- Stripe sessions ---
+
+    def pending_invoices(self, currency: str, deposit_address: str) -> list[dict]:
+        """Open invoices for this currency at this address, oldest first."""
+        return self._invoices_where(currency, deposit_address, CryptoInvoiceORM.status == "pending")
+
+    def _invoices_where(self, currency: str, deposit_address: str, condition) -> list[dict]:
+        addr = (deposit_address or "").strip().lower()
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(CryptoInvoiceORM)
+                .where(CryptoInvoiceORM.currency == currency, condition)
+                .order_by(CryptoInvoiceORM.created_at.asc())
+            ).all()
+            return [
+                {
+                    "invoice_id": r.invoice_id,
+                    "user_id": r.user_id,
+                    "currency": r.currency,
+                    "amount_crypto": float(r.amount_crypto),
+                    "amount_units": r.amount_units,
+                    "amount_usd": float(r.amount_usd),
+                    "bonus_pct": float(r.bonus_pct or 0.0),
+                }
+                for r in rows
+                # Compared case-insensitively: EVM addresses arrive lowercase
+                # from logs but may be configured checksummed.
+                if (r.deposit_address or "").strip().lower() == addr
+            ]
+
+    def reserved_invoice_units(
+        self, currency: str, deposit_address: str, expired_since: datetime
+    ) -> set[int]:
+        """Exact amounts a new invoice must not reuse: those of open invoices,
+        and of invoices that expired after `expired_since`, whose late payment
+        is still matched to them by amount."""
+        with session_scope(self.session_factory) as session:
+            return set(
+                session.scalars(
+                    select(CryptoInvoiceORM.amount_units).where(
+                        CryptoInvoiceORM.currency == currency,
+                        CryptoInvoiceORM.deposit_address == deposit_address,
+                        CryptoInvoiceORM.amount_units.is_not(None),
+                        (CryptoInvoiceORM.status == "pending")
+                        | (
+                            (CryptoInvoiceORM.status == "expired")
+                            & (CryptoInvoiceORM.expires_at >= expired_since)
+                        ),
+                    )
+                ).all()
+            )
+
+    def recently_expired_invoices(
+        self, currency: str, deposit_address: str, expired_since: datetime
+    ) -> list[dict]:
+        """Expired invoices for this currency and address whose expiry is after
+        `expired_since`, oldest first, shaped like pending_invoices()."""
+        return self._invoices_where(
+            currency, deposit_address,
+            (CryptoInvoiceORM.status == "expired") & (CryptoInvoiceORM.expires_at >= expired_since),
+        )
+
+    def count_pending_invoices(self, user_id: str) -> int:
+        with session_scope(self.session_factory) as session:
+            return session.scalar(
+                select(func.count()).select_from(CryptoInvoiceORM).where(
+                    CryptoInvoiceORM.user_id == user_id,
+                    CryptoInvoiceORM.status == "pending",
+                )
+            ) or 0
+
+    # --- On-chain deposits ---
+
+    def record_deposit(self, deposit: dict) -> str:
+        """Log a transfer seen at a deposit address, once. Returns the row's
+        status: "unmatched" for a new row, or whatever an earlier tick left."""
+        with session_scope(self.session_factory) as session:
+            existing = session.get(CryptoDepositORM, deposit["deposit_ref"])
+            if existing is not None:
+                return existing.status
+            session.add(CryptoDepositORM(status="unmatched", observed_at=datetime.now(UTC), **deposit))
+            try:
+                session.flush()
+            except IntegrityError:
+                session.rollback()
+                return session.get(CryptoDepositORM, deposit["deposit_ref"]).status
+            return "unmatched"
+
+    def get_deposit(self, deposit_ref: str) -> dict | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(CryptoDepositORM, deposit_ref)
+            return self._deposit_dict(row) if row else None
+
+    def mark_deposit(self, deposit_ref: str, **fields) -> None:
+        """Record how a deposit was resolved (status, matched_by, user, …)."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(CryptoDepositORM, deposit_ref)
+            if row is None:
+                return
+            for key, value in fields.items():
+                setattr(row, key, value)
+            if fields.get("status") == "credited" and row.credited_at is None:
+                row.credited_at = datetime.now(UTC)
+
+    def manual_credit_for_tx(self, currency: str, tx_hash: str | None) -> dict | None:
+        """The ledger entry of an admin confirm that already credited this
+        transaction (deposit_ref "manual:<currency>:<tx_hash>"), if any."""
+        if not tx_hash:
+            return None
+        with session_scope(self.session_factory) as session:
+            row = self._manual_credit_row(session, currency, tx_hash)
+            if row is None:
+                return None
+            return {"user_id": row.user_id, "amount_cents": row.amount_cents, "invoice_id": row.reference_id}
+
+    @staticmethod
+    def _manual_credit_row(session, currency: str, tx_hash: str | None):
+        # Any currency: the user may have paid in a different token than the
+        # invoice they were credited for. Hashes are hex, so LIKE is safe.
+        if not tx_hash:
+            return None
+        return session.scalar(
+            select(LedgerEntryORM).where(
+                func.lower(LedgerEntryORM.deposit_ref).like(f"manual:%:{tx_hash.strip().lower()}")
+            )
+        )
+
+    def mark_deposits_by_tx(self, currency: str | None, tx_hash: str, **fields) -> int:
+        """After an admin confirm: mark the logged transfer(s) of this
+        transaction credited, so linking the wallet can't claim them again.
+        `currency` None matches any currency."""
+        with session_scope(self.session_factory) as session:
+            q = select(CryptoDepositORM).where(
+                func.lower(CryptoDepositORM.tx_hash) == (tx_hash or "").strip().lower()
+            )
+            if currency:
+                q = q.where(CryptoDepositORM.currency == currency)
+            rows = session.scalars(q).all()
+            for row in rows:
+                for key, value in fields.items():
+                    setattr(row, key, value)
+                row.credited_at = row.credited_at or datetime.now(UTC)
+            return len(rows)
+
+    def credit_deposit(
+        self,
+        deposit_ref: str,
+        user_id: str,
+        amount_cents: int,
+        description: str,
+        matched_by: str,
+    ) -> dict | None:
+        """Credit a logged deposit straight to a user (verified wallet, wallet
+        link or admin). At most once per deposit: the ledger's UNIQUE
+        deposit_ref is shared with the invoice path, so a transfer that already
+        paid an invoice can never be credited again here.
+
+        Returns None if the deposit isn't logged, {"already_credited": True}
+        if it was credited before, else {"credited": True, ...}."""
+        with session_scope(self.session_factory) as session:
+            dep = session.get(CryptoDepositORM, deposit_ref, with_for_update=True)
+            if dep is None:
+                return None
+            if dep.status == "credited":
+                return {"already_credited": True, "deposit_ref": deposit_ref}
+            earlier = session.scalar(
+                select(LedgerEntryORM).where(LedgerEntryORM.deposit_ref == deposit_ref)
+            ) or self._manual_credit_row(session, dep.currency, dep.tx_hash)
+            if earlier is not None:
+                dep.status = "credited"
+                dep.user_id = earlier.user_id
+                dep.credited_cents = earlier.amount_cents
+                dep.credited_at = dep.credited_at or earlier.created_at
+                return {"already_credited": True, "deposit_ref": deposit_ref}
+            user = session.get(UserORM, user_id, with_for_update=True)
+            if user is None:
+                raise KeyError(f"user {user_id} not found")
+            user.balance_credits += amount_cents
+            session.add(
+                LedgerEntryORM(
+                    entry_id=str(uuid4()),
+                    user_id=user_id,
+                    amount_cents=amount_cents,
+                    balance_after=user.balance_credits,
+                    kind="topup",
+                    deposit_ref=deposit_ref,
+                    description=description,
+                    created_at=datetime.now(UTC),
+                )
+            )
+            dep.status = "credited"
+            dep.matched_by = matched_by
+            dep.user_id = user_id
+            dep.credited_cents = amount_cents
+            dep.credited_at = datetime.now(UTC)
+            try:
+                session.flush()
+            except IntegrityError:
+                session.rollback()
+                return {"already_credited": True, "deposit_ref": deposit_ref}
+            return {
+                "credited": True,
+                "deposit_ref": deposit_ref,
+                "amount_cents": amount_cents,
+                "balance_after": user.balance_credits,
+            }
+
+    def unmatched_deposits_from(
+        self, sender: str, currencies: tuple[str, ...], since: datetime
+    ) -> list[dict]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(CryptoDepositORM)
+                .where(
+                    CryptoDepositORM.sender == sender,
+                    CryptoDepositORM.currency.in_(currencies),
+                    CryptoDepositORM.status == "unmatched",
+                    CryptoDepositORM.observed_at >= since,
+                )
+                .order_by(CryptoDepositORM.observed_at.asc())
+            ).all()
+            return [self._deposit_dict(r) for r in rows]
+
+    def list_user_deposits(self, user_id: str, limit: int = 50) -> list[dict]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(CryptoDepositORM)
+                .where(CryptoDepositORM.user_id == user_id, CryptoDepositORM.status == "credited")
+                .order_by(CryptoDepositORM.observed_at.desc())
+                .limit(limit)
+            ).all()
+            return [self._deposit_dict(r) for r in rows]
+
+    def list_deposits_for_admin(self, status: str | None = None, limit: int = 200) -> list[dict]:
+        with session_scope(self.session_factory) as session:
+            q = select(CryptoDepositORM).order_by(CryptoDepositORM.observed_at.desc()).limit(limit)
+            if status:
+                q = q.where(CryptoDepositORM.status == status)
+            return [self._deposit_dict(r) for r in session.scalars(q).all()]
+
+    # --- Verified wallets ---
+
+    def add_verified_wallet(self, user_id: str, chain: str, address: str) -> tuple[dict, bool]:
+        """Link a wallet to a user. Returns (wallet, created). Raises
+        WalletLinkedElsewhere if another account owns it."""
+        with session_scope(self.session_factory) as session:
+            existing = session.scalar(
+                select(VerifiedWalletORM).where(
+                    VerifiedWalletORM.chain == chain, VerifiedWalletORM.address == address
+                )
+            )
+            if existing is not None:
+                if existing.user_id != user_id:
+                    raise WalletLinkedElsewhere(address)
+                return self._wallet_dict(existing), False
+            count = session.scalar(
+                select(func.count()).select_from(VerifiedWalletORM).where(
+                    VerifiedWalletORM.user_id == user_id
+                )
+            ) or 0
+            if count >= MAX_WALLETS_PER_USER:
+                raise TooManyWallets(user_id)
+            row = VerifiedWalletORM(
+                wallet_id=str(uuid4()),
+                user_id=user_id,
+                chain=chain,
+                address=address,
+                created_at=datetime.now(UTC),
+            )
+            session.add(row)
+            try:
+                session.flush()
+            except IntegrityError:
+                session.rollback()
+                raise WalletLinkedElsewhere(address)
+            return self._wallet_dict(row), True
+
+    def list_verified_wallets(self, user_id: str) -> list[dict]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(VerifiedWalletORM)
+                .where(VerifiedWalletORM.user_id == user_id)
+                .order_by(VerifiedWalletORM.created_at.asc())
+            ).all()
+            return [self._wallet_dict(r) for r in rows]
+
+    def delete_verified_wallet(self, user_id: str, wallet_id: str) -> bool:
+        with session_scope(self.session_factory) as session:
+            row = session.get(VerifiedWalletORM, wallet_id)
+            if row is None or row.user_id != user_id:
+                return False
+            session.delete(row)
+            return True
+
+    def wallet_owner(self, chain: str, address: str) -> str | None:
+        with session_scope(self.session_factory) as session:
+            return session.scalar(
+                select(VerifiedWalletORM.user_id).where(
+                    VerifiedWalletORM.chain == chain, VerifiedWalletORM.address == address
+                )
+            )
+
+    def find_user_id(self, identifier: str) -> str | None:
+        """A user's id from their id, username or email (case-insensitive);
+        None when nothing or more than one account matches."""
+        ident = (identifier or "").strip()
+        if not ident:
+            return None
+        with session_scope(self.session_factory) as session:
+            if session.get(UserORM, ident) is not None:
+                return ident
+            ids = session.scalars(
+                select(UserORM.user_id).where(
+                    (func.lower(UserORM.username) == ident.lower())
+                    | (func.lower(UserORM.email) == ident.lower())
+                )
+            ).all()
+            return ids[0] if len(ids) == 1 else None
+
+    def get_username(self, user_id: str) -> str | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(UserORM, user_id)
+            return row.username if row else None
 
     def create_stripe_session(self, ss: StripeSession) -> StripeSession:
         with session_scope(self.session_factory) as session:
@@ -932,6 +1385,37 @@ class BillingRepository:
             confirmed_at=row.confirmed_at,
             created_at=row.created_at,
         )
+
+    @staticmethod
+    def _deposit_dict(row: CryptoDepositORM) -> dict:
+        return {
+            "deposit_ref": row.deposit_ref,
+            "currency": row.currency,
+            "tx_hash": row.tx_hash,
+            "sender": row.sender,
+            "deposit_address": row.deposit_address,
+            "amount": row.amount_raw / (10 ** row.decimals),
+            "amount_raw": row.amount_raw,
+            "decimals": row.decimals,
+            "block_number": row.block_number,
+            "usd_price": row.usd_price,
+            "status": row.status,
+            "matched_by": row.matched_by,
+            "invoice_id": row.invoice_id,
+            "user_id": row.user_id,
+            "credited_cents": row.credited_cents,
+            "observed_at": row.observed_at.isoformat() if row.observed_at else None,
+            "credited_at": row.credited_at.isoformat() if row.credited_at else None,
+        }
+
+    @staticmethod
+    def _wallet_dict(row: VerifiedWalletORM) -> dict:
+        return {
+            "wallet_id": row.wallet_id,
+            "chain": row.chain,
+            "address": row.address,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
 
     @staticmethod
     def _to_stripe_session(row: StripeSessionORM) -> StripeSession:

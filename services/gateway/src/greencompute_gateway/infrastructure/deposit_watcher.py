@@ -1,10 +1,10 @@
-"""On-chain deposit watcher — auto-confirms crypto top-ups.
+"""On-chain deposit watcher — credits crypto top-ups automatically.
 
-Polls supported chains on a fixed interval and matches incoming transfers
-to pending `crypto_invoices`. For each match it calls the existing
-`BillingRepository.confirm_and_credit_invoice` (which is idempotent and
-atomic), so a successful match crediting the user is safe even on
-overlapping ticks or restarts.
+Polls supported chains on a fixed interval, logs every transfer that arrives
+at one of our deposit addresses (`crypto_deposits`) and hands it to
+`BillingService.resolve_deposit`, which decides whose it is and credits them.
+Crediting is idempotent per transfer (the ledger's UNIQUE deposit_ref), so
+overlapping ticks, restarts and re-scans are safe.
 
 ## Supported chains
 
@@ -16,18 +16,19 @@ overlapping ticks or restarts.
 - **USDT-ETH, USDC-ETH** — ERC-20 `Transfer` logs via JSON-RPC `eth_getLogs`.
 - **USDT-BASE, USDC-BASE** — same, against Base mainnet RPC.
 
-## How it disambiguates deposits
+## Whose payment is it?
 
-Deposit addresses are shared across users (we don't run an HD wallet),
-so we can't tell who sent a given deposit from the tx alone. We match
-each transfer to a pending invoice by AMOUNT:
+Deposit addresses are shared across users (we don't run an HD wallet), so
+the transfer itself doesn't say who it's for. In order:
 
-  invoice.amount_crypto <= deposit_amount <= invoice.amount_crypto * 1.05
-
-The 5% upper bound lets users overpay slightly (e.g. send 0.06 TAO for
-a 0.057799 TAO invoice) without manual review. If a single tx could
-match multiple pending invoices, the *earliest-created* invoice wins —
-first in, first out.
+1. **Exact amount.** Every open invoice asks for a unique amount (a few extra
+   millionths, worth under a cent), so a transfer of exactly that amount is
+   that invoice's.
+2. **Verified wallet.** A sender whose owner proved control by signing a
+   message gets the value of whatever they sent, invoice or not.
+3. **Small overpayment.** Up to 5% over exactly one open invoice's amount.
+4. Otherwise the deposit stays **unmatched**: the payer can claim it by
+   verifying the sending wallet, or an admin assigns it.
 
 ## State
 
@@ -40,8 +41,8 @@ RPC bills sane).
 
 - `GREENCOMPUTE_DEPOSIT_WATCHER_ENABLED` (default "true") — kill switch
 - `GREENCOMPUTE_DEPOSIT_WATCHER_INTERVAL_SECONDS` (default 60)
-- `ETH_RPC_URL` (default https://eth.llamarpc.com — public, can be flaky)
-- `BASE_RPC_URL` (default https://mainnet.base.org)
+- `ETH_RPC_URL` (default https://ethereum-rpc.publicnode.com — public, can be flaky)
+- `BASE_RPC_URL` (default https://base-rpc.publicnode.com)
 - `GREENCOMPUTE_SUBTENSOR_URL` (already used by price feed)
 """
 from __future__ import annotations
@@ -179,136 +180,40 @@ def _kv_set(repo: BillingRepository, key: str, value: str) -> None:
         session.add(row)
 
 
-def _pending_invoices_for(
-    repo: BillingRepository, currency: str, address: str
-) -> list[CryptoInvoiceORM]:
-    """Pending invoices for this currency+address, oldest first."""
-    addr_lower = (address or "").strip().lower()
-    if not addr_lower:
-        return []
+# Outcomes of BillingService.resolve_deposit that put money on an account.
+CREDITED = ("invoice", "invoice_overpay", "wallet")
+
+
+def _deposit_addresses(repo: BillingRepository, currencies: list[str]) -> dict[str, set[str]]:
+    """Addresses to watch per currency: the configured deposit address, plus
+    any address a still-open invoice was issued for (in case it changed).
+
+    Watched whether or not an invoice is open: a verified wallet can pay
+    without one, and an unmatched payment must be logged to be claimable."""
+    from greencompute_gateway.application.billing_service import _deposit_address_for
+
+    watched: dict[str, set[str]] = {c: set() for c in currencies}
+    for currency in currencies:
+        configured = (_deposit_address_for(currency) or "").strip()
+        if configured:
+            watched[currency].add(configured)
     with session_scope(repo.session_factory) as session:
-        rows = list(
-            session.scalars(
-                select(CryptoInvoiceORM)
-                .where(
-                    CryptoInvoiceORM.currency == currency,
-                    CryptoInvoiceORM.status == "pending",
-                )
-                .order_by(CryptoInvoiceORM.created_at.asc())
-            ).all()
-        )
-    # Filter to the right deposit address (might've rotated over time).
-    return [
-        r for r in rows
-        if (r.deposit_address or "").strip().lower() == addr_lower
-    ]
-
-
-# Bittensor produces one block every 12 seconds.
-BITTENSOR_BLOCK_SECONDS = 12
-
-# How far before the oldest pending invoice a Bittensor scan may start (~1h).
-# Covers clock skew between our database and the chain.
-INVOICE_LOOKBACK_BLOCKS = 300
-
-
-def _pending_bittensor_invoices(
-    repo: BillingRepository, currency: str
-) -> tuple[set[str], datetime | None]:
-    """Deposit addresses of pending `currency` invoices, and when the oldest
-    of them was created (None when nothing is pending)."""
-    with session_scope(repo.session_factory) as session:
-        rows = session.scalars(
-            select(CryptoInvoiceORM).where(
-                CryptoInvoiceORM.currency == currency,
+        rows = session.execute(
+            select(CryptoInvoiceORM.currency, CryptoInvoiceORM.deposit_address).where(
+                CryptoInvoiceORM.currency.in_(currencies),
                 CryptoInvoiceORM.status == "pending",
             )
         ).all()
-        addrs = {(r.deposit_address or "").strip() for r in rows if r.deposit_address}
-        created = [r.created_at for r in rows if r.created_at is not None]
-    oldest = min(created, default=None)
-    if oldest is not None and oldest.tzinfo is None:
-        oldest = oldest.replace(tzinfo=UTC)  # SQLite drops the timezone
-    return addrs, oldest
+    for currency, address in rows:
+        if address and address.strip():
+            watched[currency].add(address.strip())
+    return watched
 
 
-def _bittensor_scan_start(
-    last_seen: int | None,
-    safe_head: int,
-    oldest_pending_at: datetime | None,
-    now: datetime,
-) -> int:
-    """The last block already handled; the scan resumes at the next one.
+def _service(repo: BillingRepository):
+    from greencompute_gateway.application.billing_service import BillingService
 
-    The TAO and alpha scanners only run while an invoice is pending, so after
-    a quiet spell the stored cursor can be months behind the chain. Replaying
-    from there at MAX_BLOCKS_PER_TICK per tick took days, long after the
-    invoice had expired, so payments were never credited. Nothing sent before
-    the oldest pending invoice existed can be matched to it, so skip straight
-    to that invoice's block (estimated from its age), minus a margin.
-    """
-    start = last_seen if last_seen is not None else max(0, safe_head - 1800)  # ~6h
-    if oldest_pending_at is None:
-        return start
-    age_blocks = max(0, int((now - oldest_pending_at).total_seconds()) // BITTENSOR_BLOCK_SECONDS)
-    return max(start, safe_head - age_blocks - INVOICE_LOOKBACK_BLOCKS)
-
-
-def _amount_matches(deposit_amount: float, invoice_amount: float) -> bool:
-    """Accept the invoice amount exactly OR up to 5% overpayment.
-    Tighter than 'send anything' so an unrelated transfer to the same
-    address doesn't accidentally credit someone."""
-    if invoice_amount <= 0:
-        return False
-    return deposit_amount >= invoice_amount and deposit_amount <= invoice_amount * 1.05
-
-
-def _try_credit(
-    repo: BillingRepository,
-    invoices: list[CryptoInvoiceORM],
-    deposit_amount: float,
-    tx_hash: str,
-    deposit_ref: str,
-) -> tuple[CryptoInvoiceORM, dict] | None:
-    """Find the first pending invoice that fits this deposit amount and
-    confirm-credit it. `deposit_ref` is the globally-unique on-chain
-    transfer key — passed to confirm_and_credit_invoice so a single
-    transfer can credit at most one invoice EVER (the column is UNIQUE).
-
-    Returns the matched (invoice, result) pair, or None if no invoice
-    matched the amount. If a match was found but the transfer was already
-    consumed (duplicate_deposit), we stop — the transfer is spent."""
-    for inv in invoices:
-        if _amount_matches(deposit_amount, float(inv.amount_crypto)):
-            description = (
-                f"Crypto deposit {inv.currency.upper()} "
-                f"${inv.amount_usd:.2f} (+{int((inv.bonus_pct or 0) * 100)}% bonus)"
-            )
-            result = repo.confirm_and_credit_invoice(
-                invoice_id=inv.invoice_id,
-                tx_hash=tx_hash,
-                description=description,
-                deposit_ref=deposit_ref,
-            )
-            if result is None:
-                continue
-            # Invoice hit a terminal state (admin reject / expiry) between
-            # our pending scan and the confirm — it can't be credited, and
-            # the transfer is NOT spent. Keep trying other matches.
-            if result.get("refused"):
-                continue
-            # The transfer was already consumed by another invoice — it's
-            # spent, don't keep trying to match it to further invoices.
-            if result.get("duplicate_deposit"):
-                return inv, result
-            invoices.remove(inv)
-            return inv, result
-    return None
-
-
-# ---------------------------------------------------------------------------
-# EVM scanner (USDT/USDC on Ethereum + Base)
-# ---------------------------------------------------------------------------
+    return BillingService(repo)
 
 
 def _jsonrpc(url: str, method: str, params: list, timeout: float = 15.0):
@@ -348,16 +253,14 @@ def _topic_from_addr(addr: str) -> str:
 
 
 def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
-    """Scan one EVM chain for new ERC-20 deposits. Returns the number of
-    invoices credited this pass."""
+    """Scan one EVM chain for ERC-20 transfers to our deposit addresses, log
+    each one and credit whoever it belongs to. Returns deposits credited."""
     tokens = [t for t in TOKENS if t.chain_id == chain_id]
     if not tokens:
         return 0
     state_key = f"watcher:{chain_id}:last_block"
     rpc_url = _chain_rpc_url(chain_id)
 
-    # Group pending invoices by deposit address (across all tokens on
-    # this chain). For each token: pull recent logs filtered by `to`.
     credited = 0
     try:
         head = _hex_to_int(_jsonrpc(rpc_url, "eth_blockNumber", []))
@@ -391,31 +294,15 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
         return 0
 
     # Only advance the persisted cursor if EVERY eth_getLogs in this range
-    # succeeded. A transient RPC failure (timeout/429/5xx — the default public
-    # RPC is explicitly flaky) on any address would otherwise let us skip past
-    # blocks we never read, permanently losing real deposits. Re-scanning is
-    # safe: crediting is idempotent via the UNIQUE deposit_ref.
+    # succeeded and every deposit was handled. A transient RPC failure
+    # (timeout/429/5xx — the default public RPC is explicitly flaky) would
+    # otherwise let us skip past blocks we never read, permanently losing real
+    # deposits. Re-scanning is safe: crediting is idempotent via deposit_ref.
     scan_ok = True
+    service = _service(repo)
+    watched = _deposit_addresses(repo, [t.currency for t in tokens])
     for token in tokens:
-        # Collect deposit-address topics. The address is the SAME for all
-        # pending invoices of this currency (we only ever set one global
-        # BILLING_DEPOSIT_<X> at a time), so pull addresses from the
-        # pending invoices themselves and dedupe.
-        with session_scope(repo.session_factory) as session:
-            addrs = {
-                (r.deposit_address or "").lower()
-                for r in session.scalars(
-                    select(CryptoInvoiceORM).where(
-                        CryptoInvoiceORM.currency == token.currency,
-                        CryptoInvoiceORM.status == "pending",
-                    )
-                ).all()
-                if r.deposit_address
-            }
-        if not addrs:
-            continue
-
-        for addr in addrs:
+        for addr in sorted({a.lower() for a in watched[token.currency]}):
             try:
                 to_topic = _topic_from_addr(addr)
             except ValueError:
@@ -445,37 +332,41 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
                 scan_ok = False
                 continue
 
-            invoices = _pending_invoices_for(repo, token.currency, addr)
-            if not invoices:
-                continue
-
             for entry in logs:
-                amount_raw = _hex_to_int(entry.get("data", "0x0"))
-                deposit_amount = amount_raw / (10 ** token.decimals)
                 tx_hash = entry.get("transactionHash", "")
-                if not tx_hash:
+                topics = entry.get("topics") or []
+                if not tx_hash or len(topics) < 3:
                     continue
                 # Globally-unique transfer key. One ERC-20 tx can carry
                 # several Transfer logs, so log_index is required for
                 # uniqueness within a tx. currency already encodes the chain
                 # (usdt-eth vs usdt-base), so this never collides cross-chain.
-                log_index = entry.get("logIndex", "0x0")
-                deposit_ref = f"{token.currency}:{tx_hash}:{_hex_to_int(log_index)}"
-                matched = _try_credit(
-                    repo, invoices, deposit_amount, tx_hash, deposit_ref
-                )
-                if matched is None:
+                log_index = _hex_to_int(entry.get("logIndex", "0x0"))
+                deposit = {
+                    "deposit_ref": f"{token.currency}:{tx_hash}:{log_index}",
+                    "currency": token.currency,
+                    "tx_hash": tx_hash,
+                    # topics[1] is the sender, left-padded to 32 bytes.
+                    "sender": "0x" + topics[1][-40:].lower(),
+                    "deposit_address": addr,
+                    "amount_raw": _hex_to_int(entry.get("data", "0x0")),
+                    "decimals": token.decimals,
+                    "block_number": _hex_to_int(entry.get("blockNumber", "0x0")),
+                    "usd_price": 1.0,
+                }
+                try:
+                    outcome = service.resolve_deposit(deposit)
+                except Exception:
+                    log.exception("watcher %s: handling %s failed", chain_id, deposit["deposit_ref"])
+                    scan_ok = False
                     continue
-                inv, result = matched
-                log.info(
-                    "watcher %s/%s: invoice %s ref=%s amount=%s -> %s",
-                    chain_id, token.currency,
-                    inv.invoice_id[:8], deposit_ref[:40], deposit_amount,
-                    "credited" if result.get("credited")
-                    else "duplicate" if result.get("duplicate_deposit")
-                    else "already_confirmed",
-                )
-                if result.get("credited"):
+                if outcome != "seen":
+                    log.info(
+                        "watcher %s: %s %s from %s -> %s",
+                        chain_id, deposit["amount_raw"] / 10 ** token.decimals,
+                        token.currency, deposit["sender"], outcome,
+                    )
+                if outcome in CREDITED:
                     credited += 1
 
     # Persist the NEXT block to scan (to_block + 1) — non-overlapping with the
@@ -486,144 +377,17 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
         _kv_set(repo, state_key, str(to_block + 1))
     else:
         log.warning(
-            "watcher %s: RPC error(s) this tick — NOT advancing cursor past "
+            "watcher %s: error(s) this tick — NOT advancing cursor past "
             "blocks %d..%d; will retry next tick", chain_id, from_block, to_block,
         )
     return credited
 
 
 # ---------------------------------------------------------------------------
-# TAO scanner (Substrate / Bittensor mainnet)
+# Bittensor scanner: TAO transfers and alpha (subnet token) stake transfers
 # ---------------------------------------------------------------------------
 
-
-def scan_tao(repo: BillingRepository) -> int:
-    """Scan Bittensor mainnet for Balances.Transfer events to our TAO
-    deposit address. Returns invoices credited."""
-    try:
-        from substrateinterface import SubstrateInterface
-    except ImportError:
-        log.warning("watcher tao: substrate-interface not installed — skipping")
-        return 0
-
-    rpc_url = (
-        os.environ.get("GREENCOMPUTE_SUBTENSOR_URL")
-        or os.environ.get("SUBTENSOR_URL")
-        or "wss://entrypoint-finney.opentensor.ai:443/"
-    )
-
-    # Pull pending TAO invoices first — bail early if there's nothing to
-    # do, so we don't churn the chain RPC.
-    addrs, oldest_pending_at = _pending_bittensor_invoices(repo, "tao")
-    if not addrs:
-        return 0
-
-    state_key = "watcher:tao:last_block"
-    last_seen_str = _kv_get(repo, state_key)
-    substrate: SubstrateInterface | None = None
-    credited = 0
-    try:
-        substrate = SubstrateInterface(
-            url=rpc_url, ss58_format=42,
-            type_registry_preset="substrate-node-template",
-        )
-        head_hash = substrate.get_chain_head()
-        head_num = substrate.get_block_number(head_hash)
-        # Small reorg-safety buffer (Bittensor finalizes fast).
-        safe_head = head_num - 10
-        if safe_head <= 0:
-            return 0
-        from_block = _bittensor_scan_start(
-            int(last_seen_str) if last_seen_str else None,
-            safe_head, oldest_pending_at, datetime.now(UTC),
-        )
-        to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
-        if to_block <= from_block:
-            return 0
-
-        # Advance the cursor only across blocks we actually read. On a failed
-        # block we STOP (not skip) so the next tick resumes from it — skipping
-        # would silently lose any deposit in that block.
-        scanned_through = from_block
-        for block_num in range(from_block + 1, to_block + 1):
-            try:
-                block_hash = substrate.get_block_hash(block_num)
-                events = substrate.get_events(block_hash) or []
-            except Exception as exc:
-                log.warning(
-                    "watcher tao: get_events block %d failed: %s — stopping; "
-                    "will resume here next tick", block_num, exc
-                )
-                break
-
-            for event_idx, ev in enumerate(events):
-                ev_obj = getattr(ev, "value", ev)
-                if not isinstance(ev_obj, dict):
-                    continue
-                module = (ev_obj.get("module_id") or "").lower()
-                event = (ev_obj.get("event_id") or "").lower()
-                if module != "balances" or event != "transfer":
-                    continue
-                attrs = ev_obj.get("attributes") or {}
-                # `attributes` can be a dict {from,to,amount} or a list.
-                # Normalize.
-                if isinstance(attrs, list):
-                    if len(attrs) < 3:
-                        continue
-                    dest = str(attrs[1])
-                    amount_raw = int(attrs[2])
-                else:
-                    dest = str(attrs.get("to") or attrs.get("dest") or "")
-                    amount_raw = int(attrs.get("amount") or 0)
-                if dest not in addrs:
-                    continue
-                deposit_amount = amount_raw / 1e9  # TAO has 9 decimals
-                # Human-readable hash if available (for the invoice record);
-                # the dedup key is the block+event coordinate, which is
-                # globally unique and stable regardless of whether the
-                # extrinsic hash decodes.
-                tx_hash = str(
-                    ev_obj.get("extrinsic_hash")
-                    or ev_obj.get("extrinsic_idx")
-                    or f"block-{block_num}"
-                )
-                deposit_ref = f"tao:{block_num}:{event_idx}"
-
-                invoices = _pending_invoices_for(repo, "tao", dest)
-                if not invoices:
-                    continue
-                matched = _try_credit(
-                    repo, invoices, deposit_amount, tx_hash, deposit_ref
-                )
-                if matched is None:
-                    continue
-                inv, result = matched
-                log.info(
-                    "watcher tao: invoice %s ref=%s amount=%s TAO -> %s",
-                    inv.invoice_id[:8], deposit_ref, deposit_amount,
-                    "credited" if result.get("credited")
-                    else "duplicate" if result.get("duplicate_deposit")
-                    else "already_confirmed",
-                )
-                if result.get("credited"):
-                    credited += 1
-
-            # Block fully read — safe to advance the cursor through it.
-            scanned_through = block_num
-
-        _kv_set(repo, state_key, str(scanned_through))
-    finally:
-        if substrate is not None:
-            try:
-                substrate.close()
-            except Exception:
-                pass
-    return credited
-
-
-# ---------------------------------------------------------------------------
-# Alpha scanner (Bittensor subnet token via SubtensorModule.StakeTransferred)
-# ---------------------------------------------------------------------------
+BITTENSOR_STATE_KEY = "watcher:bittensor:last_block"
 
 
 def _event_values(ev_obj: dict) -> list | None:
@@ -681,9 +445,9 @@ def _extract_alpha_transfer(
     return dest, origin
 
 
-def _extract_stake_added(ev_obj: object) -> tuple[str, int, float] | None:
+def _extract_stake_added(ev_obj: object) -> tuple[str, int, int] | None:
     """Decode SubtensorModule.StakeAdded(coldkey, hotkey, tao_amount,
-    alpha_amount, netuid, fee) into (coldkey, netuid, alpha). Alpha has 9
+    alpha_amount, netuid, fee) into (coldkey, netuid, alpha_rao). Alpha has 9
     decimals, like TAO."""
     if not _is_event(ev_obj, "subtensormodule", "stakeadded"):
         return None
@@ -691,21 +455,21 @@ def _extract_stake_added(ev_obj: object) -> tuple[str, int, float] | None:
     if not vals or len(vals) < 5:
         return None
     try:
-        return str(vals[0]), int(vals[4]), int(vals[3]) / 1e9
+        return str(vals[0]), int(vals[4]), int(vals[3])
     except (TypeError, ValueError):
         return None
 
 
 def _alpha_deposits(
     events: list, dest_addrs: set[str], want_netuid: int
-) -> list[tuple[int, str, float, str]]:
+) -> list[tuple[int, str, int, str, object]]:
     """Alpha transfers to our deposit addresses in one block, as
-    (event_idx, our_address, alpha_received, sender).
+    (event_idx, our_address, alpha_rao_received, sender, extrinsic_idx).
 
     The amount comes from the StakeAdded event that the same extrinsic emits
     for our coldkey on our subnet. A transfer with no such companion event
     can't be valued, so it is logged and left for manual review."""
-    by_extrinsic: dict[object, list[tuple[str, int, float]]] = {}
+    by_extrinsic: dict[object, list[tuple[str, int, int]]] = {}
     transfers: list[tuple[int, object, str, str]] = []
     for idx, ev in enumerate(events):
         ev_obj = getattr(ev, "value", ev)
@@ -733,40 +497,86 @@ def _alpha_deposits(
                 "for our coldkey — can't value it, needs manual review", dest, idx,
             )
             continue
-        deposits.append((idx, dest, alpha, origin))
+        deposits.append((idx, dest, alpha, origin, xidx))
     return deposits
 
 
-def scan_alpha(repo: BillingRepository) -> int:
-    """Scan Bittensor mainnet for SubtensorModule.StakeTransferred events that
-    move alpha to our deposit coldkey, and credit matching pending alpha
-    invoices. Mirrors scan_tao's cursor/reorg/dedup machinery; the only
-    differences are the event matched and the destination-netuid guard.
-    Returns invoices credited."""
+def _tao_transfers(events: list, dest_addrs: set[str]) -> list[tuple[int, str, int, str, object]]:
+    """Balances.Transfer events paying one of our addresses, as
+    (event_idx, our_address, amount_rao, sender, extrinsic_idx)."""
+    found = []
+    for idx, ev in enumerate(events):
+        ev_obj = getattr(ev, "value", ev)
+        if not _is_event(ev_obj, "balances", "transfer"):
+            continue
+        attrs = ev_obj.get("attributes") or {}
+        # `attributes` can be a dict {from,to,amount} or a list.
+        try:
+            if isinstance(attrs, dict):
+                sender = str(attrs.get("from") or "")
+                dest = str(attrs.get("to") or attrs.get("dest") or "")
+                amount = int(attrs.get("amount") or 0)
+            else:
+                sender, dest, amount = str(attrs[0]), str(attrs[1]), int(attrs[2])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if dest in dest_addrs:
+            found.append((idx, dest, amount, sender, ev_obj.get("extrinsic_idx")))
+    return found
+
+
+def _extrinsic_hashes(substrate, block_hash) -> dict:
+    """extrinsic index -> 0x-hash for one block; empty if it can't be read."""
+    try:
+        block = substrate.get_block(block_hash=block_hash)
+        return {
+            i: "0x" + bytes(ex.extrinsic_hash).hex()
+            for i, ex in enumerate(block["extrinsics"])
+            if getattr(ex, "extrinsic_hash", None)
+        }
+    except Exception:
+        return {}
+
+
+def scan_bittensor(repo: BillingRepository) -> int:
+    """Scan Bittensor mainnet for TAO transfers and alpha stake transfers to
+    our deposit coldkeys, log each one and credit whoever it belongs to.
+    Returns deposits credited.
+
+    Runs every tick, invoice or not, reading each block once for both
+    currencies. (It used to run only while an invoice was open, so its cursor
+    sat still between invoices and fell months behind.)"""
     try:
         from substrateinterface import SubstrateInterface
     except ImportError:
-        log.warning("watcher alpha: substrate-interface not installed — skipping")
+        log.warning("watcher bittensor: substrate-interface not installed — skipping")
         return 0
 
+    watched = _deposit_addresses(repo, ["tao", "alpha"])
+    if not (watched["tao"] or watched["alpha"]):
+        return 0
     rpc_url = (
         os.environ.get("GREENCOMPUTE_SUBTENSOR_URL")
         or os.environ.get("SUBTENSOR_URL")
         or "wss://entrypoint-finney.opentensor.ai:443/"
     )
-
-    # Bail early if there are no pending alpha invoices — don't churn RPC.
-    addrs, oldest_pending_at = _pending_bittensor_invoices(repo, "alpha")
-    if not addrs:
-        return 0
-
     # Same subnet the invoice was priced against (price_feed). Single source of
     # truth so the credit netuid can never drift from the pricing netuid.
-    from greencompute_gateway.infrastructure.price_feed import _subnet_netuid
+    from greencompute_gateway.infrastructure.price_feed import _subnet_netuid, get_price
     want_netuid = _subnet_netuid()
+    service = _service(repo)
 
-    state_key = "watcher:alpha:last_block"
-    last_seen_str = _kv_get(repo, state_key)
+    prices: dict[str, float | None] = {}
+
+    def price(currency: str) -> float | None:
+        if currency not in prices:
+            try:
+                prices[currency] = get_price(currency) or None
+            except Exception:
+                prices[currency] = None
+        return prices[currency]
+
+    last_seen_str = _kv_get(repo, BITTENSOR_STATE_KEY)
     substrate: SubstrateInterface | None = None
     credited = 0
     try:
@@ -774,19 +584,18 @@ def scan_alpha(repo: BillingRepository) -> int:
             url=rpc_url, ss58_format=42,
             type_registry_preset="substrate-node-template",
         )
-        head_hash = substrate.get_chain_head()
-        head_num = substrate.get_block_number(head_hash)
+        head_num = substrate.get_block_number(substrate.get_chain_head())
         safe_head = head_num - 10  # reorg-safety buffer (Bittensor finalizes fast)
         if safe_head <= 0:
             return 0
-        from_block = _bittensor_scan_start(
-            int(last_seen_str) if last_seen_str else None,
-            safe_head, oldest_pending_at, datetime.now(UTC),
-        )
+        from_block = int(last_seen_str) if last_seen_str else max(0, safe_head - 1800)  # ~6h
         to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
         if to_block <= from_block:
             return 0
 
+        # Advance the cursor only across blocks fully handled. On a failed
+        # block we STOP (not skip) so the next tick resumes from it — skipping
+        # would silently lose any deposit in that block.
         scanned_through = from_block
         for block_num in range(from_block + 1, to_block + 1):
             try:
@@ -794,52 +603,43 @@ def scan_alpha(repo: BillingRepository) -> int:
                 events = substrate.get_events(block_hash) or []
             except Exception as exc:
                 log.warning(
-                    "watcher alpha: get_events block %d failed: %s — stopping; "
+                    "watcher bittensor: get_events block %d failed: %s — stopping; "
                     "will resume here next tick", block_num, exc
                 )
                 break
 
-            for event_idx, dest, deposit_amount, _sender in _alpha_deposits(
-                events, addrs, want_netuid
-            ):
-                ev_obj = getattr(events[event_idx], "value", events[event_idx])
-                tx_hash = str(
-                    ev_obj.get("extrinsic_hash")
-                    or ev_obj.get("extrinsic_idx")
-                    or f"block-{block_num}"
-                )
-                deposit_ref = f"alpha:{block_num}:{event_idx}"
+            found = [("tao", *t) for t in _tao_transfers(events, watched["tao"])]
+            found += [("alpha", *a) for a in _alpha_deposits(events, watched["alpha"], want_netuid)]
+            if found:
+                hashes = _extrinsic_hashes(substrate, block_hash)
+                try:
+                    for currency, idx, dest, amount, sender, xidx in found:
+                        deposit = {
+                            "deposit_ref": f"{currency}:{block_num}:{idx}",
+                            "currency": currency,
+                            "tx_hash": hashes.get(xidx),
+                            "sender": sender,
+                            "deposit_address": dest,
+                            "amount_raw": amount,
+                            "decimals": 9,
+                            "block_number": block_num,
+                            "usd_price": price(currency),
+                        }
+                        outcome = service.resolve_deposit(deposit)
+                        log.info(
+                            "watcher bittensor: %s %s from %s (ref=%s) -> %s",
+                            amount / 1e9, currency, sender, deposit["deposit_ref"], outcome,
+                        )
+                        if outcome in CREDITED:
+                            credited += 1
+                except Exception:
+                    log.exception("watcher bittensor: handling block %d failed — will retry", block_num)
+                    break
 
-                invoices = _pending_invoices_for(repo, "alpha", dest)
-                if not invoices:
-                    continue
-                matched = _try_credit(
-                    repo, invoices, deposit_amount, tx_hash, deposit_ref
-                )
-                if matched is None:
-                    # A real transfer to us that fits no pending invoice amount
-                    # — log so over/underpayments surface for manual review.
-                    log.info(
-                        "watcher alpha: %s ALPHA -> %s (netuid %d) matched no "
-                        "pending invoice amount (ref=%s)",
-                        deposit_amount, dest, want_netuid, deposit_ref,
-                    )
-                    continue
-                inv, result = matched
-                log.info(
-                    "watcher alpha: invoice %s ref=%s amount=%s ALPHA -> %s",
-                    inv.invoice_id[:8], deposit_ref, deposit_amount,
-                    "credited" if result.get("credited")
-                    else "duplicate" if result.get("duplicate_deposit")
-                    else "already_confirmed",
-                )
-                if result.get("credited"):
-                    credited += 1
-
-            # Block fully read — safe to advance the cursor through it.
+            # Block fully handled — safe to advance the cursor through it.
             scanned_through = block_num
 
-        _kv_set(repo, state_key, str(scanned_through))
+        _kv_set(repo, BITTENSOR_STATE_KEY, str(scanned_through))
     finally:
         if substrate is not None:
             try:
@@ -923,21 +723,15 @@ async def deposit_watcher_loop() -> None:
                     try:
                         n = await asyncio.to_thread(scan_evm_chain, repo, chain_id)
                         if n:
-                            log.info("watcher %s: credited %d invoice(s) this tick", chain_id, n)
+                            log.info("watcher %s: credited %d deposit(s) this tick", chain_id, n)
                     except Exception:
                         log.exception("watcher %s tick failed", chain_id)
                 try:
-                    n = await asyncio.to_thread(scan_tao, repo)
+                    n = await asyncio.to_thread(scan_bittensor, repo)
                     if n:
-                        log.info("watcher tao: credited %d invoice(s) this tick", n)
+                        log.info("watcher bittensor: credited %d deposit(s) this tick", n)
                 except Exception:
-                    log.exception("watcher tao tick failed")
-                try:
-                    n = await asyncio.to_thread(scan_alpha, repo)
-                    if n:
-                        log.info("watcher alpha: credited %d invoice(s) this tick", n)
-                except Exception:
-                    log.exception("watcher alpha tick failed")
+                    log.exception("watcher bittensor tick failed")
             # Expiry sweep — always runs (DB-only).
             try:
                 expired = await asyncio.to_thread(

@@ -39,7 +39,10 @@ def test_bare_stablecoin_is_rejected_with_the_chain_options(topup, bare):
 def test_tao_invoice_has_address_and_amount(topup):
     inv = topup("tao", 6)
     assert inv["deposit_address"] == TAO_ADDR
-    assert inv["amount_crypto"] == pytest.approx(0.02)
+    # $6 at $300 is 0.02 TAO, plus a few millionths (under a cent) that make
+    # the amount unique among open invoices.
+    assert 0.02 < inv["amount_crypto"] < 0.02 + 0.01 / 300
+    assert inv["amount_to_send"] == f"{inv['amount_crypto']:.6f}"
 
 
 def test_alpha_pays_to_the_tao_coldkey(topup):
@@ -49,7 +52,8 @@ def test_alpha_pays_to_the_tao_coldkey(topup):
 def test_chain_qualified_stablecoin_settles_one_to_one(topup):
     inv = topup("usdc-base", 25)
     assert inv["deposit_address"] == "0xabc"
-    assert inv["amount_crypto"] == 25
+    assert 25 < inv["amount_crypto"] < 25.01
+    assert inv["amount_to_send"].startswith("25.00") and len(inv["amount_to_send"]) == 9
 
 
 def test_unconfigured_address_is_503_not_an_empty_invoice(topup):

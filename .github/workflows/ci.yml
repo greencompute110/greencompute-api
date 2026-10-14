@@ -45,9 +45,13 @@ jobs:
       # wallet mnemonics; it is declared by greencompute-validator, whose
       # dependency tree `--package greencompute-gateway` never resolves.
       #
+      # `substrate-interface` (which brings eth-keys and scalecodec) verifies
+      # the wallet signatures that link a payer's wallet to their account; the
+      # production gateway installs it alongside the deposit watcher.
+      #
       # Deliberately NOT guarded with a skipif in the test module: these tests
       # protect the encryption of keys that control real funds, so a missing
       # dependency must fail CI loudly rather than silently skip the suite.
       - name: Unit tests
         working-directory: greencompute-api
-        run: uv run --package greencompute-gateway --with pytest --with cryptography pytest tests/unit -q
+        run: uv run --package greencompute-gateway --with pytest --with cryptography --with substrate-interface pytest tests/unit -q

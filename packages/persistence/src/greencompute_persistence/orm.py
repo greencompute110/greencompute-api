@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, JSON, Boolean, DateTime, Float, Index, Integer, String, Text
+from sqlalchemy import BigInteger, JSON, Boolean, DateTime, Float, Index, Integer, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -828,11 +828,25 @@ class InferenceBalanceHoldORM(Base):
 
 class CryptoInvoiceORM(Base):
     __tablename__ = "crypto_invoices"
+    __table_args__ = (
+        # Two OPEN invoices never ask for the same amount at the same address,
+        # so the amount alone tells the deposit watcher whose payment it is.
+        Index(
+            "uq_crypto_invoices_pending_amount",
+            "currency", "deposit_address", "amount_units",
+            unique=True,
+            postgresql_where=text("status = 'pending' AND amount_units IS NOT NULL"),
+            sqlite_where=text("status = 'pending' AND amount_units IS NOT NULL"),
+        ),
+    )
 
     invoice_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     currency: Mapped[str] = mapped_column(String(32))
     amount_crypto: Mapped[float] = mapped_column(Float)
+    # The exact amount to send, in millionths of the currency (6 decimals).
+    # NULL on invoices created before amounts were made unique.
+    amount_units: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     amount_usd: Mapped[float] = mapped_column(Float)
     bonus_pct: Mapped[float] = mapped_column(Float, default=0.0)
     total_credits: Mapped[int] = mapped_column(BigInteger)
@@ -841,6 +855,61 @@ class CryptoInvoiceORM(Base):
     tx_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # A user's request to have a payment for this invoice checked by hand:
+    # "open", then "resolved" or "dismissed". tx_hash holds what they reported.
+    review_status: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CryptoDepositORM(Base):
+    """Every transfer the deposit watcher sees arrive at one of our deposit
+    addresses, credited or not. Unmatched rows are what a wallet link can
+    claim later, and what an admin assigns by hand."""
+
+    __tablename__ = "crypto_deposits"
+
+    # Same key as ledger_entries.deposit_ref, e.g. "tao:9131128:42" or
+    # "usdc-base:0xabc…:7".
+    deposit_ref: Mapped[str] = mapped_column(String(300), primary_key=True)
+    currency: Mapped[str] = mapped_column(String(32), index=True)
+    tx_hash: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    sender: Mapped[str] = mapped_column(String(128), index=True)
+    deposit_address: Mapped[str] = mapped_column(String(256))
+    # Integer amount in the token's smallest unit, with its decimals.
+    amount_raw: Mapped[int] = mapped_column(BigInteger)
+    decimals: Mapped[int] = mapped_column(Integer)
+    block_number: Mapped[int] = mapped_column(BigInteger)
+    # USD price of one token when the deposit was seen (1.0 for stablecoins).
+    usd_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # unmatched | credited | ignored (dust worth under a cent)
+    status: Mapped[str] = mapped_column(String(32), default="unmatched", index=True)
+    # invoice | invoice_overpay | wallet | wallet_link | admin
+    matched_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    invoice_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    credited_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    credited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class VerifiedWalletORM(Base):
+    """A wallet whose owner proved control of it by signing a message. Every
+    payment it sends to our deposit addresses is credited to that user."""
+
+    __tablename__ = "verified_wallets"
+    __table_args__ = (
+        # One owner per wallet, or payments would be ambiguous again.
+        Index("uq_verified_wallets_chain_address", "chain", "address", unique=True),
+    )
+
+    wallet_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    # "bittensor" (TAO, alpha) or "evm" (USDT/USDC on Ethereum and Base).
+    chain: Mapped[str] = mapped_column(String(16))
+    # SS58 (prefix 42) for bittensor, lowercase 0x-hex for evm.
+    address: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

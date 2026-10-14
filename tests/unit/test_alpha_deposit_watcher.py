@@ -11,7 +11,7 @@ StakeTransferred's amount is TAO, not alpha, so the credit must come from
 StakeAdded. The fixtures below are the real events of a $5 alpha top-up on
 mainnet (block 9174691, 2026-09-29) that was never credited because the
 scanner read the TAO figure. (The credit/dedup machinery is shared with
-scan_tao and covered by test_deposit_double_credit.)
+scan_bittensor and covered by test_crypto_deposits.)
 """
 from greencompute_gateway.infrastructure.deposit_watcher import (
     _alpha_deposits,
@@ -38,8 +38,8 @@ def _real_topup(xidx=5):
 
 def test_real_mainnet_topup_is_valued_in_alpha_not_tao():
     deposits = _alpha_deposits(_real_topup(), ADDRS, NETUID)
-    # 0.985006 alpha was invoiced and received; 0.01648644 is its TAO value.
-    assert deposits == [(1, OUR, 0.985006, SENDER)]
+    # 0.985006 alpha (in rao) was invoiced and received; 16,486,440 rao is its TAO value.
+    assert deposits == [(1, OUR, 985_006_000, SENDER, 5)]
 
 
 def test_dict_attributes_decode_the_same():
@@ -50,7 +50,7 @@ def test_dict_attributes_decode_the_same():
                                  "hotkey": HOTKEY, "origin_netuid": NETUID,
                                  "destination_netuid": NETUID, "amount": 16_486_440}),
     ]
-    assert _alpha_deposits(events, ADDRS, NETUID) == [(1, OUR, 0.985006, SENDER)]
+    assert _alpha_deposits(events, ADDRS, NETUID) == [(1, OUR, 985_006_000, SENDER, 5)]
 
 
 def test_stake_added_from_another_extrinsic_is_not_borrowed():

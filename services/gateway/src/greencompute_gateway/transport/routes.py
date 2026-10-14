@@ -2103,7 +2103,7 @@ def billing_topup_crypto(
         "usdt-eth", "usdt-base",
         "usdc-eth", "usdc-base",
         "tao",
-        # Alpha (subnet token) — auto-credited by scan_alpha in the deposit
+        # Alpha (subnet token) — auto-credited by scan_bittensor in the deposit
         # watcher, which matches SubtensorModule.StakeTransferred events to our
         # deposit coldkey on the configured netuid. Priced via price_feed.
         "alpha",
@@ -2121,8 +2121,20 @@ def billing_topup_crypto(
             detail=f"currency must be one of: {', '.join(allowed)}",
         )
     amount_usd = _validate_topup_amount(payload.get("amount_usd"))
+    from greencompute_gateway.application.billing_service import (
+        MAX_PENDING_INVOICES_PER_USER,
+        TooManyOpenInvoices,
+    )
     try:
         return _get_billing().create_crypto_invoice(api_key.user_id, currency, amount_usd)
+    except TooManyOpenInvoices as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"you already have {MAX_PENDING_INVOICES_PER_USER} unpaid invoices open; pay one "
+                "or wait for it to expire (30 minutes), or pay from a verified wallet without an invoice"
+            ),
+        ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -2227,6 +2239,44 @@ def _latest_refund_amount_cents(charge: dict) -> int:
     return int(charge.get("amount_refunded") or 0)
 
 
+def _request_review(invoice_id: str, user_id: str, tx_hash: str, note: str | None) -> dict:
+    tx_hash = (tx_hash or "").strip()
+    if not tx_hash:
+        raise HTTPException(status_code=400, detail="tx_hash required")
+    result = _get_billing().repo.request_invoice_review(invoice_id, user_id, tx_hash, note)
+    if result is None:
+        # Either the invoice doesn't exist or the caller doesn't own it; same
+        # response either way so we don't leak invoice ids.
+        raise HTTPException(status_code=404, detail="invoice not found")
+    if result.get("refused"):
+        raise HTTPException(
+            status_code=409, detail=f"invoice is {result['status']}; there is nothing to review"
+        )
+    from greencompute_gateway.infrastructure.alerts import send_payment_alert
+
+    username = _get_billing().repo.get_username(user_id) or user_id
+    send_payment_alert(
+        f"Payment review requested by {username}: invoice {invoice_id[:8]} ({result['status']}), "
+        f"tx {tx_hash}. Resolve it under Billing admin > Review requests."
+    )
+    return result
+
+
+@router.post("/platform/billing/crypto/{invoice_id}/review")
+def billing_request_review(
+    invoice_id: str,
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """User-side: a payment for this invoice wasn't credited (wrong amount,
+    sent after it expired, paid from an exchange...). Body: {"tx_hash", "note"
+    (optional)}. Works on pending and expired invoices; support checks the
+    transaction on-chain and credits it."""
+    user_id = _require_user(authorization, x_api_key)
+    return _request_review(invoice_id, user_id, str(payload.get("tx_hash") or ""), payload.get("note"))
+
+
 @router.post("/platform/billing/crypto/{invoice_id}/report-tx")
 def billing_report_crypto_tx(
     invoice_id: str,
@@ -2234,30 +2284,9 @@ def billing_report_crypto_tx(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    """User-side — attach a tx hash to an invoice after sending funds.
-    Does NOT credit the user; admin still has to verify and confirm. The
-    hash is stored on the invoice so the admin UI has a starting point.
-    """
-    api_key = require_api_key(authorization, x_api_key)
-    if api_key.user_id is None:
-        raise HTTPException(status_code=403, detail="api key must be bound to a user")
-    tx_hash = (payload.get("tx_hash") or "").strip()
-    if not tx_hash:
-        raise HTTPException(status_code=400, detail="tx_hash required")
-    result = _get_billing().repo.report_invoice_tx_hash(
-        invoice_id=invoice_id,
-        user_id=api_key.user_id,
-        tx_hash=tx_hash,
-    )
-    if result is None:
-        # Either invoice doesn't exist or caller doesn't own it — same response
-        # either way so we don't leak invoice IDs.
-        raise HTTPException(status_code=404, detail="invoice not found")
-    return {
-        "invoice_id": result.invoice_id,
-        "status": result.status,
-        "tx_hash": result.tx_hash,
-    }
+    """Older name for /review: attaches the tx hash and opens a review."""
+    user_id = _require_user(authorization, x_api_key)
+    return _request_review(invoice_id, user_id, str(payload.get("tx_hash") or ""), None)
 
 
 @router.post("/platform/billing/crypto/{invoice_id}/confirm", include_in_schema=False)
@@ -2317,10 +2346,148 @@ def billing_list_crypto_invoices(
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    repo = _get_billing().repo
+    reviews = repo.invoice_review_statuses(api_key.user_id)
     return [
-        inv.model_dump(mode="json")
-        for inv in _get_billing().repo.list_crypto_invoices(api_key.user_id)
+        {
+            **inv.model_dump(mode="json"),
+            "amount_to_send": f"{inv.amount_crypto:.6f}",
+            "review_status": reviews.get(inv.invoice_id),
+        }
+        for inv in repo.list_crypto_invoices(api_key.user_id)
     ]
+
+
+def _require_user(authorization: str | None, x_api_key: str | None) -> str:
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.user_id is None:
+        raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    return api_key.user_id
+
+
+@router.get("/platform/billing/crypto/addresses")
+def billing_crypto_addresses(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Where to send each currency, and which wallet type can be verified
+    for it. A verified wallet can pay these addresses without an invoice."""
+    _require_user(authorization, x_api_key)
+    from greencompute_gateway.application.billing_service import (
+        BONUS_RATES,
+        _base_currency,
+        _deposit_address_for,
+    )
+    from greencompute_gateway.infrastructure.wallet_signatures import CURRENCY_CHAIN
+
+    currencies = []
+    for currency, chain in CURRENCY_CHAIN.items():
+        address = _deposit_address_for(currency)
+        if address:
+            currencies.append({
+                "currency": currency,
+                "deposit_address": address,
+                "wallet_chain": chain,
+                "bonus_pct": BONUS_RATES.get(_base_currency(currency), 0.0),
+            })
+    return {"currencies": currencies}
+
+
+@router.get("/platform/billing/crypto/deposits")
+def billing_crypto_deposits(
+    limit: int = 50,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    """The caller's credited on-chain deposits, newest first."""
+    user_id = _require_user(authorization, x_api_key)
+    keep = ("deposit_ref", "currency", "tx_hash", "sender", "amount", "status",
+            "matched_by", "invoice_id", "credited_cents", "observed_at", "credited_at")
+    return [
+        {k: d[k] for k in keep}
+        for d in _get_billing().repo.list_user_deposits(user_id, limit=max(1, min(limit, 200)))
+    ]
+
+
+@router.get("/platform/billing/wallets")
+def billing_list_wallets(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    """The caller's verified wallets."""
+    user_id = _require_user(authorization, x_api_key)
+    return _get_billing().repo.list_verified_wallets(user_id)
+
+
+@router.post("/platform/billing/wallets/challenge")
+def billing_wallet_challenge(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Step 1 of verifying a wallet: the message to sign with it.
+    Body: {"chain": "bittensor" | "evm", "address": "..."}."""
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.infrastructure.wallet_signatures import InvalidAddress
+
+    try:
+        return _get_billing().wallet_challenge(
+            user_id, str(payload.get("chain") or "").lower(), str(payload.get("address") or "")
+        )
+    except InvalidAddress as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/platform/billing/wallets")
+def billing_link_wallet(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Step 2: link the wallet with a signature over the challenge message.
+    Body: {"chain", "address", "issued_at" (from the challenge), "signature"}.
+    Also credits any unmatched payments the wallet sent in the last 30 days."""
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application.billing_service import WalletProofError
+    from greencompute_gateway.infrastructure.billing_repository import (
+        MAX_WALLETS_PER_USER,
+        TooManyWallets,
+        WalletLinkedElsewhere,
+    )
+    from greencompute_gateway.infrastructure.wallet_signatures import InvalidAddress
+
+    try:
+        return _get_billing().link_wallet(
+            user_id,
+            str(payload.get("chain") or "").lower(),
+            str(payload.get("address") or ""),
+            str(payload.get("issued_at") or ""),
+            str(payload.get("signature") or ""),
+        )
+    except (InvalidAddress, WalletProofError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except WalletLinkedElsewhere as exc:
+        raise HTTPException(
+            status_code=409, detail="this wallet is already verified by another account"
+        ) from exc
+    except TooManyWallets as exc:
+        raise HTTPException(
+            status_code=409, detail=f"an account can verify at most {MAX_WALLETS_PER_USER} wallets"
+        ) from exc
+
+
+@router.delete("/platform/billing/wallets/{wallet_id}")
+def billing_unlink_wallet(
+    wallet_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Unlink a verified wallet. Later payments from it are no longer
+    credited to this account automatically."""
+    user_id = _require_user(authorization, x_api_key)
+    if not _get_billing().repo.delete_verified_wallet(user_id, wallet_id):
+        raise HTTPException(status_code=404, detail="wallet not found")
+    return {"deleted": True, "wallet_id": wallet_id}
 
 
 @router.get("/platform/billing/admin/crypto/invoices", include_in_schema=False)
@@ -2338,6 +2505,78 @@ def billing_admin_list_crypto_invoices(
         status=status,
         limit=max(1, min(limit, 500)),
     )
+
+
+@router.get("/platform/billing/admin/crypto/deposits", include_in_schema=False)
+def billing_admin_list_deposits(
+    status: str | None = None,
+    limit: int = 200,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    """Admin — on-chain deposits the watcher logged; status=unmatched lists
+    payments nobody has been credited for yet."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return _get_billing().repo.list_deposits_for_admin(status=status, limit=max(1, min(limit, 500)))
+
+
+@router.get("/platform/billing/admin/crypto/reviews", include_in_schema=False)
+def billing_admin_list_reviews(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    """Admin — open review requests, oldest first, each with any logged
+    deposit carrying the transaction hash the user reported."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return _get_billing().repo.list_open_reviews()
+
+
+@router.post("/platform/billing/admin/crypto/reviews/{invoice_id}/resolve", include_in_schema=False)
+def billing_admin_resolve_review(
+    invoice_id: str,
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — close a review. Body: {"action": "credit_deposit" (with
+    "deposit_ref") | "confirm_invoice" | "dismiss"}."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    from greencompute_gateway.application.billing_service import ReviewError
+
+    try:
+        return _get_billing().resolve_review(
+            invoice_id, str(payload.get("action") or ""), payload.get("deposit_ref")
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="invoice not found") from exc
+    except ReviewError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/platform/billing/admin/crypto/deposits/{deposit_ref}/assign", include_in_schema=False)
+def billing_admin_assign_deposit(
+    deposit_ref: str,
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — credit an unmatched deposit to a user, at its value when it
+    arrived. Body: {"user": user id, username or email}. Refuses a deposit
+    that was already credited."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    ident = str(payload.get("user") or payload.get("user_id") or "").strip()
+    if not ident:
+        raise HTTPException(status_code=400, detail="user required (id, username or email)")
+    billing = _get_billing()
+    user_id = billing.repo.find_user_id(ident)
+    if user_id is None:
+        raise HTTPException(status_code=404, detail=f"no single account matches {ident!r}")
+    result = billing.assign_deposit(deposit_ref, user_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="deposit not found")
+    if result.get("already_credited"):
+        raise HTTPException(status_code=409, detail="deposit was already credited")
+    return result
 
 
 @router.get("/platform/billing/admin/miner-revenue", include_in_schema=False)
