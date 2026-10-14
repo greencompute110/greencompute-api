@@ -312,6 +312,7 @@ class GatewayService:
         caller_admin: bool | None = None,
         allow_user_id_override: bool | None = None,
         allow_admin_grant: bool = False,
+        caller_scopes: list[str] | None = None,
     ) -> APIKeyRecord:
         """Mint an api key, deriving privilege from the authenticated caller
         rather than trusting the wire.
@@ -353,10 +354,18 @@ class GatewayService:
             scopes = request.scopes
             admin = bool(request.admin) and allow_admin_grant
         else:
-            # Self-service: bind to the authenticated principal, drop scopes,
-            # never admin — even if the body asked for admin=true / another user.
+            # Self-service: bind to the authenticated principal, never admin —
+            # even if the body asked for admin=true / another user. Scopes may
+            # narrow the key, but a scoped caller can't mint anything broader
+            # than itself (and never a full-access key).
+            from greencompute_gateway.domain.scopes import normalize_scopes
+
             user_id = caller_user_id
-            scopes = []
+            scopes = normalize_scopes(request.scopes)
+            if caller_scopes and (not scopes or not set(scopes) <= set(caller_scopes)):
+                raise PermissionError(
+                    f"a key with scopes {sorted(caller_scopes)} can only create keys with some of those scopes"
+                )
             admin = False
         api_key = APIKeyRecord(
             name=request.name,
