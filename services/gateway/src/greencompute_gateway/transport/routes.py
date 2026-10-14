@@ -1,14 +1,16 @@
+import hashlib
 import json
 import logging
 import math
 import os
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from greencompute_protocol import (
+    DeploymentState,
     APIKeyCreateRequest,
     APIKeySummary,
     BareMetalInquiryCreateRequest,
@@ -558,17 +560,65 @@ def cancel_build(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+def _with_idempotency(api_key, endpoint: str, idempotency_key: str | None, body: dict, response: Response, run) -> dict:
+    """Run a create at most once per account, endpoint and Idempotency-Key.
+
+    A client that timed out can resend the same request with the same key and
+    gets the first result back (with `Idempotent-Replayed: true`) instead of a
+    second rental. Only successes are remembered, for 24 hours: a request that
+    failed (e.g. 402) can be retried with the same key."""
+    if idempotency_key is None:
+        return run()
+    key = idempotency_key.strip()
+    if not key or len(key) > 255:
+        raise HTTPException(status_code=400, detail="Idempotency-Key must be 1 to 255 characters")
+    scope = api_key.user_id or api_key.key_id
+    request_hash = hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+    repo = service.repository
+    outcome, stored = repo.idempotency_begin(scope, endpoint, key, request_hash)
+    if outcome == "replay":
+        response.headers["Idempotent-Replayed"] = "true"
+        return stored
+    if outcome == "mismatch":
+        raise HTTPException(
+            status_code=422,
+            detail="this Idempotency-Key was already used with a different request body; use a new key",
+        )
+    if outcome == "in_progress":
+        raise HTTPException(
+            status_code=409,
+            detail="a request with this Idempotency-Key is still being processed; retry in a moment",
+            headers={"Retry-After": "2"},
+        )
+    try:
+        result = run()
+    except BaseException:
+        repo.idempotency_release(scope, endpoint, key)
+        raise
+    repo.idempotency_complete(scope, endpoint, key, request_hash, result)
+    return result
+
+
 @router.post("/platform/workloads")
 def create_workload(
     payload: WorkloadCreateRequest | dict,
+    response: Response,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict:
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("create_workload", api_key.key_id, limit=30, window_seconds=60)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
     payload_data = payload if isinstance(payload, dict) else payload.model_dump(mode="json")
+    return _with_idempotency(
+        api_key, "create_workload", idempotency_key, payload_data, response,
+        lambda: _create_workload(payload_data, api_key),
+    )
+
+
+def _create_workload(payload_data: dict, api_key) -> dict:
     template = payload_data.get("template")
     # NOTE: the route accepts `WorkloadCreateRequest | dict`, so an invalid body
     # (e.g. gpu_count > 16) silently falls back to `dict` at parse time instead
@@ -798,16 +848,25 @@ DEPLOYMENT_SECRET_FIELDS = {"ssh_private_key"}
 @router.post("/platform/deployments")
 def create_deployment(
     payload: DeploymentCreateRequest,
+    response: Response,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    enforce_rate_limit("create_deployment", api_key.key_id, limit=30, window_seconds=60)
+    return _with_idempotency(
+        api_key, "create_deployment", idempotency_key, json.loads(payload.model_dump_json()), response,
+        lambda: _create_deployment(payload, api_key),
+    )
+
+
+def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
     from greencompute_gateway.application.services import (
         InsufficientBalanceForRentalError,
         UnsupportedGPUError,
     )
 
-    api_key = require_api_key(authorization, x_api_key)
-    enforce_rate_limit("create_deployment", api_key.key_id, limit=30, window_seconds=60)
     try:
         return service.create_deployment(
             payload,
@@ -874,13 +933,25 @@ def _attach_workload_info(rows: list[dict], workloads_by_id: dict) -> list[dict]
 
 @router.get("/platform/deployments")
 def list_deployments(
+    state: str | None = Query(
+        default=None,
+        description="Only deployments in these states, comma-separated, e.g. `ready` or `terminated,failed`",
+    ),
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
     api_key = require_api_key(authorization, x_api_key)
+    wanted = {s.strip().lower() for s in (state or "").split(",") if s.strip()}
+    known = {s.value for s in DeploymentState}
+    if wanted - known:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown state {sorted(wanted - known)}; use any of {sorted(known)}",
+        )
     rows = [
         deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
         for deployment in service.list_deployments(user_id=api_key.user_id, admin=api_key.admin)
+        if not wanted or deployment.state.value in wanted
     ]
     if api_key.admin:
         # Batch-map users + workloads once so each row can show the customer

@@ -476,6 +476,8 @@ class ControlPlaneRepository:
                 port_mappings=_serialize_port_mappings(deployment.port_mappings),
                 hourly_rate_cents=deployment.hourly_rate_cents,
                 save_on_exhaustion=deployment.save_on_exhaustion,
+                ready_at=deployment.ready_at,
+                max_runtime_minutes=deployment.max_runtime_minutes,
                 suspended_at=deployment.suspended_at,
                 deployment_fee_usd=deployment.deployment_fee_usd,
                 fee_acknowledged=deployment.fee_acknowledged,
@@ -513,6 +515,8 @@ class ControlPlaneRepository:
             row.port_mappings = _serialize_port_mappings(deployment.port_mappings)
             row.hourly_rate_cents = deployment.hourly_rate_cents
             row.save_on_exhaustion = deployment.save_on_exhaustion
+            row.ready_at = deployment.ready_at
+            row.max_runtime_minutes = deployment.max_runtime_minutes
             row.suspended_at = deployment.suspended_at
             row.deployment_fee_usd = deployment.deployment_fee_usd
             row.fee_acknowledged = deployment.fee_acknowledged
@@ -1050,6 +1054,8 @@ class ControlPlaneRepository:
             port_mappings=_deserialize_port_mappings(row.port_mappings),
             hourly_rate_cents=row.hourly_rate_cents if row.hourly_rate_cents is not None else 10,
             save_on_exhaustion=row.save_on_exhaustion if row.save_on_exhaustion is not None else True,
+            ready_at=row.ready_at,
+            max_runtime_minutes=row.max_runtime_minutes,
             suspended_at=row.suspended_at,
             deployment_fee_usd=row.deployment_fee_usd,
             fee_acknowledged=row.fee_acknowledged,

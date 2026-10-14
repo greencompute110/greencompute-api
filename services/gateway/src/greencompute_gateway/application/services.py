@@ -590,6 +590,7 @@ class GatewayService:
                 "requested_instances": payload.requested_instances,
                 "accept_fee": payload.accept_fee,
                 "save_on_exhaustion": payload.save_on_exhaustion,
+                "max_runtime_minutes": payload.max_runtime_minutes,
                 "owner_user_id": user_id,
             }
         )

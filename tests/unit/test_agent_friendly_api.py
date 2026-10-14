@@ -128,10 +128,9 @@ def test_every_deployment_route_uses_the_exclusion():
     import greencompute_gateway.transport.routes as routes
 
     tree = ast.parse(inspect.getsource(routes))
-    offenders = []
-    for fn in tree.body:
-        if not isinstance(fn, ast.FunctionDef):
-            continue
+    functions = {fn.name: fn for fn in tree.body if isinstance(fn, ast.FunctionDef)}
+    to_check = []
+    for fn in functions.values():
         paths = [
             d.args[0].value for d in fn.decorator_list
             if isinstance(d, ast.Call) and d.args and isinstance(d.args[0], ast.Constant)
@@ -139,6 +138,14 @@ def test_every_deployment_route_uses_the_exclusion():
         ]
         if not any("/platform/deployments" in p for p in paths):
             continue
+        to_check.append(fn)
+        # Also the module-level helpers the route hands its work to.
+        to_check += [
+            functions[c.func.id] for c in ast.walk(fn)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in functions
+        ]
+    offenders = []
+    for fn in to_check:
         for call in ast.walk(fn):
             if isinstance(call, ast.Call) and getattr(call.func, "attr", "") == "model_dump":
                 if not any(k.arg == "exclude" for k in call.keywords):
