@@ -16,6 +16,18 @@ metrics = get_metrics_store("greencompute-control-plane")
 replay_store = MemoryReplayStore()
 
 
+def caller_is_admin(authorization: str | None, x_api_key: str | None) -> bool:
+    """For public routes that show admins more. Never raises, and an anonymous
+    or ordinary caller isn't counted as an auth failure."""
+    secret = x_api_key if isinstance(x_api_key, str) else None
+    if not secret and isinstance(authorization, str) and authorization.lower().startswith("bearer "):
+        secret = authorization[7:].strip()
+    if not secret:
+        return False
+    api_key = credential_store.get_api_key_by_secret(secret)
+    return bool(api_key and api_key.admin)
+
+
 def require_admin_api_key(authorization: str | None, x_api_key: str | None) -> None:
     if not isinstance(x_api_key, str):
         x_api_key = None

@@ -6,7 +6,7 @@ from greencompute_persistence import get_metrics_store
 from greencompute_protocol import CapacityUpdate, DeploymentState, DeploymentStatusUpdate, Heartbeat, MinerRegistration
 from greencompute_control_plane.application.services import service
 from greencompute_control_plane.domain.state import InvalidDeploymentTransition
-from greencompute_control_plane.transport.security import require_admin_api_key, require_miner_request
+from greencompute_control_plane.transport.security import caller_is_admin, require_admin_api_key, require_miner_request
 
 router = APIRouter()
 
@@ -813,9 +813,21 @@ def platform_metrics(
     return metrics.snapshot()
 
 
+# What the public sees of the pool: what can be deployed right now, not how
+# big the fleet is. Much of the capacity is rented by direct contract, so a
+# total ("14 of 16") would undersell it; larger orders go through sales.
+_PUBLIC_POOL_FIELDS = ("gpu_model", "vram_gb_per_gpu", "available_gpus", "rentable_now")
+
+
 @router.get("/platform/v1/gpu-pool")
-def gpu_pool() -> list[dict]:
+def gpu_pool(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
     """Public endpoint: aggregated GPU availability for the rental page.
+
+    The public gets each class's GPUs available to deploy now; admins also
+    get total_gpus, node_count and override details.
 
     If an admin set a `gpu_capacity_overrides` row for a GPU class, the
     override REPLACES the measured count — sales uses this to advertise
@@ -898,4 +910,7 @@ def gpu_pool() -> list[dict]:
     # plainly whether a live node exists; `available_gpus` alone can't.
     for b in public:
         b["rentable_now"] = b["node_count"] > 0
-    return sorted(public, key=lambda b: -b["available_gpus"])
+    public.sort(key=lambda b: -b["available_gpus"])
+    if caller_is_admin(authorization, x_api_key):
+        return public
+    return [{k: b[k] for k in _PUBLIC_POOL_FIELDS} for b in public]
