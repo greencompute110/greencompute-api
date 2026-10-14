@@ -2645,6 +2645,19 @@ def billing_admin_list_crypto_invoices(
     )
 
 
+@router.get("/platform/billing/admin/monitor", include_in_schema=False)
+def billing_admin_monitor(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — what the billing monitor sees right now: problems, notices and
+    today's numbers. Read-only; alerts are sent by the background loop."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    from greencompute_gateway.application.billing_monitor import snapshot
+
+    return snapshot(_get_billing().repo.session_factory)
+
+
 @router.get("/platform/billing/admin/crypto/deposits", include_in_schema=False)
 def billing_admin_list_deposits(
     status: str | None = None,
