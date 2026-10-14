@@ -870,16 +870,20 @@ class BillingRepository:
             if fields.get("status") == "credited" and row.credited_at is None:
                 row.credited_at = datetime.now(UTC)
 
-    def manual_credit_for_tx(self, currency: str, tx_hash: str | None) -> dict | None:
-        """The ledger entry of an admin confirm that already credited this
-        transaction (deposit_ref "manual:<currency>:<tx_hash>"), if any."""
-        if not tx_hash:
-            return None
+    def earlier_credit(self, deposit_ref: str, currency: str, tx_hash: str | None) -> dict | None:
+        """The ledger entry that already credited this transfer, if any: one
+        with its deposit_ref (e.g. paid an invoice before this deposit log
+        existed), or an admin confirm of its transaction (deposit_ref
+        "manual:<currency>:<tx_hash>")."""
         with session_scope(self.session_factory) as session:
-            row = self._manual_credit_row(session, currency, tx_hash)
+            row = session.scalar(select(LedgerEntryORM).where(LedgerEntryORM.deposit_ref == deposit_ref))
+            by = "invoice"
+            if row is None:
+                row, by = self._manual_credit_row(session, currency, tx_hash), "admin"
             if row is None:
                 return None
-            return {"user_id": row.user_id, "amount_cents": row.amount_cents, "invoice_id": row.reference_id}
+            return {"user_id": row.user_id, "amount_cents": row.amount_cents, "invoice_id": row.reference_id,
+                    "matched_by": by}
 
     @staticmethod
     def _manual_credit_row(session, currency: str, tx_hash: str | None):

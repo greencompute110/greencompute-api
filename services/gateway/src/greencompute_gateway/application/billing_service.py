@@ -491,12 +491,13 @@ class BillingService:
         if status != "unmatched":
             return "seen"
         currency = deposit["currency"]
-        manual = self.repo.manual_credit_for_tx(currency, deposit.get("tx_hash"))
-        if manual:
-            # An admin already confirmed an invoice against this transaction.
+        earlier = self.repo.earlier_credit(ref, currency, deposit.get("tx_hash"))
+        if earlier:
+            # Already paid for: by the watcher before this log existed, or by
+            # an admin confirming an invoice against this transaction.
             self.repo.mark_deposit(
-                ref, status="credited", matched_by="admin", invoice_id=manual["invoice_id"],
-                user_id=manual["user_id"], credited_cents=manual["amount_cents"],
+                ref, status="credited", matched_by=earlier["matched_by"], invoice_id=earlier["invoice_id"],
+                user_id=earlier["user_id"], credited_cents=earlier["amount_cents"],
             )
             return "seen"
         amount = deposit["amount_raw"] / (10 ** deposit["decimals"])

@@ -276,6 +276,22 @@ def test_watcher_seeing_a_transfer_after_the_admin_confirmed_it(svc):
     assert (balance(svc, "bob"), balance(svc, "carol")) == (3000, 0)
 
 
+def test_transfer_credited_before_the_deposit_log_existed_is_not_unmatched(svc):
+    """The new bittensor cursor re-scans recent blocks the old watcher already
+    credited; those transfers must not land in the claimable/unmatched list."""
+    payer = Keypair.create_from_uri("//AliceOldPayment")
+    inv = svc.create_crypto_invoice("alice", "tao", 30)
+    units = invoice_units(svc, inv["invoice_id"])
+    # What the previous watcher did: credit the invoice by deposit_ref, no deposit row.
+    svc.repo.confirm_and_credit_invoice(inv["invoice_id"], "0xold", "TAO deposit", deposit_ref="tao:9:4")
+    assert svc.resolve_deposit(deposit("tao:9:4", "tao", units * 1000, sender=payer.ss58_address, tx="0xold")) == "seen"
+    logged = svc.repo.get_deposit("tao:9:4")
+    assert (logged["status"], logged["user_id"], logged["invoice_id"]) == ("credited", "alice", inv["invoice_id"])
+    assert svc.repo.list_deposits_for_admin(status="unmatched") == []
+    assert _link(svc, "bob", payer)["credited"] == []
+    assert (balance(svc, "alice"), balance(svc, "bob")) == (3000, 0)
+
+
 def test_admin_assigns_an_unmatched_deposit_once(svc):
     svc.resolve_deposit(deposit("usdc-base:0x1:0", amount_raw=12_340_000))
     assert svc.assign_deposit("usdc-base:0x1:0", "carol")["credited"]
