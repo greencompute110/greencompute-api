@@ -689,6 +689,9 @@ def _redact_workload(d: dict) -> dict:
             k: ("***redacted***" if _is_secret_meta_key(k) else v)
             for k, v in meta.items()
         }
+        # A pod's environment usually carries tokens: return the names only.
+        if isinstance(d["metadata"].get("env"), dict):
+            d["metadata"]["env"] = {name: "***redacted***" for name in d["metadata"]["env"]}
     return d
 
 

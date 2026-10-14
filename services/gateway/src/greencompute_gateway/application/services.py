@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import secrets
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from greencompute_control_plane.application.services import (
     service as default_control_plane_service,
 )
 from greencompute_protocol import (
+    WorkloadKind,
     APIKeyCreateRequest,
     BuildAttemptRecord,
     APIKeyRecord,
@@ -152,6 +154,50 @@ class InsufficientBalanceForInferenceError(Exception):
 # zone: a workload allowed to claim any host -- the API's own included -- would
 # capture every request sent to it, whatever model the caller asked for.
 _INGRESS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$")
+
+
+# A pod's start command and environment (metadata.command, metadata.env), so
+# a job can run unattended without an SSH session.
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+# Set by the platform for every pod; a user value would break SSH or GPU access.
+_RESERVED_ENV = {"AUTHORIZED_KEYS", "GC_START_COMMAND_B64", "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES"}
+_MAX_COMMAND_CHARS = 8192
+_MAX_ENV_VARS = 64
+
+
+def normalize_pod_start(metadata: dict) -> dict:
+    """Validate a pod's `command` and `env` in place. `command` may be a shell
+    command line or a list of arguments (shell-quoted and joined); `env` is
+    an object of NAME: value. Raises ValueError with what to fix."""
+    command = metadata.get("command")
+    if command is not None:
+        if isinstance(command, list) and command and all(isinstance(a, str) for a in command):
+            command = shlex.join(command)
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("metadata.command must be a non-empty string, or a list of strings")
+        if len(command) > _MAX_COMMAND_CHARS or "\x00" in command:
+            raise ValueError(f"metadata.command must be at most {_MAX_COMMAND_CHARS} characters")
+        metadata["command"] = command
+    env = metadata.get("env")
+    if env is not None:
+        if not isinstance(env, dict):
+            raise ValueError('metadata.env must be an object such as {"HF_HOME": "/workspace/hf"}')
+        if len(env) > _MAX_ENV_VARS:
+            raise ValueError(f"metadata.env can set at most {_MAX_ENV_VARS} variables")
+        clean: dict[str, str] = {}
+        for name, value in env.items():
+            if not isinstance(name, str) or not _ENV_NAME.match(name):
+                raise ValueError(f"metadata.env: {name!r} is not a valid variable name")
+            if name.upper() in _RESERVED_ENV:
+                raise ValueError(f"metadata.env: {name} is set by the platform and can't be changed")
+            if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                raise ValueError(f"metadata.env.{name} must be a string")
+            value = str(value)
+            if len(value) > _MAX_COMMAND_CHARS or "\x00" in value:
+                raise ValueError(f"metadata.env.{name} must be at most {_MAX_COMMAND_CHARS} characters")
+            clean[name] = value
+        metadata["env"] = clean
+    return metadata
 
 
 def model_ingress_zone() -> str:
@@ -439,6 +485,8 @@ class GatewayService:
 
     def create_workload(self, request: WorkloadCreateRequest, owner_user_id: str | None = None) -> WorkloadSpec:
         workload = WorkloadSpec(**request.model_dump(), owner_user_id=owner_user_id)
+        if workload.kind == WorkloadKind.POD:
+            workload.metadata = normalize_pod_start(dict(workload.metadata or {}))
         if workload.ingress_host is not None:
             workload.ingress_host = self._claim_ingress_host(workload.ingress_host, workload.workload_id)
         return self.control_plane.upsert_workload(workload)
