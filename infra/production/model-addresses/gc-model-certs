@@ -1,0 +1,41 @@
+#!/bin/sh
+# Issue a TLS certificate for each model address that is in use: a model
+# workload with a deployment that isn't finished. Run every minute from cron;
+# renewals are left to certbot's own timer (the webroot is remembered).
+#
+# Capped per run, and a name that failed waits an hour before retrying, to
+# stay well inside Let's Encrypt's limits.
+set -eu
+
+ZONE="inference.green-compute.com"
+WEBROOT=/var/www/acme
+STATE=/var/lib/gc-model-certs
+MAX_PER_RUN=5
+
+mkdir -p "$WEBROOT" "$STATE"
+exec 9>"$STATE/lock"
+flock -n 9 || exit 0
+
+hosts=$(docker exec production-postgres-1 psql -U greencompute -d greencompute -tAc "
+  SELECT DISTINCT w.ingress_host FROM workloads w
+  JOIN deployments d ON d.workload_id = w.workload_id
+  WHERE w.ingress_host LIKE '%.${ZONE}' AND d.state NOT IN ('terminated', 'failed')")
+
+issued=0
+for host in $hosts; do
+  echo "$host" | grep -Eq "^[a-z0-9-]+\.inference\.green-compute\.com$" || continue
+  [ -f "/etc/letsencrypt/live/$host/fullchain.pem" ] && continue
+  if [ -f "$STATE/$host.failed" ] && [ $(( $(date +%s) - $(stat -c %Y "$STATE/$host.failed") )) -lt 3600 ]; then
+    continue
+  fi
+  [ "$issued" -ge "$MAX_PER_RUN" ] && break
+  issued=$((issued + 1))
+  if certbot certonly --webroot -w "$WEBROOT" -d "$host" --cert-name "$host" \
+       --non-interactive --quiet --keep-until-expiring; then
+    rm -f "$STATE/$host.failed"
+    logger -t gc-model-certs "issued $host"
+  else
+    touch "$STATE/$host.failed"
+    logger -t gc-model-certs "FAILED $host"
+  fi
+done

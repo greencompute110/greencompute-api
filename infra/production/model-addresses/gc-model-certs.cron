@@ -1,0 +1,2 @@
+# /etc/cron.d/gc-model-certs: TLS certificates for model addresses
+* * * * * root /usr/local/sbin/gc-model-certs
