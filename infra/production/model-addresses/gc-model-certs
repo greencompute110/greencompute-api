@@ -1,7 +1,8 @@
 #!/bin/sh
-# Issue a TLS certificate for each model address that is in use: a model
-# workload with a deployment that isn't finished. Run every minute from cron;
-# renewals are left to certbot's own timer (the webroot is remembered).
+# Issue a TLS certificate for each model address that is in use (a model
+# workload with a deployment that isn't finished), and give it an nginx server
+# block. Run every minute from cron. Renewals are left to certbot's own timer;
+# its deploy hook reloads nginx.
 #
 # Capped per run, and a name that failed waits an hour before retrying, to
 # stay well inside Let's Encrypt's limits.
@@ -11,8 +12,9 @@ ZONE="inference.green-compute.com"
 WEBROOT=/var/www/acme
 STATE=/var/lib/gc-model-certs
 MAX_PER_RUN=5
+HOSTS_DIR=/etc/nginx/model-hosts
 
-mkdir -p "$WEBROOT" "$STATE"
+mkdir -p "$WEBROOT" "$STATE" "$HOSTS_DIR"
 exec 9>"$STATE/lock"
 flock -n 9 || exit 0
 
@@ -21,21 +23,52 @@ hosts=$(docker exec production-postgres-1 psql -U greencompute -d greencompute -
   JOIN deployments d ON d.workload_id = w.workload_id
   WHERE w.ingress_host LIKE '%.${ZONE}' AND d.state NOT IN ('terminated', 'failed')")
 
+write_server() {
+  cat > "$HOSTS_DIR/$1.conf" <<CONF
+server {
+    listen 443 ssl;
+    server_name $1;
+    ssl_certificate     /etc/letsencrypt/live/$1/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$1/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    include /etc/nginx/snippets/gc-model-proxy.conf;
+}
+CONF
+}
+
 issued=0
+added=""
 for host in $hosts; do
   echo "$host" | grep -Eq "^[a-z0-9-]+\.inference\.green-compute\.com$" || continue
-  [ -f "/etc/letsencrypt/live/$host/fullchain.pem" ] && continue
-  if [ -f "$STATE/$host.failed" ] && [ $(( $(date +%s) - $(stat -c %Y "$STATE/$host.failed") )) -lt 3600 ]; then
-    continue
+  if [ ! -f "/etc/letsencrypt/live/$host/fullchain.pem" ]; then
+    if [ -f "$STATE/$host.failed" ] && [ $(( $(date +%s) - $(stat -c %Y "$STATE/$host.failed") )) -lt 3600 ]; then
+      continue
+    fi
+    [ "$issued" -ge "$MAX_PER_RUN" ] && continue
+    issued=$((issued + 1))
+    if certbot certonly --webroot -w "$WEBROOT" -d "$host" --cert-name "$host" \
+         --non-interactive --quiet --keep-until-expiring; then
+      rm -f "$STATE/$host.failed"
+      logger -t gc-model-certs "issued $host"
+    else
+      touch "$STATE/$host.failed"
+      logger -t gc-model-certs "FAILED $host"
+      continue
+    fi
   fi
-  [ "$issued" -ge "$MAX_PER_RUN" ] && break
-  issued=$((issued + 1))
-  if certbot certonly --webroot -w "$WEBROOT" -d "$host" --cert-name "$host" \
-       --non-interactive --quiet --keep-until-expiring; then
-    rm -f "$STATE/$host.failed"
-    logger -t gc-model-certs "issued $host"
-  else
-    touch "$STATE/$host.failed"
-    logger -t gc-model-certs "FAILED $host"
+  if [ ! -f "$HOSTS_DIR/$host.conf" ]; then
+    write_server "$host"
+    added="$added $host"
   fi
 done
+
+if [ -n "$added" ]; then
+  if nginx -t -q 2>/dev/null; then
+    systemctl reload nginx
+    logger -t gc-model-certs "serving$added"
+  else
+    for host in $added; do rm -f "$HOSTS_DIR/$host.conf"; done
+    logger -t gc-model-certs "nginx -t failed; removed new server blocks for$added"
+  fi
+fi
