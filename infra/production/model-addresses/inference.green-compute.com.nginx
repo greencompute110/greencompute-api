@@ -3,7 +3,8 @@
 # served here; everything else lives on api.green-compute.com.
 #
 # Install: /etc/nginx/sites-available/inference.green-compute.com, symlinked
-# into sites-enabled, plus gc-model-proxy.conf in /etc/nginx/snippets/.
+# into sites-enabled, plus gc-model-proxy.conf in /etc/nginx/snippets/ and
+# gc-server-names.conf in /etc/nginx/conf.d/.
 # Certificates are per name, issued by gc-model-certs.
 
 server {
