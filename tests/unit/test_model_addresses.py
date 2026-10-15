@@ -95,3 +95,15 @@ def test_rentals_keep_their_ssh_endpoint(hosts):
 def test_a_model_without_an_address_shows_no_endpoint(hosts):
     dep = DeploymentRecord(workload_id="w-gone", endpoint="http://10.0.0.5:8007/inference/d2")
     assert routes._deployment_out(dep, admin=False)["endpoint"] is None
+
+
+def test_a_call_to_the_address_reaches_the_model_whatever_model_says(svc):
+    """The model is picked by the address; the upstream model id then comes
+    from that deployment's workload, not from re-reading `model`."""
+    from greencompute_protocol import ChatCompletionMessage, ChatCompletionRequest
+
+    wl = _create(svc, name="qwen", runtime={"model_identifier": "Qwen/Qwen2.5-7B-Instruct"})
+    request = ChatCompletionRequest(model="anything-at-all", messages=[ChatCompletionMessage(role="user", content="hi")])
+    resolved, _ = svc.resolve_workload_reference(request.model, routed_host=wl.ingress_host)
+    deployment = DeploymentRecord(workload_id=resolved.workload_id, endpoint="http://10.0.0.5:8007/inference/d1")
+    assert svc._rewrite_model_for_upstream(request, deployment).model == "Qwen/Qwen2.5-7B-Instruct"
