@@ -29,7 +29,7 @@ from greencompute_protocol import (
     WorkloadShareCreateRequest,
     WorkloadUpdateRequest,
 )
-from greencompute_gateway.application.services import service
+from greencompute_gateway.application.services import model_url, service
 from greencompute_gateway.domain.routing import NoReadyDeploymentError
 from greencompute_gateway.infrastructure.inference_client import (
     InferenceBadResponseError,
@@ -908,6 +908,22 @@ def list_workload_shares(
 #: is owner/admin-gated and audit-logged per access.
 DEPLOYMENT_SECRET_FIELDS = {"ssh_private_key"}
 
+
+def _deployment_out(deployment, admin: bool, workload_hosts: dict | None = None) -> dict:
+    """A deployment as the API returns it: no secrets and, for anyone but an
+    admin, a model's endpoint is the model's own address rather than the box
+    serving it (that one is firewalled and names the machine). Rentals keep
+    their ssh:// endpoint. `workload_hosts` caches lookups across a list."""
+    out = deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
+    if admin or not str(out.get("endpoint") or "").startswith(("http://", "https://")):
+        return out
+    cache = workload_hosts if workload_hosts is not None else {}
+    if deployment.workload_id not in cache:
+        workload = service.control_plane.repository.get_workload(deployment.workload_id)
+        cache[deployment.workload_id] = workload.ingress_host if workload else None
+    out["endpoint"] = model_url(cache[deployment.workload_id])
+    return out
+
 @router.post("/platform/deployments", response_model=None, responses=ok(schemas.Deployment, "The new deployment"))
 def create_deployment(
     payload: DeploymentCreateRequest,
@@ -932,12 +948,12 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
 
     _enforce_key_limits(api_key, starting_rental=True)
     try:
-        return service.create_deployment(
+        return _deployment_out(service.create_deployment(
             payload,
             user_id=api_key.user_id,
             admin=api_key.admin,
             created_by_key_id=api_key.key_id,
-        ).model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
+        ), api_key.admin)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1013,8 +1029,9 @@ def list_deployments(
             status_code=400,
             detail=f"unknown state {sorted(wanted - known)}; use any of {sorted(known)}",
         )
+    hosts: dict = {}
     rows = [
-        deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
+        _deployment_out(deployment, api_key.admin, hosts)
         for deployment in service.list_deployments(user_id=api_key.user_id, admin=api_key.admin)
         if not wanted or deployment.state.value in wanted
     ]
@@ -1038,7 +1055,7 @@ def get_deployment(
     deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=api_key.admin)
     if deployment is None:
         raise HTTPException(status_code=404, detail="deployment not found")
-    return deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
+    return _deployment_out(deployment, api_key.admin)
 
 
 @router.get("/platform/deployments/{deployment_id}/ssh", response_model=None, responses=ok(schemas.SSHAccess))
@@ -1166,12 +1183,12 @@ def update_deployment(
 ) -> dict:
     api_key = require_api_key(authorization, x_api_key)
     try:
-        return service.update_deployment(
+        return _deployment_out(service.update_deployment(
             deployment_id,
             payload,
             actor_user_id=api_key.user_id,
             admin=api_key.admin,
-        ).model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
+        ), api_key.admin)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1186,11 +1203,11 @@ def terminate_deployment(
 ) -> dict:
     api_key = require_api_key(authorization, x_api_key)
     try:
-        return service.terminate_deployment(
+        return _deployment_out(service.terminate_deployment(
             deployment_id,
             actor_user_id=api_key.user_id,
             admin=api_key.admin,
-        ).model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
+        ), api_key.admin)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1214,11 +1231,11 @@ def resume_deployment(
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("resume_deployment", api_key.key_id, limit=30, window_seconds=60)
     try:
-        return service.resume_deployment(
+        return _deployment_out(service.resume_deployment(
             deployment_id,
             user_id=api_key.user_id,
             admin=api_key.admin,
-        ).model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
+        ), api_key.admin)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:

@@ -205,6 +205,19 @@ def model_ingress_zone() -> str:
     return zone.strip().lower().strip(".")
 
 
+def default_ingress_label(name: str, workload_id: str, length: int = 6) -> str:
+    """A model's address label: its name (the part after any "org/") plus the
+    start of its workload id, e.g. "llama-3-8b-instruct-1a2b3c"."""
+    base = (name or "").rsplit("/", 1)[-1].lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", base).strip("-")[:30].strip("-") or "model"
+    return f"{slug}-{workload_id.replace('-', '')[:length]}"
+
+
+def model_url(ingress_host: str | None) -> str | None:
+    """The OpenAI-compatible base URL a model is called at."""
+    return f"https://{ingress_host}/v1" if ingress_host else None
+
+
 def validate_ingress_host(host: str) -> str:
     """Normalise a requested ingress host, or raise ValueError unless it is a
     single label directly under the model ingress zone."""
@@ -517,6 +530,8 @@ class GatewayService:
             workload.metadata = normalize_pod_start(dict(workload.metadata or {}))
         if workload.ingress_host is not None:
             workload.ingress_host = self._claim_ingress_host(workload.ingress_host, workload.workload_id)
+        elif workload.kind == WorkloadKind.INFERENCE:
+            workload.ingress_host = self._assign_ingress_host(workload)
         return self.control_plane.upsert_workload(workload)
 
     def get_workload(self, workload_id: str, user_id: str | None = None, *, admin: bool = False) -> WorkloadSpec | None:
@@ -1497,6 +1512,17 @@ class GatewayService:
             started=started,
             status=status,
         )
+
+    def _assign_ingress_host(self, workload: WorkloadSpec) -> str:
+        """Every model gets its own address, <name>-<id>.<zone>, so it can be
+        called without naming it and without exposing the box serving it."""
+        zone = model_ingress_zone()
+        for length in (6, 9):  # label stays within 40 characters
+            host = f"{default_ingress_label(workload.name, workload.workload_id, length)}.{zone}"
+            holder = self.control_plane.find_workload_by_ingress_host(host)
+            if holder is None or holder.workload_id == workload.workload_id:
+                return host
+        raise ValueError("could not assign a model address")
 
     def _claim_ingress_host(self, host: str, workload_id: str) -> str:
         normalized = validate_ingress_host(host)
