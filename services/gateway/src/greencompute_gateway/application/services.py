@@ -1707,7 +1707,14 @@ class GatewayService:
         """
         if deployment is not None and self._is_external(deployment):
             return request
-        workload, _ = self.resolve_workload_reference(request.model)
+        # The deployment was already chosen (by model address or by name), so
+        # its workload is the model. Resolving `model` again would ignore the
+        # address and fail on a name the caller didn't need to send.
+        workload = (
+            self.control_plane.repository.get_workload(deployment.workload_id) if deployment is not None else None
+        )
+        if workload is None:
+            workload, _ = self.resolve_workload_reference(request.model)
         if workload.runtime and workload.runtime.model_identifier:
             return request.model_copy(update={"model": workload.runtime.model_identifier})
         return request
