@@ -1,0 +1,4 @@
+#!/bin/sh
+# /etc/letsencrypt/renewal-hooks/deploy/reload-nginx: certbot runs this after
+# renewing any certificate, so nginx serves the new one.
+nginx -t -q && systemctl reload nginx
