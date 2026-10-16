@@ -124,6 +124,10 @@ class ControlPlaneRepository:
             row = session.get(HeartbeatORM, hotkey)
             return self._to_heartbeat(row) if row else None
 
+    def list_heartbeats(self) -> list[Heartbeat]:
+        with session_scope(self.session_factory) as session:
+            return [self._to_heartbeat(row) for row in session.scalars(select(HeartbeatORM)).all()]
+
     def upsert_capacity(self, update: CapacityUpdate) -> CapacityUpdate:
         with session_scope(self.session_factory) as session:
             row = session.get(CapacityORM, update.hotkey) or CapacityORM(hotkey=update.hotkey)

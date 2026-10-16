@@ -31,6 +31,13 @@ class Settings(BaseModel):
     # above the capacity-post interval to avoid flapping a live tenant.
     node_inventory_timeout_seconds: int = Field(default=900, ge=1)
     server_observed_timeout_seconds: int = Field(default=300, ge=1)
+    # A running pod whose machine stops reporting is kept (its disk is on that
+    # machine, so it can't move) and not billed while silent; it is ended only
+    # after the machine has been silent this long.
+    pod_offline_end_after_seconds: int = Field(default=86400, ge=60)
+    # A running model replica is moved to another machine only after its
+    # machine has been silent this long, so a network blip doesn't tear it down.
+    inference_requeue_after_seconds: int = Field(default=900, ge=60)
     deployment_request_retry_limit: int = Field(default=10, ge=1)
     # Lifetime cross-miner reassignment cap. Gates give-up on the PERSISTENT
     # deployment.retry_count (which survives requeue), separate from the
@@ -76,6 +83,8 @@ settings = Settings(
     miner_heartbeat_timeout_seconds=_int("GREENCOMPUTE_MINER_HEARTBEAT_TIMEOUT_SECONDS", 120),
     node_inventory_timeout_seconds=_int("GREENCOMPUTE_NODE_INVENTORY_TIMEOUT_SECONDS", 900),
     server_observed_timeout_seconds=_int("GREENCOMPUTE_SERVER_OBSERVED_TIMEOUT_SECONDS", 300),
+    pod_offline_end_after_seconds=_int("GREENCOMPUTE_POD_OFFLINE_END_AFTER_SECONDS", 86400),
+    inference_requeue_after_seconds=_int("GREENCOMPUTE_INFERENCE_REQUEUE_AFTER_SECONDS", 900),
     deployment_request_retry_limit=_int("GREENCOMPUTE_DEPLOYMENT_REQUEST_RETRY_LIMIT", 10),
     deployment_reassign_retry_limit=_int("GREENCOMPUTE_DEPLOYMENT_REASSIGN_RETRY_LIMIT", 10),
     deployment_request_retry_delay_seconds=_int("GREENCOMPUTE_DEPLOYMENT_REQUEST_RETRY_DELAY_SECONDS", 10),
