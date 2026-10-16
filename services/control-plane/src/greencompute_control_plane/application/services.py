@@ -1188,57 +1188,110 @@ class ControlPlaneService:
         return expired
 
     def process_unhealthy_miners(self, now: datetime | None = None) -> list[DeploymentRecord]:
+        """Move work off machines that have stopped reporting, without tearing
+        down running rentals over a network blip.
+
+        - Not yet running: moved as soon as its machine looks gone.
+        - A running model replica: moved once its machine has been silent for
+          inference_requeue_after_seconds (or straight away if the machine
+          reports itself unhealthy).
+        - A running pod/VM: never moved, since its disk is on that machine. It
+          keeps its lease (so the node agent keeps the container), isn't billed
+          while silent (meter_usage), and is ended only after
+          pod_offline_end_after_seconds of silence.
+        - Every machine silent at once: nothing is done. That is far more likely
+          the control plane being cut off, or an outage at the provider, than
+          every miner failing together (2026-10-14 and 2026-10-16), and there
+          is nowhere to move work to anyway.
+        """
         observed_at = now or datetime.now(UTC)
         reassigned: list[DeploymentRecord] = []
-        for assignment in self.repository.list_assignments(statuses=["assigned", "activating", "active"]):
-            heartbeat = self.repository.get_heartbeat(assignment.hotkey)
-            if heartbeat is not None:
-                heartbeat_observed_at = heartbeat.observed_at
-                if heartbeat_observed_at.tzinfo is None:
-                    heartbeat_observed_at = heartbeat_observed_at.replace(tzinfo=UTC)
-            else:
-                heartbeat_observed_at = None
-            if heartbeat is not None and heartbeat.healthy and heartbeat_observed_at is not None:
-                age_seconds = (observed_at - heartbeat_observed_at).total_seconds()
-                if age_seconds <= settings.miner_heartbeat_timeout_seconds:
-                    # ORCH-M4: the per-hotkey heartbeat is fresh+healthy, but for
-                    # a multi-box hotkey that signal can MASK a single dead box.
-                    # Each box stamps its own NodeInventoryORM.observed_at, so a
-                    # dead box's node goes stale even while a healthy sibling
-                    # keeps the hotkey heartbeat fresh. Consult THIS assignment's
-                    # node freshness: if its node inventory is missing or stale
-                    # beyond node_inventory_timeout_seconds, the box is genuinely
-                    # not reporting → requeue (which releases the reservation).
-                    # A node still heartbeating fresh is never requeued, so a
-                    # healthy in-flight pod is never disturbed. Keep
-                    # node_inventory_timeout_seconds >> capacity post interval to
-                    # avoid flapping on a single missed post.
-                    node = self._find_node(assignment.node_id)
-                    if node is None:
-                        reason = (
-                            f"node {assignment.node_id} inventory missing for "
-                            f"hotkey={assignment.hotkey} (per-node staleness)"
-                        )
-                    elif self._is_node_stale(node, now=observed_at):
-                        reason = (
-                            f"node {assignment.node_id} inventory stale beyond "
-                            f"{settings.node_inventory_timeout_seconds}s for "
-                            f"hotkey={assignment.hotkey} (per-node staleness)"
-                        )
-                    else:
-                        continue
-                else:
-                    reason = (
-                        f"miner heartbeat stale after {int(age_seconds)} seconds for hotkey={assignment.hotkey}"
-                    )
-            elif heartbeat is not None and not heartbeat.healthy:
-                reason = f"miner marked unhealthy for hotkey={assignment.hotkey}"
-            else:
-                reason = f"miner heartbeat missing for hotkey={assignment.hotkey}"
-            deployment = self._requeue_assignment(assignment, reason, observed_at)
-            if deployment is not None:
-                reassigned.append(deployment)
+        assignments = self.repository.list_assignments(statuses=["assigned", "activating", "active"])
+        if assignments and not self._any_miner_reporting(observed_at):
+            self.metrics.increment("deployment.requeue_skipped.all_silent")
+            logger.warning("no miner is reporting; leaving all %d assignments in place", len(assignments))
+            return reassigned
+        for assignment in assignments:
+            problem = self._assignment_problem(assignment, observed_at)
+            if problem is None:
+                continue
+            reason, silent_for = problem
+            deployment = self.repository.get_deployment(assignment.deployment_id)
+            if deployment is not None and deployment.state == DeploymentState.READY:
+                workload = self.repository.get_workload(deployment.workload_id)
+                if workload is None or workload.kind != WorkloadKind.INFERENCE:
+                    if silent_for is not None and silent_for >= settings.pod_offline_end_after_seconds:
+                        self._end_offline_pod(deployment, silent_for)
+                    continue
+                if silent_for is not None and silent_for < settings.inference_requeue_after_seconds:
+                    continue
+            requeued = self._requeue_assignment(assignment, reason, observed_at)
+            if requeued is not None:
+                reassigned.append(requeued)
         return reassigned
+
+    def _any_miner_reporting(self, now: datetime) -> bool:
+        return any(
+            hb.observed_at is not None
+            and (now - self._ensure_utc(hb.observed_at)).total_seconds() <= settings.miner_heartbeat_timeout_seconds
+            for hb in self.repository.list_heartbeats()
+        )
+
+    def _assignment_problem(self, assignment, now: datetime) -> tuple[str, float | None] | None:
+        """Why the machine behind an assignment looks gone, and for how many
+        seconds it has been silent (None if it still reports, e.g. unhealthy
+        or its node record is missing). None when the machine is fine."""
+        heartbeat = self.repository.get_heartbeat(assignment.hotkey)
+        if heartbeat is None or heartbeat.observed_at is None:
+            return f"miner heartbeat missing for hotkey={assignment.hotkey}", None
+        age = (now - self._ensure_utc(heartbeat.observed_at)).total_seconds()
+        if age > settings.miner_heartbeat_timeout_seconds:
+            return f"miner heartbeat stale after {int(age)} seconds for hotkey={assignment.hotkey}", age
+        if not heartbeat.healthy:
+            return f"miner marked unhealthy for hotkey={assignment.hotkey}", None
+        # ORCH-M4: a fresh per-hotkey heartbeat can mask one dead box when
+        # several boxes share the hotkey. Each box stamps its own node
+        # inventory, so check this assignment's node too.
+        node = self._find_node(assignment.node_id)
+        if node is None:
+            return f"node {assignment.node_id} inventory missing for hotkey={assignment.hotkey} (per-node staleness)", None
+        if self._is_node_stale(node, now=now):
+            node_age = (now - self._ensure_utc(self._as_datetime(node.observed_at))).total_seconds()
+            return (
+                f"node {assignment.node_id} inventory stale beyond {settings.node_inventory_timeout_seconds}s "
+                f"for hotkey={assignment.hotkey} (per-node staleness)",
+                node_age,
+            )
+        return None
+
+    def _box_silent(self, deployment: DeploymentRecord, now: datetime) -> bool:
+        """True while the machine running a deployment isn't reporting."""
+        if not deployment.hotkey:
+            return False
+        heartbeat = self.repository.get_heartbeat(deployment.hotkey)
+        if heartbeat is None or heartbeat.observed_at is None:
+            return True
+        if (now - self._ensure_utc(heartbeat.observed_at)).total_seconds() > settings.miner_heartbeat_timeout_seconds:
+            return True
+        node = self._find_node(deployment.node_id) if deployment.node_id else None
+        return node is not None and self._is_node_stale(node, now=now)
+
+    def _end_offline_pod(self, deployment: DeploymentRecord, silent_for: float) -> None:
+        reason = f"ended: the machine running it stopped reporting {int(silent_for // 3600)} hours ago"
+        try:
+            self.update_deployment_status(
+                DeploymentStatusUpdate(
+                    deployment_id=deployment.deployment_id, state=DeploymentState.TERMINATED, error=reason,
+                )
+            )
+            self.metrics.increment("deployment.ended.machine_offline")
+            logger.warning("Ended pod %s: %s", deployment.deployment_id, reason)
+        except Exception as exc:
+            logger.error("Failed to end offline pod %s: %s", deployment.deployment_id, exc)
+
+    @staticmethod
+    def _as_datetime(value) -> datetime:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
 
     def process_idle_inference_deployments(self, now: datetime | None = None) -> list[str]:
         """Auto-suspend private-endpoint inference deployments with no
@@ -1722,6 +1775,10 @@ class ControlPlaneService:
             # (see gateway's _charge_inference_tokens). Charging hourly here
             # too would be double-billing. Only pod/vm rentals are hourly.
             if workload is not None and workload.kind == WorkloadKind.INFERENCE:
+                continue
+            # A pod whose machine has stopped reporting is kept, not moved (see
+            # process_unhealthy_miners); don't bill for time it may be unusable.
+            if self._box_silent(deployment, datetime.now(UTC)):
                 continue
             gpu_count = workload.requirements.gpu_count if workload else 1
             # Per-minute cost in *millicents* — integer math, no float rounding.
