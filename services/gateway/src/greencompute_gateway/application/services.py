@@ -1579,7 +1579,9 @@ class GatewayService:
             raise ValueError(f"ingress_host {normalized} is already taken")
         return normalized
 
-    def resolve_workload_reference(self, model: str, routed_host: str | None = None) -> tuple[WorkloadSpec, dict]:
+    def resolve_workload_reference(
+        self, model: str, routed_host: str | None = None, *, user_id: str | None = None, admin: bool = False,
+    ) -> tuple[WorkloadSpec, dict]:
         normalized_host = self._normalize_host(routed_host)
         # Only hosts in the model ingress zone route by hostname, so a stored
         # value outside it (e.g. the API's own name) can never take traffic.
@@ -1600,14 +1602,34 @@ class GatewayService:
         if aliased is not None:
             return aliased, {"matched_by": "workload_alias", "host": normalized_host, "model": model}
 
-        named = self.control_plane.find_workload_by_name(model)
+        named = self._pick_named_workload(model, user_id=user_id, admin=admin)
         if named is not None:
             return named, {"matched_by": "name", "host": normalized_host, "model": model}
-
-        for workload_item in self.control_plane.list_workloads():
-            if workload_item.name == model:
-                return workload_item, {"matched_by": "name_scan", "host": normalized_host, "model": model}
         raise NoReadyDeploymentError(f"unknown model={model}")
+
+    def _pick_named_workload(self, name: str, *, user_id: str | None, admin: bool) -> WorkloadSpec | None:
+        """The workload a name means for this caller. Names repeat (everyone
+        who deploys Llama 3.1 8B from the dashboard gets the same one), and
+        taking the first match sent customers to someone else's private
+        model, which then failed the access check. Prefer, in order: the
+        caller's own, then shared/public ones, each with a ready deployment
+        first, newest first. With none accessible, the first match is
+        returned so the access check still answers "unknown model"."""
+        candidates = self.control_plane.repository.list_workloads_by_name(name)
+        if not candidates:
+            return None
+
+        def rank(workload: WorkloadSpec) -> tuple[int, int, float]:
+            if admin or (user_id is not None and workload.owner_user_id == user_id):
+                access = 0
+            elif self._user_can_access_workload(workload, user_id):
+                access = 1
+            else:
+                access = 2
+            ready = 0 if self.control_plane.repository.list_ready_deployments(workload.workload_id) else 1
+            return access, ready, -(workload.created_at.timestamp() if workload.created_at else 0)
+
+        return min(candidates, key=rank)
 
     def _track_latency_ema(self, deployment_id: str, latency_ms: float, alpha: float = 0.3) -> None:
         """EMA of recent chat-completion latencies. Alpha=0.3 means a single
@@ -1645,7 +1667,9 @@ class GatewayService:
                 "model": request.model,
                 "host": self._normalize_host(routed_host),
             }
-        workload, routing = self.resolve_workload_reference(request.model, routed_host=routed_host)
+        workload, routing = self.resolve_workload_reference(
+            request.model, routed_host=routed_host, user_id=user_id, admin=admin
+        )
         # Authorization: a caller may only invoke a workload they own, one shared
         # with them, or a public one. Otherwise report it as an unknown model so
         # a private workload's existence is not enumerable via its id/alias/name.
