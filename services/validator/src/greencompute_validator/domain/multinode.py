@@ -231,7 +231,7 @@ def teardown_order(rows: list[dict]) -> list[dict]:
 
 
 KEEP, REBUILD, CREATE = "keep", "rebuild", "create"
-LIVE_STATES = {"ready", "starting", "scheduled", "provisioning", "pending"}
+LIVE_STATES = {"ready", "starting", "pulling", "scheduled", "provisioning", "pending"}
 
 
 def replica_action(rank_rows: list[dict], node_count: int) -> str:
