@@ -759,6 +759,8 @@ class CatalogSubmissionORM(Base):
     model_id: Mapped[str] = mapped_column(String(128), index=True)
     hotkey: Mapped[str] = mapped_column(String(128), index=True, default="")
     signature: Mapped[str] = mapped_column(Text, default="")
+    # The signed-in account that proposed it, when the website sent its key.
+    submitted_by_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     display_name: Mapped[str] = mapped_column(String(255), default="")
     hf_repo: Mapped[str] = mapped_column(String(255), default="")
     template: Mapped[str] = mapped_column(String(32), default="vllm")

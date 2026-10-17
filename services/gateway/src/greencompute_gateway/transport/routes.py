@@ -966,14 +966,21 @@ def list_workload_shares(
 #: still available, deliberately, from GET /platform/deployments/{id}/ssh, which
 #: is owner/admin-gated and audit-logged per access.
 DEPLOYMENT_SECRET_FIELDS = {"ssh_private_key"}
+LIST_ERROR_CHARS = 500
 
 
-def _deployment_out(deployment, admin: bool, workload_hosts: dict | None = None) -> dict:
+def _deployment_out(deployment, admin: bool, workload_hosts: dict | None = None, *, brief: bool = False) -> dict:
     """A deployment as the API returns it: no secrets and, for anyone but an
     admin, a model's endpoint is the model's own address rather than the box
     serving it (that one is firewalled and names the machine). Rentals keep
-    their ssh:// endpoint. `workload_hosts` caches lookups across a list."""
+    their ssh:// endpoint. `workload_hosts` caches lookups across a list.
+
+    `brief` (lists) caps last_error: a model that dies on start stores its
+    whole container log, and thousands of deployments made the admin list
+    ~20 MB. GET /platform/deployments/{id} still has the full text."""
     out = deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
+    if brief and out.get("last_error") and len(out["last_error"]) > LIST_ERROR_CHARS:
+        out["last_error"] = out["last_error"][:LIST_ERROR_CHARS] + " …"
     if admin or not str(out.get("endpoint") or "").startswith(("http://", "https://")):
         return out
     cache = workload_hosts if workload_hosts is not None else {}
@@ -1090,7 +1097,7 @@ def list_deployments(
         )
     hosts: dict = {}
     rows = [
-        _deployment_out(deployment, api_key.admin, hosts)
+        _deployment_out(deployment, api_key.admin, hosts, brief=True)
         for deployment in service.list_deployments(user_id=api_key.user_id, admin=api_key.admin)
         if not wanted or deployment.state.value in wanted
     ]
@@ -2901,6 +2908,18 @@ def analytics_active_rentals(
 ) -> dict:
     require_api_key(authorization, x_api_key, admin_required=True)
     return _analytics_repo().active_rentals()
+
+
+@router.get("/platform/admin/analytics/gpu-usage", include_in_schema=False)
+def analytics_gpu_usage(
+    days: int = 7,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — per GPU class: online/offline, rented, serving models, free,
+    and requests turned away for lack of capacity in the last `days`."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return _analytics_repo().gpu_usage(days=days)
 
 
 @router.post("/platform/billing/admin/credit", include_in_schema=False)

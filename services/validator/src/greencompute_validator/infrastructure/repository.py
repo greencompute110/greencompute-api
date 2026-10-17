@@ -22,6 +22,7 @@ from greencompute_persistence.orm import (
     ProbeResultORM,
     ScoreCardHistoryORM,
     ScoreCardORM,
+    UserORM,
     ValidatorCapabilityORM,
     WeightSnapshotORM,
     WorkloadORM,
@@ -594,13 +595,14 @@ class ValidatorRepository:
             session.delete(row)
             return True
 
-    def create_catalog_submission(self, sub: CatalogSubmission) -> CatalogSubmission:
+    def create_catalog_submission(self, sub: CatalogSubmission, submitted_by_user_id: str | None = None) -> CatalogSubmission:
         with session_scope(self.session_factory) as session:
             row = CatalogSubmissionORM(
                 submission_id=sub.submission_id,
                 model_id=sub.model_id,
                 hotkey=sub.hotkey,
                 signature=sub.signature,
+                submitted_by_user_id=submitted_by_user_id,
                 display_name=sub.display_name,
                 hf_repo=sub.hf_repo,
                 template=sub.template,
@@ -627,6 +629,19 @@ class ValidatorRepository:
                 .order_by(CatalogSubmissionORM.submitted_at.desc())
             ).all()
             return [self._submission_from_orm(r) for r in rows]
+
+    def catalog_submitters(self, submission_ids: list[str]) -> dict[str, dict]:
+        """submission_id -> {user_id, username, email} of the account that
+        proposed it, for submissions made while signed in."""
+        if not submission_ids:
+            return {}
+        with session_scope(self.session_factory) as session:
+            rows = session.execute(
+                select(CatalogSubmissionORM.submission_id, UserORM.user_id, UserORM.username, UserORM.email)
+                .join(UserORM, UserORM.user_id == CatalogSubmissionORM.submitted_by_user_id)
+                .where(CatalogSubmissionORM.submission_id.in_(submission_ids))
+            ).all()
+            return {sid: {"user_id": uid, "username": name, "email": email} for sid, uid, name, email in rows}
 
     def list_catalog_submissions(self, status: str | None = None) -> list[CatalogSubmission]:
         with session_scope(self.session_factory) as session:

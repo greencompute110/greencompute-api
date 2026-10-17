@@ -11,9 +11,11 @@ multiple endpoints.
 """
 from __future__ import annotations
 
+import os
+import re
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from greencompute_persistence import (
     create_db_engine,
@@ -27,10 +29,34 @@ from greencompute_persistence.orm import (
     DeploymentORM,
     LedgerEntryORM,
     MinerPayoutAccrualORM,
+    NodeInventoryORM,
     StripeSessionORM,
     UserORM,
     WorkloadORM,
 )
+
+
+# GPU classes we sell, always listed in gpu_usage even with nothing online.
+_OFFERED_GPUS = ("rtx4090", "rtx5090")
+# Deployment states that hold GPUs on a node.
+_HOLDING_STATES = ("scheduled", "pulling", "starting", "ready", "draining")
+# How a request turned away for lack of capacity ends (scheduler / node agent).
+_NO_CAPACITY_ERRORS = ("no compatible miner capacity%", "GPU allocation failed%")
+
+
+def _gpu_key(model: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", (model or "").lower()) or "unknown"
+
+
+def _gpu_label(key: str) -> str:
+    m = re.fullmatch(r"(rtx|gtx|a|h|l)(\d+)(.*)", key)
+    if key == "any":
+        return "Any GPU"
+    return f"{m.group(1).upper()} {m.group(2)}{m.group(3).upper()}".strip() if m else key.upper()
+
+
+def _aware(dt: datetime | None) -> datetime | None:
+    return dt if dt is None or dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 # Cap how far back any single analytics call can scan — keeps slow SELECTs
@@ -207,6 +233,87 @@ class AnalyticsRepository:
         }
 
     # --- Active rentals / fleet utilisation ---------------------------------
+
+    def gpu_usage(self, *, days: int = 7, now: datetime | None = None) -> dict:
+        """Per GPU class: GPUs online (nodes reporting) and offline (registered
+        but silent), in use by rentals or by models, free, and requests turned
+        away for lack of capacity in the window — the signal for asking miners
+        to add GPUs."""
+        days = max(1, min(days, _MAX_DAYS))
+        now = now or datetime.now(UTC)
+        stale_after = timedelta(seconds=int(os.environ.get("GREENCOMPUTE_NODE_INVENTORY_TIMEOUT_SECONDS") or 900))
+        classes: dict[str, dict] = {}
+
+        def bucket(key: str) -> dict:
+            return classes.setdefault(key, {
+                "gpu_model": key, "label": _gpu_label(key),
+                "online_gpus": 0, "offline_gpus": 0, "nodes_online": 0, "nodes_offline": 0,
+                "rented_gpus": 0, "model_gpus": 0,
+                "turned_away_requests": 0, "turned_away_gpus": 0, "turned_away_customers": 0,
+            })
+
+        for key in _OFFERED_GPUS:
+            bucket(key)
+        with session_scope(self.session_factory) as session:
+            node_class: dict[str, str] = {}
+            for node_id, payload, observed_at in session.execute(
+                select(NodeInventoryORM.node_id, NodeInventoryORM.payload, NodeInventoryORM.observed_at)
+            ).all():
+                payload = payload if isinstance(payload, dict) else {}
+                key = _gpu_key(payload.get("gpu_model"))
+                node_class[node_id] = key
+                b = bucket(key)
+                count = int(payload.get("gpu_count") or 0)
+                seen = _aware(observed_at)
+                if seen is not None and now - seen <= stale_after:
+                    b["online_gpus"] += count
+                    b["nodes_online"] += 1
+                else:
+                    b["offline_gpus"] += count
+                    b["nodes_offline"] += 1
+
+            for node_id, kind, requirements, ready_instances in session.execute(
+                select(DeploymentORM.node_id, WorkloadORM.kind, WorkloadORM.requirements, DeploymentORM.ready_instances)
+                .join(WorkloadORM, WorkloadORM.workload_id == DeploymentORM.workload_id, isouter=True)
+                .where(DeploymentORM.state.in_(_HOLDING_STATES), DeploymentORM.node_id.is_not(None))
+            ).all():
+                key = node_class.get(node_id)
+                if key is None:
+                    continue
+                per_instance = (requirements or {}).get("gpu_count") if isinstance(requirements, dict) else None
+                gpus = (per_instance if isinstance(per_instance, int) and per_instance > 0 else 1) * max(ready_instances or 0, 1)
+                classes[key]["model_gpus" if kind == "inference" else "rented_gpus"] += gpus
+
+            customers: dict[str, set] = {}
+            for owner, requirements in session.execute(
+                select(DeploymentORM.owner_user_id, WorkloadORM.requirements)
+                .join(WorkloadORM, WorkloadORM.workload_id == DeploymentORM.workload_id, isouter=True)
+                .where(
+                    DeploymentORM.state == "failed",
+                    DeploymentORM.updated_at >= now - timedelta(days=days),
+                    DeploymentORM.owner_user_id.is_not(None),
+                    or_(*(DeploymentORM.last_error.like(p) for p in _NO_CAPACITY_ERRORS)),
+                )
+            ).all():
+                req = requirements if isinstance(requirements, dict) else {}
+                wanted = {_gpu_key(m) for m in (req.get("supported_gpu_models") or [])}
+                key = wanted.pop() if len(wanted) == 1 else "any"
+                b = bucket(key)
+                per_instance = req.get("gpu_count")
+                b["turned_away_requests"] += 1
+                b["turned_away_gpus"] += per_instance if isinstance(per_instance, int) and per_instance > 0 else 1
+                customers.setdefault(key, set()).add(owner)
+            for key, owners in customers.items():
+                classes[key]["turned_away_customers"] = len(owners)
+
+        for b in classes.values():
+            in_use = b["rented_gpus"] + b["model_gpus"]
+            b["in_use_gpus"] = in_use
+            b["free_gpus"] = max(b["online_gpus"] - in_use, 0)
+            b["utilization_pct"] = round(100 * in_use / b["online_gpus"], 1) if b["online_gpus"] else None
+        order = {key: i for i, key in enumerate(_OFFERED_GPUS)}
+        rows = sorted(classes.values(), key=lambda b: (order.get(b["gpu_model"], 99), b["gpu_model"] == "any", b["gpu_model"]))
+        return {"generated_at": now.isoformat(), "days": days, "classes": rows}
 
     def active_rentals(self) -> dict:
         """Snapshot of READY deployments + their GPU and dollar footprint.
