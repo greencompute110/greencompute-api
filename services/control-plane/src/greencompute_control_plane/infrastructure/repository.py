@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -71,6 +71,8 @@ class ControlPlaneRepository:
         self.session_factory = create_session_factory(self.engine)
         if needs_bootstrap(str(self.engine.url), bootstrap):
             init_database(self.engine)
+        # node_id -> ((available, total), when its last history row was written)
+        self._last_history: dict[str, tuple[tuple[int, int], datetime]] = {}
 
     def upsert_miner(self, registration: MinerRegistration) -> MinerRegistration:
         with session_scope(self.session_factory) as session:
@@ -187,6 +189,8 @@ class ControlPlaneRepository:
                 inventory.observed_at = update.observed_at
                 session.add(inventory)
 
+                if not self._history_due(node.node_id, node.available_gpus, node.gpu_count, update.observed_at):
+                    continue
                 session.add(
                     CapacityHistoryORM(
                         history_id=CapacityHistoryRecord(
@@ -206,6 +210,29 @@ class ControlPlaneRepository:
                     )
                 )
         return update
+
+    # Capacity history used to get a row on every capacity post (every few
+    # seconds per node): 42M rows / 13 GB by 2026-10. Now a row is written
+    # when a node's GPU counts change, or every HISTORY_INTERVAL otherwise.
+    HISTORY_INTERVAL = timedelta(minutes=10)
+
+    def _history_due(self, node_id: str, available: int, total: int, observed_at: datetime) -> bool:
+        last = self._last_history.get(node_id)
+        if last is not None and last[0] == (available, total) and observed_at - last[1] < self.HISTORY_INTERVAL:
+            return False
+        self._last_history[node_id] = ((available, total), observed_at)
+        return True
+
+    def prune_capacity_history(self, older_than: datetime, batch: int = 50_000) -> int:
+        """Delete up to `batch` history rows older than `older_than`; called
+        repeatedly from the worker loop so a large backlog drains gradually."""
+        with session_scope(self.session_factory) as session:
+            ids = session.scalars(
+                select(CapacityHistoryORM.history_id).where(CapacityHistoryORM.observed_at < older_than).limit(batch)
+            ).all()
+            if ids:
+                session.execute(delete(CapacityHistoryORM).where(CapacityHistoryORM.history_id.in_(ids)))
+            return len(ids)
 
     def get_capacity(self, hotkey: str) -> CapacityUpdate | None:
         with session_scope(self.session_factory) as session:

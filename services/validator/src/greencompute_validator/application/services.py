@@ -673,7 +673,7 @@ class ValidatorService:
             # what's already running, and hand each node only that shrinking
             # deficit, so only as many NEW replicas as the fleet still needs get
             # placed. (Per-node pins below keep existing replicas where they are.)
-            live_states = {"ready", "starting", "scheduled", "provisioning", "pending"}
+            live_states = {"ready", "starting", "pulling", "scheduled", "provisioning", "pending"}
             fleet_running: dict[str, int] = {}
             for d in self.repository.list_flux_deployments(hotkey):
                 mid = d.get("model_id")
@@ -798,7 +798,7 @@ class ValidatorService:
         # — the catalog can never respawn a crashed replica. This is exactly what
         # wedged the whole catalog when a validator restart flipped live runtimes
         # to 'failed'. Count only live states here; reap the dead rows below.
-        live_states = {"ready", "starting", "scheduled", "provisioning", "pending"}
+        live_states = {"ready", "starting", "pulling", "scheduled", "provisioning", "pending"}
         existing_models = {
             d["model_id"] for d in existing
             if d["model_id"] and d["state"] in live_states

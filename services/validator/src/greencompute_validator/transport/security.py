@@ -25,6 +25,18 @@ replay_store = MemoryReplayStore()
 control_plane_repository = ControlPlaneRepository()
 
 
+def caller_user_id(authorization: str | None, x_api_key: str | None) -> str | None:
+    """The account behind an optional API key, for public routes that record
+    who acted (e.g. catalog submissions). Never raises; no key -> None."""
+    secret = x_api_key if isinstance(x_api_key, str) else None
+    if not secret and isinstance(authorization, str) and authorization.lower().startswith("bearer "):
+        secret = authorization[7:].strip()
+    if not secret:
+        return None
+    api_key = credential_store.get_api_key_by_secret(secret)
+    return api_key.user_id if api_key is not None else None
+
+
 def require_admin_api_key(authorization: str | None, x_api_key: str | None) -> None:
     if not isinstance(x_api_key, str):
         x_api_key = None

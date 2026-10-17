@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any
 from collections import Counter
@@ -117,6 +118,12 @@ class ControlPlaneService:
 
     def list_nodes(self):
         return self.repository.list_nodes()
+
+    def prune_capacity_history(self, now: datetime | None = None) -> int:
+        """Drop capacity history older than GREENCOMPUTE_CAPACITY_HISTORY_DAYS
+        (default 7), one batch per call."""
+        days = int(os.environ.get("GREENCOMPUTE_CAPACITY_HISTORY_DAYS") or 7)
+        return self.repository.prune_capacity_history((now or datetime.now(UTC)) - timedelta(days=days))
 
     def list_capacity_history(self, limit: int | None = None):
         return self.repository.list_capacity_history(limit=limit)
@@ -767,14 +774,37 @@ class ControlPlaneService:
         workload_id: str | None = None,
         now: datetime | None = None,
     ) -> list[dict[str, Any]]:
+        """Whether each live deployment can take traffic, and if not, why.
+
+        Finished deployments (terminated/failed) never take traffic and pile
+        up into thousands of rows, so they're left out, and each lookup is made
+        once per report rather than per deployment: checking every one of 7k
+        deployments with several queries each took 42 s and stalled the
+        Network Health page."""
         observed_at = now or datetime.now(UTC)
         reports: list[dict[str, Any]] = []
+        nodes = {node.node_id: node for node in self.repository.list_nodes()}
+        servers = {server.server_id: server for server in self.repository.list_servers()}
+        cooling = {
+            placement.node_id
+            for placement in self.repository.list_placements(limit=1000)
+            if placement.cooldown_until is not None and self._ensure_utc(placement.cooldown_until) > observed_at
+        }
+        miners: dict[str, Any] = {}
+        heartbeats: dict[str, Any] = {}
         for deployment in self.repository.list_deployments():
+            if deployment.state in (DeploymentState.TERMINATED, DeploymentState.FAILED):
+                continue
             if workload_id is not None and deployment.workload_id != workload_id:
                 continue
             reasons: list[str] = []
-            node = self._find_node(deployment.node_id) if deployment.node_id else None
-            miner = self.repository.get_miner(deployment.hotkey or "") if deployment.hotkey else None
+            node = nodes.get(deployment.node_id) if deployment.node_id else None
+            hotkey = deployment.hotkey
+            if hotkey and hotkey not in miners:
+                miners[hotkey] = self.repository.get_miner(hotkey)
+                heartbeats[hotkey] = self.repository.get_heartbeat(hotkey)
+            miner = miners.get(hotkey) if hotkey else None
+            heartbeat = heartbeats.get(hotkey) if hotkey else None
             if deployment.state != DeploymentState.READY:
                 reasons.append(f"deployment_state:{deployment.state.value}")
             if deployment.endpoint is None:
@@ -783,16 +813,16 @@ class ControlPlaneService:
                 reasons.append("missing_hotkey")
             if miner is not None and miner.drained:
                 reasons.append("miner_drained")
-            heartbeat = self.repository.get_heartbeat(deployment.hotkey or "") if deployment.hotkey else None
             if heartbeat is not None and not heartbeat.healthy:
                 reasons.append("miner_unhealthy")
             if node is None and deployment.node_id is not None:
                 reasons.append("node_missing")
             if node is not None and self._is_node_stale(node, now=observed_at):
                 reasons.append("node_stale")
-            if node is not None and self._is_server_for_node_stale(node, now=observed_at):
+            server = servers.get(node.server_id) if node is not None and node.server_id else None
+            if server is not None and self._is_server_stale(server.observed_at, now=observed_at):
                 reasons.append("server_stale")
-            if deployment.node_id and self._is_node_in_cooldown(deployment.node_id, now=observed_at):
+            if deployment.node_id and deployment.node_id in cooling:
                 reasons.append("placement_cooldown")
             reports.append(
                 {
@@ -804,18 +834,29 @@ class ControlPlaneService:
                     "state": deployment.state.value,
                     "eligible": len(reasons) == 0,
                     "reasons": reasons,
-                    "last_error": deployment.last_error,
+                    "last_error": (deployment.last_error or "")[:300] or None,
                     "failure_class": deployment.failure_class,
                 }
             )
         return reports
 
     def deployment_failure_report(self) -> list[dict[str, Any]]:
-        return [
-            deployment.model_dump(mode="json")
+        """Failed deployments, newest first. Errors are capped: a model that
+        dies on start stores its whole container log, and hundreds of those
+        made admin pages download megabytes."""
+        failed = [
+            deployment
             for deployment in self.repository.list_deployments()
             if deployment.state == DeploymentState.FAILED or deployment.retry_exhausted
         ]
+        failed.sort(key=lambda d: self._ensure_utc(d.updated_at), reverse=True)
+        out = []
+        for deployment in failed:
+            item = deployment.model_dump(mode="json")
+            if item.get("last_error") and len(item["last_error"]) > 2000:
+                item["last_error"] = item["last_error"][:2000] + " …"
+            out.append(item)
+        return out
 
     def fleet_orchestration_report(self) -> dict[str, Any]:
         servers = self.repository.list_servers()

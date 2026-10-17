@@ -30,6 +30,7 @@ from greencompute_validator.application.managed_wallet_factory import (
 )
 from greencompute_validator.domain.managed_wallet import is_valid_ss58
 from greencompute_validator.transport.security import (
+    caller_user_id,
     require_admin_api_key,
     require_miner_request,
     verify_application_signature,
@@ -1086,12 +1087,20 @@ def catalog_submissions_status(hotkey: str) -> list[dict]:
 
 
 @router.post("/validator/v1/catalog/submissions", status_code=201)
-def submit_catalog(payload: CatalogSubmission) -> dict:
+def submit_catalog(
+    payload: CatalogSubmission,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
     """Public — a miner (or anyone) proposes a model for the catalog.
     Admin review required; approval triggers catalog-entry + workload creation.
+    When the website sends the signed-in account's key, that account is
+    recorded as the submitter.
     """
     payload.model_id = _validate_model_id(payload.model_id)
-    service.repository.create_catalog_submission(payload)
+    service.repository.create_catalog_submission(
+        payload, submitted_by_user_id=caller_user_id(authorization, x_api_key)
+    )
     return payload.model_dump(mode="json")
 
 
@@ -1104,7 +1113,8 @@ def list_catalog_submissions(
     """Admin — list catalog submissions, optionally filtered by status."""
     require_admin_api_key(authorization, x_api_key)
     subs = service.repository.list_catalog_submissions(status=status)
-    return [s.model_dump(mode="json") for s in subs]
+    submitters = service.repository.catalog_submitters([s.submission_id for s in subs])
+    return [{**s.model_dump(mode="json"), "submitted_by": submitters.get(s.submission_id)} for s in subs]
 
 
 # Defined AFTER /catalog/submissions* routes so FastAPI (first-match) doesn't

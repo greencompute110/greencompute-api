@@ -93,6 +93,14 @@ async def _control_plane_worker_loop() -> None:
                         "key-limit cycle failed: %s", limit_exc
                     )
                     _worker_state["last_error"] = f"key limits: {limit_exc}"
+                try:
+                    service.prune_capacity_history()
+                except Exception as prune_exc:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "capacity history prune failed: %s", prune_exc
+                    )
+                    _worker_state["last_error"] = f"capacity history prune: {prune_exc}"
                 # Reclaim GPU reservations orphaned by a delete/terminate that
                 # didn't release them — keeps leaked holds from permanently
                 # shrinking schedulable capacity. Isolated try/except.
