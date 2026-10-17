@@ -156,6 +156,8 @@ def test_gpu_usage_by_class(analytics):
     assert (r4090["turned_away_requests"], r4090["turned_away_customers"]) == (4, 2)
     assert (r5090["online_gpus"], r5090["offline_gpus"], r5090["nodes_offline"], r5090["utilization_pct"]) == (0, 8, 1, None)
     assert r4090["label"] == "RTX 4090"
+    from greencompute_gateway.infrastructure.analytics_repository import _gpu_label
+    assert (_gpu_label("a4000"), _gpu_label("h100"), _gpu_label("rtx5090")) == ("A4000", "H100", "RTX 5090")
 
 
 # --- catalog submitter --------------------------------------------------------------

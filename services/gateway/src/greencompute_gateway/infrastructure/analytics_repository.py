@@ -52,7 +52,11 @@ def _gpu_label(key: str) -> str:
     m = re.fullmatch(r"(rtx|gtx|a|h|l)(\d+)(.*)", key)
     if key == "any":
         return "Any GPU"
-    return f"{m.group(1).upper()} {m.group(2)}{m.group(3).upper()}".strip() if m else key.upper()
+    if not m:
+        return key.upper()
+    # "RTX 4090", but "A4000" / "H100" for single-letter families.
+    gap = " " if len(m.group(1)) > 1 else ""
+    return f"{m.group(1).upper()}{gap}{m.group(2)}{m.group(3).upper()}".strip()
 
 
 def _aware(dt: datetime | None) -> datetime | None:
