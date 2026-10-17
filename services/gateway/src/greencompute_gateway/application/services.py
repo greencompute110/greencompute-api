@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -205,12 +206,44 @@ def model_ingress_zone() -> str:
     return zone.strip().lower().strip(".")
 
 
-def default_ingress_label(name: str, workload_id: str, length: int = 6) -> str:
-    """A model's address label: its name (the part after any "org/") plus the
-    start of its workload id, e.g. "llama-3-8b-instruct-1a2b3c"."""
-    base = (name or "").rsplit("/", 1)[-1].lower()
-    slug = re.sub(r"[^a-z0-9]+", "-", base).strip("-")[:30].strip("-") or "model"
-    return f"{slug}-{workload_id.replace('-', '')[:length]}"
+# Words left out of an address because they add length, not meaning.
+_LABEL_DROP_PREFIX = ("meta",)
+_LABEL_DROP_ANYWHERE = ("instruct",)
+_LABEL_DROP_SUFFIX = ("chat", "it", "hf")
+_LABEL_SLUG_MAX = 24
+# The protocol's placeholder model id, i.e. "no model given".
+_PLACEHOLDER_MODEL_ID = "sshleifer/tiny-gpt2"
+
+
+def default_ingress_label(
+    name: str, workload_id: str, length: int = 6, model_identifier: str | None = None,
+) -> str:
+    """A model's address label: a short form of the model's name plus a short
+    id, e.g. "llama-3-1-8b-7fb157" for meta-llama/Meta-Llama-3.1-8B-Instruct.
+    The id is the workload id's start, or a hash of ids that aren't hex
+    (catalog workloads are "catalog-<model>")."""
+    words: list[str] = []
+    for source in (model_identifier, name):
+        if not source or source == _PLACEHOLDER_MODEL_ID or "://" in source:
+            continue
+        words = [w for w in re.split(r"[^a-z0-9]+", source.rsplit("/", 1)[-1].lower()) if w]
+        if words:
+            break
+    if len(words) > 1 and words[0] in _LABEL_DROP_PREFIX:
+        words = words[1:]
+    words = [w for w in words if w not in _LABEL_DROP_ANYWHERE] or words
+    while len(words) > 1 and words[-1] in _LABEL_DROP_SUFFIX:
+        words = words[:-1]
+    slug = ""
+    for word in words:
+        longer = f"{slug}-{word}" if slug else word
+        if len(longer) > _LABEL_SLUG_MAX:
+            break
+        slug = longer
+    slug = slug or (words[0][:_LABEL_SLUG_MAX] if words else "model")
+    hexed = workload_id.replace("-", "")
+    short = hexed[:length] if re.fullmatch(r"[0-9a-f]+", hexed) else hashlib.sha1(workload_id.encode()).hexdigest()[:length]
+    return f"{slug}-{short}"
 
 
 def model_url(ingress_host: str | None) -> str | None:
@@ -1566,7 +1599,11 @@ class GatewayService:
         called without naming it and without exposing the box serving it."""
         zone = model_ingress_zone()
         for length in (6, 9):  # label stays within 40 characters
-            host = f"{default_ingress_label(workload.name, workload.workload_id, length)}.{zone}"
+            label = default_ingress_label(
+                workload.name, workload.workload_id, length,
+                model_identifier=getattr(workload.runtime, "model_identifier", None),
+            )
+            host = f"{label}.{zone}"
             holder = self.control_plane.find_workload_by_ingress_host(host)
             if holder is None or holder.workload_id == workload.workload_id:
                 return host

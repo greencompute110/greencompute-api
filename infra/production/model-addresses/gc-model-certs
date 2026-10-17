@@ -6,6 +6,9 @@
 #
 # Capped per run, and a name that failed waits an hour before retrying, to
 # stay well inside Let's Encrypt's limits.
+#
+# A server block (and certificate) for an address no workload has any more,
+# e.g. after a model's address changed, is removed.
 set -eu
 
 ZONE="inference.green-compute.com"
@@ -23,6 +26,10 @@ hosts=$(docker exec production-postgres-1 psql -U greencompute -d greencompute -
   JOIN deployments d ON d.workload_id = w.workload_id
   WHERE w.ingress_host LIKE '%.${ZONE}' AND d.state NOT IN ('terminated', 'failed')")
 
+# Every address a workload has, deployed or not; a block outside it is stale.
+known=$(docker exec production-postgres-1 psql -U greencompute -d greencompute -tAc "
+  SELECT ingress_host FROM workloads WHERE ingress_host LIKE '%.${ZONE}'")
+
 write_server() {
   cat > "$HOSTS_DIR/$1.conf" <<CONF
 server {
@@ -39,6 +46,17 @@ CONF
 
 issued=0
 added=""
+removed=""
+if [ -n "$known" ]; then
+  for conf in "$HOSTS_DIR"/*.conf; do
+    [ -f "$conf" ] || continue
+    host=$(basename "$conf" .conf)
+    echo "$known" | grep -qxF "$host" && continue
+    rm -f "$conf"
+    certbot delete --cert-name "$host" --non-interactive --quiet 2>/dev/null || true
+    removed="$removed $host"
+  done
+fi
 for host in $hosts; do
   echo "$host" | grep -Eq "^[a-z0-9-]+\.inference\.green-compute\.com$" || continue
   if [ ! -f "/etc/letsencrypt/live/$host/fullchain.pem" ]; then
@@ -63,10 +81,12 @@ for host in $hosts; do
   fi
 done
 
-if [ -n "$added" ]; then
+[ -n "$removed" ] && logger -t gc-model-certs "no longer in use, removed$removed"
+
+if [ -n "$added" ] || [ -n "$removed" ]; then
   if nginx -t -q 2>/dev/null; then
     systemctl reload nginx
-    logger -t gc-model-certs "serving$added"
+    [ -n "$added" ] && logger -t gc-model-certs "serving$added"
   else
     for host in $added; do rm -f "$HOSTS_DIR/$host.conf"; done
     logger -t gc-model-certs "nginx -t failed; removed new server blocks for$added"
