@@ -41,6 +41,20 @@ class UserORM(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class AdminAccountORM(Base):
+    """Accounts with admin access to the website. Bound to the account (not
+    the email string) when added, so registering later with an admin's email
+    gives nothing. Each gets a managed admin key the website uses for admin
+    pages; removing the row deletes that key."""
+
+    __tablename__ = "admin_accounts"
+
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    email: Mapped[str] = mapped_column(String(255))
+    added_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class APIKeyORM(Base):
     __tablename__ = "api_keys"
 

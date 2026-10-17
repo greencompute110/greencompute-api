@@ -231,6 +231,10 @@ def validate_ingress_host(host: str) -> str:
     return normalized
 
 
+# The managed key behind an admin account's website access (see add_admin).
+WEBSITE_ADMIN_KEY_NAME = "website admin access"
+
+
 class GatewayService:
     def __init__(
         self,
@@ -432,6 +436,50 @@ class GatewayService:
         if deleted is None:
             raise KeyError(f"api key not found: {key_id}")
         return deleted
+
+    # --- website admins (by account) -------------------------------------------
+    # Admins are accounts, added by email. Each gets one managed admin key that
+    # the website server fetches for them (never the account's own keys, so an
+    # admin's agent keys and personal pages stay non-admin). Removing an admin
+    # deletes that key, which ends their access at once.
+
+    def list_admins(self) -> list[dict]:
+        return self.repository.list_admin_accounts()
+
+    def add_admin(self, email: str, *, added_by: str | None) -> dict:
+        address = (email or "").strip().lower()
+        if "@" not in address or len(address) > 255:
+            raise ValueError("email must be an email address")
+        user = self.repository.find_user_by_email(address)
+        if user is None:
+            raise KeyError(f"no account uses {address}; they need to sign up on the website first")
+        self.repository.add_admin_account(user.user_id, user.email or address, added_by)
+        return next(a for a in self.repository.list_admin_accounts() if a["user_id"] == user.user_id)
+
+    def remove_admin(self, ident: str) -> dict:
+        """`ident` is the account's email or user id."""
+        user = self.repository.find_user_by_email(ident) if "@" in ident else self.repository.get_user(ident)
+        user_id = user.user_id if user else ident
+        if not self.repository.remove_admin_account(user_id):
+            raise KeyError(f"{ident} is not an admin")
+        for key in self.repository.list_api_keys(user_id=user_id):
+            if key.admin and key.name == WEBSITE_ADMIN_KEY_NAME:
+                self.repository.delete_api_key(key.key_id)
+        return {"removed": True, "user_id": user_id}
+
+    def website_admin_key(self, user_id: str) -> str | None:
+        """The account's managed admin key, created on first use; None if the
+        account isn't an admin."""
+        if not self.repository.is_admin_account(user_id):
+            return None
+        for key in self.repository.list_api_keys(user_id=user_id):
+            if key.admin and key.name == WEBSITE_ADMIN_KEY_NAME:
+                return key.secret
+        created = self.repository.save_api_key(APIKeyRecord(
+            name=WEBSITE_ADMIN_KEY_NAME, user_id=user_id, admin=True, scopes=[],
+            secret=f"gk_{secrets.token_urlsafe(24)}",
+        ))
+        return created.secret
 
     def start_build(self, request: BuildRequest, owner_user_id: str | None = None) -> BuildRecord:
         return self.builder.start_build(request, owner_user_id=owner_user_id)

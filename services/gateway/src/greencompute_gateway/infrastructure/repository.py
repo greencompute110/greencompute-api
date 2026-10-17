@@ -6,12 +6,13 @@ from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
 from greencompute_persistence.db import needs_bootstrap
 from greencompute_persistence.orm import (
+    AdminAccountORM,
     KeyValueStateORM,
     APIKeyORM,
     BareMetalInquiryORM,
@@ -60,6 +61,48 @@ class GatewayRepository:
         with session_scope(self.session_factory) as session:
             row = session.get(UserORM, user_id)
             return self._to_user(row) if row else None
+
+    def find_user_by_email(self, email: str) -> UserRecord | None:
+        """Case-insensitive, for admin lookups by a typed-in address."""
+        if not email:
+            return None
+        with session_scope(self.session_factory) as session:
+            row = session.scalars(
+                select(UserORM).where(func.lower(UserORM.email) == email.strip().lower()).limit(1)
+            ).first()
+            return self._to_user(row) if row else None
+
+    def list_admin_accounts(self) -> list[dict]:
+        with session_scope(self.session_factory) as session:
+            rows = session.execute(
+                select(AdminAccountORM, UserORM.username)
+                .outerjoin(UserORM, UserORM.user_id == AdminAccountORM.user_id)
+                .order_by(AdminAccountORM.added_at)
+            ).all()
+            return [
+                {"user_id": a.user_id, "email": a.email, "username": username, "added_by": a.added_by,
+                 "added_at": a.added_at.isoformat() if a.added_at else None}
+                for a, username in rows
+            ]
+
+    def is_admin_account(self, user_id: str | None) -> bool:
+        if not user_id:
+            return False
+        with session_scope(self.session_factory) as session:
+            return session.get(AdminAccountORM, user_id) is not None
+
+    def add_admin_account(self, user_id: str, email: str, added_by: str | None) -> None:
+        with session_scope(self.session_factory) as session:
+            if session.get(AdminAccountORM, user_id) is None:
+                session.add(AdminAccountORM(user_id=user_id, email=email, added_by=added_by, added_at=datetime.now(UTC)))
+
+    def remove_admin_account(self, user_id: str) -> bool:
+        with session_scope(self.session_factory) as session:
+            row = session.get(AdminAccountORM, user_id)
+            if row is None:
+                return False
+            session.delete(row)
+            return True
 
     def get_user_by_email(self, email: str) -> UserRecord | None:
         if not email:

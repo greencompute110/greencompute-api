@@ -29,7 +29,7 @@ from greencompute_protocol import (
     WorkloadShareCreateRequest,
     WorkloadUpdateRequest,
 )
-from greencompute_gateway.application.services import model_url, service
+from greencompute_gateway.application.services import WEBSITE_ADMIN_KEY_NAME, model_url, service
 from greencompute_gateway.domain.routing import NoReadyDeploymentError
 from greencompute_gateway.infrastructure.inference_client import (
     InferenceBadResponseError,
@@ -162,6 +162,9 @@ def list_api_keys(
 ) -> list[dict]:
     api_key = require_api_key(authorization, x_api_key)
     keys = service.list_api_keys(user_id=api_key.user_id, admin=api_key.admin)
+    if not api_key.admin:
+        # An admin's managed website key isn't one of "their" keys to manage.
+        keys = [k for k in keys if not (k.admin and k.name == WEBSITE_ADMIN_KEY_NAME)]
     return [
         APIKeySummary(
             key_id=k.key_id,
@@ -228,6 +231,62 @@ def delete_api_key(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.get("/platform/admin/admins", include_in_schema=False)
+def list_admins(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    """Admin — accounts with admin access to the website."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    return service.list_admins()
+
+
+@router.post("/platform/admin/admins", include_in_schema=False)
+def add_admin(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — give an existing account admin access: {"email": "..."}."""
+    api_key = require_api_key(authorization, x_api_key, admin_required=True)
+    try:
+        return service.add_admin(str(payload.get("email") or ""), added_by=api_key.key_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
+
+
+@router.delete("/platform/admin/admins/{ident}", include_in_schema=False)
+def remove_admin(
+    ident: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — remove admin access (by email or user id); deletes their
+    website admin key, so it takes effect immediately."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    try:
+        return service.remove_admin(ident)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
+
+
+@router.post("/platform/admin/website-key", include_in_schema=False)
+def website_admin_key(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """For the website server (provision secret): the admin key of a signed-in
+    account if it is an admin, else {"admin": false}. Never callable with a
+    user's own key, so an admin's other keys can't be turned into admin ones."""
+    require_provision_or_admin(authorization, x_api_key)
+    user_id = str(payload.get("user_id") or "")
+    key = service.website_admin_key(user_id) if user_id else None
+    return {"admin": key is not None, "key": key}
 
 
 @router.post("/platform/register", include_in_schema=False)
