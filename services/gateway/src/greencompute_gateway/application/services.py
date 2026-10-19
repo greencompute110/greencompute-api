@@ -13,6 +13,8 @@ from time import perf_counter
 from uuid import uuid4
 from urllib.parse import urlsplit
 
+from pydantic import Field
+
 log = logging.getLogger(__name__)
 
 from greencompute_builder.application.services import BuilderService, service as default_builder_service
@@ -94,6 +96,21 @@ def _external_model_upstreams() -> dict[str, str]:
         if model_id and url:
             out[model_id] = url
     return out
+
+
+class GatewayDeploymentCreateRequest(DeploymentCreateRequest):
+    """POST /platform/deployments. Keeping a pod when credit runs out costs
+    money every day, so it happens only when the caller asks for it; the
+    protocol's own default (true) is left for internal callers."""
+
+    save_on_exhaustion: bool = Field(
+        default=False,
+        description=(
+            "Keep the pod and its disk if your balance runs out, at $1 per day for up to 30 days, "
+            "so you can top up and resume. When false (the default) the pod and its disk are "
+            "deleted 15 minutes after it stops."
+        ),
+    )
 
 
 class UnsupportedGPUError(ValueError):
@@ -266,6 +283,14 @@ def validate_ingress_host(host: str) -> str:
 
 # The managed key behind an admin account's website access (see add_admin).
 WEBSITE_ADMIN_KEY_NAME = "website admin access"
+
+
+def _owned_by(owner_user_id: str | None, user_id: str | None) -> bool:
+    """True when `user_id` owns a workload or deployment. Platform rows (the
+    shared catalog workloads and their replicas) have no owner, and a key that
+    isn't bound to a user must not count as owning them because both are None:
+    that let such a key list, stop and delete the catalog's replicas."""
+    return user_id is not None and owner_user_id == user_id
 
 
 class GatewayService:
@@ -634,7 +659,7 @@ class GatewayService:
         workload = self.control_plane.repository.get_workload(workload_id)
         if workload is None:
             raise KeyError(f"workload not found: {workload_id}")
-        if not admin and workload.owner_user_id != actor_user_id:
+        if not admin and not _owned_by(workload.owner_user_id, actor_user_id):
             raise PermissionError(f"workload update denied: {workload_id}")
         if request.display_name is not None:
             workload.display_name = request.display_name
@@ -658,8 +683,14 @@ class GatewayService:
             workload.lifecycle = request.lifecycle
         return self.control_plane.upsert_workload(workload)
 
-    def list_workloads(self, user_id: str | None = None, *, admin: bool = False) -> list[WorkloadSpec]:
+    def list_workloads(
+        self, user_id: str | None = None, *, admin: bool = False, mine: bool = False
+    ) -> list[WorkloadSpec]:
         workloads = self.control_plane.list_workloads()
+        if mine:
+            # Only the caller's own: not public catalog models, not other
+            # customers' public or shared ones (admin keys included).
+            return [w for w in workloads if _owned_by(w.owner_user_id, user_id)]
         if admin:
             return workloads
         shared_ids = set()
@@ -679,12 +710,18 @@ class GatewayService:
         admin: bool = False,
         created_by_key_id: str | None = None,
     ) -> DeploymentRecord:
-        payload = request if isinstance(request, DeploymentCreateRequest) else DeploymentCreateRequest(**request)
+        payload = request if isinstance(request, DeploymentCreateRequest) else GatewayDeploymentCreateRequest(**request)
         workload = self.control_plane.repository.get_workload(payload.workload_id)
         if workload is None:
             raise KeyError(f"workload not found: {payload.workload_id}")
         if not admin and not self._user_can_access_workload(workload, user_id):
             raise PermissionError(f"workload access denied: {payload.workload_id}")
+        if not admin and (workload.metadata or {}).get("managed_by") == "flux":
+            # A shared catalog model: the platform runs its replicas. Customers
+            # call it by name, or deploy their own copy from its HF id.
+            raise PermissionError(
+                f"{workload.name} is a shared model: call it by name, or create your own workload to deploy a private copy"
+            )
 
         # Fail fast on a GPU we don't have. Without this the deployment is
         # accepted and then never schedules, which an agent can only discover by
@@ -796,7 +833,7 @@ class GatewayService:
         old = self.control_plane.repository.get_deployment(deployment_id)
         if old is None:
             raise KeyError(f"deployment not found: {deployment_id}")
-        if not admin and old.owner_user_id != user_id:
+        if not admin and not _owned_by(old.owner_user_id, user_id):
             raise PermissionError(f"deployment access denied: {deployment_id}")
         if old.state != DeploymentState.SUSPENDED:
             raise ValueError(
@@ -834,14 +871,14 @@ class GatewayService:
         return [
             deployment
             for deployment in deployments
-            if deployment.owner_user_id == user_id or (deployment.owner_user_id is None and user_id is None)
+            if _owned_by(deployment.owner_user_id, user_id)
         ]
 
     def get_deployment(self, deployment_id: str, user_id: str | None = None, *, admin: bool = False) -> DeploymentRecord | None:
         deployment = self.control_plane.repository.get_deployment(deployment_id)
         if deployment is None:
             return None
-        if admin or deployment.owner_user_id == user_id or (deployment.owner_user_id is None and user_id is None):
+        if admin or _owned_by(deployment.owner_user_id, user_id):
             return deployment
         return None
 
@@ -856,7 +893,7 @@ class GatewayService:
         deployment = self.control_plane.repository.get_deployment(deployment_id)
         if deployment is None:
             raise KeyError(f"deployment not found: {deployment_id}")
-        if not admin and deployment.owner_user_id != actor_user_id:
+        if not admin and not _owned_by(deployment.owner_user_id, actor_user_id):
             raise PermissionError(f"deployment update denied: {deployment_id}")
         return self.control_plane.update_deployment(deployment_id, request)
 
@@ -870,7 +907,7 @@ class GatewayService:
         deployment = self.control_plane.repository.get_deployment(deployment_id)
         if deployment is None:
             raise KeyError(f"deployment not found: {deployment_id}")
-        if not admin and deployment.owner_user_id != actor_user_id:
+        if not admin and not _owned_by(deployment.owner_user_id, actor_user_id):
             raise PermissionError(f"deployment terminate denied: {deployment_id}")
         return self.control_plane.cleanup_deployment(deployment_id, reason="user terminated")
 
@@ -1199,7 +1236,7 @@ class GatewayService:
         workload = self.control_plane.repository.get_workload(workload_id)
         if workload is None:
             raise KeyError(f"workload not found: {workload_id}")
-        if not admin and workload.owner_user_id != actor_user_id:
+        if not admin and not _owned_by(workload.owner_user_id, actor_user_id):
             raise PermissionError(f"workload share denied: {workload_id}")
         if self.repository.get_user(request.shared_with_user_id) is None:
             raise KeyError(f"user not found: {request.shared_with_user_id}")
@@ -1221,7 +1258,7 @@ class GatewayService:
         workload = self.control_plane.repository.get_workload(workload_id)
         if workload is None:
             raise KeyError(f"workload not found: {workload_id}")
-        if not admin and workload.owner_user_id != actor_user_id:
+        if not admin and not _owned_by(workload.owner_user_id, actor_user_id):
             raise PermissionError(f"workload share denied: {workload_id}")
         return self.repository.list_workload_shares(workload_id)
 
@@ -1235,7 +1272,7 @@ class GatewayService:
         workload = self.control_plane.repository.get_workload(workload_id)
         if workload is None:
             raise KeyError(f"workload not found: {workload_id}")
-        if not admin and workload.owner_user_id != actor_user_id:
+        if not admin and not _owned_by(workload.owner_user_id, actor_user_id):
             raise PermissionError(f"workload delete denied: {workload_id}")
         deleted = self.control_plane.repository.delete_workload(workload_id)
         if deleted is None:
@@ -2163,9 +2200,7 @@ class GatewayService:
     def _user_can_access_workload(self, workload: WorkloadSpec, user_id: str | None) -> bool:
         if workload.public:
             return True
-        if workload.owner_user_id is None and user_id is None:
-            return True
-        if user_id is not None and workload.owner_user_id == user_id:
+        if _owned_by(workload.owner_user_id, user_id):
             return True
         if user_id is None:
             return False

@@ -7,19 +7,44 @@ describing every response as "any object". Agents generating clients from
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field, create_model
 
 from greencompute_protocol import CryptoInvoice, DeploymentRecord, LedgerEntry, WorkloadSpec
+
+# Added to each row of GET /platform/deployments: what the deployment runs.
+_LIST_FIELDS = {
+    "workload_kind": (str | None, Field(
+        default=None, description="List only: `pod`/`vm` for a rental, `inference` for a model.",
+    )),
+    "workload_name": (str | None, Field(
+        default=None, description="List only: the model's or workload's display name.",
+    )),
+    "gpu_model": (str | None, Field(
+        default=None, description="List only: the GPU the workload asked for, e.g. `rtx-4090`.",
+    )),
+    "gpu_count": (int | None, Field(default=None, description="List only: GPUs per instance.")),
+}
 
 # A deployment as the API returns it: the stored record without its secrets.
 Deployment = create_model(
     "Deployment",
     __doc__="A running (or stopped) instance of a workload.",
+    **_LIST_FIELDS,
     **{
         name: (field.annotation, field)
         for name, field in DeploymentRecord.model_fields.items()
         if name != "ssh_private_key"
     },
+    storage_cents_per_day=(
+        int,
+        Field(default=0, description="While a saved rental is suspended: what it costs per day to keep, in cents. 0 otherwise."),
+    ),
+    deletes_at=(
+        datetime | None,
+        Field(default=None, description="While a rental is suspended: when it and its disk will be deleted unless resumed."),
+    ),
 )
 
 Workload = WorkloadSpec

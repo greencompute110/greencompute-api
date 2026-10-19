@@ -212,6 +212,17 @@ def _provision_secret() -> str:
     return (os.environ.get("GREENCOMPUTE_PROVISION_SECRET") or "").strip()
 
 
+def is_provision_secret(authorization: str | None, x_api_key: str | None) -> bool:
+    """True when the caller presented GREENCOMPUTE_PROVISION_SECRET (the
+    website server). Not presenting it is not an auth failure, so unlike
+    require_provision_or_admin this never counts toward the per-IP throttle:
+    the website's server-side calls with a user's own key share a few egress
+    IPs."""
+    secret = extract_api_key_secret(authorization, x_api_key)
+    provision = _provision_secret()
+    return bool(secret and provision and _ct_eq(secret, provision))
+
+
 def require_provision_or_admin(
     authorization: str | None,
     x_api_key: str | None,

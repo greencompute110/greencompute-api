@@ -29,7 +29,13 @@ from greencompute_protocol import (
     WorkloadShareCreateRequest,
     WorkloadUpdateRequest,
 )
-from greencompute_gateway.application.services import WEBSITE_ADMIN_KEY_NAME, model_url, service
+from greencompute_gateway.application import account_deletion
+from greencompute_gateway.application.services import (
+    WEBSITE_ADMIN_KEY_NAME,
+    GatewayDeploymentCreateRequest,
+    model_url,
+    service,
+)
 from greencompute_gateway.domain.routing import NoReadyDeploymentError
 from greencompute_gateway.infrastructure.inference_client import (
     InferenceBadResponseError,
@@ -42,6 +48,7 @@ from greencompute_gateway.transport.schemas import ok
 from greencompute_gateway.transport.security import (
     current_client_ip,
     enforce_rate_limit,
+    is_provision_secret,
     metrics,
     require_api_key,
     require_provision_or_admin,
@@ -359,6 +366,77 @@ def update_user(
         return service.update_user_profile(user_id, payload).model_dump(mode="json")
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# --- Deleting your own account (website Settings → Danger zone) -------------
+# Hidden from the spec: it is a website flow, and an agent working through
+# the API should never find "delete the account" among its options.
+
+
+def _account_to_delete(authorization: str | None, x_api_key: str | None, user_id: str | None) -> str:
+    """Whose account a deletion request is about. The website server names
+    the signed-in account with the provision secret (it falls back to that
+    when the account's website key was revoked); anyone else must use a key
+    of the account itself, and not an admin key."""
+    if is_provision_secret(authorization, x_api_key):
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        return user_id
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.admin or not api_key.user_id:
+        raise HTTPException(status_code=403, detail="use a key of the account being deleted")
+    return api_key.user_id
+
+
+@router.get("/platform/account/deletion", include_in_schema=False)
+def account_deletion_preview(
+    user_id: str | None = Query(default=None),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """What deleting the account would do now: the credit that would be lost
+    and anything still active that has to be stopped first."""
+    target = _account_to_delete(authorization, x_api_key, user_id)
+    preview = account_deletion.deletion_preview(service.repository.session_factory, target)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    return preview
+
+
+@router.post("/platform/account/delete", include_in_schema=False)
+def delete_account(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Delete the account: {"confirm": "DELETE"}. Refused (409) while a rental
+    or deployment is pending, running or saved. Revokes every API key, removes
+    verified wallets and secrets, erases the profile and forfeits remaining
+    credit; ledger and payment records stay, under the anonymised user id.
+    See application/account_deletion.py for the full list."""
+    target = _account_to_delete(authorization, x_api_key, str(payload.get("user_id") or "") or None)
+    if str(payload.get("confirm") or "") != account_deletion.CONFIRM_WORD:
+        raise HTTPException(status_code=400, detail='send {"confirm": "DELETE"} to delete the account')
+    try:
+        result = account_deletion.delete_account(service.repository.session_factory, target)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="account not found") from exc
+    except account_deletion.AccountHasActiveDeployments as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "stop or delete your running GPUs and deployments before deleting your account",
+                "code": "active_deployments",
+                "deployments": exc.deployments,
+            },
+        ) from exc
+    if not result.get("already_deleted"):
+        metrics.increment("account.deleted")
+        log.info(
+            "account deleted user_id=%s keys=%s wallets=%s credit_forfeited_cents=%s",
+            target, result["api_keys_revoked"], result["wallets_removed"], result["credit_forfeited_cents"],
+        )
+    return result
 
 
 @router.post("/platform/images")
@@ -816,13 +894,17 @@ def _redact_workload(d: dict) -> dict:
 
 @router.get("/platform/workloads", response_model=None, responses=ok(list[schemas.Workload]))
 def list_workloads(
+    mine: bool = Query(
+        default=False,
+        description="Only workloads you own, without the shared catalog models or ones others made public",
+    ),
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
     api_key = require_api_key(authorization, x_api_key)
     return [
         _redact_workload(workload.model_dump(mode="json"))
-        for workload in service.list_workloads(user_id=api_key.user_id, admin=api_key.admin)
+        for workload in service.list_workloads(user_id=api_key.user_id, admin=api_key.admin, mine=mine)
     ]
 
 
@@ -969,30 +1051,44 @@ DEPLOYMENT_SECRET_FIELDS = {"ssh_private_key"}
 LIST_ERROR_CHARS = 500
 
 
-def _deployment_out(deployment, admin: bool, workload_hosts: dict | None = None, *, brief: bool = False) -> dict:
+def _deployment_out(deployment, admin: bool, workloads: dict | None = None, *, brief: bool = False) -> dict:
     """A deployment as the API returns it: no secrets and, for anyone but an
     admin, a model's endpoint is the model's own address rather than the box
     serving it (that one is firewalled and names the machine). Rentals keep
-    their ssh:// endpoint. `workload_hosts` caches lookups across a list.
+    their ssh:// endpoint. `workloads` caches lookups across a list.
+
+    A suspended rental also says what it costs per day while it waits and when
+    it will be deleted, so nobody has to work out the retention rules.
 
     `brief` (lists) caps last_error: a model that dies on start stores its
     whole container log, and thousands of deployments made the admin list
     ~20 MB. GET /platform/deployments/{id} still has the full text."""
+    cache = workloads if workloads is not None else {}
+
+    def workload():
+        if deployment.workload_id not in cache:
+            cache[deployment.workload_id] = service.control_plane.repository.get_workload(deployment.workload_id)
+        return cache[deployment.workload_id]
+
     out = deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
     if brief and out.get("last_error") and len(out["last_error"]) > LIST_ERROR_CHARS:
         out["last_error"] = out["last_error"][:LIST_ERROR_CHARS] + " …"
+    storage_cents, deletes_at = (
+        service.control_plane.suspension_terms(deployment, workload())
+        if out.get("state") == DeploymentState.SUSPENDED.value
+        else (0, None)
+    )
+    out["storage_cents_per_day"] = storage_cents
+    out["deletes_at"] = deletes_at.isoformat() if deletes_at else None
     if admin or not str(out.get("endpoint") or "").startswith(("http://", "https://")):
         return out
-    cache = workload_hosts if workload_hosts is not None else {}
-    if deployment.workload_id not in cache:
-        workload = service.control_plane.repository.get_workload(deployment.workload_id)
-        cache[deployment.workload_id] = workload.ingress_host if workload else None
-    out["endpoint"] = model_url(cache[deployment.workload_id])
+    host = workload().ingress_host if workload() else None
+    out["endpoint"] = model_url(host)
     return out
 
 @router.post("/platform/deployments", response_model=None, responses=ok(schemas.Deployment, "The new deployment"))
 def create_deployment(
-    payload: DeploymentCreateRequest,
+    payload: GatewayDeploymentCreateRequest,
     response: Response,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -1066,15 +1162,19 @@ def _attach_owner_info(rows: list[dict], users_by_id: dict) -> list[dict]:
 
 
 def _attach_workload_info(rows: list[dict], workloads_by_id: dict) -> list[dict]:
-    """Enrich admin deployment rows with the workload's kind + display name so
-    the 'who is renting what' admin view can tell rentals (pod/vm) from model
-    deployments (inference) at a glance, and show a friendly name instead of
-    the workload UUID. Admin-only by caller."""
+    """Enrich deployment rows with what each one runs: the workload's kind
+    (pod/vm = a rental, inference = a model), its display name, and the GPU it
+    asked for. Lists can then say "RTX 4090 x 1" or the model's name instead
+    of a workload UUID. The admin list passes every workload; a user's list
+    passes only the workloads behind their own deployments."""
     for row in rows:
         wl = workloads_by_id.get(row.get("workload_id"))
         if wl is not None:
             row["workload_kind"] = getattr(wl.kind, "value", str(wl.kind))
             row["workload_name"] = wl.display_name or wl.name
+            gpus = wl.requirements.supported_gpu_models
+            row["gpu_model"] = gpus[0] if gpus else None
+            row["gpu_count"] = wl.requirements.gpu_count
     return rows
 
 
@@ -1095,9 +1195,9 @@ def list_deployments(
             status_code=400,
             detail=f"unknown state {sorted(wanted - known)}; use any of {sorted(known)}",
         )
-    hosts: dict = {}
+    workloads: dict = {}
     rows = [
-        _deployment_out(deployment, api_key.admin, hosts, brief=True)
+        _deployment_out(deployment, api_key.admin, workloads, brief=True)
         for deployment in service.list_deployments(user_id=api_key.user_id, admin=api_key.admin)
         if not wanted or deployment.state.value in wanted
     ]
@@ -1107,7 +1207,12 @@ def list_deployments(
         users_by_id = {u.user_id: u for u in service.list_users()}
         _attach_owner_info(rows, users_by_id)
         workloads_by_id = {w.workload_id: w for w in service.list_workloads(admin=True)}
-        _attach_workload_info(rows, workloads_by_id)
+    else:
+        # Only the workloads behind the caller's own deployments, in one query.
+        workloads_by_id = service.control_plane.repository.get_workloads(
+            {row["workload_id"] for row in rows}
+        )
+    _attach_workload_info(rows, workloads_by_id)
     return rows
 
 
