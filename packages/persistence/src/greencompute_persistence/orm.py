@@ -167,6 +167,12 @@ class DeploymentORM(Base):
     created_by_key_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     hourly_rate_cents: Mapped[int] = mapped_column(Integer, default=10)
     metering_remainder_mcents: Mapped[int] = mapped_column(Integer, default=0)
+    # The hourly meter never charges for time before this: stamped each time
+    # the deployment becomes READY, or by the first metering pass that finds a
+    # READY private model without one (one already running when private models
+    # started being billed by the hour), so it is charged from then, not from
+    # ready_at. NULL on rentals that were running before it existed.
+    billable_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Credit-exhaustion lifecycle (opt-in "save my pod").
     # save_on_exhaustion: preserve this pod (storage-billed) when credits run
     #   out instead of deleting it shortly after. Defaults TRUE (opt-OUT) so a

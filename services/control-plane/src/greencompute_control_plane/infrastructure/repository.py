@@ -673,6 +673,22 @@ class ControlPlaneRepository:
             session.add(row)
             return row.metering_remainder_mcents
 
+    def get_billable_since(self, deployment_id: str) -> datetime | None:
+        """The time the hourly meter may charge from (see DeploymentORM.billable_since)."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(DeploymentORM, deployment_id)
+            if row is None or row.billable_since is None:
+                return None
+            since = row.billable_since
+            return since if since.tzinfo else since.replace(tzinfo=UTC)
+
+    def set_billable_since(self, deployment_id: str, at: datetime) -> None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(DeploymentORM, deployment_id)
+            if row is not None:
+                row.billable_since = at
+                session.add(row)
+
     def save_assignment(self, assignment: LeaseAssignment) -> LeaseAssignment:
         with session_scope(self.session_factory) as session:
             row = session.scalar(

@@ -24,7 +24,7 @@ Full architecture + setup docs: [../README.md](../README.md).
 ## what each service owns
 
 ### gateway
-- **OpenAI-compat routing**: `/v1/chat/completions` resolves the requested model (catalog slug or private workload), picks a healthy miner deployment via round-robin with latency-EMA sorting, streams or buffers the response, debits per-token cost.
+- **OpenAI-compat routing**: `/v1/chat/completions` resolves the requested model (catalog slug or private workload), picks a healthy miner deployment via round-robin with latency-EMA sorting, streams or buffers the response, debits per-token cost for catalog models (private models are paid for by the hour by their owner, so their requests are free).
 - **Catalog vs private**: the same endpoint serves both tiers. Catalog models are slug-resolved via `workload.name`; private endpoints resolve via `workload_id` UUIDs.
 - **Billing**: pre-flight balance gate; on success, debits user + accrues miner reporting row + records demand-stats tick.
 - **Streaming fix**: injects `stream_options.include_usage=true` so vLLM emits a final usage chunk (otherwise streaming calls would be un-billable).
@@ -34,7 +34,7 @@ Full architecture + setup docs: [../README.md](../README.md).
 - Miner registration (`POST /miner/v1/register`), heartbeats (`/miner/v1/heartbeat`), capacity reports (`/miner/v1/capacity`).
 - Scheduler + placement policy: finds eligible miner nodes respecting health, staleness, cooldown, VRAM, GPU count.
 - Lease assignment → `LeaseAssignmentORM`; miners poll `GET /miner/v1/leases/{hotkey}` to pick up.
-- Hourly pod-rental metering with millicent fractional accumulator.
+- Hourly metering of pod rentals and private models (inference deployments with an owner, not catalog) with millicent fractional accumulator; never for time before `deployments.billable_since`.
 - Idle-kill on private-endpoint inference workloads (`managed_by != flux`) after 30 min of zero invocations.
 
 ### validator
