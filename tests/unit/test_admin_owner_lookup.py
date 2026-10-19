@@ -93,3 +93,11 @@ def test_get_workloads_fetches_several_by_id():
     repo.upsert_workload(WorkloadSpec(name="b", image="img"))
     assert set(repo.get_workloads({a.workload_id, "missing", ""})) == {a.workload_id}
     assert repo.get_workloads(set()) == {}
+
+
+def test_deployment_schema_documents_the_list_fields():
+    from greencompute_gateway.transport import schemas
+
+    fields = schemas.Deployment.model_fields
+    assert {"workload_kind", "workload_name", "gpu_model", "gpu_count"} <= set(fields)
+    assert "deployment_id" in fields and "ssh_private_key" not in fields
