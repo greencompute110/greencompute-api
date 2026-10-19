@@ -816,13 +816,17 @@ def _redact_workload(d: dict) -> dict:
 
 @router.get("/platform/workloads", response_model=None, responses=ok(list[schemas.Workload]))
 def list_workloads(
+    mine: bool = Query(
+        default=False,
+        description="Only workloads you own, without the shared catalog models or ones others made public",
+    ),
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
     api_key = require_api_key(authorization, x_api_key)
     return [
         _redact_workload(workload.model_dump(mode="json"))
-        for workload in service.list_workloads(user_id=api_key.user_id, admin=api_key.admin)
+        for workload in service.list_workloads(user_id=api_key.user_id, admin=api_key.admin, mine=mine)
     ]
 
 
