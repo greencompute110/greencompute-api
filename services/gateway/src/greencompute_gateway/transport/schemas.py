@@ -35,8 +35,22 @@ Deployment = create_model(
     **{
         name: (field.annotation, field)
         for name, field in DeploymentRecord.model_fields.items()
-        if name != "ssh_private_key"
+        if name not in ("ssh_private_key", "hourly_rate_cents")
     },
+    hourly_rate_cents=(
+        int,
+        Field(
+            default=10,
+            ge=0,
+            description=(
+                "Cents per GPU per hour, quoted when the deployment is created and locked to the GPU it "
+                "is placed on (never above the quote). Your deployments, GPU rentals and private models "
+                "alike, are charged this × the GPU count, by the minute, while `ready`; requests to a "
+                "private model are not charged per token. (Shared catalog models aren't deployments of "
+                "yours: they are charged per token.)"
+            ),
+        ),
+    ),
     storage_cents_per_day=(
         int,
         Field(default=0, description="While a saved rental is suspended: what it costs per day to keep, in cents. 0 otherwise."),
@@ -96,10 +110,20 @@ class InferencePricing(BaseModel):
     models: list[ModelPrice]
 
 
+class PrivateModelPricing(BaseModel):
+    billing: str
+    idle_pause_minutes: int = Field(
+        description="A private model with no requests for this long is paused, and costs nothing while paused.",
+    )
+
+
 class Pricing(BaseModel):
     currency: str
     gpu_rental: GpuRentalPricing
     inference: InferencePricing
+    private_model: PrivateModelPricing = Field(
+        description="Your own deployed model: the GPU rental rate × its GPU count, by the minute while it runs.",
+    )
     docs: str
 
 
