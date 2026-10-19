@@ -3,8 +3,10 @@ rather than at the end of the month. Every few minutes it checks:
 
   - every account's balance still equals the sum of its ledger (a mismatch
     means something changed a balance without recording it);
-  - every running rental is being charged;
-  - no rental keeps running on an empty balance past the reaper's grace;
+  - every running rental and private model (both billed by the hour) is
+    being charged;
+  - no rental or private model keeps running on an empty balance past the
+    reaper's grace;
   - no charge other than saved-pod storage took a balance below zero
     (storage is billed into debt by design, until the disk is deleted);
   - credits worth a look: manual ones, large ones, and new accounts topping
@@ -28,6 +30,7 @@ import os
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, time, timedelta
 
+from greencompute_control_plane.domain.metering import is_private_model
 from greencompute_persistence import session_scope
 from greencompute_persistence.orm import (
     CryptoDepositORM,
@@ -62,7 +65,11 @@ MAY_GO_NEGATIVE = ("storage", "adjustment", "refund", "chargeback")
 # never counted as spend. account_closed: credit forfeited when its owner
 # deleted the account.
 MANUAL_DEBITS = ("adjustment", "refund", "chargeback", "account_closed")
-SPEND_KINDS_LABEL = {"usage": "GPU rentals", "storage": "saved-pod storage", "inference": "inference"}
+SPEND_KINDS_LABEL = {
+    "usage": "GPU time (rentals and private models)",
+    "storage": "saved-pod storage",
+    "inference": "inference",
+}
 
 PROBLEM = "problem"
 NOTICE = "notice"
@@ -125,20 +132,33 @@ def ledger_drift(session) -> list[Finding]:
     ]
 
 
-def _running_rentals(session):
-    """READY pod/VM deployments (inference is charged per token, not by the hour)."""
-    return session.execute(
-        select(DeploymentORM, WorkloadORM.requirements, UserORM.balance_credits, UserORM.username)
+def _running_rentals(session) -> list[tuple]:
+    """READY deployments billed by the hour, as (deployment, requirements,
+    owner's balance, owner's name, what): pod/VM rentals (what="rental") and
+    private models (what="private model"). Shared catalog models are charged
+    per token, not by the hour."""
+    rows = session.execute(
+        select(
+            DeploymentORM, WorkloadORM.requirements, UserORM.balance_credits, UserORM.username,
+            WorkloadORM.kind, WorkloadORM.metadata_json,
+        )
         .join(WorkloadORM, WorkloadORM.workload_id == DeploymentORM.workload_id)
         .outerjoin(UserORM, UserORM.user_id == DeploymentORM.owner_user_id)
-        .where(DeploymentORM.state == "ready", WorkloadORM.kind != "inference")
+        .where(DeploymentORM.state == "ready")
     ).all()
+    return [
+        (dep, req, balance, name, "rental" if kind != "inference" else "private model")
+        for dep, req, balance, name, kind, meta in rows
+        if kind != "inference" or is_private_model(dep.owner_user_id, kind, dep.workload_id, meta)
+    ]
 
 
 def unbilled_rentals(session, now: datetime) -> list[Finding]:
+    # Charged from billable_since (when it last became ready; a private model
+    # already running when hourly billing for models shipped: from then).
     rentals = [
         r for r in _running_rentals(session)
-        if (_aware(r[0].ready_at or r[0].updated_at) or now) <= now - UNBILLED_AFTER
+        if (_aware(r[0].billable_since or r[0].ready_at or r[0].updated_at) or now) <= now - UNBILLED_AFTER
     ]
     if not rentals:
         return []
@@ -149,11 +169,11 @@ def unbilled_rentals(session, now: datetime) -> list[Finding]:
         .group_by(LedgerEntryORM.reference_id)
     ).all())
     out = []
-    for dep, _req, balance, name in rentals:
+    for dep, _req, balance, name, what in rentals:
         who = name or (dep.owner_user_id or "")[:8]
         if not dep.owner_user_id:
             out.append(Finding("unbilled_rental", f"unbilled:{dep.deployment_id}", PROBLEM,
-                               f"rental {dep.deployment_id[:8]} is running with no owner to charge"))
+                               f"{what} {dep.deployment_id[:8]} is running with no owner to charge"))
             continue
         if (balance or 0) <= 0:
             continue  # nothing to charge; running_on_empty covers it
@@ -161,7 +181,7 @@ def unbilled_rentals(session, now: datetime) -> list[Finding]:
         if last is None or last < now - UNBILLED_AFTER:
             since = "never charged" if last is None else f"last charged {int((now - last).total_seconds() // 60)} min ago"
             out.append(Finding("unbilled_rental", f"unbilled:{dep.deployment_id}", PROBLEM,
-                               f"{who}: rental {dep.deployment_id[:8]} is running but {since}"))
+                               f"{who}: {what} {dep.deployment_id[:8]} is running but {since}"))
     return out
 
 
@@ -186,19 +206,20 @@ def stalled_watchers(session, now: datetime) -> list[Finding]:
     return out
 
 
-def rentals_on_empty(session) -> list[tuple[str, str, int]]:
-    """(deployment_id, owner name, balance) of running rentals whose owner has no balance."""
+def rentals_on_empty(session) -> list[tuple[str, str, int, str]]:
+    """(deployment_id, owner name, balance, what) of running rentals and
+    private models whose owner has no balance."""
     return [
-        (dep.deployment_id, name or (dep.owner_user_id or "")[:8], balance or 0)
-        for dep, _req, balance, name in _running_rentals(session)
+        (dep.deployment_id, name or (dep.owner_user_id or "")[:8], balance or 0, what)
+        for dep, _req, balance, name, what in _running_rentals(session)
         if dep.owner_user_id and (balance or 0) <= 0
     ]
 
 
-def _empty_finding(dep_id: str, name: str, balance: int, minutes: int | None) -> Finding:
+def _empty_finding(dep_id: str, name: str, balance: int, minutes: int | None, what: str = "rental") -> Finding:
     how_long = f" for {minutes} min" if minutes is not None else ""
     return Finding("running_on_empty", f"empty:{dep_id}", PROBLEM,
-                   f"{name}: rental {dep_id[:8]} still running on a {_usd(balance)} balance{how_long}")
+                   f"{name}: {what} {dep_id[:8]} still running on a {_usd(balance)} balance{how_long}")
 
 
 def negative_charges(session, since: datetime) -> list[Finding]:
@@ -322,10 +343,12 @@ def summary(session, start: datetime, end: datetime) -> dict:
         select(func.count()).select_from(UserORM).where(UserORM.created_at >= start, UserORM.created_at < end)
     ) or 0
     running = _running_rentals(session)
-    gpus = sum(int((req or {}).get("gpu_count") or 1) * (dep.requested_instances or 1) for dep, req, _b, _n in running)
+    gpus = sum(
+        int((req or {}).get("gpu_count") or 1) * (dep.requested_instances or 1) for dep, req, _b, _n, _w in running
+    )
     per_hour = sum(
         (dep.hourly_rate_cents or 0) * int((req or {}).get("gpu_count") or 1) * (dep.requested_instances or 1)
-        for dep, req, _b, _n in running
+        for dep, req, _b, _n, _w in running
     )
     positive, debt, debtors = session.execute(
         select(
@@ -340,7 +363,8 @@ def summary(session, start: datetime, end: datetime) -> dict:
         "topups": {k: {"count": v[0], "cents": v[1]} for k, v in topups.items()},
         "spend_cents": spend,
         "new_accounts": new_accounts,
-        "running_rentals": len(running),
+        "running_rentals": sum(1 for *_, what in running if what == "rental"),
+        "running_private_models": sum(1 for *_, what in running if what == "private model"),
         "running_gpus": gpus,
         "running_cents_per_hour": per_hour,
         "customer_balances_cents": int(positive),
@@ -370,6 +394,7 @@ def summary_text(s: dict, day: str) -> str:
         f"Spend: {_usd(sum(spend.values()))}" + (f" ({spend_parts})" if spend_parts else ""),
         f"New accounts: {s['new_accounts']}",
         f"Running now: {s['running_rentals']} rental{'s' if s['running_rentals'] != 1 else ''}, "
+        f"{s['running_private_models']} private model{'s' if s['running_private_models'] != 1 else ''}, "
         f"{s['running_gpus']} GPUs, {_usd(s['running_cents_per_hour'])}/hr",
         f"Customer balances: {_usd(s['customer_balances_cents'])}; storage debt {_usd(s['storage_debt_cents'])} "
         f"across {s['accounts_in_debt']} account{'s' if s['accounts_in_debt'] != 1 else ''}",
@@ -423,14 +448,14 @@ def _empty_with_grace(session, state: _State, now: datetime) -> list[Finding]:
         ).scalars()
     }
     out = []
-    for dep_id, name, balance in current:
+    for dep_id, name, balance, what in current:
         row = seen.pop(dep_id, None)
         if row is None:
             state.put(f"empty:{dep_id}", "", now)
             continue
         first = _aware(row.updated_at)
         if first <= now - EMPTY_GRACE:
-            out.append(_empty_finding(dep_id, name, balance, int((now - first).total_seconds() // 60)))
+            out.append(_empty_finding(dep_id, name, balance, int((now - first).total_seconds() // 60), what))
     for row in seen.values():  # no longer running on empty
         session.delete(row)
     return out
@@ -506,7 +531,7 @@ def snapshot(session_factory, now: datetime | None = None) -> dict:
         findings = (
             ledger_drift(session)
             + unbilled_rentals(session, now)
-            + [_empty_finding(d, n, b, None) for d, n, b in rentals_on_empty(session)]
+            + [_empty_finding(d, n, b, None, w) for d, n, b, w in rentals_on_empty(session)]
             + negative_charges(session, day_ago)
             + notable_credits(session, day_ago, now)
             + spend_spikes(session, now)

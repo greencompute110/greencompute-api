@@ -22,6 +22,7 @@ from greencompute_control_plane.application.services import (
     ControlPlaneService,
     service as default_control_plane_service,
 )
+from greencompute_control_plane.domain import metering
 from greencompute_protocol import (
     WorkloadKind,
     APIKeyCreateRequest,
@@ -134,6 +135,8 @@ class InsufficientBalanceForRentalError(Exception):
     have enough credits to cover ≥ 1 hour of the requested workload at the
     highest possible GPU rate. The route layer catches this and returns a
     402 Payment Required with the details so the UI can prompt a top-up.
+    `private_model` says the deployment is a private model (billed by the
+    hour like a rental) rather than a pod/VM, for the error's wording.
     """
 
     def __init__(
@@ -144,12 +147,14 @@ class InsufficientBalanceForRentalError(Exception):
         rate_cents_per_hour: int,
         gpu_count: int,
         requested_instances: int,
+        private_model: bool = False,
     ) -> None:
         self.required_cents = required_cents
         self.current_cents = current_cents
         self.rate_cents_per_hour = rate_cents_per_hour
         self.gpu_count = gpu_count
         self.requested_instances = requested_instances
+        self.private_model = private_model
         super().__init__(
             f"insufficient balance: need {required_cents}¢, have {current_cents}¢ "
             f"(rate {rate_cents_per_hour}¢/GPU/hr × {gpu_count} GPU × {requested_instances} inst × 1 hr)"
@@ -786,12 +791,17 @@ class GatewayService:
             if current_cents < required_cents:
                 # Raised as ValueError so the route layer can catch and return
                 # 402 with the detail payload — see create_deployment route.
+                # A private model is billed by the hour like a rental, so it
+                # needs the same hour of credit at the rate it will be charged.
                 raise InsufficientBalanceForRentalError(
                     required_cents=required_cents,
                     current_cents=current_cents,
                     rate_cents_per_hour=max_rate_cents_per_hour,
                     gpu_count=gpu_count,
                     requested_instances=1,
+                    private_model=metering.is_private_model(
+                        user_id, workload.kind, workload.workload_id, workload.metadata
+                    ),
                 )
 
         return self.control_plane.create_deployment(
@@ -859,6 +869,7 @@ class GatewayService:
                     rate_cents_per_hour=old.hourly_rate_cents,
                     gpu_count=gpu_count,
                     requested_instances=1,
+                    private_model=self.control_plane.is_private_model(old, workload),
                 )
 
         # In-place restart of the SAME container — preserves the saved work.
@@ -1335,8 +1346,9 @@ class GatewayService:
         )
         # Reserve this request's worst-case cost so concurrent requests from a
         # near-zero balance can't all pass the gate. Released in finally once the
-        # real charge has settled (or the request failed).
-        if user_id and not admin:
+        # real charge has settled (or the request failed). Not for a private
+        # model: its owner pays for it by the hour, so the request costs nothing.
+        if user_id and not admin and not self._is_private_model(candidates[0]):
             self._reserve_inference_budget(user_id, request_id, request)
         try:
             return self._invoke_from_candidates(
@@ -1453,7 +1465,8 @@ class GatewayService:
         )
         # Reserve eagerly (before returning the generator) so an insufficient
         # balance raises HERE and maps to a 402, instead of dying mid-stream.
-        if user_id and not admin:
+        # A private model is paid for by the hour: nothing to reserve.
+        if user_id and not admin and not self._is_private_model(candidates[0]):
             self._reserve_inference_budget(user_id, request_id, request)
         inner = self._stream_from_candidates(
             request,
@@ -1995,6 +2008,38 @@ class GatewayService:
             completion_bound = min(requested_max, completion_bound)
         return completion_bound
 
+    def _is_private_model(self, deployment: DeploymentRecord) -> bool:
+        """A customer's own model, paid for by the hour by its owner (see
+        ControlPlaneService.is_private_model): requests to it are not charged
+        per token, whoever makes them. Shared catalog models and external
+        upstreams (no owner) are."""
+        return bool(deployment.owner_user_id) and self.control_plane.is_private_model(deployment)
+
+    def bills_per_token(
+        self,
+        request: ChatCompletionRequest,
+        routed_host: str | None = None,
+        *,
+        user_id: str | None = None,
+        admin: bool = False,
+    ) -> bool:
+        """Whether this request would be charged per token, i.e. it isn't for a
+        private model. For the chat route's up-front balance check, so someone
+        a private model is shared with can call it on an empty balance. An
+        unknown model counts as per token (the request fails later anyway)."""
+        if _external_model_upstreams().get((request.model or "").strip().lower()):
+            return True
+        try:
+            workload, _routing = self.resolve_workload_reference(
+                request.model, routed_host=routed_host, user_id=user_id, admin=admin
+            )
+        except NoReadyDeploymentError:
+            return True
+        if not admin and not self._user_can_access_workload(workload, user_id):
+            return True  # answered exactly as an unknown model, so it isn't enumerable
+        ready = self.control_plane.repository.list_ready_deployments(workload.workload_id)
+        return not ready or not self._is_private_model(ready[0])
+
     def _reserve_inference_budget(
         self, user_id: str, reference_id: str, request: ChatCompletionRequest
     ) -> None:
@@ -2110,6 +2155,12 @@ class GatewayService:
             BillingRepository,
         )
 
+        if deployment is not None and self._is_private_model(deployment):
+            # The owner pays for a private model by the hour, whoever calls it
+            # (control-plane meter_usage): no per-token charge or accrual. The
+            # request is still recorded (invocation, usage, demand stats).
+            self.metrics.increment("inference.private_model.not_charged")
+            return
         cents = inference_cost_cents(prompt_tokens, completion_tokens, model=model)
         billing = BillingRepository()
         try:
