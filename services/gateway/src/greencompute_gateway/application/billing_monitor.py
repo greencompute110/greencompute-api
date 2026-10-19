@@ -51,6 +51,10 @@ REALERT_AFTER = timedelta(hours=6)  # a problem still there is reported again
 FIRST_RUN_LOOKBACK = timedelta(hours=1)
 CURSOR_OVERLAP = timedelta(minutes=5)  # ledger rows commit slightly out of order
 SENT_RETENTION = timedelta(days=7)
+# Each deposit watcher moves its cursor every tick (about a minute); one that
+# hasn't for this long has stopped crediting payments on that chain.
+WATCHER_STALL = timedelta(minutes=30)
+WATCHER_CHAINS = {"eth": "Ethereum (USDC/USDT)", "base": "Base (USDC/USDT)", "bittensor": "Bittensor (TAO/alpha)"}
 
 # Charges allowed to take a balance below zero: saved-pod storage and admin debits.
 MAY_GO_NEGATIVE = ("storage", "adjustment", "refund", "chargeback")
@@ -158,6 +162,27 @@ def unbilled_rentals(session, now: datetime) -> list[Finding]:
             since = "never charged" if last is None else f"last charged {int((now - last).total_seconds() // 60)} min ago"
             out.append(Finding("unbilled_rental", f"unbilled:{dep.deployment_id}", PROBLEM,
                                f"{who}: rental {dep.deployment_id[:8]} is running but {since}"))
+    return out
+
+
+def stalled_watchers(session, now: datetime) -> list[Finding]:
+    """Deposit watchers whose cursor hasn't moved lately: payments on that
+    chain aren't being seen. (The Base watcher sat stuck for five days after
+    the 2026-10-14 outage with nothing but log lines to show for it.)"""
+    if os.environ.get("GREENCOMPUTE_DEPOSIT_WATCHER_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+        return []
+    out = []
+    for chain, label in WATCHER_CHAINS.items():
+        row = session.get(KeyValueStateORM, f"watcher:{chain}:last_block")
+        moved = _aware(row.updated_at) if row else None
+        if moved is None or moved > now - WATCHER_STALL:
+            continue
+        hours = (now - moved).total_seconds() / 3600
+        out.append(Finding(
+            "stalled_watcher", f"watcher:{chain}:{row.value}", PROBLEM,
+            f"payments on {label} aren't being detected: the deposit watcher has been stuck at block "
+            f"{row.value} for {hours:.1f} h (gateway logs: 'watcher {chain}')",
+        ))
     return out
 
 
@@ -446,6 +471,7 @@ def run_once(session_factory, now: datetime | None = None, send=None) -> dict:
             + negative_charges(session, since)
             + notable_credits(session, since, now)
             + spend_spikes(session, now)
+            + stalled_watchers(session, now)
         )
         new = [f for f in findings if state.due(f, now)]
         state.put("cursor:ledger", now.isoformat(), now)
@@ -484,6 +510,7 @@ def snapshot(session_factory, now: datetime | None = None) -> dict:
             + negative_charges(session, day_ago)
             + notable_credits(session, day_ago, now)
             + spend_spikes(session, now)
+            + stalled_watchers(session, now)
         )
         today = summary(session, datetime.combine(now.date(), time(), tzinfo=UTC), now)
     return {

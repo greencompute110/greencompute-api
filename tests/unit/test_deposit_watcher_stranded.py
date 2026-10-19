@@ -1,0 +1,143 @@
+"""A deposit watcher left behind further than its RPC serves logs for (Base's
+public RPC keeps ~5.5 hours) used to retry the same range forever: the Base
+watcher sat stuck for five days after the 2026-10-14 outage. It now skips the
+range only when the deposit addresses provably received nothing in it, and
+the billing monitor reports a watcher that has stopped moving."""
+import urllib.error
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from greencompute_gateway.application import billing_monitor as mon
+from greencompute_gateway.infrastructure import deposit_watcher as w
+from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+from greencompute_persistence import session_scope
+from greencompute_persistence.orm import KeyValueStateORM
+
+ADDR = "0x" + "ab" * 20
+HEAD = 1_000_000
+
+
+@pytest.fixture
+def repo(tmp_path, monkeypatch):
+    for name in ("BILLING_DEPOSIT_USDC_BASE", "BILLING_DEPOSIT_USDT_BASE"):
+        monkeypatch.setenv(name, ADDR)
+    monkeypatch.delenv("BASE_RPC_URL", raising=False)
+    return BillingRepository(database_url=f"sqlite:///{tmp_path / 'w.sqlite'}", bootstrap=True)
+
+
+class Chain:
+    """A fake RPC: logs are refused for blocks older than `window`; balances
+    and nonces come from `state(block)`."""
+
+    def __init__(self, window=10_000, state=lambda block: (100, 1, 0)):
+        self.window, self.state, self.calls = window, state, []
+
+    def __call__(self, url, method, params, timeout=15.0):
+        self.calls.append((url, method))
+        if method == "eth_blockNumber":
+            return hex(HEAD)
+        if method == "eth_getLogs":
+            if HEAD - int(params[0]["fromBlock"], 16) > self.window:
+                raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+            return []
+        usdc, usdt, nonce = self.state(int(params[1], 16))
+        if method == "eth_getTransactionCount":
+            return hex(nonce)
+        return hex(usdc if params[0]["to"].lower() == w.TOKENS[3].contract else usdt)
+
+
+def cursor(repo, value=None):
+    if value is not None:
+        w._kv_set(repo, "watcher:base:last_block", str(value))
+    return int(w._kv_get(repo, "watcher:base:last_block"))
+
+
+def test_a_stranded_watcher_skips_a_range_where_nothing_arrived(repo, monkeypatch):
+    monkeypatch.setattr(w, "_jsonrpc", Chain())
+    cursor(repo, HEAD - 200_000)
+    w.scan_evm_chain(repo, "base")
+    assert cursor(repo) == HEAD - w.CONFIRMATIONS["base"] - w.RESUME_BLOCKS_BEHIND["base"]
+    w.scan_evm_chain(repo, "base")  # and then scans normally, inside the window
+    assert cursor(repo) == HEAD - w.CONFIRMATIONS["base"] - w.RESUME_BLOCKS_BEHIND["base"] + 1001
+
+
+def test_it_stays_put_when_a_balance_changed_in_the_range(repo, monkeypatch):
+    monkeypatch.setattr(w, "_jsonrpc", Chain(state=lambda block: (100 if block < HEAD - 150_000 else 125, 1, 0)))
+    cursor(repo, HEAD - 200_000)
+    w.scan_evm_chain(repo, "base")
+    assert cursor(repo) == HEAD - 200_000
+
+
+def test_it_stays_put_when_the_address_sent_anything(repo, monkeypatch):
+    monkeypatch.setattr(w, "_jsonrpc", Chain(state=lambda block: (100, 1, 0 if block < HEAD - 150_000 else 1)))
+    cursor(repo, HEAD - 200_000)
+    w.scan_evm_chain(repo, "base")
+    assert cursor(repo) == HEAD - 200_000
+
+
+def test_it_stays_put_when_old_state_cant_be_read(repo, monkeypatch):
+    chain = Chain()
+    def no_state(url, method, params, timeout=15.0):
+        if method in ("eth_call", "eth_getTransactionCount"):
+            raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, None)
+        return chain(url, method, params, timeout)
+    monkeypatch.setattr(w, "_jsonrpc", no_state)
+    cursor(repo, HEAD - 200_000)
+    w.scan_evm_chain(repo, "base")
+    assert cursor(repo) == HEAD - 200_000
+
+
+def test_a_brief_failure_is_retried_not_skipped(repo, monkeypatch):
+    chain = Chain(window=0)  # every getLogs fails, but we're only a little behind
+    monkeypatch.setattr(w, "_jsonrpc", chain)
+    cursor(repo, HEAD - 2_000)
+    w.scan_evm_chain(repo, "base")
+    assert cursor(repo) == HEAD - 2_000
+    assert ("https://mainnet.base.org", "eth_call") not in chain.calls
+
+
+def test_base_catches_up_a_thousand_blocks_a_tick(repo, monkeypatch):
+    monkeypatch.setattr(w, "_jsonrpc", Chain())
+    cursor(repo, HEAD - 8_000)
+    w.scan_evm_chain(repo, "base")
+    assert cursor(repo) == HEAD - 8_000 + 1001
+
+
+def test_old_state_falls_back_to_an_archive_endpoint(repo, monkeypatch):
+    chain = Chain()
+    def publicnode_has_no_history(url, method, params, timeout=15.0):
+        if method in ("eth_call", "eth_getTransactionCount") and "publicnode" in url:
+            raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+        return chain(url, method, params, timeout)
+    monkeypatch.setattr(w, "_jsonrpc", publicnode_has_no_history)
+    cursor(repo, HEAD - 200_000)
+    w.scan_evm_chain(repo, "base")
+    assert cursor(repo) > HEAD - 200_000
+    assert ("https://mainnet.base.org", "eth_getTransactionCount") in chain.calls
+
+
+# --- the billing monitor --------------------------------------------------------
+
+NOW = datetime(2026, 10, 19, 15, 0, tzinfo=UTC)
+
+
+def _cursor_moved(repo, chain, ago):
+    with session_scope(repo.session_factory) as s:
+        s.add(KeyValueStateORM(key=f"watcher:{chain}:last_block", value="52609788", updated_at=NOW - ago))
+
+
+def test_the_monitor_reports_a_watcher_that_stopped(repo, monkeypatch):
+    monkeypatch.delenv("GREENCOMPUTE_DEPOSIT_WATCHER_ENABLED", raising=False)
+    _cursor_moved(repo, "base", timedelta(days=5))
+    _cursor_moved(repo, "eth", timedelta(minutes=2))
+    with session_scope(repo.session_factory) as s:
+        found = mon.stalled_watchers(s, NOW)
+    assert [f.check for f in found] == ["stalled_watcher"]
+    assert "Base" in found[0].text and "120.0 h" in found[0].text
+
+
+def test_no_report_when_the_watcher_is_switched_off(repo, monkeypatch):
+    monkeypatch.setenv("GREENCOMPUTE_DEPOSIT_WATCHER_ENABLED", "false")
+    _cursor_moved(repo, "base", timedelta(days=5))
+    with session_scope(repo.session_factory) as s:
+        assert mon.stalled_watchers(s, NOW) == []
