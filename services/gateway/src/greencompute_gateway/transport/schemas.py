@@ -13,10 +13,25 @@ from pydantic import BaseModel, Field, create_model
 
 from greencompute_protocol import CryptoInvoice, DeploymentRecord, LedgerEntry, WorkloadSpec
 
+# Added to each row of GET /platform/deployments: what the deployment runs.
+_LIST_FIELDS = {
+    "workload_kind": (str | None, Field(
+        default=None, description="List only: `pod`/`vm` for a rental, `inference` for a model.",
+    )),
+    "workload_name": (str | None, Field(
+        default=None, description="List only: the model's or workload's display name.",
+    )),
+    "gpu_model": (str | None, Field(
+        default=None, description="List only: the GPU the workload asked for, e.g. `rtx-4090`.",
+    )),
+    "gpu_count": (int | None, Field(default=None, description="List only: GPUs per instance.")),
+}
+
 # A deployment as the API returns it: the stored record without its secrets.
 Deployment = create_model(
     "Deployment",
     __doc__="A running (or stopped) instance of a workload.",
+    **_LIST_FIELDS,
     **{
         name: (field.annotation, field)
         for name, field in DeploymentRecord.model_fields.items()
