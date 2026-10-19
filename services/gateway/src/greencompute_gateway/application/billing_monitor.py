@@ -54,8 +54,10 @@ SENT_RETENTION = timedelta(days=7)
 
 # Charges allowed to take a balance below zero: saved-pod storage and admin debits.
 MAY_GO_NEGATIVE = ("storage", "adjustment", "refund", "chargeback")
-# Money taken out of an account by hand; always reported.
-MANUAL_DEBITS = ("adjustment", "refund", "chargeback")
+# Money taken out of an account other than by spending; always reported, and
+# never counted as spend. account_closed: credit forfeited when its owner
+# deleted the account.
+MANUAL_DEBITS = ("adjustment", "refund", "chargeback", "account_closed")
 SPEND_KINDS_LABEL = {"usage": "GPU rentals", "storage": "saved-pod storage", "inference": "inference"}
 
 PROBLEM = "problem"

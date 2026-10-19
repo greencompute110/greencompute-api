@@ -29,6 +29,7 @@ from greencompute_protocol import (
     WorkloadShareCreateRequest,
     WorkloadUpdateRequest,
 )
+from greencompute_gateway.application import account_deletion
 from greencompute_gateway.application.services import WEBSITE_ADMIN_KEY_NAME, model_url, service
 from greencompute_gateway.domain.routing import NoReadyDeploymentError
 from greencompute_gateway.infrastructure.inference_client import (
@@ -42,6 +43,7 @@ from greencompute_gateway.transport.schemas import ok
 from greencompute_gateway.transport.security import (
     current_client_ip,
     enforce_rate_limit,
+    is_provision_secret,
     metrics,
     require_api_key,
     require_provision_or_admin,
@@ -359,6 +361,77 @@ def update_user(
         return service.update_user_profile(user_id, payload).model_dump(mode="json")
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# --- Deleting your own account (website Settings → Danger zone) -------------
+# Hidden from the spec: it is a website flow, and an agent working through
+# the API should never find "delete the account" among its options.
+
+
+def _account_to_delete(authorization: str | None, x_api_key: str | None, user_id: str | None) -> str:
+    """Whose account a deletion request is about. The website server names
+    the signed-in account with the provision secret (it falls back to that
+    when the account's website key was revoked); anyone else must use a key
+    of the account itself, and not an admin key."""
+    if is_provision_secret(authorization, x_api_key):
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        return user_id
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.admin or not api_key.user_id:
+        raise HTTPException(status_code=403, detail="use a key of the account being deleted")
+    return api_key.user_id
+
+
+@router.get("/platform/account/deletion", include_in_schema=False)
+def account_deletion_preview(
+    user_id: str | None = Query(default=None),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """What deleting the account would do now: the credit that would be lost
+    and anything still active that has to be stopped first."""
+    target = _account_to_delete(authorization, x_api_key, user_id)
+    preview = account_deletion.deletion_preview(service.repository.session_factory, target)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    return preview
+
+
+@router.post("/platform/account/delete", include_in_schema=False)
+def delete_account(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Delete the account: {"confirm": "DELETE"}. Refused (409) while a rental
+    or deployment is pending, running or saved. Revokes every API key, removes
+    verified wallets and secrets, erases the profile and forfeits remaining
+    credit; ledger and payment records stay, under the anonymised user id.
+    See application/account_deletion.py for the full list."""
+    target = _account_to_delete(authorization, x_api_key, str(payload.get("user_id") or "") or None)
+    if str(payload.get("confirm") or "") != account_deletion.CONFIRM_WORD:
+        raise HTTPException(status_code=400, detail='send {"confirm": "DELETE"} to delete the account')
+    try:
+        result = account_deletion.delete_account(service.repository.session_factory, target)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="account not found") from exc
+    except account_deletion.AccountHasActiveDeployments as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "stop or delete your running GPUs and deployments before deleting your account",
+                "code": "active_deployments",
+                "deployments": exc.deployments,
+            },
+        ) from exc
+    if not result.get("already_deleted"):
+        metrics.increment("account.deleted")
+        log.info(
+            "account deleted user_id=%s keys=%s wallets=%s credit_forfeited_cents=%s",
+            target, result["api_keys_revoked"], result["wallets_removed"], result["credit_forfeited_cents"],
+        )
+    return result
 
 
 @router.post("/platform/images")
