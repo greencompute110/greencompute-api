@@ -969,25 +969,39 @@ DEPLOYMENT_SECRET_FIELDS = {"ssh_private_key"}
 LIST_ERROR_CHARS = 500
 
 
-def _deployment_out(deployment, admin: bool, workload_hosts: dict | None = None, *, brief: bool = False) -> dict:
+def _deployment_out(deployment, admin: bool, workloads: dict | None = None, *, brief: bool = False) -> dict:
     """A deployment as the API returns it: no secrets and, for anyone but an
     admin, a model's endpoint is the model's own address rather than the box
     serving it (that one is firewalled and names the machine). Rentals keep
-    their ssh:// endpoint. `workload_hosts` caches lookups across a list.
+    their ssh:// endpoint. `workloads` caches lookups across a list.
+
+    A suspended rental also says what it costs per day while it waits and when
+    it will be deleted, so nobody has to work out the retention rules.
 
     `brief` (lists) caps last_error: a model that dies on start stores its
     whole container log, and thousands of deployments made the admin list
     ~20 MB. GET /platform/deployments/{id} still has the full text."""
+    cache = workloads if workloads is not None else {}
+
+    def workload():
+        if deployment.workload_id not in cache:
+            cache[deployment.workload_id] = service.control_plane.repository.get_workload(deployment.workload_id)
+        return cache[deployment.workload_id]
+
     out = deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
     if brief and out.get("last_error") and len(out["last_error"]) > LIST_ERROR_CHARS:
         out["last_error"] = out["last_error"][:LIST_ERROR_CHARS] + " …"
+    storage_cents, deletes_at = (
+        service.control_plane.suspension_terms(deployment, workload())
+        if out.get("state") == DeploymentState.SUSPENDED.value
+        else (0, None)
+    )
+    out["storage_cents_per_day"] = storage_cents
+    out["deletes_at"] = deletes_at.isoformat() if deletes_at else None
     if admin or not str(out.get("endpoint") or "").startswith(("http://", "https://")):
         return out
-    cache = workload_hosts if workload_hosts is not None else {}
-    if deployment.workload_id not in cache:
-        workload = service.control_plane.repository.get_workload(deployment.workload_id)
-        cache[deployment.workload_id] = workload.ingress_host if workload else None
-    out["endpoint"] = model_url(cache[deployment.workload_id])
+    host = workload().ingress_host if workload() else None
+    out["endpoint"] = model_url(host)
     return out
 
 @router.post("/platform/deployments", response_model=None, responses=ok(schemas.Deployment, "The new deployment"))
@@ -1095,9 +1109,9 @@ def list_deployments(
             status_code=400,
             detail=f"unknown state {sorted(wanted - known)}; use any of {sorted(known)}",
         )
-    hosts: dict = {}
+    workloads: dict = {}
     rows = [
-        _deployment_out(deployment, api_key.admin, hosts, brief=True)
+        _deployment_out(deployment, api_key.admin, workloads, brief=True)
         for deployment in service.list_deployments(user_id=api_key.user_id, admin=api_key.admin)
         if not wanted or deployment.state.value in wanted
     ]
