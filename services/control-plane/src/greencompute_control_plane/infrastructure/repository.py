@@ -434,6 +434,16 @@ class ControlPlaneRepository:
             row = session.get(WorkloadORM, workload_id)
             return self._to_workload(row) if row else None
 
+    def get_workloads(self, workload_ids: set[str] | list[str]) -> dict[str, WorkloadSpec]:
+        """Several workloads by id in one query; ids not found are left out."""
+        ids = {i for i in workload_ids if i}
+        if not ids:
+            return {}
+        with session_scope(self.session_factory) as session:
+            stmt = select(WorkloadORM).where(WorkloadORM.workload_id.in_(ids))
+            rows = session.scalars(stmt).all()
+            return {row.workload_id: self._to_workload(row) for row in rows}
+
     def find_workload_by_name(self, name: str) -> WorkloadSpec | None:
         with session_scope(self.session_factory) as session:
             row = session.scalar(select(WorkloadORM).where(WorkloadORM.name == name))

@@ -1066,15 +1066,19 @@ def _attach_owner_info(rows: list[dict], users_by_id: dict) -> list[dict]:
 
 
 def _attach_workload_info(rows: list[dict], workloads_by_id: dict) -> list[dict]:
-    """Enrich admin deployment rows with the workload's kind + display name so
-    the 'who is renting what' admin view can tell rentals (pod/vm) from model
-    deployments (inference) at a glance, and show a friendly name instead of
-    the workload UUID. Admin-only by caller."""
+    """Enrich deployment rows with what each one runs: the workload's kind
+    (pod/vm = a rental, inference = a model), its display name, and the GPU it
+    asked for. Lists can then say "RTX 4090 x 1" or the model's name instead
+    of a workload UUID. The admin list passes every workload; a user's list
+    passes only the workloads behind their own deployments."""
     for row in rows:
         wl = workloads_by_id.get(row.get("workload_id"))
         if wl is not None:
             row["workload_kind"] = getattr(wl.kind, "value", str(wl.kind))
             row["workload_name"] = wl.display_name or wl.name
+            gpus = wl.requirements.supported_gpu_models
+            row["gpu_model"] = gpus[0] if gpus else None
+            row["gpu_count"] = wl.requirements.gpu_count
     return rows
 
 
@@ -1107,7 +1111,12 @@ def list_deployments(
         users_by_id = {u.user_id: u for u in service.list_users()}
         _attach_owner_info(rows, users_by_id)
         workloads_by_id = {w.workload_id: w for w in service.list_workloads(admin=True)}
-        _attach_workload_info(rows, workloads_by_id)
+    else:
+        # Only the workloads behind the caller's own deployments, in one query.
+        workloads_by_id = service.control_plane.repository.get_workloads(
+            {row["workload_id"] for row in rows}
+        )
+    _attach_workload_info(rows, workloads_by_id)
     return rows
 
 

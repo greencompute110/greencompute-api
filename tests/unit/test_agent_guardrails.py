@@ -165,6 +165,7 @@ def test_list_deployments_by_state(monkeypatch):
     ]
     monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: SimpleNamespace(user_id="u1", key_id="k1", admin=False))
     monkeypatch.setattr(routes.service, "list_deployments", lambda **kw: rows)
+    monkeypatch.setattr(routes.service.control_plane.repository, "get_workloads", lambda ids: {})
     states = lambda q: sorted(r["state"] for r in routes.list_deployments(state=q, authorization="x", x_api_key=None))
     assert states(None) == ["failed", "ready", "terminated"]
     assert states("terminated") == ["terminated"]

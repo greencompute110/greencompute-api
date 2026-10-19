@@ -20,6 +20,17 @@ Deployment = create_model(
         for name, field in DeploymentRecord.model_fields.items()
         if name != "ssh_private_key"
     },
+    # Added to each row of GET /platform/deployments: what the deployment runs.
+    workload_kind=(str | None, Field(
+        default=None, description="List only: `pod`/`vm` for a rental, `inference` for a model.",
+    )),
+    workload_name=(str | None, Field(
+        default=None, description="List only: the model's or workload's display name.",
+    )),
+    gpu_model=(str | None, Field(
+        default=None, description="List only: the GPU the workload asked for, e.g. `rtx-4090`.",
+    )),
+    gpu_count=(int | None, Field(default=None, description="List only: GPUs per instance.")),
 )
 
 Workload = WorkloadSpec
