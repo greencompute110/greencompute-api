@@ -70,9 +70,26 @@ log = logging.getLogger(__name__)
 
 
 # How many blocks to scan in a single tick, per chain. ETH ≈ 12s/block,
-# so 200 blocks ≈ 40min of catch-up per tick. Base ≈ 2s/block so 200 ≈ 7min.
-# TAO ≈ 12s/block, same as ETH.
+# so 200 blocks ≈ 40min of catch-up per tick. Base ≈ 2s/block, so it gets
+# 1000 (≈33min): at 200 a few hours' outage took longer to catch up than the
+# default RPC keeps logs for. TAO ≈ 12s/block, same as ETH.
 MAX_BLOCKS_PER_TICK = 200
+_MAX_BLOCKS_PER_TICK = {"base": 1000}
+
+# The default public RPCs only serve eth_getLogs for recent blocks
+# (base-rpc.publicnode.com: the last ~10,000, about 5.5 hours; older ranges
+# get HTTP 403). A watcher left further behind than this, e.g. by an outage,
+# can never read its next range again: it was stuck for five days after the
+# 2026-10-14 outage. Past this lag a failed range may be skipped, but only
+# when the deposit addresses provably received nothing in it (see
+# _nothing_received).
+STRANDED_AFTER_BLOCKS = {"eth": 1500, "base": 9000}
+# Where a skip lands: far enough inside the RPC's window to scan normally.
+RESUME_BLOCKS_BEHIND = {"eth": 600, "base": 3000}
+# Endpoints that answer balance/nonce queries at old blocks (archive state),
+# tried after the chain's own RPC. mainnet.base.org refuses our eth_getLogs
+# (429) but serves historical eth_call.
+_ARCHIVE_STATE_URLS = {"base": ["https://mainnet.base.org"]}
 
 # Reorg-safety: only credit transfers buried at least this many blocks deep,
 # so a transfer that later gets reorged out never credits funds we don't
@@ -252,6 +269,40 @@ def _topic_from_addr(addr: str) -> str:
     return "0x" + "0" * 24 + raw
 
 
+def _state_at(urls: list[str], block: int, tokens: list[TokenConfig], addresses: set[str]):
+    """Each watched address's token balances and nonce at `block`, from the
+    first endpoint that answers; None if none does."""
+    tag = hex(block)
+    for url in urls:
+        try:
+            out = {}
+            for addr in sorted(addresses):
+                data = "0x70a08231" + addr.lower().removeprefix("0x").rjust(64, "0")
+                balances = tuple(
+                    _hex_to_int(_jsonrpc(url, "eth_call", [{"to": t.contract, "data": data}, tag]))
+                    for t in tokens
+                )
+                out[addr] = (balances, _hex_to_int(_jsonrpc(url, "eth_getTransactionCount", [addr, tag])))
+            return out
+        except Exception as exc:
+            log.info("watcher: state at block %d from %s failed: %s", block, url, exc)
+    return None
+
+
+def _nothing_received(chain_id: str, rpc_url: str, tokens, addresses, first: int, last: int) -> bool:
+    """True when the deposit addresses provably received no watched token in
+    blocks first..last: every balance and every nonce is the same before
+    `first` and after `last`. A deposit raises a balance; tokens only leave a
+    receive-only address in a transaction it sends (which moves its nonce) or
+    through an allowance it granted earlier, which these addresses never do."""
+    if not addresses:
+        return True
+    urls = [rpc_url, *_ARCHIVE_STATE_URLS.get(chain_id, [])]
+    before = _state_at(urls, first - 1, tokens, addresses)
+    after = _state_at(urls, last, tokens, addresses) if before is not None else None
+    return before is not None and before == after
+
+
 def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
     """Scan one EVM chain for ERC-20 transfers to our deposit addresses, log
     each one and credit whoever it belongs to. Returns deposits credited."""
@@ -289,7 +340,7 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
         from_block = int(last_seen_str)
     else:
         from_block = max(0, safe_head - (7200 if chain_id == "eth" else 43200))
-    to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
+    to_block = min(safe_head, from_block + _MAX_BLOCKS_PER_TICK.get(chain_id, MAX_BLOCKS_PER_TICK))
     if to_block < from_block:
         return 0
 
@@ -375,11 +426,28 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
     # next tick rather than silently skipped.
     if scan_ok:
         _kv_set(repo, state_key, str(to_block + 1))
-    else:
-        log.warning(
-            "watcher %s: error(s) this tick — NOT advancing cursor past "
-            "blocks %d..%d; will retry next tick", chain_id, from_block, to_block,
+        return credited
+    resume = safe_head - RESUME_BLOCKS_BEHIND.get(chain_id, 0)
+    if (
+        head - from_block > STRANDED_AFTER_BLOCKS.get(chain_id, 10**9)
+        and resume > from_block
+        and _nothing_received(
+            chain_id, rpc_url, tokens, {a.lower() for t in tokens for a in watched[t.currency]},
+            from_block, resume - 1,
         )
+    ):
+        log.warning(
+            "watcher %s: blocks %d..%d are older than the RPC serves logs for; "
+            "the deposit addresses' balances and nonces didn't change across "
+            "them, so nothing was received — skipping to %d",
+            chain_id, from_block, resume - 1, resume,
+        )
+        _kv_set(repo, state_key, str(resume))
+        return credited
+    log.warning(
+        "watcher %s: error(s) this tick — NOT advancing cursor past "
+        "blocks %d..%d; will retry next tick", chain_id, from_block, to_block,
+    )
     return credited
 
 
