@@ -29,6 +29,8 @@ from greencompute_protocol import (
     WorkloadShareCreateRequest,
     WorkloadUpdateRequest,
 )
+from greencompute_control_plane.config import settings as control_plane_settings
+from greencompute_control_plane.domain.metering import is_catalog_workload
 from greencompute_gateway.application import account_deletion
 from greencompute_gateway.application.services import (
     WEBSITE_ADMIN_KEY_NAME,
@@ -1134,17 +1136,35 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
     except InsufficientBalanceForRentalError as exc:
         # 402 Payment Required — UI reads the numeric fields to render a
         # friendly "Add $X to start" prompt.
-        raise HTTPException(
-            status_code=402,
-            detail={
-                "message": "insufficient balance to start this rental",
-                "required_cents": exc.required_cents,
-                "current_cents": exc.current_cents,
-                "rate_cents_per_hour": exc.rate_cents_per_hour,
-                "gpu_count": exc.gpu_count,
-                "requested_instances": exc.requested_instances,
-            },
-        ) from exc
+        raise HTTPException(status_code=402, detail=_hour_of_credit_detail(exc, "start")) from exc
+
+
+def _hour_of_credit_detail(exc, action: str) -> dict:
+    """The 402 body when a balance can't cover the first hour of a deployment
+    billed by the hour. For a private model the message says so in plain
+    words: that it is charged by the hour at all is new (it used to be per
+    token)."""
+    if exc.private_model:
+        hourly = exc.rate_cents_per_hour * exc.gpu_count
+        gpus = "1 GPU" if exc.gpu_count == 1 else f"{exc.gpu_count} GPUs"
+        message = (
+            f"insufficient balance to {action} this private model: it costs ${hourly / 100:.2f}/hour "
+            f"({gpus} at ${exc.rate_cents_per_hour / 100:.2f}/hr) while it runs, billed by the minute, "
+            f"and {'starting' if action == 'start' else 'resuming'} it needs at least one hour "
+            f"(${exc.required_cents / 100:.2f}) of credit; your balance is ${exc.current_cents / 100:.2f}"
+        )
+    elif action == "start":
+        message = "insufficient balance to start this rental"
+    else:
+        message = "insufficient balance to resume this deployment"
+    return {
+        "message": message,
+        "required_cents": exc.required_cents,
+        "current_cents": exc.current_cents,
+        "rate_cents_per_hour": exc.rate_cents_per_hour,
+        "gpu_count": exc.gpu_count,
+        "requested_instances": exc.requested_instances,
+    }
 
 
 def _attach_owner_info(rows: list[dict], users_by_id: dict) -> list[dict]:
@@ -1415,17 +1435,7 @@ def resume_deployment(
         # Not in SUSPENDED state.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except InsufficientBalanceForRentalError as exc:
-        raise HTTPException(
-            status_code=402,
-            detail={
-                "message": "insufficient balance to resume this deployment",
-                "required_cents": exc.required_cents,
-                "current_cents": exc.current_cents,
-                "rate_cents_per_hour": exc.rate_cents_per_hour,
-                "gpu_count": exc.gpu_count,
-                "requested_instances": exc.requested_instances,
-            },
-        ) from exc
+        raise HTTPException(status_code=402, detail=_hour_of_credit_detail(exc, "resume")) from exc
 
 
 @router.post("/platform/secrets")
@@ -1841,10 +1851,14 @@ def chat_completions(
     # Pre-flight balance gate: require any positive balance. Per-request cost
     # is fractions of a cent for small prompts, so we don't need a large
     # floor — just "not broke". Admin keys bypass. Anonymous (user_id=None)
-    # also bypasses so internal / system callers are not blocked.
+    # also bypasses so internal / system callers are not blocked. A private
+    # model costs its caller nothing (its owner pays by the hour), so it is
+    # only gated when the request is charged per token.
     if api_key.user_id is not None and not api_key.admin:
         current = BillingRepository().get_balance(api_key.user_id)
-        if current <= 0:
+        if current <= 0 and service.bills_per_token(
+            payload, routed_host=host, user_id=api_key.user_id, admin=api_key.admin
+        ):
             raise HTTPException(
                 status_code=402,
                 detail={
@@ -2012,18 +2026,31 @@ def public_pricing() -> dict:
             "minimum_charge_usd": round(INFERENCE_MIN_CHARGE_CENTS / 100, 2),
             "models": models,
         },
+        "private_model": {
+            "billing": (
+                "per minute while running, at the gpu_rental rate per GPU; requests to it are not "
+                "charged per token. Starting or resuming one needs one hour of that rate in credit"
+            ),
+            "idle_pause_minutes": control_plane_settings.idle_private_endpoint_timeout_seconds // 60,
+        },
         "docs": "https://www.green-compute.com/docs",
     }
 
 
 def _public_inference_model_names() -> list[str]:
-    """Names of the public inference workloads -- the same filter /v1/models uses."""
+    """Names of the public inference workloads -- the same filter /v1/models
+    uses -- less customers' own models, which are paid for by the hour by
+    their owner rather than per token."""
     names = []
     for workload in service.control_plane.list_workloads():
         kind = getattr(workload, "kind", None)
         if kind is not None and str(kind).lower().rsplit(".", 1)[-1] != "inference":
             continue
         if not getattr(workload, "public", False):
+            continue
+        if getattr(workload, "owner_user_id", None) and not is_catalog_workload(
+            workload.workload_id, getattr(workload, "metadata", None)
+        ):
             continue
         name = (workload.name or "").strip()
         if name:

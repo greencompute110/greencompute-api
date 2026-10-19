@@ -26,6 +26,7 @@ from greencompute_protocol import (
     WorkloadSpec,
 )
 from greencompute_control_plane.config import settings
+from greencompute_control_plane.domain import metering
 from greencompute_control_plane.domain.metering import UsageAggregator
 from greencompute_control_plane.domain.scheduler import PlacementPolicy
 from greencompute_control_plane.domain.state import transition_state
@@ -363,6 +364,7 @@ class ControlPlaneService:
         # transition_state no-ops on equal (so a live-state re-report still
         # applies endpoint/ready_instances/port-mapping updates below) and
         # raises on a disallowed live→X transition.
+        became_ready = update.state == DeploymentState.READY and deployment.state != DeploymentState.READY
         deployment.state = transition_state(deployment.state, update.state)
         deployment.ready_instances = update.ready_instances if update.state == DeploymentState.READY else 0
         deployment.endpoint = update.endpoint or deployment.endpoint
@@ -425,6 +427,10 @@ class ControlPlaneService:
         }:
             self.repository.release_gpu_reservation(update.deployment_id)
         saved = self.repository.update_deployment(deployment)
+        if became_ready:
+            # The hourly meter charges from here: not for time spent starting,
+            # nor (after a resume) for the time it was paused.
+            self.repository.set_billable_since(saved.deployment_id, datetime.now(UTC))
         subject = {
             DeploymentState.READY: "deployment.ready",
             DeploymentState.SUSPENDED: "deployment.suspended",
@@ -1580,9 +1586,13 @@ class ControlPlaneService:
             (n for n in self.repository.list_nodes() if n.node_id == assignment.node_id),
             None,
         )
-        deployment.hourly_rate_cents = rate_for_gpu(
-            assigned_node.gpu_model if assigned_node else None
-        )
+        granted_rate = rate_for_gpu(assigned_node.gpu_model if assigned_node else None)
+        # Never above the rate quoted at creation, which the one-hour credit
+        # check and the website showed. A model with no GPU constraint can be
+        # placed on any card with enough memory, including a class that isn't
+        # offered (e.g. a paused 5090), which would otherwise raise its price.
+        quoted_rate = deployment.hourly_rate_cents or granted_rate
+        deployment.hourly_rate_cents = min(granted_rate, quoted_rate)
         deployment.state = DeploymentState.SCHEDULED
         deployment.retry_count = max(deployment.retry_count, max(0, event.attempts - 1))
         deployment.health_check_failures = 0
@@ -1783,8 +1793,13 @@ class ControlPlaneService:
 
     # --- Usage metering ---
 
-    def meter_usage(self, elapsed_seconds: float | None = None) -> dict[str, int]:
-        """Deduct GPU usage from user balances for all READY deployments.
+    def meter_usage(
+        self, elapsed_seconds: float | None = None, now: datetime | None = None
+    ) -> dict[str, int]:
+        """Charge the owners of READY deployments that are billed by the hour:
+        pod/VM rentals and private models (see is_private_model). Shared
+        catalog models are paid for per token at request time instead
+        (gateway's _charge_inference_tokens), so they are skipped here.
 
         ``elapsed_seconds`` is the real wall-clock time since the previous
         metering cycle (the worker passes a monotonic delta). Charges are
@@ -1792,6 +1807,15 @@ class ControlPlaneService:
         time, DB contention and restarts can't make the cycle bill one minute of
         cost for >60s of real runtime (systematic under-billing). When omitted
         (tests / ad-hoc calls) it falls back to the nominal one-minute charge.
+        A deployment is never charged for time before its billable_since (when
+        it last became READY), so the cycle it starts or resumes in only
+        counts the seconds since.
+
+        No back-charging: a private model already running when hourly billing
+        for models shipped may have no billable_since. The first pass that
+        sees it stamps one and charges nothing, so it pays from then on and
+        never from its ready_at. (Rentals without one were already metered
+        before the column existed and keep being charged per cycle.)
 
         Returns dict of deployment_id -> cents actually debited. Drains the
         user's balance to its floor (never below 0, never free up to the
@@ -1804,9 +1828,10 @@ class ControlPlaneService:
         # Clamp to [0, 1h]: monotonic deltas never go backward, and a delta
         # larger than an hour means the cycle stalled badly — cap the charge
         # rather than bill a surprise multi-hour amount from one tick.
-        billed_seconds = None
+        cycle_seconds = 60.0
         if elapsed_seconds is not None:
-            billed_seconds = max(0.0, min(float(elapsed_seconds), 3600.0))
+            cycle_seconds = max(0.0, min(float(elapsed_seconds), 3600.0))
+        now = now or datetime.now(UTC)
         from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 
         billing_repo = BillingRepository()
@@ -1818,17 +1843,26 @@ class ControlPlaneService:
                 continue
 
             workload = self.repository.get_workload(deployment.workload_id)
-            # Inference workloads are metered per-token at request time
-            # (see gateway's _charge_inference_tokens). Charging hourly here
-            # too would be double-billing. Only pod/vm rentals are hourly.
-            if workload is not None and workload.kind == WorkloadKind.INFERENCE:
+            private_model = self.is_private_model(deployment, workload)
+            # Shared catalog models are metered per token at request time;
+            # charging hourly here too would be double-billing.
+            if workload is not None and workload.kind == WorkloadKind.INFERENCE and not private_model:
                 continue
             # A pod whose machine has stopped reporting is kept, not moved (see
             # process_unhealthy_miners); don't bill for time it may be unusable.
-            if self._box_silent(deployment, datetime.now(UTC)):
+            if self._box_silent(deployment, now):
+                continue
+            billed_seconds = cycle_seconds
+            since = self.repository.get_billable_since(deployment.deployment_id)
+            if since is not None:
+                billed_seconds = min(billed_seconds, max(0.0, (now - since).total_seconds()))
+            elif private_model:
+                # Running since before private models were billed by the hour:
+                # its billing starts now, never from ready_at.
+                self.repository.set_billable_since(deployment.deployment_id, now)
                 continue
             gpu_count = workload.requirements.gpu_count if workload else 1
-            # Per-minute cost in *millicents* — integer math, no float rounding.
+            # Cost in *millicents* — integer math, no float rounding.
             # Hourly-cents × 1000 / 60 = millicents per minute.
             #   1× 4090 @ 40¢/hr  →  40 × 1000 / 60 = 667 mcents/min
             #   3× 5090 @ 70¢/hr  →  70 × 3 × 1000 / 60 = 3500 mcents/min
@@ -1843,19 +1877,13 @@ class ControlPlaneService:
             # ready_instances is the node-reported truth; a READY deployment
             # with a stale 0 still bills its one running instance.
             billed_instances = max(deployment.ready_instances or 0, 1)
-            # Millicents accrued this cycle. Anchored to real elapsed seconds
-            # when the worker provides them (hourly_cents × 1000 / 3600 per
-            # second), else the nominal per-minute amount. Round-to-nearest; the
+            # Millicents accrued this cycle, anchored to the seconds billed
+            # (hourly_cents × 1000 / 3600 per second). Round-to-nearest; the
             # deployment's millicent accumulator carries any sub-cent remainder
             # so hourly totals converge exactly to the advertised rate.
-            if billed_seconds is not None:
-                add_mcents = round(
-                    hourly_cents * 1000 * gpu_count * billed_instances * billed_seconds / 3600
-                )
-            else:
-                add_mcents = round(
-                    hourly_cents * 1000 * gpu_count * billed_instances / 60
-                )
+            add_mcents = round(
+                hourly_cents * 1000 * gpu_count * billed_instances * billed_seconds / 3600
+            )
             whole_cents, _remainder = self.repository.accrue_metering(
                 deployment.deployment_id,
                 add_mcents=add_mcents,
@@ -1901,7 +1929,11 @@ class ControlPlaneService:
                     amount_cents=amount,
                     kind="usage",
                     reference_id=deployment.deployment_id,
-                    description=f"GPU usage {gpu_count}× GPU @ ${hourly_cents/100:.2f}/hr",
+                    description=(
+                        self._private_model_charge_description(workload, gpu_count, hourly_cents)
+                        if private_model
+                        else f"GPU usage {gpu_count}× GPU @ ${hourly_cents/100:.2f}/hr"
+                    ),
                 )
             except KeyError:
                 # User not found — skip (matches prior behavior).
@@ -1953,6 +1985,29 @@ class ControlPlaneService:
             logger.info("Metered %d deployments, total %d cents", len(result), sum(result.values()))
 
         return result
+
+    def is_private_model(self, deployment: DeploymentRecord, workload: WorkloadSpec | None = None) -> bool:
+        """A customer's own model (domain.metering.is_private_model): billed by
+        the hour while READY, like a rental, and never per token."""
+        if not deployment.owner_user_id:
+            return False
+        workload = workload or self.repository.get_workload(deployment.workload_id)
+        return workload is not None and metering.is_private_model(
+            deployment.owner_user_id, workload.kind, workload.workload_id, workload.metadata
+        )
+
+    @staticmethod
+    def _private_model_charge_description(
+        workload: WorkloadSpec | None, gpu_count: int, hourly_cents: int
+    ) -> str:
+        """e.g. "Private model Llama-3.1-8B-Instruct · 1 GPU at $0.40/hr"."""
+        name = None
+        if workload is not None:
+            model_id = getattr(workload.runtime, "model_identifier", None)
+            name = workload.display_name or (model_id.rsplit("/", 1)[-1] if model_id else None) or workload.name
+        gpus = "1 GPU" if gpu_count == 1 else f"{gpu_count} GPUs"
+        each = "" if gpu_count == 1 else " each"
+        return f"Private model {name or 'deployment'} · {gpus} at ${hourly_cents / 100:.2f}/hr{each}"
 
     def _is_rental(self, deployment: DeploymentRecord, workload: WorkloadSpec | None = None) -> bool:
         """A pod or VM rental. The saved-pod lifecycle (storage charge, delete

@@ -1,6 +1,7 @@
 """The billing monitor: catches balances changed without a ledger row, rentals
-running uncharged or on an empty balance, charges into debt, credits worth a
-look and spend spikes, without repeating itself; plus the daily summary."""
+and private models running uncharged or on an empty balance, charges into debt,
+credits worth a look and spend spikes, without repeating itself; plus the daily
+summary."""
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -40,15 +41,20 @@ def ledger(sf, user, cents, kind="usage", when=NOW, ref=None, deposit_ref=None, 
                              created_at=when))
 
 
-def rental(sf, owner, kind="pod", ready_minutes_ago=30, gpus=1, rate=40):
-    wid, did = str(uuid4()), str(uuid4())
+def rental(sf, owner, kind="pod", ready_minutes_ago=30, gpus=1, rate=40, catalog=False, billable_minutes_ago=None):
+    """A running deployment: a pod by default; kind="inference" is the owner's
+    private model, or with catalog=True a shared catalog replica (no owner)."""
+    wid, did = (f"catalog-{uuid4()}" if catalog else str(uuid4())), str(uuid4())
     with session_scope(sf) as s:
-        s.add(WorkloadORM(workload_id=wid, owner_user_id=owner, name="w", image="img", kind=kind,
-                          security_tier="standard", pricing_class="standard", runtime={},
-                          requirements={"gpu_count": gpus}))
-        s.add(DeploymentORM(deployment_id=did, workload_id=wid, owner_user_id=owner, state="ready",
-                            requested_instances=1, hourly_rate_cents=rate,
-                            ready_at=NOW - timedelta(minutes=ready_minutes_ago)))
+        s.add(WorkloadORM(workload_id=wid, owner_user_id=None if catalog else owner, name="w", image="img",
+                          kind=kind, security_tier="standard", pricing_class="standard", runtime={},
+                          requirements={"gpu_count": gpus},
+                          metadata_json={"managed_by": "flux"} if catalog else {}))
+        s.add(DeploymentORM(deployment_id=did, workload_id=wid, owner_user_id=None if catalog else owner,
+                            state="ready", requested_instances=1, hourly_rate_cents=rate,
+                            ready_at=NOW - timedelta(minutes=ready_minutes_ago),
+                            billable_since=None if billable_minutes_ago is None
+                            else NOW - timedelta(minutes=billable_minutes_ago)))
     return did
 
 
@@ -90,10 +96,31 @@ def test_a_rental_running_without_being_charged(sf):
     stuck = rental(sf, "alice")
     ledger(sf, "alice", -1, ref=stuck, when=NOW - timedelta(minutes=40))
     rental(sf, "alice", ready_minutes_ago=5)  # too new to judge
-    rental(sf, "alice", kind="inference")  # charged per token, not hourly
+    rental(sf, "alice", kind="inference", catalog=True)  # shared model: charged per token, not hourly
     result, alerts = run(sf)
     assert checks(result) == ["unbilled_rental"]
     assert f"rental {stuck[:8]} is running but last charged 40 min ago" in alerts
+
+
+def test_a_private_model_running_without_being_charged(sf):
+    """Private models are billed by the hour too, so one that isn't is flagged."""
+    ledger(sf, "alice", 5000, kind="topup", deposit_ref="stripe:pi_1", when=NOW - timedelta(days=1))
+    stuck = rental(sf, "alice", kind="inference")
+    # Running for days, but only billed since hourly billing for models
+    # started 5 minutes ago: too soon to judge.
+    rental(sf, "alice", kind="inference", ready_minutes_ago=3 * 24 * 60, billable_minutes_ago=5)
+    result, alerts = run(sf)
+    assert checks(result) == ["unbilled_rental"]
+    assert f"alice: private model {stuck[:8]} is running but never charged" in alerts
+
+
+def test_a_private_model_on_an_empty_balance_is_reported(sf):
+    dep = rental(sf, "bob", kind="inference")
+    rental(sf, "bob", kind="inference", catalog=True)
+    run(sf)
+    result, alerts = run(sf, NOW + timedelta(minutes=31))
+    assert checks(result) == ["running_on_empty"]
+    assert f"bob: private model {dep[:8]} still running on a $0.00 balance for 31 min" in alerts
 
 
 def test_a_rental_on_an_empty_balance_is_reported_after_the_grace(sf):
@@ -153,13 +180,15 @@ def test_daily_summary_once_a_day(sf):
     ledger(sf, "alice", -400, when=yesterday)
     ledger(sf, "bob", -1200, kind="storage", when=yesterday)  # into debt
     rental(sf, "alice", gpus=2)
+    rental(sf, "alice", kind="inference")
+    rental(sf, "alice", kind="inference", catalog=True)  # not billed by the hour: not counted
     sent = []
     mon.run_once(sf, now=NOW, send=sent.append)
     [daily] = [m for m in sent if m.startswith("Green Compute daily")]
     assert "2026-10-13" in daily
     assert "Top-ups: 2, $36.00 (card $25.00, crypto $11.00, manual $0.00)" in daily
-    assert "Spend: $16.00 (saved-pod storage $12.00, GPU rentals $4.00)" in daily
-    assert "Running now: 1 rental, 2 GPUs, $0.80/hr" in daily
+    assert "Spend: $16.00 (saved-pod storage $12.00, GPU time (rentals and private models) $4.00)" in daily
+    assert "Running now: 1 rental, 1 private model, 3 GPUs, $1.20/hr" in daily
     assert "storage debt $1.00 across 1 account" in daily
     sent.clear()
     mon.run_once(sf, now=NOW + timedelta(hours=1), send=sent.append)
