@@ -20,6 +20,11 @@ class StripeNotConfiguredError(RuntimeError):
     """
 
 
+class StripeUnavailableError(RuntimeError):
+    """Stripe refused or failed the request; the gateway answers 503 with a
+    message the dashboard can show. The real error goes to the log."""
+
+
 def _get_stripe():
     """Lazy import + configuration guard. Only call if you intend to hit Stripe."""
     try:
@@ -38,26 +43,35 @@ def _get_stripe():
 
 
 def create_checkout_session(amount_cents: int, user_id: str) -> tuple[str, str]:
-    """Create a Stripe Checkout Session. Returns (session_id, checkout_url)."""
+    """Create a Stripe Checkout Session. Returns (session_id, checkout_url).
+
+    Payment methods come from the Stripe Dashboard settings: newer Stripe API
+    versions reject `payment_method_types` outright (which broke every card
+    top-up once the gateway picked up stripe 16)."""
     stripe = _get_stripe()
-    session = stripe.checkout.Session.create(
-        payment_method_types=["card"],
-        line_items=[{
-            "price_data": {
-                "currency": "usd",
-                "unit_amount": amount_cents,
-                "product_data": {
-                    "name": "GreenCompute Credits",
-                    "description": f"${amount_cents / 100:.2f} USD top-up",
+    try:
+        session = stripe.checkout.Session.create(
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": amount_cents,
+                    "product_data": {
+                        "name": "Green Compute credit",
+                        "description": f"${amount_cents / 100:.2f} USD top-up",
+                    },
                 },
-            },
-            "quantity": 1,
-        }],
-        mode="payment",
-        success_url=STRIPE_SUCCESS_URL,
-        cancel_url=STRIPE_CANCEL_URL,
-        metadata={"user_id": user_id},
-    )
+                "quantity": 1,
+            }],
+            mode="payment",
+            success_url=STRIPE_SUCCESS_URL,
+            cancel_url=STRIPE_CANCEL_URL,
+            metadata={"user_id": user_id},
+        )
+    except Exception as exc:  # stripe.StripeError and network failures alike
+        log.error("stripe checkout session failed: %s", exc)
+        raise StripeUnavailableError(
+            "Card payments are unavailable right now. Try crypto, or contact support."
+        ) from exc
     return session.id, session.url
 
 
