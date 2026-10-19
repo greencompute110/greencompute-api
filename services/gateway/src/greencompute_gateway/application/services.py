@@ -13,6 +13,8 @@ from time import perf_counter
 from uuid import uuid4
 from urllib.parse import urlsplit
 
+from pydantic import Field
+
 log = logging.getLogger(__name__)
 
 from greencompute_builder.application.services import BuilderService, service as default_builder_service
@@ -94,6 +96,21 @@ def _external_model_upstreams() -> dict[str, str]:
         if model_id and url:
             out[model_id] = url
     return out
+
+
+class GatewayDeploymentCreateRequest(DeploymentCreateRequest):
+    """POST /platform/deployments. Keeping a pod when credit runs out costs
+    money every day, so it happens only when the caller asks for it; the
+    protocol's own default (true) is left for internal callers."""
+
+    save_on_exhaustion: bool = Field(
+        default=False,
+        description=(
+            "Keep the pod and its disk if your balance runs out, at $1 per day for up to 30 days, "
+            "so you can top up and resume. When false (the default) the pod and its disk are "
+            "deleted 15 minutes after it stops."
+        ),
+    )
 
 
 class UnsupportedGPUError(ValueError):
@@ -693,7 +710,7 @@ class GatewayService:
         admin: bool = False,
         created_by_key_id: str | None = None,
     ) -> DeploymentRecord:
-        payload = request if isinstance(request, DeploymentCreateRequest) else DeploymentCreateRequest(**request)
+        payload = request if isinstance(request, DeploymentCreateRequest) else GatewayDeploymentCreateRequest(**request)
         workload = self.control_plane.repository.get_workload(payload.workload_id)
         if workload is None:
             raise KeyError(f"workload not found: {payload.workload_id}")

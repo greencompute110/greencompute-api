@@ -1148,6 +1148,12 @@ class ControlPlaneService:
                 reason=reason,
                 cooldown_until=datetime.min.replace(tzinfo=UTC),
             )
+        elif deployment.state == DeploymentState.SUSPENDED:
+            # A saved pod's lease sits at 'suspended' (its GPUs were freed when
+            # it stopped), which the lookup above skips. Without flipping it the
+            # node-agent kept the stopped container and its disk on the box
+            # after the user deleted the pod.
+            self.repository.update_assignment_status(deployment_id, "terminated", reason=reason)
 
         deployment.state = DeploymentState.TERMINATED
         deployment.ready_instances = 0
@@ -1948,6 +1954,39 @@ class ControlPlaneService:
 
         return result
 
+    def _is_rental(self, deployment: DeploymentRecord, workload: WorkloadSpec | None = None) -> bool:
+        """A pod or VM rental. The saved-pod lifecycle (storage charge, delete
+        deadline) is for these only: a private model is also SUSPENDED when it
+        sits idle, and was being billed storage as a 'saved pod'."""
+        workload = workload or self.repository.get_workload(deployment.workload_id)
+        return workload is not None and workload.kind != WorkloadKind.INFERENCE
+
+    def suspension_terms(
+        self, deployment: DeploymentRecord, workload: WorkloadSpec | None = None
+    ) -> tuple[int, datetime | None]:
+        """For a suspended rental: what it costs per day while it waits (cents)
+        and when the reaper deletes it, by the same rules as meter_pod_storage
+        and reap_exhausted_pods. (0, None) for anything else."""
+        if (
+            deployment.state != DeploymentState.SUSPENDED
+            or deployment.suspended_at is None
+            or not self._is_rental(deployment, workload)
+        ):
+            return 0, None
+        from greencompute_protocol.billing_rates import STORAGE_CENTS_PER_DAY
+
+        saved = deployment.save_on_exhaustion
+        cents = STORAGE_CENTS_PER_DAY if saved and settings.pod_storage_billing_enabled else 0
+        deletes_at = None
+        if settings.pod_exhaustion_reaper_enabled:
+            keep = (
+                timedelta(days=settings.pod_saved_retention_days)
+                if saved
+                else timedelta(minutes=settings.pod_unsaved_grace_minutes)
+            )
+            deletes_at = self._ensure_utc(deployment.suspended_at) + keep
+        return cents, deletes_at
+
     def meter_pod_storage(self) -> dict[str, int]:
         """Charge SAVED suspended pods a per-day storage hold ($1/day) as a
         NEGATIVE-balance debt, so a later top-up settles it via ordinary balance
@@ -1975,6 +2014,8 @@ class ControlPlaneService:
                 continue
             if deployment.suspended_at is None:
                 continue  # grandfathered pre-feature suspend — never bill
+            if not self._is_rental(deployment):
+                continue  # an idle private model, not a saved pod
             whole_cents = self.repository.accrue_storage(
                 deployment.deployment_id, add_mcents=add_mcents
             )
@@ -2017,7 +2058,9 @@ class ControlPlaneService:
         for deployment in self.repository.list_deployments_by_state(DeploymentState.SUSPENDED):
             if deployment.suspended_at is None:
                 continue  # grandfathered — never auto-reap
-            age = (observed_at - self._ensure_utc(deployment.suspended_at)).total_seconds()
+            if not self._is_rental(deployment):
+                continue  # idle private models keep their own lifecycle
+            age =(observed_at - self._ensure_utc(deployment.suspended_at)).total_seconds()
             deadline = retention_seconds if deployment.save_on_exhaustion else grace_seconds
             if age < deadline:
                 continue
