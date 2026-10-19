@@ -1,18 +1,22 @@
 """Saved pods (save_on_exhaustion): deleting one stops its storage charge and
 frees its disk, only rentals are billed or reaped as saved pods (an idle
-private model was being charged $1/day as one), and the API says what a
-suspended rental costs and when it goes."""
+private model was being charged $1/day as one), the API says what a suspended
+rental costs and when it goes, and API callers don't opt in by default."""
 from datetime import UTC, timedelta
+from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI, Response
 
 from greencompute_control_plane.application.services import ControlPlaneService
 from greencompute_control_plane.config import settings
 from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
+from greencompute_gateway.application.services import GatewayDeploymentCreateRequest
 from greencompute_gateway.transport import routes
 from greencompute_persistence import session_scope
 from greencompute_persistence.orm import DeploymentORM, UserORM
 from greencompute_protocol import (
+    DeploymentCreateRequest,
     DeploymentRecord,
     DeploymentState,
     DeploymentStatusUpdate,
@@ -133,3 +137,55 @@ def test_the_api_shows_what_a_suspended_rental_costs_and_when_it_goes(cp, monkey
     ready = DeploymentRecord(workload_id=dep.workload_id, state=DeploymentState.READY)
     out = routes._deployment_out(ready, admin=False)
     assert out["storage_cents_per_day"] == 0 and out["deletes_at"] is None
+
+
+# --- API callers don't save a pod unless they ask -----------------------------
+
+
+def test_save_on_exhaustion_is_off_unless_asked_for():
+    assert GatewayDeploymentCreateRequest(workload_id="w").save_on_exhaustion is False
+    assert GatewayDeploymentCreateRequest(workload_id="w", save_on_exhaustion=True).save_on_exhaustion is True
+    # Internal callers of the protocol model keep its default.
+    assert DeploymentCreateRequest(workload_id="w").save_on_exhaustion is True
+
+
+def test_post_deployments_without_the_field_does_not_save_the_pod(monkeypatch):
+    app = FastAPI()
+    app.include_router(routes.router)
+    spec = app.openapi()
+    body = spec["paths"]["/platform/deployments"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+    assert body == {"$ref": "#/components/schemas/GatewayDeploymentCreateRequest"}
+    field = spec["components"]["schemas"]["GatewayDeploymentCreateRequest"]["properties"]["save_on_exhaustion"]
+    assert field["default"] is False
+
+    seen = []
+
+    def fake_create(payload, *, user_id=None, admin=False, created_by_key_id=None):
+        seen.append(payload.save_on_exhaustion)
+        return DeploymentRecord(workload_id=payload.workload_id, owner_user_id=user_id)
+
+    monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: SimpleNamespace(user_id="u1", key_id="k1", admin=False))
+    monkeypatch.setattr(routes, "enforce_rate_limit", lambda *a, **k: None)
+    monkeypatch.setattr(routes, "_enforce_key_limits", lambda *a, **k: None)
+    monkeypatch.setattr(routes.service, "create_deployment", fake_create)
+    for raw in ({"workload_id": "w1"}, {"workload_id": "w1", "save_on_exhaustion": True}):
+        routes.create_deployment(
+            GatewayDeploymentCreateRequest.model_validate(raw), Response(),
+            authorization="Bearer k", x_api_key=None, idempotency_key=None,
+        )
+    assert seen == [False, True]
+
+
+def test_a_dict_request_to_the_gateway_service_does_not_save_the_pod(monkeypatch):
+    from greencompute_gateway.application.services import GatewayService
+
+    captured = {}
+    workload = WorkloadSpec(name="job", image="img", kind=WorkloadKind.POD)
+    control_plane = SimpleNamespace(
+        repository=SimpleNamespace(get_workload=lambda _id: workload),
+        create_deployment=lambda body: captured.update(body) or DeploymentRecord(workload_id=body["workload_id"]),
+    )
+    gateway = GatewayService.__new__(GatewayService)
+    gateway.control_plane = control_plane
+    gateway.create_deployment({"workload_id": workload.workload_id}, admin=True)
+    assert captured["save_on_exhaustion"] is False

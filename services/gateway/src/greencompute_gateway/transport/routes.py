@@ -29,7 +29,12 @@ from greencompute_protocol import (
     WorkloadShareCreateRequest,
     WorkloadUpdateRequest,
 )
-from greencompute_gateway.application.services import WEBSITE_ADMIN_KEY_NAME, model_url, service
+from greencompute_gateway.application.services import (
+    WEBSITE_ADMIN_KEY_NAME,
+    GatewayDeploymentCreateRequest,
+    model_url,
+    service,
+)
 from greencompute_gateway.domain.routing import NoReadyDeploymentError
 from greencompute_gateway.infrastructure.inference_client import (
     InferenceBadResponseError,
@@ -1006,7 +1011,7 @@ def _deployment_out(deployment, admin: bool, workloads: dict | None = None, *, b
 
 @router.post("/platform/deployments", response_model=None, responses=ok(schemas.Deployment, "The new deployment"))
 def create_deployment(
-    payload: DeploymentCreateRequest,
+    payload: GatewayDeploymentCreateRequest,
     response: Response,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
