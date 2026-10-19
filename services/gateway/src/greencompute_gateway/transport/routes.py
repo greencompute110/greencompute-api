@@ -63,7 +63,7 @@ log = logging.getLogger(__name__)
 # UI references MIN_TOPUP_USD so the preset/custom-input minimum can never
 # drift from what the backend enforces (BILL-M3). MAX is env-overridable so
 # ops can raise it for a known big customer without a redeploy.
-MIN_TOPUP_USD = 1.0
+MIN_TOPUP_USD = 5.0
 try:
     MAX_TOPUP_USD = float(os.environ.get("GREENCOMPUTE_MAX_TOPUP_USD", "50000"))
 except (TypeError, ValueError):

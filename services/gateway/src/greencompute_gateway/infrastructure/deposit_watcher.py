@@ -43,6 +43,9 @@ RPC bills sane).
 - `GREENCOMPUTE_DEPOSIT_WATCHER_INTERVAL_SECONDS` (default 60)
 - `ETH_RPC_URL` (default https://ethereum-rpc.publicnode.com — public, can be flaky)
 - `BASE_RPC_URL` (default https://base-rpc.publicnode.com)
+- `ETH_FALLBACK_RPC_URL`, `BASE_FALLBACK_RPC_URL` (optional) — a keyed RPC that
+  serves old blocks (e.g. Alchemy), read when the main one can't serve a range
+- `GREENCOMPUTE_WATCHER_FALLBACK_LOG_RANGE` (default 10, Alchemy's free plan)
 - `GREENCOMPUTE_SUBTENSOR_URL` (already used by price feed)
 """
 from __future__ import annotations
@@ -51,6 +54,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -87,9 +91,21 @@ STRANDED_AFTER_BLOCKS = {"eth": 1500, "base": 9000}
 # Where a skip lands: far enough inside the RPC's window to scan normally.
 RESUME_BLOCKS_BEHIND = {"eth": 600, "base": 3000}
 # Endpoints that answer balance/nonce queries at old blocks (archive state),
-# tried after the chain's own RPC. mainnet.base.org refuses our eth_getLogs
-# (429) but serves historical eth_call.
+# tried after the chain's own RPC and its fallback. mainnet.base.org refuses
+# our eth_getLogs (429) but serves historical eth_call.
 _ARCHIVE_STATE_URLS = {"base": ["https://mainnet.base.org"]}
+
+# An optional keyed backup RPC per chain (e.g. Alchemy) that keeps all history
+# but caps each eth_getLogs at a few blocks: Alchemy's free plan allows 10.
+# Read when the main RPC can't serve a range (it's too old, or it's failing),
+# FALLBACK_BLOCKS_PER_TICK at a time with every token and address in one call
+# per FALLBACK_LOG_RANGE blocks: 30 calls a minute while it's in use.
+_FALLBACK_RPC_ENV = {"eth": "ETH_FALLBACK_RPC_URL", "base": "BASE_FALLBACK_RPC_URL"}
+FALLBACK_LOG_RANGE = int(os.environ.get("GREENCOMPUTE_WATCHER_FALLBACK_LOG_RANGE", "").strip() or 10)
+FALLBACK_BLOCKS_PER_TICK = 300
+# After the main RPC fails, stay on the backup this long before trying it again.
+FALLBACK_HOLD_SECONDS = 600
+_primary_failed_at: dict[str, float] = {}
 
 # Reorg-safety: only credit transfers buried at least this many blocks deep,
 # so a transfer that later gets reorged out never credits funds we don't
@@ -289,6 +305,37 @@ def _state_at(urls: list[str], block: int, tokens: list[TokenConfig], addresses:
     return None
 
 
+def _fallback_rpc_url(chain_id: str) -> str:
+    env_name = _FALLBACK_RPC_ENV.get(chain_id)
+    return os.environ.get(env_name, "").strip() if env_name else ""
+
+
+def _fallback_logs(url: str, tokens, addresses: set[str], first: int, last: int) -> dict[tuple[str, str], list]:
+    """Transfers of any watched token to any watched address in first..last,
+    from the backup RPC in FALLBACK_LOG_RANGE-block calls, keyed by
+    (token contract, recipient). Raises if any call fails."""
+    contracts = [t.contract for t in tokens]
+    to_topics = [_topic_from_addr(a) for a in sorted(addresses)]
+    found: dict[tuple[str, str], list] = {}
+    start = first
+    while start <= last:
+        end = min(last, start + FALLBACK_LOG_RANGE - 1)
+        logs = _jsonrpc(
+            url,
+            "eth_getLogs",
+            [{"fromBlock": hex(start), "toBlock": hex(end), "address": contracts,
+              "topics": [ERC20_TRANSFER_TOPIC, None, to_topics]}],
+            timeout=20.0,
+        ) or []
+        for entry in logs:
+            topics = entry.get("topics") or []
+            if len(topics) >= 3:
+                key = ((entry.get("address") or "").lower(), "0x" + topics[2][-40:].lower())
+                found.setdefault(key, []).append(entry)
+        start = end + 1
+    return found
+
+
 def _nothing_received(chain_id: str, rpc_url: str, tokens, addresses, first: int, last: int) -> bool:
     """True when the deposit addresses provably received no watched token in
     blocks first..last: every balance and every nonce is the same before
@@ -297,7 +344,7 @@ def _nothing_received(chain_id: str, rpc_url: str, tokens, addresses, first: int
     through an allowance it granted earlier, which these addresses never do."""
     if not addresses:
         return True
-    urls = [rpc_url, *_ARCHIVE_STATE_URLS.get(chain_id, [])]
+    urls = [u for u in (rpc_url, _fallback_rpc_url(chain_id)) if u] + _ARCHIVE_STATE_URLS.get(chain_id, [])
     before = _state_at(urls, first - 1, tokens, addresses)
     after = _state_at(urls, last, tokens, addresses) if before is not None else None
     return before is not None and before == after
@@ -311,12 +358,19 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
         return 0
     state_key = f"watcher:{chain_id}:last_block"
     rpc_url = _chain_rpc_url(chain_id)
+    fallback_url = _fallback_rpc_url(chain_id)
 
     credited = 0
-    try:
-        head = _hex_to_int(_jsonrpc(rpc_url, "eth_blockNumber", []))
-    except Exception as exc:
-        log.warning("watcher %s: failed to fetch head block: %s", chain_id, exc)
+    head = None
+    for url in (rpc_url, fallback_url):
+        if not url:
+            continue
+        try:
+            head = _hex_to_int(_jsonrpc(url, "eth_blockNumber", []))
+            break
+        except Exception as exc:
+            log.warning("watcher %s: failed to fetch head block: %s", chain_id, exc)
+    if head is None:
         return 0
 
     # Only scan blocks that are deep enough to be reorg-safe. Crediting on a
@@ -341,6 +395,14 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
     else:
         from_block = max(0, safe_head - (7200 if chain_id == "eth" else 43200))
     to_block = min(safe_head, from_block + _MAX_BLOCKS_PER_TICK.get(chain_id, MAX_BLOCKS_PER_TICK))
+    # The backup RPC reads ranges the main one can't: older than it keeps
+    # logs for, or anything while it's been failing lately.
+    use_fallback = bool(fallback_url) and (
+        head - from_block > STRANDED_AFTER_BLOCKS.get(chain_id, 10**9)
+        or time.monotonic() - _primary_failed_at.get(chain_id, float("-inf")) < FALLBACK_HOLD_SECONDS
+    )
+    if use_fallback:
+        to_block = min(to_block, from_block + FALLBACK_BLOCKS_PER_TICK - 1)
     if to_block < from_block:
         return 0
 
@@ -352,7 +414,21 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
     scan_ok = True
     service = _service(repo)
     watched = _deposit_addresses(repo, [t.currency for t in tokens])
-    for token in tokens:
+    prefetched = None
+    if use_fallback:
+        valid = set()
+        for a in {a.lower() for t in tokens for a in watched[t.currency]}:
+            try:
+                _topic_from_addr(a)
+                valid.add(a)
+            except ValueError:
+                pass
+        try:
+            prefetched = _fallback_logs(fallback_url, tokens, valid, from_block, to_block) if valid else {}
+        except Exception as exc:
+            log.warning("watcher %s: backup RPC eth_getLogs failed: %s", chain_id, exc)
+            scan_ok = False
+    for token in tokens if scan_ok else ():
         for addr in sorted({a.lower() for a in watched[token.currency]}):
             try:
                 to_topic = _topic_from_addr(addr)
@@ -361,27 +437,31 @@ def scan_evm_chain(repo: BillingRepository, chain_id: str) -> int:
                     "watcher %s: skipping invalid deposit address %r", chain_id, addr
                 )
                 continue
-            try:
-                logs = _jsonrpc(
-                    rpc_url,
-                    "eth_getLogs",
-                    [
-                        {
-                            "fromBlock": hex(from_block),
-                            "toBlock": hex(to_block),
-                            "address": token.contract,
-                            "topics": [ERC20_TRANSFER_TOPIC, None, to_topic],
-                        }
-                    ],
-                    timeout=20.0,
-                ) or []
-            except Exception as exc:
-                log.warning(
-                    "watcher %s/%s: eth_getLogs failed: %s",
-                    chain_id, token.currency, exc,
-                )
-                scan_ok = False
-                continue
+            if prefetched is not None:
+                logs = prefetched.get((token.contract, addr), [])
+            else:
+                try:
+                    logs = _jsonrpc(
+                        rpc_url,
+                        "eth_getLogs",
+                        [
+                            {
+                                "fromBlock": hex(from_block),
+                                "toBlock": hex(to_block),
+                                "address": token.contract,
+                                "topics": [ERC20_TRANSFER_TOPIC, None, to_topic],
+                            }
+                        ],
+                        timeout=20.0,
+                    ) or []
+                except Exception as exc:
+                    log.warning(
+                        "watcher %s/%s: eth_getLogs failed: %s",
+                        chain_id, token.currency, exc,
+                    )
+                    _primary_failed_at[chain_id] = time.monotonic()
+                    scan_ok = False
+                    continue
 
             for entry in logs:
                 tx_hash = entry.get("transactionHash", "")
