@@ -17,6 +17,12 @@ ADDR = "0x" + "ab" * 20
 HEAD = 1_000_000
 
 
+@pytest.fixture(autouse=True)
+def fresh_failures(monkeypatch):
+    monkeypatch.setattr(w, "_primary_failed_at", {})
+    monkeypatch.delenv("BASE_FALLBACK_RPC_URL", raising=False)
+
+
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
     for name in ("BILLING_DEPOSIT_USDC_BASE", "BILLING_DEPOSIT_USDT_BASE"):
@@ -141,3 +147,70 @@ def test_no_report_when_the_watcher_is_switched_off(repo, monkeypatch):
     _cursor_moved(repo, "base", timedelta(days=5))
     with session_scope(repo.session_factory) as s:
         assert mon.stalled_watchers(s, NOW) == []
+
+
+# --- a keyed backup RPC (Alchemy) that keeps history but serves 10 blocks a call ---
+
+BACKUP = "https://base-mainnet.example/v2/key"
+PAID_AT = HEAD - 199_950  # a payment inside the stranded range
+
+
+class Backup(Chain):
+    """The main RPC (publicnode) refuses old logs; the backup serves any
+    block, at most 10 per eth_getLogs, with both tokens in one call."""
+
+    def __init__(self, primary_window=10_000, **kw):
+        super().__init__(window=primary_window, **kw)
+        self.backup_calls = []
+
+    def __call__(self, url, method, params, timeout=15.0):
+        if url != BACKUP or method != "eth_getLogs":
+            return super().__call__(url, method, params, timeout)
+        first, last = int(params[0]["fromBlock"], 16), int(params[0]["toBlock"], 16)
+        assert last - first + 1 <= 10, "backup allows 10 blocks per call"
+        assert isinstance(params[0]["address"], list) and len(params[0]["address"]) == 2
+        self.backup_calls.append((first, last))
+        if first <= PAID_AT <= last:
+            return [{"transactionHash": "0xpaid", "logIndex": "0x0", "blockNumber": hex(PAID_AT), "data": hex(25_000_000),
+                     "address": w.TOKENS[3].contract, "topics": [w.ERC20_TRANSFER_TOPIC, "0x" + "0" * 24 + "cd" * 20, params[0]["topics"][2][0]]}]
+        return []
+
+
+@pytest.fixture
+def backup(repo, monkeypatch):
+    monkeypatch.setenv("BASE_FALLBACK_RPC_URL", BACKUP)
+    seen = []
+    monkeypatch.setattr(w, "_service", lambda repo: type("S", (), {"resolve_deposit": staticmethod(lambda d: seen.append(d) or "unmatched")})())
+    return seen
+
+
+def test_a_stranded_range_is_read_from_the_backup_instead_of_skipped(repo, backup, monkeypatch):
+    chain = Backup()
+    monkeypatch.setattr(w, "_jsonrpc", chain)
+    cursor(repo, HEAD - 200_000)
+    w.scan_evm_chain(repo, "base")
+    assert cursor(repo) == HEAD - 200_000 + w.FALLBACK_BLOCKS_PER_TICK
+    assert len(chain.backup_calls) == w.FALLBACK_BLOCKS_PER_TICK // 10
+    assert [(d["currency"], d["amount_raw"], d["block_number"]) for d in backup] == [("usdc-base", 25_000_000, PAID_AT)]
+
+
+def test_after_the_main_rpc_fails_the_backup_takes_over(repo, backup, monkeypatch):
+    chain = Backup(primary_window=0)  # the main RPC refuses even recent logs
+    monkeypatch.setattr(w, "_jsonrpc", chain)
+    cursor(repo, HEAD - 2_000)
+    w.scan_evm_chain(repo, "base")  # fails on the main RPC, no skip this close to the head
+    assert cursor(repo) == HEAD - 2_000 and not chain.backup_calls
+    w.scan_evm_chain(repo, "base")  # the next tick reads from the backup
+    assert cursor(repo) == HEAD - 2_000 + w.FALLBACK_BLOCKS_PER_TICK
+
+
+def test_when_the_backup_fails_too_the_provable_skip_still_applies(repo, backup, monkeypatch):
+    chain = Backup()
+    def backup_down(url, method, params, timeout=15.0):
+        if url == BACKUP and method == "eth_getLogs":
+            raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, None)
+        return chain(url, method, params, timeout)
+    monkeypatch.setattr(w, "_jsonrpc", backup_down)
+    cursor(repo, HEAD - 200_000)
+    w.scan_evm_chain(repo, "base")
+    assert cursor(repo) == HEAD - w.CONFIRMATIONS["base"] - w.RESUME_BLOCKS_BEHIND["base"]
