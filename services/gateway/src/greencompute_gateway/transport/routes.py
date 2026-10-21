@@ -2612,6 +2612,7 @@ def _request_review(invoice_id: str, user_id: str, tx_hash: str, note: str | Non
         f"Payment review requested by {username}: invoice {invoice_id[:8]} ({result['status']}), "
         f"tx {tx_hash}. Resolve it under Billing admin > Review requests."
     )
+    _get_billing().email_review_received(invoice_id)
     return result
 
 

@@ -543,6 +543,7 @@ class BillingRepository:
                 "credited": True,
                 "invoice_id": invoice_id,
                 "total_credits": credited,
+                "balance_after": user.balance_credits,
             }
 
     def expire_stale_pending_invoices(self, grace_seconds: int) -> int:
@@ -653,6 +654,8 @@ class BillingRepository:
                 "invoice_id": row.invoice_id,
                 "user_id": row.user_id,
                 "currency": row.currency,
+                "amount_crypto": float(row.amount_crypto),
+                "amount_units": row.amount_units,
                 "amount_usd": float(row.amount_usd),
                 "bonus_pct": float(row.bonus_pct or 0.0),
                 "total_credits": row.total_credits,
@@ -896,6 +899,24 @@ class BillingRepository:
                 func.lower(LedgerEntryORM.deposit_ref).like(f"manual:%:{tx_hash.strip().lower()}")
             )
         )
+
+    def tx_credited_to(self, user_id: str, tx_hash: str | None) -> bool:
+        """Has a transfer in this transaction been credited to this user: by
+        the watcher, a wallet link or an admin?"""
+        if not (tx_hash or "").strip():
+            return False
+        with session_scope(self.session_factory) as session:
+            dep = session.scalar(
+                select(CryptoDepositORM.deposit_ref).where(
+                    func.lower(CryptoDepositORM.tx_hash) == tx_hash.strip().lower(),
+                    CryptoDepositORM.status == "credited",
+                    CryptoDepositORM.user_id == user_id,
+                ).limit(1)
+            )
+            if dep is not None:
+                return True
+            manual = self._manual_credit_row(session, "", tx_hash)
+            return manual is not None and manual.user_id == user_id
 
     def mark_deposits_by_tx(self, currency: str | None, tx_hash: str, **fields) -> int:
         """After an admin confirm: mark the logged transfer(s) of this
@@ -1212,7 +1233,8 @@ class BillingRepository:
         Returns:
           - None if the session doesn't exist
           - {"already_credited": True, ...} if it was already paid/credited
-          - {"credited": True, "session_id", "amount_cents"} on a fresh credit
+          - {"credited": True, "session_id", "amount_cents", "balance_after"}
+            on a fresh credit
 
         Does NOT swallow a missing user (KeyError) — let it propagate so a
         genuinely-broken session 500s and Stripe retries, rather than silently
@@ -1266,6 +1288,7 @@ class BillingRepository:
                 "credited": True,
                 "session_id": ss.session_id,
                 "amount_cents": ss.amount_cents,
+                "balance_after": user.balance_credits,
             }
 
     def reverse_stripe_topup(

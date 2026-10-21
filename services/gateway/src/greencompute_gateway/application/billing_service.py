@@ -149,6 +149,25 @@ def _base_currency(currency: str) -> str:
     return c
 
 
+def _token_amount(amount: float) -> str:
+    """A crypto amount for a payment email, to 6 decimals: "3.692550"."""
+    return f"{amount:.6f}"
+
+
+def _invoice_token_amount(inv: dict) -> str:
+    """What the invoice asked the payer to send."""
+    units = inv.get("amount_units")
+    return format_units(units) if units is not None else _token_amount(inv["amount_crypto"])
+
+
+def _usd(cents: int | None) -> float | None:
+    return None if cents is None else round(cents / 100.0, 2)
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 class BillingService:
     def __init__(self, billing_repo: BillingRepository) -> None:
         self.repo = billing_repo
@@ -256,6 +275,10 @@ class BillingService:
                 log.exception(
                     "ops notification (stripe) failed for session %s", existing.session_id
                 )
+            self._email_payment(
+                existing.user_id, f"payment:stripe:{stripe_session_id}",
+                cents=amount_cents, balance_cents=result.get("balance_after"), method="card",
+            )
         return result
 
     def reconcile_pending_stripe_sessions(self, *, dry_run: bool = True) -> dict:
@@ -534,7 +557,10 @@ class BillingService:
                     f"Crypto deposit {currency.upper()} {amount:g} from verified wallet",
                     "wallet",
                 )
-                return "wallet" if result and result.get("credited") else "seen"
+                if result and result.get("credited"):
+                    self._email_deposit(owner, deposit, cents, result.get("balance_after"))
+                    return "wallet"
+                return "seen"
 
         overpaid = [
             inv for inv in invoices
@@ -597,6 +623,10 @@ class BillingService:
                 invoice_id=inv["invoice_id"], user_id=inv["user_id"],
                 credited_cents=result["total_credits"],
             )
+            self._email_deposit(
+                inv["user_id"], deposit, result["total_credits"], result.get("balance_after"),
+                bonus_pct=inv["bonus_pct"],
+            )
             return how
         # Already credited by an earlier tick.
         self.repo.mark_deposit(deposit["deposit_ref"], status="credited")
@@ -621,16 +651,22 @@ class BillingService:
 
         if action == "dismiss":
             self.repo.set_review_status(invoice_id, "dismissed")
+            if not self._paid_elsewhere(review):
+                self._email_review_resolved(review, "dismissed")
             return {"invoice_id": invoice_id, "review_status": "dismissed"}
 
         if action == "credit_deposit":
-            dep = self.repo.get_deposit(deposit_ref or "")
+            # One email for this, the review's: not payment_received as well.
+            dep, result = self._assign_deposit(deposit_ref or "", review["user_id"])
             if dep is None:
                 raise ReviewError("deposit not found")
-            result = self.assign_deposit(dep["deposit_ref"], review["user_id"])
             if not result or not result.get("credited"):
                 raise ReviewError("that deposit was already credited")
             self.repo.set_review_status(invoice_id, "resolved", paid_tx=dep["tx_hash"] or "")
+            self._email_review_resolved(
+                review, "credited", cents=result["amount_cents"], balance_cents=result.get("balance_after"),
+                currency=dep["currency"], crypto_amount=_token_amount(dep["amount"]), tx_hash=dep["tx_hash"],
+            )
             return {"invoice_id": invoice_id, "review_status": "resolved", "credited_cents": result["amount_cents"]}
 
         if action == "confirm_invoice":
@@ -656,6 +692,9 @@ class BillingService:
                     credited_cents=review["total_credits"],
                 )
             self.repo.set_review_status(invoice_id, "resolved")
+            self._email_review_resolved(
+                review, "credited", cents=review["total_credits"], balance_cents=result.get("balance_after"),
+            )
             return {"invoice_id": invoice_id, "review_status": "resolved", "credited_cents": review["total_credits"]}
 
         raise ReviewError("action must be credit_deposit, confirm_invoice or dismiss")
@@ -708,6 +747,7 @@ class BillingService:
                 "wallet_link",
             )
             if result and result.get("credited"):
+                self._email_deposit(user_id, dep, cents, result.get("balance_after"))
                 credited.append({
                     "deposit_ref": dep["deposit_ref"],
                     "currency": dep["currency"],
@@ -718,12 +758,19 @@ class BillingService:
         return credited
 
     def assign_deposit(self, deposit_ref: str, user_id: str) -> dict | None:
-        """Admin: credit an unmatched deposit to a user."""
+        """Admin: credit an unmatched deposit to a user, and email them."""
+        dep, result = self._assign_deposit(deposit_ref, user_id)
+        if result and result.get("credited"):
+            self._email_deposit(user_id, dep, result["amount_cents"], result.get("balance_after"))
+        return result
+
+    def _assign_deposit(self, deposit_ref: str, user_id: str) -> tuple[dict | None, dict | None]:
+        """(the logged deposit, the credit result); (None, None) if it isn't logged."""
         dep = self.repo.get_deposit(deposit_ref)
         if dep is None:
-            return None
+            return None, None
         cents = self.deposit_value_cents(dep["currency"], dep["amount"], dep["usd_price"])
-        return self.repo.credit_deposit(
+        return dep, self.repo.credit_deposit(
             deposit_ref, user_id, cents,
             f"Crypto deposit {dep['currency'].upper()} {dep['amount']:g} (assigned by admin)",
             "admin",
@@ -788,7 +835,127 @@ class BillingService:
                 )
             except Exception:
                 log.exception("ops notification (crypto) failed for invoice %s", invoice_id)
+            review = self._invoice_review(invoice_id)
+            self._email_payment(
+                invoice.user_id, f"payment:invoice:{invoice_id}",
+                cents=invoice.total_credits, balance_cents=result.get("balance_after"), method="crypto",
+                currency=invoice.currency,
+                crypto_amount=_invoice_token_amount(review) if review else _token_amount(invoice.amount_crypto),
+                tx_hash=tx_hash, bonus_pct=invoice.bonus_pct,
+                via_review=bool(review and review["review_status"] == "open"),
+            )
         return result
+
+    # --- Payment emails ---
+    # Sent by the website (infrastructure/notify_website.py), in the
+    # background and only after a credit has committed. Every caller sends
+    # only when its credit was newly applied ("credited"), never for an
+    # "already credited" or "seen" transfer, so each payment emails once.
+
+    def _email(self, user_id: str, kind: str, event_id: str | None, **fields) -> None:
+        from greencompute_gateway.infrastructure.notify_website import notify_user
+
+        notify_user(self.repo.session_factory, user_id, kind, fields, event_id=event_id)
+
+    def _email_payment(
+        self,
+        user_id: str,
+        event_id: str,
+        *,
+        cents: int,
+        balance_cents: int | None,
+        method: str,
+        currency: str | None = None,
+        crypto_amount: str | None = None,
+        tx_hash: str | None = None,
+        bonus_pct: float = 0.0,
+        via_review: bool = False,
+    ) -> None:
+        """payment_received: `cents` were added to the balance (bonus included)."""
+        self._email(
+            user_id, "payment_received", event_id,
+            amount_usd=_usd(cents),
+            method=method,
+            currency=currency,
+            crypto_amount=crypto_amount,
+            tx_hash=tx_hash or None,
+            bonus_pct=bonus_pct or 0.0,
+            balance_usd=_usd(balance_cents),
+            credited_at=_now_iso(),
+            via_review=via_review,
+        )
+
+    def _email_deposit(
+        self, user_id: str, dep: dict, cents: int, balance_cents: int | None, bonus_pct: float | None = None
+    ) -> None:
+        """payment_received for a logged on-chain transfer. One email per
+        transfer: its deposit_ref is the ledger's unique key."""
+        self._email_payment(
+            user_id, f"payment:{dep['deposit_ref']}",
+            cents=cents, balance_cents=balance_cents, method="crypto",
+            currency=dep["currency"],
+            crypto_amount=_token_amount(dep["amount_raw"] / (10 ** dep["decimals"])),
+            tx_hash=dep.get("tx_hash"),
+            bonus_pct=BONUS_RATES.get(_base_currency(dep["currency"]), 0.0) if bonus_pct is None else bonus_pct,
+        )
+
+    def _invoice_review(self, invoice_id: str) -> dict | None:
+        """The invoice with its review state, for an email; None if that fails."""
+        try:
+            return self.repo.get_invoice_review(invoice_id)
+        except Exception:
+            log.exception("payment email: invoice %s lookup failed", invoice_id)
+            return None
+
+    def _paid_elsewhere(self, review: dict) -> bool:
+        """Was the payment behind a dismissed review added some other way
+        meanwhile (the watcher, a verified wallet, an admin)? That sent its own
+        email, and "we couldn't match it" would be wrong. Unsure counts as
+        yes: better no email than a wrong one."""
+        if review["status"] == "confirmed":
+            return True
+        try:
+            return self.repo.tx_credited_to(review["user_id"], review["tx_hash"])
+        except Exception:
+            log.exception("review email: checking invoice %s failed", review["invoice_id"])
+            return True
+
+    def email_review_received(self, invoice_id: str) -> None:
+        """review_received: the user asked for a payment to be checked by hand."""
+        review = self._invoice_review(invoice_id)
+        if review is None:
+            return
+        self._email(
+            review["user_id"], "review_received", None,
+            amount_usd=round(review["amount_usd"], 2),
+            currency=review["currency"],
+            crypto_amount=_invoice_token_amount(review),
+            tx_hash=review["tx_hash"],
+        )
+
+    def _email_review_resolved(
+        self,
+        review: dict,
+        outcome: str,
+        *,
+        cents: int | None = None,
+        balance_cents: int | None = None,
+        currency: str | None = None,
+        crypto_amount: str | None = None,
+        tx_hash: str | None = None,
+    ) -> None:
+        """review_resolved: "credited" (what was added) or "dismissed". When
+        the review credits, this is the only email: no payment_received."""
+        self._email(
+            review["user_id"], "review_resolved", None,
+            outcome=outcome,
+            amount_usd=_usd(cents),
+            balance_usd=_usd(balance_cents),
+            invoice_amount_usd=round(review["amount_usd"], 2),
+            currency=currency or review["currency"],
+            crypto_amount=crypto_amount or _invoice_token_amount(review),
+            tx_hash=(tx_hash if tx_hash is not None else review["tx_hash"]) or None,
+        )
 
     # --- Usage deduction ---
 
