@@ -408,3 +408,14 @@ def test_the_post_carries_the_secret_and_a_short_timeout(monkeypatch):
     assert nw._post(NOTIFY_URL, SECRET, json.dumps({"type": "payment_received"}).encode()) == 200
     assert seen == {"url": NOTIFY_URL, "method": "POST", "secret": SECRET,
                     "body": {"type": "payment_received"}, "timeout": 5.0}
+
+
+def test_an_error_building_the_email_never_reaches_the_payment(monkeypatch):
+    """The helpers run after the credit commits: even a bug in them (here a
+    deposit missing fields) is logged, not raised into the credit path."""
+    from greencompute_gateway.application import billing_service as bs
+
+    svc = bs.BillingService.__new__(bs.BillingService)
+    svc.repo = None
+    assert svc._email_deposit("u1", {"deposit_ref": "x"}, 100, 200) is None
+    assert svc._email_review_resolved({}, "credited") is None

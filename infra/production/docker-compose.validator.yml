@@ -53,11 +53,6 @@ services:
       # fails CLOSED if unset, so it MUST be set in .env (PROVISION_SECRET) in
       # lockstep with the same value in the UI's env.
       GREENCOMPUTE_PROVISION_SECRET: ${PROVISION_SECRET:-}
-      # Payment emails: the gateway asks the website (with the provision secret
-      # above) to email users when a payment is added or a review is resolved.
-      # PAYMENT_EMAILS_ENABLED=false stops them.
-      GREENCOMPUTE_PAYMENT_EMAILS_ENABLED: ${PAYMENT_EMAILS_ENABLED:-true}
-      WEBSITE_NOTIFY_URL: ${WEBSITE_NOTIFY_URL:-https://www.green-compute.com/api/internal/notify}
       GREENCOMPUTE_BUS_TRANSPORT: durable
       # Stripe
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}

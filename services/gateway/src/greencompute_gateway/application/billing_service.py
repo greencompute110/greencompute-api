@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from datetime import UTC, datetime, timedelta
@@ -166,6 +167,19 @@ def _usd(cents: int | None) -> float | None:
 
 def _now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _email_safely(fn):
+    """Payment emails run after the credit has committed: whatever goes wrong
+    building or sending one is logged, never raised into the payment path."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            log.exception("payment email (%s) failed", fn.__name__)
+            return None
+    return wrapper
 
 
 class BillingService:
@@ -852,11 +866,13 @@ class BillingService:
     # only when its credit was newly applied ("credited"), never for an
     # "already credited" or "seen" transfer, so each payment emails once.
 
+    @_email_safely
     def _email(self, user_id: str, kind: str, event_id: str | None, **fields) -> None:
         from greencompute_gateway.infrastructure.notify_website import notify_user
 
         notify_user(self.repo.session_factory, user_id, kind, fields, event_id=event_id)
 
+    @_email_safely
     def _email_payment(
         self,
         user_id: str,
@@ -885,6 +901,7 @@ class BillingService:
             via_review=via_review,
         )
 
+    @_email_safely
     def _email_deposit(
         self, user_id: str, dep: dict, cents: int, balance_cents: int | None, bonus_pct: float | None = None
     ) -> None:
@@ -920,6 +937,7 @@ class BillingService:
             log.exception("review email: checking invoice %s failed", review["invoice_id"])
             return True
 
+    @_email_safely
     def email_review_received(self, invoice_id: str) -> None:
         """review_received: the user asked for a payment to be checked by hand."""
         review = self._invoice_review(invoice_id)
@@ -933,6 +951,7 @@ class BillingService:
             tx_hash=review["tx_hash"],
         )
 
+    @_email_safely
     def _email_review_resolved(
         self,
         review: dict,

@@ -98,7 +98,12 @@ def _post(url: str, secret: str, data: bytes) -> int | None:
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json", "X-Provision-Secret": secret},
+        headers={
+            "Content-Type": "application/json",
+            "X-Provision-Secret": secret,
+            # Hosts' firewalls often refuse urllib's default "Python-urllib/x.y".
+            "User-Agent": "GreenCompute-Gateway/1.0 (payment emails)",
+        },
         method="POST",
     )
     try:
