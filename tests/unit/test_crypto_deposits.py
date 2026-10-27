@@ -257,8 +257,8 @@ def test_challenge_expires(svc, monkeypatch):
 def test_admin_confirm_then_wallet_link_does_not_pay_twice(svc):
     payer = Keypair.create_from_uri("//BobLaptop")
     inv = svc.create_crypto_invoice("bob", "tao", 30)
-    # Bob pays the wrong amount; the watcher logs it unmatched.
-    svc.resolve_deposit(deposit("tao:7:1", "tao", 90_000_000, sender=payer.ss58_address, tx="0xabc"))
+    # Bob pays far too little (under half the invoice); the watcher logs it unmatched.
+    svc.resolve_deposit(deposit("tao:7:1", "tao", 40_000_000, sender=payer.ss58_address, tx="0xabc"))
     # Support confirms his invoice by hand against that transaction...
     assert svc.confirm_crypto_deposit(inv["invoice_id"], "0xabc")["credited"]
     # ...and later he links the wallet: nothing more is credited.
@@ -533,7 +533,8 @@ def test_review_request_guards(api, svc):
 
 def test_admin_credits_the_logged_deposit_behind_a_review(api, svc):
     inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
-    # Alice rounds up to 21.5 USDC, more than 5% over: nobody is credited.
+    svc.create_crypto_invoice("bob", "usdc-base", 20)
+    # Alice rounds up to 21.5 USDC; Bob's invoice fits too, so nobody is credited.
     svc.resolve_deposit(deposit("usdc-base:0xpaid:0", amount_raw=21_500_000, tx="0xPAID"))
     _expire(svc, inv["invoice_id"])
     api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xpaid"})
@@ -629,7 +630,7 @@ def test_unmatched_payment_and_review_request_alert_the_team(api, svc, monkeypat
     from greencompute_gateway.infrastructure import alerts
 
     texts = []
-    monkeypatch.setattr(alerts, "send_payment_alert", lambda text: texts.append(text))
+    monkeypatch.setattr(alerts, "send_payment_alert", lambda text, **_: texts.append(text))
     svc.resolve_deposit(deposit("usdc-base:0xstray:0", amount_raw=7_000_000))
     inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
     api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xmine"})

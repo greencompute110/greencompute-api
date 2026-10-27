@@ -635,6 +635,21 @@ class BillingRepository:
                 "review_status": "open",
             }
 
+    def open_review_for_tx(self, user_id: str, tx_hash: str) -> str | None:
+        """The invoice this user already has an open review on for this
+        transaction, if any: one transaction is reviewed once."""
+        tx = (tx_hash or "").strip().lower()
+        if not tx:
+            return None
+        with session_scope(self.session_factory) as session:
+            return session.scalar(
+                select(CryptoInvoiceORM.invoice_id).where(
+                    CryptoInvoiceORM.user_id == user_id,
+                    CryptoInvoiceORM.review_status == "open",
+                    func.lower(CryptoInvoiceORM.tx_hash) == tx,
+                ).limit(1)
+            )
+
     def invoice_review_statuses(self, user_id: str) -> dict[str, str]:
         with session_scope(self.session_factory) as session:
             rows = session.execute(

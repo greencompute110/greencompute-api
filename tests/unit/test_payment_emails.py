@@ -104,7 +104,7 @@ def api(svc, monkeypatch):
 
     monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: types.SimpleNamespace(user_id="alice"))
     monkeypatch.setattr(routes, "_get_billing", lambda: svc)
-    monkeypatch.setattr("greencompute_gateway.infrastructure.alerts.send_payment_alert", lambda text: None)
+    monkeypatch.setattr("greencompute_gateway.infrastructure.alerts.send_payment_alert", lambda text, **_: None)
 
     def call(name, *args):
         return getattr(routes, name)(*args, authorization="Bearer k", x_api_key=None)
@@ -193,14 +193,14 @@ def test_verified_wallet_payment_emails_with_the_alpha_bonus(svc, sent):
 
 
 def test_unmatched_and_dust_payments_send_nothing(svc, sent, monkeypatch):
-    monkeypatch.setattr("greencompute_gateway.infrastructure.alerts.send_payment_alert", lambda text: None)
+    monkeypatch.setattr("greencompute_gateway.infrastructure.alerts.send_payment_alert", lambda text, **_: None)
     assert svc.resolve_deposit(deposit("usdc-base:0x3:0", amount_raw=7_000_000)) == "unmatched"
     assert svc.resolve_deposit(deposit("tao:1:1", "tao", 10, sender="5Dust")) == "ignored"
     assert sent == []
 
 
 def test_linking_a_wallet_emails_each_claimed_payment_once(svc, sent, monkeypatch):
-    monkeypatch.setattr("greencompute_gateway.infrastructure.alerts.send_payment_alert", lambda text: None)
+    monkeypatch.setattr("greencompute_gateway.infrastructure.alerts.send_payment_alert", lambda text, **_: None)
     payer = Keypair.create_from_uri("//BobLaptop")
     svc.resolve_deposit(deposit("tao:7:1", "tao", 100_000_000, sender=payer.ss58_address, tx="0xa"))
     svc.resolve_deposit(deposit("tao:7:2", "tao", 50_000_000, sender=payer.ss58_address, tx="0xb"))
@@ -215,7 +215,7 @@ def test_linking_a_wallet_emails_each_claimed_payment_once(svc, sent, monkeypatc
 
 
 def test_admin_assigning_a_deposit_emails_once(svc, sent, monkeypatch):
-    monkeypatch.setattr("greencompute_gateway.infrastructure.alerts.send_payment_alert", lambda text: None)
+    monkeypatch.setattr("greencompute_gateway.infrastructure.alerts.send_payment_alert", lambda text, **_: None)
     svc.resolve_deposit(deposit("usdc-base:0x9:0", amount_raw=12_340_000, tx="0x9"))
     assert svc.assign_deposit("usdc-base:0x9:0", "bob")["credited"]
     assert svc.assign_deposit("usdc-base:0x9:0", "alice")["already_credited"]
@@ -254,8 +254,9 @@ def test_requesting_a_review_emails_what_happens_next(svc, sent, api):
 
 
 def test_review_credited_from_a_deposit_sends_one_email(svc, sent, api, monkeypatch):
-    monkeypatch.setattr("greencompute_gateway.infrastructure.alerts.send_payment_alert", lambda text: None)
+    monkeypatch.setattr("greencompute_gateway.infrastructure.alerts.send_payment_alert", lambda text, **_: None)
     inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    svc.create_crypto_invoice("bob", "usdc-base", 20)  # two customers fit: it waits for a person
     svc.resolve_deposit(deposit("usdc-base:0xpaid:0", amount_raw=21_500_000, tx="0xPAID"))
     api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xpaid"})
     sent.clear()
