@@ -82,6 +82,10 @@ WALLET_LINK_LOOKBACK = timedelta(days=30)
 # expired is still that invoice's for this long, credited at the price when it
 # arrived. New invoices don't reuse those amounts in the meantime.
 LATE_PAYMENT_WINDOW = timedelta(hours=24)
+# A payment that isn't the exact amount still belongs to an invoice when it's
+# within this range of what the invoice asked for (here 50%-200%) and every
+# invoice it could be for is the same customer's: credit what arrived.
+TOLERANT_MATCH = (0.5, 2.0)
 
 
 class TooManyOpenInvoices(Exception):
@@ -517,10 +521,14 @@ class BillingService:
           2. an invoice that asked for exactly this amount and expired within
              LATE_PAYMENT_WINDOW: credited at the value when it arrived;
           3. the sender is a verified wallet: credit its owner the value sent;
-          4. exactly one open invoice this could be an overpayment of (up to
-             5% over): credit the full value received at the invoice's rate;
-          5. otherwise it stays unmatched, to be claimed by linking the
-             sending wallet or assigned by an admin, and the team is alerted.
+          4. not the exact amount, but every open (or recently expired)
+             invoice it could be for (50%-200% of what arrived) is one
+             customer's: credit what arrived, at the invoice's rate if it's
+             still open, else at the value when it arrived. A payment is never
+             refused for its size;
+          5. otherwise (no such invoice, or invoices of several customers fit)
+             it stays unmatched, to be claimed by linking the sending wallet
+             or assigned by an admin, and the team is alerted.
 
         Returns how it was resolved."""
         ref = deposit["deposit_ref"]
@@ -576,18 +584,9 @@ class BillingService:
                     return "wallet"
                 return "seen"
 
-        overpaid = [
-            inv for inv in invoices
-            if inv["amount_crypto"] <= amount <= inv["amount_crypto"] * 1.05
-            and not _exact_amount(inv, deposit)
-        ]
-        if len(overpaid) == 1:
-            inv = overpaid[0]
-            outcome = self._credit_invoice(
-                inv, deposit, "invoice_overpay", credit_cents=_value_at_invoice_rate(inv, amount),
-            )
-            if outcome:
-                return outcome
+        outcome = self._credit_one_customers_invoice(deposit, amount, invoices)
+        if outcome:
+            return outcome
 
         if self.deposit_value_cents(currency, amount, deposit.get("usd_price")) < 1:
             self.repo.mark_deposit(ref, status="ignored")
@@ -600,6 +599,41 @@ class BillingService:
             "Billing admin > Unmatched deposits, or wait for the payer to verify the wallet."
         )
         return "unmatched"
+
+    def _credit_one_customers_invoice(self, deposit: dict, amount: float, open_invoices: list[dict]) -> str | None:
+        """Rule 4 of resolve_deposit: the transfer isn't any invoice's exact
+        amount, but it plainly belongs to one customer, because every open or
+        recently expired invoice within TOLERANT_MATCH of it is theirs (say
+        11 USDT against their two $10 invoices, or 0.1999 TAO against their
+        0.2201 TAO one). Credit what arrived against their oldest open
+        invoice, or, if none is open, their latest expired one. None when no
+        invoice fits or several customers' do."""
+        low, high = TOLERANT_MATCH
+
+        def fits(inv: dict) -> bool:
+            asked = inv["amount_crypto"]
+            return asked > 0 and low * asked <= amount <= high * asked
+
+        currency = deposit["currency"]
+        open_fit = [inv for inv in open_invoices if fits(inv)]
+        expired_fit = [
+            inv for inv in self.repo.recently_expired_invoices(
+                currency, deposit["deposit_address"], datetime.now(UTC) - LATE_PAYMENT_WINDOW
+            )
+            if fits(inv)
+        ]
+        candidates = open_fit + expired_fit
+        if not candidates or len({inv["user_id"] for inv in candidates}) != 1:
+            return None
+        if open_fit:
+            inv = open_fit[0]  # oldest first
+            how = "invoice_overpay" if amount > inv["amount_crypto"] else "invoice_underpay"
+            return self._credit_invoice(inv, deposit, how, credit_cents=_value_at_invoice_rate(inv, amount))
+        return self._credit_invoice(
+            expired_fit[-1], deposit, "invoice_late",
+            credit_cents=self.deposit_value_cents(currency, amount, deposit.get("usd_price")),
+            allow_expired=True,
+        )
 
     def _credit_invoice(
         self,
@@ -619,7 +653,10 @@ class BillingService:
             )
         else:
             amount = deposit["amount_raw"] / (10 ** deposit["decimals"])
-            note = "paid after the invoice expired" if how == "invoice_late" else "more than invoiced"
+            note = {
+                "invoice_late": "paid after the invoice expired",
+                "invoice_underpay": "less than invoiced",
+            }.get(how, "more than invoiced")
             description = f"Crypto deposit {inv['currency'].upper()} {amount:g} ({note})"
         result = self.repo.confirm_and_credit_invoice(
             invoice_id=inv["invoice_id"],

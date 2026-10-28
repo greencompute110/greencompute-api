@@ -1,6 +1,7 @@
 """Payment alerts for the team: a payment nobody was credited for, or a user
-asking for a payment to be reviewed. Posted to Slack and/or Telegram when
-configured; otherwise they are only logged.
+asking for a payment to be reviewed. Emailed to the support inbox (through
+the website, infrastructure/notify_website.py), and posted to Slack and/or
+Telegram when configured.
 
 - GREENCOMPUTE_ALERT_SLACK_WEBHOOK_URL: a Slack incoming-webhook URL
 - GREENCOMPUTE_ALERT_TELEGRAM_BOT_TOKEN + GREENCOMPUTE_ALERT_TELEGRAM_CHAT_ID
@@ -49,8 +50,14 @@ def _post(url: str, body: dict) -> None:
         log.warning("payment alert to %s failed: %s", "telegram" if "telegram" in url else "slack", exc)
 
 
-def send_payment_alert(text: str) -> None:
-    """Log the alert and post it to every configured channel, in the background."""
+def send_payment_alert(text: str, *, email_support: bool = True) -> None:
+    """Log the alert, email it to the support inbox, and post it to every
+    configured channel, in the background. `email_support=False` when the
+    support inbox gets its own, fuller email about the same thing."""
     log.warning("payment alert: %s", text)
+    if email_support:
+        from greencompute_gateway.infrastructure.notify_website import notify_support
+
+        notify_support(text)
     for url, body in _requests(text):
         threading.Thread(target=_post, args=(url, body), daemon=True, name="payment-alert").start()

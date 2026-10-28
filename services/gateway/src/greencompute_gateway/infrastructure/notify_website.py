@@ -58,6 +58,33 @@ def notify_user(session_factory, user_id: str, kind: str, fields: dict, *, event
         log.warning("payment email (%s) not sent: %s", kind, type(exc).__name__)
 
 
+def notify_support(text: str) -> None:
+    """Email a payment alert (an unmatched payment, a billing-monitor finding,
+    the daily summary) to the support inbox through the website, in the
+    background. Never raises."""
+    try:
+        secret = (os.environ.get("GREENCOMPUTE_PROVISION_SECRET") or "").strip()
+        if not secret or not _enabled() or not text:
+            return
+        url = (os.environ.get("WEBSITE_NOTIFY_URL") or "").strip() or DEFAULT_NOTIFY_URL
+        data = json.dumps({"type": "ops_alert", "event_id": f"ops_alert:{uuid4().hex}", "text": text[:4000]}).encode()
+        threading.Thread(target=_send_support, args=(url, secret, data), daemon=True, name="support-alert").start()
+    except Exception as exc:
+        log.warning("support alert not sent: %s", type(exc).__name__)
+
+
+def _send_support(url: str, secret: str, data: bytes) -> None:
+    for attempt in (1, 2):
+        status = _post(url, secret, data)
+        if status is not None and status < 500:
+            if status >= 300:
+                log.warning("support alert refused by the website: HTTP %s", status)
+            return
+        if attempt == 1:
+            time.sleep(_RETRY_DELAY_SECONDS)
+    log.warning("support alert not sent: website unreachable")
+
+
 def _recipient(session_factory, user_id: str) -> tuple[str, str | None] | None:
     """(email, name) to write to, or None for an account without an email
     address or one that was deleted (anonymised to "deleted-<id>")."""

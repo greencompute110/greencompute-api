@@ -2596,7 +2596,19 @@ def _request_review(invoice_id: str, user_id: str, tx_hash: str, note: str | Non
     tx_hash = (tx_hash or "").strip()
     if not tx_hash:
         raise HTTPException(status_code=400, detail="tx_hash required")
-    result = _get_billing().repo.request_invoice_review(invoice_id, user_id, tx_hash, note)
+    billing = _get_billing()
+    # One transaction is reviewed once (the same hash filed on two invoices
+    # left an admin to spot the duplicate).
+    if billing.repo.tx_credited_to(user_id, tx_hash):
+        raise HTTPException(status_code=409, detail="This transaction has already been added to your balance.")
+    already = billing.repo.open_review_for_tx(user_id, tx_hash)
+    if already and already != invoice_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"You've already asked us to check this transaction (invoice {already[:8]}). "
+            "We'll email you when it's done.",
+        )
+    result = billing.repo.request_invoice_review(invoice_id, user_id, tx_hash, note)
     if result is None:
         # Either the invoice doesn't exist or the caller doesn't own it; same
         # response either way so we don't leak invoice ids.
@@ -2610,7 +2622,8 @@ def _request_review(invoice_id: str, user_id: str, tx_hash: str, note: str | Non
     username = _get_billing().repo.get_username(user_id) or user_id
     send_payment_alert(
         f"Payment review requested by {username}: invoice {invoice_id[:8]} ({result['status']}), "
-        f"tx {tx_hash}. Resolve it under Billing admin > Review requests."
+        f"tx {tx_hash}. Resolve it under Billing admin > Review requests.",
+        email_support=False,  # the website emails support its own review request email
     )
     _get_billing().email_review_received(invoice_id)
     return result

@@ -214,7 +214,7 @@ def _kv_set(repo: BillingRepository, key: str, value: str) -> None:
 
 
 # Outcomes of BillingService.resolve_deposit that put money on an account.
-CREDITED = ("invoice", "invoice_overpay", "wallet")
+CREDITED = ("invoice", "invoice_overpay", "invoice_underpay", "invoice_late", "wallet")
 
 
 def _deposit_addresses(repo: BillingRepository, currencies: list[str]) -> dict[str, set[str]]:
