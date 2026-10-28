@@ -1107,6 +1107,7 @@ def create_deployment(
 def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
     from greencompute_gateway.application.services import (
         InsufficientBalanceForRentalError,
+        NoCapacityError,
         UnsupportedGPUError,
     )
 
@@ -1137,6 +1138,24 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         # 402 Payment Required — UI reads the numeric fields to render a
         # friendly "Add $X to start" prompt.
         raise HTTPException(status_code=402, detail=_hour_of_credit_detail(exc, "start")) from exc
+    except NoCapacityError as exc:
+        # 503 + Retry-After: "busy", as distinct from the 400 "never" above.
+        # `code` is for programs; `message` is for people.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "no_capacity",
+                "message": exc.message,
+                "gpu_models": exc.gpu_models,
+                "requested_gpus": exc.gpu_count,
+                "available_gpus": exc.available_gpus,
+                "max_gpus_per_deployment": exc.max_gpus_per_deployment,
+                "retry_after_seconds": exc.retry_after_seconds,
+                "hint": "nothing was created. Poll GET /platform/pricing (available_gpus per GPU) "
+                        "and resend this request once it is at least requested_gpus",
+            },
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
 
 
 def _hour_of_credit_detail(exc, action: str) -> dict:
@@ -1957,23 +1976,29 @@ def embeddings(
     }
 
 
+from greencompute_gateway.domain.gpu_catalog import normalize_gpu_model as _normalize_gpu_model
 from greencompute_gateway.domain.gpu_catalog import public_gpu_models as _public_gpu_models
-from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models as _rentable_gpu_models
 
 
 def _rentable_now() -> list[str]:
-    cp = service.control_plane
-    return _rentable_gpu_models(cp.repository.list_nodes(), cp._is_node_stale)
+    """Public GPU ids with a node the scheduler would use right now."""
+    return service.control_plane.online_gpu_models()
+
+
+def _capacity_by_model() -> dict[str, dict[str, int]]:
+    """Normalised GPU model -> available_gpus / max_gpus_per_deployment, as the scheduler counts them."""
+    return service.control_plane.capacity_by_model()
 
 
 @router.get("/platform/nodes/supported", response_model=None, responses=ok(list[str], "GPU ids you can rent right now"))
 def list_supported_gpus() -> list[str]:
-    """Public -- the GPU ids you can rent RIGHT NOW (a live node reports them).
+    """Public -- the GPU ids with a machine online and taking rentals.
 
     No API key required: an agent needs this to decide whether to sign up at
     all. Any spelling is accepted on input ("RTX 4090", "rtx-4090"); these are
-    the canonical forms. A GPU we price but have no live node for is omitted --
-    advertising it made agents create deployments that could never schedule.
+    the canonical forms. A GPU we price but have no usable node for is omitted
+    -- advertising it made agents create deployments that could never
+    schedule. Whether any are FREE is `available_gpus` in /platform/pricing.
     """
     return _rentable_now()
 
@@ -1995,17 +2020,26 @@ def public_pricing() -> dict:
         rates_for_model,
     )
 
-    rentable = set(_rentable_now())
-    gpus = [
-        {
+    # Free GPUs as the scheduler counts them (net of reservations, on nodes it
+    # would use). `available_now` used to mean only "a machine with this GPU
+    # is online", so it read true while every card was rented; that meaning
+    # is now `online`.
+    online = set(_rentable_now())
+    capacity = _capacity_by_model()
+    gpus = []
+    for m in _public_gpu_models():
+        c = capacity.get(_normalize_gpu_model(m), {})
+        n = c.get("available_gpus", 0)
+        gpus.append({
             "gpu_model": m,
-            "available_now": m in rentable,
+            "online": m in online,
+            "available_now": n > 0,
+            "available_gpus": n,
+            "max_gpus_per_deployment": c.get("max_gpus_per_deployment", 0),
             "vram_gb": GPU_VRAM_GB.get(m),
             "cents_per_gpu_hour": GPU_RATE_CENTS_PER_HOUR[m],
             "usd_per_gpu_hour": round(GPU_RATE_CENTS_PER_HOUR[m] / 100, 2),
-        }
-        for m in _public_gpu_models()
-    ]
+        })
     models = []
     for name in sorted(_public_inference_model_names()):
         cin, cout = rates_for_model(name)

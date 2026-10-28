@@ -16,6 +16,8 @@ from greencompute_gateway.domain.gpu_catalog import matches_public_gpu, public_g
 from greencompute_gateway.transport.routes import DEPLOYMENT_SECRET_FIELDS, public_pricing
 from greencompute_protocol import (
     BuildRecord,
+    CapacityUpdate,
+    Heartbeat,
     DeploymentRecord,
     NodeCapability,
     WorkloadCreateRequest,
@@ -186,6 +188,7 @@ def test_pricing_endpoint_matches_what_billing_charges(monkeypatch):
     monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
     monkeypatch.setattr(routes, "_public_inference_model_names", lambda: [])
     monkeypatch.setattr(routes, "_rentable_now", lambda: ["rtx4090"])
+    monkeypatch.setattr(routes, "_capacity_by_model", lambda: {"rtx4090": {"available_gpus": 3, "max_gpus_per_deployment": 3}})
     body = public_pricing()
     gpus = {g["gpu_model"]: g for g in body["gpu_rental"]["gpus"]}
     assert set(gpus) == {"rtx4090", "rtx5090"}
@@ -196,68 +199,69 @@ def test_pricing_endpoint_matches_what_billing_charges(monkeypatch):
     assert body["currency"] == "USD"
 
 
-# --- 6. Only GPUs a LIVE node has are rentable (cold-agent test, 2026-10-09) --
+# --- 6. Only GPUs a usable node has are online (cold-agent test, 2026-10-09) --
 #
 # The RTX 5090 cluster stopped reporting 47+ days earlier, but the price table
 # still listed the 5090 and an admin capacity override advertised 8 free. A
-# 5090 request passed validation and would have sat `pending` forever.
+# 5090 request passed validation and would have sat `pending` forever. "Online"
+# is now the scheduler's own node filter (`_schedulable_nodes`): stale,
+# drained and unhealthy nodes are all offline, not "busy".
 
 
-def _live_node(gpu, stale=False):
-    return SimpleNamespace(gpu_model=gpu, stale=stale)
+def _online(nodes, env=None, monkeypatch=None):
+    if monkeypatch is not None:
+        if env is None:
+            monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
+        else:
+            monkeypatch.setenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", env)
+    stub = SimpleNamespace(_schedulable_nodes=lambda: ([SimpleNamespace(gpu_model=g) for g in nodes], len(nodes), {}))
+    return ControlPlaneService.online_gpu_models(stub)
 
 
-def _is_stale(n):
-    return n.stale
-
-
-def test_a_priced_gpu_with_only_stale_nodes_is_not_rentable(monkeypatch):
-    from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models
-
-    monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
-    nodes = [_live_node("rtx4090"), _live_node("rtx5090", stale=True), _live_node("RTX 5090", stale=True)]
-    assert rentable_gpu_models(nodes, _is_stale) == ["rtx4090"]
-
-
-def test_a_live_node_makes_its_gpu_rentable_whatever_the_spelling(monkeypatch):
-    from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models
+def test_a_priced_gpu_with_only_unusable_nodes_is_not_online(monkeypatch):
+    from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
+    from datetime import UTC, datetime, timedelta
 
     monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
-    nodes = [_live_node("RTX-4090"), _live_node("rtx 5090")]
-    assert rentable_gpu_models(nodes, _is_stale) == ["rtx4090", "rtx5090"]
+    repo = ControlPlaneRepository(database_url="sqlite+pysqlite:///:memory:", bootstrap=True)
+    cp = ControlPlaneService(repository=repo)
+    cp.update_capacity(CapacityUpdate(hotkey="a", nodes=[_node("rtx4090")]))
+    cp.record_heartbeat(Heartbeat(hotkey="a"))
+    cp.update_capacity(CapacityUpdate(hotkey="b", nodes=[_node("rtx5090").model_copy(update={"hotkey": "b"})],
+                                      observed_at=datetime.now(UTC) - timedelta(days=47)))
+    cp.record_heartbeat(Heartbeat(hotkey="b"))
+    assert cp.online_gpu_models() == ["rtx4090"]
+
+
+def test_a_usable_node_makes_its_gpu_online_whatever_the_spelling(monkeypatch):
+    assert _online(["RTX-4090", "rtx 5090"], monkeypatch=monkeypatch) == ["rtx4090", "rtx5090"]
 
 
 def test_excluding_a_family_hides_it_even_with_live_nodes(monkeypatch):
     # "Pause RTX 5090 rentals" is a config switch, independent of liveness.
-    from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models
-
-    monkeypatch.setenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", "4090")
-    nodes = [_live_node("rtx4090"), _live_node("rtx5090")]
-    assert rentable_gpu_models(nodes, _is_stale) == ["rtx4090"]
+    assert _online(["rtx4090", "rtx5090"], env="4090", monkeypatch=monkeypatch) == ["rtx4090"]
 
 
-def test_internal_only_hardware_is_never_rentable_publicly(monkeypatch):
-    from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models
-
-    monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
-    assert rentable_gpu_models([_live_node("a4000")], _is_stale) == []
+def test_internal_only_hardware_is_never_online_publicly(monkeypatch):
+    assert _online(["a4000"], monkeypatch=monkeypatch) == []
 
 
-def _gateway_stub(nodes, supported):
+def _gateway_stub(online, supported):
     workload = _workload(supported)
     cp = SimpleNamespace(
-        repository=SimpleNamespace(get_workload=lambda wid: workload, list_nodes=lambda: nodes),
-        _is_node_stale=_is_stale,
+        repository=SimpleNamespace(get_workload=lambda wid: workload),
+        online_gpu_models=lambda: online,
+        placement_preview=lambda w: (True, {}),
         create_deployment=lambda body: pytest.fail("must be rejected before reaching the control-plane"),
     )
     return SimpleNamespace(control_plane=cp, _user_can_access_workload=lambda w, u: True), workload
 
 
-def test_a_stale_only_gpu_is_rejected_up_front_with_what_is_available(monkeypatch):
+def test_an_offline_gpu_is_rejected_up_front_with_what_is_available(monkeypatch):
     from greencompute_gateway.application.services import UnsupportedGPUError
 
     monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
-    stub, wl = _gateway_stub([_live_node("rtx4090"), _live_node("rtx5090", stale=True)], ["rtx5090"])
+    stub, wl = _gateway_stub(["rtx4090"], ["rtx5090"])
     with pytest.raises(UnsupportedGPUError) as exc:
         GatewayService.create_deployment(stub, {"workload_id": wl.workload_id}, user_id="u1")
     assert exc.value.available == ["rtx4090"]
@@ -281,10 +285,17 @@ def test_pricing_flags_which_gpus_are_available_now(monkeypatch):
 
     monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
     monkeypatch.setattr(routes, "_public_inference_model_names", lambda: [])
-    monkeypatch.setattr(routes, "_rentable_now", lambda: ["rtx4090"])
+    # Two 4090 machines with 3 and 2 free; a 5090 machine online but full.
+    monkeypatch.setattr(routes, "_rentable_now", lambda: ["rtx4090", "rtx5090"])
+    monkeypatch.setattr(routes, "_capacity_by_model", lambda: {
+        "rtx4090": {"available_gpus": 5, "max_gpus_per_deployment": 3},
+        "rtx5090": {"available_gpus": 0, "max_gpus_per_deployment": 0},
+    })
     gpus = {g["gpu_model"]: g for g in routes.public_pricing()["gpu_rental"]["gpus"]}
-    assert gpus["rtx4090"]["available_now"] is True
-    assert gpus["rtx5090"]["available_now"] is False
+    g = gpus["rtx4090"]
+    assert (g["online"], g["available_now"], g["available_gpus"], g["max_gpus_per_deployment"]) == (True, True, 5, 3)
+    g = gpus["rtx5090"]
+    assert (g["online"], g["available_now"], g["available_gpus"], g["max_gpus_per_deployment"]) == (True, False, 0, 0)
 
 
 # --- 7. Deleting a workload keeps the evidence behind its charges ------------
