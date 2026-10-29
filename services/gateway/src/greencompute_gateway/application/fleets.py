@@ -198,6 +198,12 @@ def view(service, fleet: FleetORM, members: list | None = None, online: list[str
     live = [(m, d) for m, d in members if _live(d)]
     workload = service.control_plane.repository.get_workload(fleet.workload_id)
     cost = _member_cost_cents(service, workload, online) if workload is not None else None
+    running = sum(1 for _, d in live if d.state == DeploymentState.READY)
+    status = fleet.status_reason or ""
+    # Nothing to wait for: say how things stand now, not at the last pass.
+    if fleet.state == "active" and len(live) >= fleet.target:
+        status = (f"All {fleet.target} running." if running >= fleet.target
+                  else f"{len(live)} of {fleet.target} started; {running} running.")
     return {
         "fleet_id": fleet.fleet_id,
         "workload_id": fleet.workload_id,
@@ -205,8 +211,8 @@ def view(service, fleet: FleetORM, members: list | None = None, online: list[str
         "target": fleet.target,
         "replace": fleet.replace,
         "state": fleet.state,
-        "status": fleet.status_reason or "",
-        "running": sum(1 for _, d in live if d.state == DeploymentState.READY),
+        "status": status,
+        "running": running,
         "starting": sum(1 for _, d in live if d.state in _STARTING),
         "paused": sum(1 for _, d in live if d.state == DeploymentState.SUSPENDED),
         "max_runtime_minutes": fleet.max_runtime_minutes,
