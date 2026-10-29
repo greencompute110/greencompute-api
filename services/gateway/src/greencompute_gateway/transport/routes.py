@@ -2471,6 +2471,58 @@ def billing_forecast(
     return forecast(api_key.user_id, control_plane=service.control_plane)
 
 
+@router.get("/platform/billing/spending", response_model=None, responses=ok(schemas.SpendingSummary, "What you spent, per day and per deployment"))
+def billing_spending(
+    from_: str | None = Query(default=None, alias="from", description="First day, YYYY-MM-DD (UTC). Default: 29 days before `to`."),
+    to: str | None = Query(default=None, description="Last day, YYYY-MM-DD (UTC), included. Default: today."),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Your charges added up per day and per deployment (with its name, GPUs
+    and hours), and your top-ups, for up to 400 days. The ledger has one row
+    per metered minute; this is the readable version."""
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.user_id is None:
+        raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    from greencompute_gateway.application.statements import parse_range, spending_summary
+
+    try:
+        first, last = parse_range(from_, to)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return spending_summary(_get_billing().repo, service.control_plane, api_key.user_id, first, last)
+
+
+@router.get("/platform/billing/statement", response_model=None, responses=ok(schemas.Statement, "One month's statement"))
+def billing_statement(
+    month: str | None = Query(default=None, description="YYYY-MM (UTC). Default: this month."),
+    format: str = Query(default="json", description="`json`, or `csv` for a file to download."),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    """A month as statement lines (one per deployment per day per kind of
+    charge, plus each top-up, refund or adjustment), with opening and closing
+    balance. `format=csv` returns the same as a CSV file."""
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.user_id is None:
+        raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    if format not in ("json", "csv"):
+        raise HTTPException(status_code=400, detail="format must be json or csv")
+    from greencompute_gateway.application.statements import monthly_statement, statement_csv
+
+    try:
+        statement = monthly_statement(_get_billing().repo, service.control_plane, api_key.user_id, month)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if format == "csv":
+        return Response(
+            content=statement_csv(statement),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="green-compute-statement-{statement["month"]}.csv"'},
+        )
+    return statement
+
+
 @router.get("/platform/billing/ledger", response_model=None, responses=ok(list[schemas.LedgerItem], "Top-ups and charges, newest first"))
 def billing_ledger(
     limit: int = 50,
