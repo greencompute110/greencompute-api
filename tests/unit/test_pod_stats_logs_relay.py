@@ -93,3 +93,12 @@ def test_spec_documents_both():
     assert "/platform/deployments/{deployment_id}/logs" in spec["paths"]
     props = spec["components"]["schemas"]["GpuReading"]["properties"]
     assert {"power_w", "temperature_c", "sm_clock_mhz", "util_pct"} <= set(props)
+
+
+def test_a_reply_cut_short_is_no_reading_not_a_crash(relay, monkeypatch):
+    import http.client
+
+    def cut(req, timeout):
+        raise http.client.IncompleteRead(b"{\"cpu")
+    monkeypatch.setattr(routes.urllib_request, "urlopen", cut)
+    assert routes.get_deployment_stats("d1", authorization="Bearer k", x_api_key=None) == {}

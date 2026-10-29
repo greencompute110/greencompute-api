@@ -1,4 +1,5 @@
 import hashlib
+import http.client
 import json
 import logging
 import math
@@ -1483,8 +1484,8 @@ def _node_get(deployment, path: str, *, timeout: float, max_bytes: int) -> dict 
                 return None
             data = json.loads(body.decode() or "{}")
             return data if isinstance(data, dict) else None
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
-        return None
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, http.client.HTTPException):
+        return None  # incl. a reply cut short (IncompleteRead) by a restarting node
 
 
 @router.get("/platform/deployments/{deployment_id}/stats", response_model=None,

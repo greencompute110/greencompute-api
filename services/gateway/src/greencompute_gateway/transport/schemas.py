@@ -343,6 +343,7 @@ class GpuReading(BaseModel):
     sm_clock_mhz: float | None = None
     mem_clock_mhz: float | None = None
     fan_pct: float | None = Field(default=None, description="Null where the card doesn't report it.")
+    error: str | None = Field(default=None, description="Set, with no readings, when this GPU didn't answer.")
 
 
 class PodStats(BaseModel):
