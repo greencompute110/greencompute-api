@@ -606,6 +606,14 @@ class ControlPlaneRepository:
             row = session.get(DeploymentORM, deployment_id)
             return self._to_deployment(row) if row else None
 
+    def get_deployments(self, deployment_ids: list[str]) -> dict[str, DeploymentRecord]:
+        """Several deployments in one query, by id (missing ones left out)."""
+        if not deployment_ids:
+            return {}
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(select(DeploymentORM).where(DeploymentORM.deployment_id.in_(deployment_ids))).all()
+            return {row.deployment_id: self._to_deployment(row) for row in rows}
+
     def update_deployment(self, deployment: DeploymentRecord) -> DeploymentRecord:
         with session_scope(self.session_factory) as session:
             row = session.get(DeploymentORM, deployment.deployment_id)

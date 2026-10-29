@@ -726,36 +726,33 @@ def _enforce_key_limits(api_key, *, starting_rental: bool = False) -> None:
     daily_limit = getattr(api_key, "daily_spend_limit_usd", None)
     if getattr(api_key, "admin", False) or (max_active is None and daily_limit is None):
         return
-    from greencompute_persistence.key_limits import key_active_rentals, key_spend_cents
+    from greencompute_persistence.key_limits import key_rental_room
 
-    session_factory = service.repository.session_factory
-    if starting_rental and max_active is not None:
-        active = key_active_rentals(session_factory, api_key.key_id)
-        if active >= max_active:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "message": "this API key already has as many rentals running as it is allowed",
-                    "code": "key_limit",
-                    "max_active_rentals": max_active,
-                    "active_rentals": active,
-                    "hint": "stop one with DELETE /platform/deployments/{id}, or use a key with a higher limit",
-                },
-            )
-    if daily_limit is not None:
-        spent = key_spend_cents(session_factory, api_key.key_id)
-        if spent >= round(daily_limit * 100):
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "message": "this API key has reached its spend limit for the last 24 hours",
-                    "code": "key_limit",
-                    "daily_spend_limit_usd": daily_limit,
-                    "spent_last_24h_usd": round(spent / 100, 2),
-                    "hint": "wait for earlier spending to fall out of the 24-hour window, or use a key with a higher limit",
-                },
-            )
-
+    _room, why, numbers = key_rental_room(
+        service.repository.session_factory, api_key.key_id, max_active if starting_rental else None, daily_limit,
+    )
+    if why == "active":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "this API key already has as many rentals running as it is allowed",
+                "code": "key_limit",
+                "max_active_rentals": max_active,
+                "active_rentals": numbers["active_rentals"],
+                "hint": "stop one with DELETE /platform/deployments/{id}, or use a key with a higher limit",
+            },
+        )
+    if why == "spend":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "this API key has reached its spend limit for the last 24 hours",
+                "code": "key_limit",
+                "daily_spend_limit_usd": daily_limit,
+                "spent_last_24h_usd": round(numbers["spent_cents"] / 100, 2),
+                "hint": "wait for earlier spending to fall out of the 24-hour window, or use a key with a higher limit",
+            },
+        )
 
 def _with_idempotency(api_key, endpoint: str, idempotency_key: str | None, body: dict, response: Response, run) -> dict:
     """Run a create at most once per account, endpoint and Idempotency-Key.
@@ -1105,6 +1102,7 @@ def create_deployment(
 def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
     from greencompute_gateway.application.services import (
         InsufficientBalanceForRentalError,
+        KeyLimitError,
         NoCapacityError,
         UnsupportedGPUError,
     )
@@ -1136,6 +1134,11 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         # 402 Payment Required — UI reads the numeric fields to render a
         # friendly "Add $X to start" prompt.
         raise HTTPException(status_code=402, detail=_hour_of_credit_detail(exc, "start")) from exc
+    except KeyLimitError as exc:
+        # Normally caught by _enforce_key_limits above; this is the race
+        # where another request took the last slot in between.
+        _enforce_key_limits(api_key, starting_rental=True)
+        raise HTTPException(status_code=403, detail={"message": str(exc), "code": "key_limit"}) from exc
     except NoCapacityError as exc:
         # 503 + Retry-After: "busy", as distinct from the 400 "never" above.
         # `code` is for programs; `message` is for people.
@@ -1213,6 +1216,116 @@ def _attach_workload_info(rows: list[dict], workloads_by_id: dict) -> list[dict]
             row["gpu_model"] = gpus[0] if gpus else None
             row["gpu_count"] = wl.requirements.gpu_count
     return rows
+
+
+def _fleet_call(fn):
+    """Fleet errors as HTTP: not found 404, not yours 403, can't 400."""
+    from greencompute_gateway.application.fleets import FleetError
+
+    try:
+        return fn()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'\"")) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except FleetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/platform/fleets", response_model=None, responses=ok(schemas.Fleet, "The new fleet"))
+def create_fleet(
+    payload: schemas.FleetCreate,
+    response: Response,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    """Keep `target` rentals of a workload running (`replace: true`, the
+    default): any that stops or fails is replaced, under the same name. Or,
+    with `replace: false`, start `target` of them as GPUs free up and stop
+    there. Members are ordinary deployments named `<name_prefix>-01`, `-02`, …
+    and are billed as usual; the fleet waits when GPUs, credit or this key's
+    limits run out, and pauses if three in a row fail before they are ready."""
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.user_id is None:
+        raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    enforce_rate_limit("create_fleet", api_key.key_id, limit=10, window_seconds=60)
+    from greencompute_gateway.application import fleets
+
+    def run() -> dict:
+        fleet = _fleet_call(lambda: fleets.create_fleet(
+            service, user_id=api_key.user_id, key_id=None if api_key.admin else api_key.key_id,
+            admin=api_key.admin, body=payload.model_dump(),
+        ))
+        return fleets.view(service, fleet)
+
+    # A retry with the same Idempotency-Key returns the first fleet, never a second one.
+    return _with_idempotency(api_key, "create_fleet", idempotency_key, payload.model_dump(), response, run)
+
+
+@router.get("/platform/fleets", response_model=None, responses=ok(list[schemas.Fleet], "Your fleets"))
+def list_fleets(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    """Your fleets: all but those stopped more than a week ago."""
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.user_id is None:
+        raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    from greencompute_gateway.application import fleets
+
+    online = service.control_plane.online_gpu_models()  # once, not per fleet
+    return [fleets.view(service, f, online=online) for f in fleets.list_fleets(service, api_key.user_id)]
+
+
+@router.get("/platform/fleets/{fleet_id}", response_model=None, responses=ok(schemas.Fleet, "The fleet and its members"))
+def get_fleet(
+    fleet_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    api_key = require_api_key(authorization, x_api_key)
+    from greencompute_gateway.application import fleets
+
+    fleet = _fleet_call(lambda: fleets.get_fleet(service, fleet_id, api_key.user_id, admin=api_key.admin))
+    return fleets.view(service, fleet)
+
+
+@router.patch("/platform/fleets/{fleet_id}", response_model=None, responses=ok(schemas.Fleet, "The fleet"))
+def update_fleet(
+    fleet_id: str,
+    payload: schemas.FleetUpdate,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Change `target` (raising starts more, lowering stops the newest
+    not-yet-ready ones first), or `paused` true/false. Resuming a fleet that
+    paused itself after failures clears that count."""
+    api_key = require_api_key(authorization, x_api_key)
+    from greencompute_gateway.application import fleets
+
+    fleet = _fleet_call(lambda: fleets.update_fleet(
+        service, fleet_id, user_id=api_key.user_id, admin=api_key.admin,
+        body=payload.model_dump(exclude_none=True),
+    ))
+    return fleets.view(service, fleet)
+
+
+@router.delete("/platform/fleets/{fleet_id}", response_model=None, responses=ok(schemas.Fleet, "The stopped fleet"))
+def stop_fleet(
+    fleet_id: str,
+    keep_running: bool = Query(default=False, description="true: stop the fleet but leave its rentals running."),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Stop the fleet and its rentals (or only the fleet, with `keep_running=true`)."""
+    api_key = require_api_key(authorization, x_api_key)
+    from greencompute_gateway.application import fleets
+
+    fleet = _fleet_call(lambda: fleets.stop_fleet(
+        service, fleet_id, user_id=api_key.user_id, admin=api_key.admin, keep_running=keep_running,
+    ))
+    return fleets.view(service, fleet)
 
 
 @router.get("/platform/deployments", response_model=None, responses=ok(list[schemas.Deployment], "Your deployments, including stopped ones"))

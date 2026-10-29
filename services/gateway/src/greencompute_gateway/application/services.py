@@ -194,6 +194,20 @@ class NoCapacityError(Exception):
         super().__init__(self.message)
 
 
+class KeyLimitError(Exception):
+    """The API key a deployment is created with is at one of its limits:
+    `reason` "active" (rentals at once) or "spend" (daily spend). Enforced
+    in create_deployment itself, so every caller (the route, fleets) is held
+    to the same rule."""
+
+    def __init__(self, reason: str, *, max_active_rentals=None, daily_spend_limit_usd=None, numbers=None) -> None:
+        self.reason = reason
+        self.max_active_rentals = max_active_rentals
+        self.daily_spend_limit_usd = daily_spend_limit_usd
+        self.numbers = numbers or {}
+        super().__init__(f"api key at its {reason} limit")
+
+
 class InsufficientBalanceForRentalError(Exception):
     """Raised by GatewayService.create_deployment when the caller doesn't
     have enough credits to cover ≥ 1 hour of the requested workload at the
@@ -870,6 +884,21 @@ class GatewayService:
                         user_id, workload.kind, workload.workload_id, workload.metadata
                     ),
                 )
+
+        # The creating key's own limits (rentals at once, daily spend).
+        if not admin and created_by_key_id:
+            key = self.repository.get_api_key(created_by_key_id)
+            if key is not None and not key.admin and (
+                key.max_active_rentals is not None or key.daily_spend_limit_usd is not None
+            ):
+                from greencompute_persistence.key_limits import key_rental_room
+
+                _room, why, numbers = key_rental_room(
+                    self.repository.session_factory, key.key_id, key.max_active_rentals, key.daily_spend_limit_usd,
+                )
+                if why:
+                    raise KeyLimitError(why, max_active_rentals=key.max_active_rentals,
+                                        daily_spend_limit_usd=key.daily_spend_limit_usd, numbers=numbers)
 
         # Fail fast when the fleet is full, too (after the balance check, so a
         # caller who must top up hears that first and is ready to go when a GPU

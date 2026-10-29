@@ -217,6 +217,45 @@ class DeploymentORM(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class FleetORM(Base):
+    """"Keep N running" (gateway application/fleets.py): a target count of
+    rentals from one workload, filled and refilled by the fleet loop."""
+    __tablename__ = "fleets"
+
+    fleet_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    created_by_key_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    workload_id: Mapped[str] = mapped_column(String(64))
+    name_prefix: Mapped[str] = mapped_column(String(44))
+    target: Mapped[int] = mapped_column(Integer)
+    # True: replace members that stop. False: start `target` once, then done.
+    replace: Mapped[bool] = mapped_column(Boolean, default=True)
+    # active | paused | completed | stopped
+    state: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    max_runtime_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    save_on_exhaustion: Mapped[bool] = mapped_column(Boolean, default=False)
+    resume_on_topup: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Failures before this don't count toward pausing (set on resume).
+    failures_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class FleetMemberORM(Base):
+    """A deployment a fleet started, and its slot (the NN in prefix-NN)."""
+    __tablename__ = "fleet_members"
+
+    deployment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    fleet_id: Mapped[str] = mapped_column(String(64), index=True)
+    slot: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Set once the fleet sees it ended; `ran`: it was ready at some point.
+    # Finished members older than a day are no longer loaded.
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ran: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class CreditWarningORM(Base):
     """The low-credit email a customer last got (gateway credit_watch): the
     level it was for (24 or 2 hours of credit left), so each level is sent
