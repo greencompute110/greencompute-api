@@ -116,7 +116,7 @@ def test_a_status_report_cannot_say_why_a_deployment_is_suspended(monkeypatch):
 
 from greencompute_control_plane.config import settings as cp_settings
 from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
-from greencompute_protocol import MinerRegistration, sign_payload
+from greencompute_protocol import DeploymentRecord, MinerRegistration, sign_payload
 
 
 def _registration(secret, payout="5Fowner", url="http://owner"):
@@ -165,3 +165,66 @@ def test_re_registering_does_not_undo_an_admin_drain(registry):
     repo.set_miner_drained("victim-hotkey", True)
     assert _post_register(tc, _registration("owner-secret-1"), "owner-secret-1").status_code == 200
     assert repo.get_miner("victim-hotkey").drained is True
+
+
+# --- the status route says nothing about a deployment to a stranger ------------
+
+
+def _signed_status(tc, deployment_id, hotkey, secret):
+    body = ('{"deployment_id":"%s","state":"ready"}' % deployment_id).encode()
+    headers = {"Content-Type": "application/json"}
+    if hotkey:
+        signed = sign_payload(secret=secret, actor_id=hotkey, body=body)
+        headers.update({"X-Miner-Hotkey": hotkey, "X-Miner-Signature": signed.signature,
+                        "X-Miner-Nonce": signed.nonce, "X-Miner-Timestamp": str(signed.timestamp)})
+    return tc.post(f"/miner/v1/deployments/{deployment_id}/status", content=body, headers=headers)
+
+
+def test_a_stranger_cannot_tell_which_deployment_ids_exist(registry, monkeypatch):
+    tc, repo = registry
+    for hotkey, secret in (("miner-a", "secret-a-123"), ("miner-b", "secret-b-123")):
+        reg = MinerRegistration(hotkey=hotkey, payout_address="5F", auth_secret=secret,
+                                api_base_url="http://m", validator_url="http://v")
+        assert _post_register(tc, reg, secret).status_code == 200
+    wl_id = "w-1"
+    real = repo.create_deployment(DeploymentRecord(workload_id=wl_id, hotkey="miner-a", node_id="n1"))
+    monkeypatch.setattr(cp_routes.service, "update_deployment_status",
+                        lambda p: SimpleNamespace(model_dump=lambda mode=None: {"state": p.state.value}))
+
+    # Anonymous: 401 whether or not the id exists.
+    assert _signed_status(tc, real.deployment_id, None, None).status_code == 401
+    assert _signed_status(tc, "no-such-id", None, None).status_code == 401
+    # Another registered miner: 404 for someone else's deployment, same as for none.
+    assert _signed_status(tc, real.deployment_id, "miner-b", "secret-b-123").status_code == 404
+    assert _signed_status(tc, "no-such-id", "miner-b", "secret-b-123").status_code == 404
+    # A forged signature for the owner's hotkey: 401.
+    assert _signed_status(tc, real.deployment_id, "miner-a", "wrong-secret-1").status_code == 401
+    # The owner: accepted.
+    assert _signed_status(tc, real.deployment_id, "miner-a", "secret-a-123").status_code == 200
+
+
+
+def _signed_get(tc, deployment_id, hotkey, secret):
+    headers = {}
+    if hotkey:
+        signed = sign_payload(secret=secret, actor_id=hotkey, body=b"")
+        headers = {"X-Miner-Hotkey": hotkey, "X-Miner-Signature": signed.signature,
+                   "X-Miner-Nonce": signed.nonce, "X-Miner-Timestamp": str(signed.timestamp)}
+    return tc.get(f"/miner/v1/deployments/{deployment_id}", headers=headers)
+
+
+def test_reading_a_deployment_follows_the_same_rule(registry):
+    tc, repo = registry
+    for hotkey, secret in (("miner-a", "secret-a-123"), ("miner-b", "secret-b-123")):
+        reg = MinerRegistration(hotkey=hotkey, payout_address="5F", auth_secret=secret,
+                                api_base_url="http://m", validator_url="http://v")
+        assert _post_register(tc, reg, secret).status_code == 200
+    placed = repo.create_deployment(DeploymentRecord(workload_id="w", hotkey="miner-a", node_id="n1"))
+    unplaced = repo.create_deployment(DeploymentRecord(workload_id="w"))  # no miner yet
+
+    assert _signed_get(tc, placed.deployment_id, None, None).status_code == 401
+    assert _signed_get(tc, "no-such-id", None, None).status_code == 401
+    assert _signed_get(tc, placed.deployment_id, "miner-b", "secret-b-123").status_code == 404
+    assert _signed_get(tc, unplaced.deployment_id, "miner-b", "secret-b-123").status_code == 404  # was readable
+    ok = _signed_get(tc, placed.deployment_id, "miner-a", "secret-a-123")
+    assert ok.status_code == 200 and ok.json()["deployment_id"] == placed.deployment_id

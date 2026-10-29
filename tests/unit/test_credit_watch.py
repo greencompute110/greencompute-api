@@ -376,7 +376,7 @@ def test_a_machine_cannot_say_why_a_deployment_is_suspended(world, monkeypatch):
         payload=DeploymentStatusUpdate(deployment_id=dep.deployment_id, state=DeploymentState.SUSPENDED,
                                        suspended_reason="balance"),
         raw_body=b"{}",
-        x_miner_hotkey=None, x_miner_signature=None, x_miner_nonce=None, x_miner_timestamp=None, x_miner_auth_mode=None,
+        x_miner_hotkey="m", x_miner_signature=None, x_miner_nonce=None, x_miner_timestamp=None, x_miner_auth_mode=None,
     )
     assert cp.repository.get_deployment(dep.deployment_id).suspended_reason is None
 

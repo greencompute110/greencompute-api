@@ -24,6 +24,32 @@ def _feature_disabled(feature: str) -> None:
 metrics = get_metrics_store("greencompute-control-plane")
 
 
+def _miner_owned_deployment(
+    deployment_id: str,
+    body: bytes,
+    x_miner_hotkey,
+    x_miner_signature,
+    x_miner_nonce,
+    x_miner_timestamp,
+    x_miner_auth_mode,
+):
+    """The deployment, for the miner that runs it. Authenticates the caller
+    as the miner it claims to be BEFORE looking anything up, then answers
+    404 alike for an id that doesn't exist, one not placed yet and one that
+    is another miner's. Looking it up first told anyone which ids exist
+    (404 for unknown, 401/403 for real ones), and an unplaced deployment was
+    readable by any signed-in miner."""
+    claimed = x_miner_hotkey if isinstance(x_miner_hotkey, str) else ""
+    require_miner_request(
+        claimed, body, x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp,
+        x_miner_auth_mode=x_miner_auth_mode,
+    )
+    deployment = service.repository.get_deployment(deployment_id)
+    if deployment is None or not deployment.hotkey or deployment.hotkey != claimed:
+        raise HTTPException(status_code=404, detail="deployment not found")
+    return deployment
+
+
 @router.post("/miner/v1/register", response_model=MinerRegistration)
 def register_miner(
     payload: MinerRegistration,
@@ -107,11 +133,9 @@ def get_deployment(
     x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
     x_miner_auth_mode: str | None = Header(default=None, alias="X-Miner-Auth-Mode"),
 ) -> dict:
-    deployment = service.repository.get_deployment(deployment_id)
-    if deployment is None:
-        raise HTTPException(status_code=404, detail="deployment not found")
-    hotkey = deployment.hotkey or (x_miner_hotkey or "")
-    require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp, x_miner_auth_mode=x_miner_auth_mode)
+    deployment = _miner_owned_deployment(
+        deployment_id, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp, x_miner_auth_mode,
+    )
     return deployment.model_dump(mode="json")
 
 
@@ -166,17 +190,9 @@ def deployment_status(
 ) -> dict:
     if payload.deployment_id != deployment_id:
         raise HTTPException(status_code=400, detail="deployment id mismatch")
-    deployment = service.repository.get_deployment(deployment_id)
-    if deployment is None or deployment.hotkey is None:
-        raise HTTPException(status_code=404, detail="deployment not found")
-    require_miner_request(
-        deployment.hotkey,
-        raw_body,
-        x_miner_hotkey,
-        x_miner_signature,
-        x_miner_nonce,
-        x_miner_timestamp,
-        x_miner_auth_mode=x_miner_auth_mode,
+    _miner_owned_deployment(
+        deployment_id, raw_body, x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp,
+        x_miner_auth_mode,
     )
     # Why a deployment is suspended is the control plane's to say (the meter,
     # the idle sweep), never the machine's: a stamped "balance" from a miner
@@ -185,6 +201,9 @@ def deployment_status(
         payload = payload.model_copy(update={"suspended_reason": None})
     try:
         saved = service.update_deployment_status(payload)
+    except KeyError as exc:
+        # Deleted between the ownership check and the update.
+        raise HTTPException(status_code=404, detail="deployment not found") from exc
     except InvalidDeploymentTransition as exc:
         # Illegal transition from a live (non-terminal) state — surface as a
         # non-retryable 409 so the miner stops retrying, never a 500. Terminal
