@@ -42,6 +42,10 @@ def test_a_list_command_is_quoted_and_joined():
     ({"env": {"nvidia_visible_devices": "all"}}, "set by the platform"),
     ({"env": {"A": {"nested": 1}}}, "must be a string"),
     ({"env": {f"V{i}": "x" for i in range(65)}}, "at most 64"),
+    ({"command": "./mine.sh", "restart_policy": "sometimes"}, "never, on-failure, always"),
+    ({"command": "./mine.sh", "restart_policy": 1}, "never, on-failure, always"),
+    ({"restart_policy": "always"}, "set that too"),
+    ({"env": {"GC_RESTART_POLICY": "always"}}, "set by the platform"),
 ])
 def test_bad_command_or_env_is_refused_with_the_reason(svc, metadata, error):
     with pytest.raises(ValueError, match=error):
@@ -59,3 +63,11 @@ def test_env_values_never_leave_the_api():
     out = _redact_workload({"metadata": {"command": "python x.py", "env": {"HF_TOKEN": "hf_secret", "SEED": "7"}}})
     assert out["metadata"]["env"] == {"HF_TOKEN": "***redacted***", "SEED": "***redacted***"}
     assert out["metadata"]["command"] == "python x.py"
+
+
+def test_restart_policy_is_kept_on_a_pod_with_a_command(svc):
+    wl = _pod(svc, command="./mine.sh", restart_policy="ON_FAILURE")
+    assert wl.metadata["restart_policy"] == "on-failure"
+    assert _pod(svc, command="./mine.sh", restart_policy="always").metadata["restart_policy"] == "always"
+    # "never" is the default, so it needs no command.
+    assert _pod(svc, restart_policy="never").metadata["restart_policy"] == "never"
