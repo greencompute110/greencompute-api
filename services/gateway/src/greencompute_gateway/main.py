@@ -10,6 +10,7 @@ from greencompute_persistence import database_ready, load_runtime_settings, rend
 from greencompute_gateway.transport.security import current_client_ip, current_request_route
 from greencompute_gateway.transport.security import metrics as gateway_metrics
 from greencompute_gateway.transport.routes import router
+from greencompute_gateway.transport.errors import CrashToJSON, install_error_handlers
 
 settings = load_runtime_settings("greencompute-gateway")
 
@@ -79,6 +80,8 @@ _cors_fallback = "http://localhost:3000,http://127.0.0.1:3000"
 _origins_line = _cors_raw if _cors_raw else _cors_fallback
 _origins = [o.strip() for o in _origins_line.split(",") if o.strip()]
 _wildcard = len(_origins) == 1 and _origins[0] == "*"
+# Inside CORS (added before it), so a browser can read the JSON 500.
+app.add_middleware(CrashToJSON)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if _wildcard else _origins,
@@ -103,6 +106,7 @@ async def _stash_client_ip(request, call_next):
 
 
 app.include_router(router)
+install_error_handlers(app)
 
 
 @app.get("/")
