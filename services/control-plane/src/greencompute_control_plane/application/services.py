@@ -162,6 +162,7 @@ class ControlPlaneService:
             owner_user_id=owner_user_id,
             requested_instances=payload.requested_instances,
             save_on_exhaustion=payload.save_on_exhaustion,
+            resume_on_topup=payload.resume_on_topup,
             max_runtime_minutes=payload.max_runtime_minutes,
             created_by_key_id=created_by_key_id,
             deployment_fee_usd=self._estimate_deployment_fee(workload, payload.requested_instances),
@@ -426,6 +427,8 @@ class ControlPlaneService:
             deployment.deployment_fee_usd = self._estimate_deployment_fee(workload, deployment.requested_instances)
         if request.fee_acknowledged is not None:
             deployment.fee_acknowledged = request.fee_acknowledged
+        if request.resume_on_topup is not None:
+            deployment.resume_on_topup = request.resume_on_topup
         deployment.updated_at = datetime.now(UTC)
         return self.repository.update_deployment(deployment)
 
@@ -463,7 +466,10 @@ class ControlPlaneService:
             deployment.ssh_private_key = update.ssh_private_key
         if update.port_mappings is not None:
             deployment.port_mappings = update.port_mappings
-        deployment.last_error = update.error
+        # A machine re-reporting SUSPENDED (it stopped the container the meter
+        # told it to) carries no text: keep the reason the customer was given.
+        if not (update.state == DeploymentState.SUSPENDED and update.error is None and deployment.last_error):
+            deployment.last_error = update.error
         deployment.failure_class = self._classify_deployment_failure(update.error, update.state, deployment.failure_class)
         if update.state == DeploymentState.READY:
             deployment.health_check_failures = 0
@@ -483,12 +489,17 @@ class ControlPlaneService:
         if update.state == DeploymentState.SUSPENDED:
             if deployment.suspended_at is None:
                 deployment.suspended_at = update.observed_at
+            # Why, for code (auto-resume acts on "balance"); a re-report without
+            # a reason keeps the one already stamped.
+            if update.suspended_reason:
+                deployment.suspended_reason = update.suspended_reason
         elif update.state in {
             DeploymentState.PULLING,
             DeploymentState.STARTING,
             DeploymentState.READY,
         }:
             deployment.suspended_at = None
+            deployment.suspended_reason = None
         self.repository.add_deployment_event(update)
         assignment_status = {
             DeploymentState.PULLING: "activating",
@@ -1465,6 +1476,7 @@ class ControlPlaneService:
                         deployment_id=deployment.deployment_id,
                         state=DeploymentState.SUSPENDED,
                         error=f"idle — no invocations in {timeout // 60} min",
+                        suspended_reason="idle",
                     )
                 )
                 self.metrics.increment("deployment.suspended.idle_inference")
@@ -2045,6 +2057,7 @@ class ControlPlaneService:
                             deployment_id=deployment.deployment_id,
                             state=DeploymentState.SUSPENDED,
                             error="Insufficient balance — top up your credits to resume",
+                            suspended_reason="balance",
                         )
                     )
                     self.metrics.increment("deployment.suspended.insufficient_balance")
@@ -2056,6 +2069,27 @@ class ControlPlaneService:
             logger.info("Metered %d deployments, total %d cents", len(result), sum(result.values()))
 
         return result
+
+    def hourly_charge_cents(
+        self, deployment: DeploymentRecord, workload: WorkloadSpec | None = None, *, now: datetime | None = None,
+    ) -> int | None:
+        """What the hourly meter charges this deployment per hour while it is
+        READY: None when it isn't billed by the hour at all (no owner, or a
+        shared catalog model, which is paid per token), 0 while its machine
+        isn't reporting (kept, not billed), else the locked rate (or the
+        legacy 10c the meter also falls back to) per GPU for the one instance
+        that runs. meter_usage's own rules, so the credit forecast and
+        auto-resume can't drift from the ledger."""
+        if not deployment.owner_user_id:
+            return None
+        if workload is None:
+            workload = self.repository.get_workload(deployment.workload_id)
+        if workload is not None and workload.kind == WorkloadKind.INFERENCE and not self.is_private_model(deployment, workload):
+            return None
+        if self._box_silent(deployment, now or datetime.now(UTC)):
+            return 0
+        gpu_count = (workload.requirements.gpu_count if workload else 1) or 1
+        return (deployment.hourly_rate_cents or 10) * gpu_count * max(deployment.ready_instances or 0, 1)
 
     def is_private_model(self, deployment: DeploymentRecord, workload: WorkloadSpec | None = None) -> bool:
         """A customer's own model (domain.metering.is_private_model): billed by

@@ -152,15 +152,16 @@ def _gateway(can_place, free, balance_cents=10_000):
         placement_preview=lambda w: (can_place, capacity),
         create_deployment=lambda body: SimpleNamespace(created=True),
     )
-    svc = SimpleNamespace(control_plane=cp, _user_can_access_workload=lambda w, u: True)
+    svc = SimpleNamespace(
+        control_plane=cp,
+        _user_can_access_workload=lambda w, u: True,
+        billing_repo=SimpleNamespace(get_balance=lambda uid: balance_cents),
+    )
     return svc, workload
 
 
 def test_a_full_fleet_is_refused_at_create_time(monkeypatch):
-    from greencompute_gateway.infrastructure.billing_repository import BillingRepository
-
     monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
-    monkeypatch.setattr(BillingRepository, "get_balance", lambda self, uid: 10_000)
     svc, wl = _gateway(can_place=False, free={"rtx4090": 0})
     with pytest.raises(NoCapacityError) as exc:
         GatewayService.create_deployment(svc, {"workload_id": wl.workload_id}, user_id="u1")
@@ -170,10 +171,7 @@ def test_a_full_fleet_is_refused_at_create_time(monkeypatch):
     assert "nothing was created" in exc.value.message
 
 
-def test_free_gpus_mean_the_create_goes_through(monkeypatch):
-    from greencompute_gateway.infrastructure.billing_repository import BillingRepository
-
-    monkeypatch.setattr(BillingRepository, "get_balance", lambda self, uid: 10_000)
+def test_free_gpus_mean_the_create_goes_through():
     svc, wl = _gateway(can_place=True, free={"rtx4090": 3})
     assert GatewayService.create_deployment(svc, {"workload_id": wl.workload_id}, user_id="u1").created
 
@@ -181,10 +179,8 @@ def test_free_gpus_mean_the_create_goes_through(monkeypatch):
 def test_no_balance_is_reported_before_no_capacity(monkeypatch):
     # Top up first, then you're ready the moment a GPU frees up.
     from greencompute_gateway.application.services import InsufficientBalanceForRentalError
-    from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 
-    monkeypatch.setattr(BillingRepository, "get_balance", lambda self, uid: 0)
-    svc, wl = _gateway(can_place=False, free={"rtx4090": 0})
+    svc, wl = _gateway(can_place=False, free={"rtx4090": 0}, balance_cents=0)
     with pytest.raises(InsufficientBalanceForRentalError):
         GatewayService.create_deployment(svc, {"workload_id": wl.workload_id}, user_id="u1")
 

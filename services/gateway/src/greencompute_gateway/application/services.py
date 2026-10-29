@@ -13,7 +13,7 @@ from time import perf_counter
 from uuid import uuid4
 from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 log = logging.getLogger(__name__)
 
@@ -99,10 +99,32 @@ def _external_model_upstreams() -> dict[str, str]:
     return out
 
 
+#: An unsaved pod is deleted shortly after it stops, so there is nothing to resume.
+RESUME_NEEDS_SAVE = (
+    "resume_on_topup needs save_on_exhaustion: true; a pod that isn't saved is deleted "
+    "15 minutes after it stops, so there would be nothing to resume"
+)
+
+
 class GatewayDeploymentCreateRequest(DeploymentCreateRequest):
     """POST /platform/deployments. Keeping a pod when credit runs out costs
     money every day, so it happens only when the caller asks for it; the
     protocol's own default (true) is left for internal callers."""
+
+    resume_on_topup: bool = Field(
+        default=False,
+        description=(
+            "Needs save_on_exhaustion. If this pod is paused because your balance ran out, resume it by itself "
+            "within a minute of a top-up that covers an hour of everything you would then have running. "
+            "You are emailed when it comes back. Off unless asked for."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _resume_needs_a_saved_pod(self):
+        if self.resume_on_topup and not self.save_on_exhaustion:
+            raise ValueError(RESUME_NEEDS_SAVE)
+        return self
 
     save_on_exhaustion: bool = Field(
         default=False,
@@ -360,6 +382,17 @@ class GatewayService:
         # default to 0 → new deployments rank first, which we want (it lets
         # the scheduler learn their latency quickly).
         self._deployment_latency_ema: dict[str, float] = {}
+
+    @property
+    def billing_repo(self):
+        """One BillingRepository (one engine and pool) per service, built from
+        the environment on first use, like the control plane's meter does;
+        never a new engine per request."""
+        if getattr(self, "_billing_repo", None) is None:
+            from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+
+            self._billing_repo = BillingRepository()
+        return self._billing_repo
 
     def register_user(self, request: UserRegistrationRequest) -> UserRecord:
         # Idempotent: if a user with this email already exists, return it.
@@ -791,7 +824,6 @@ class GatewayService:
         # Admin deployments bypass the check.
         if not admin and user_id is not None:
             from greencompute_protocol import rate_for_gpu
-            from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 
             supported = workload.requirements.supported_gpu_models or []
             if supported:
@@ -819,7 +851,7 @@ class GatewayService:
             # Gating on requested_instances would 402 users for balance
             # they'll never be billed.
             required_cents = max_rate_cents_per_hour * gpu_count
-            current_cents = BillingRepository().get_balance(user_id)
+            current_cents = self.billing_repo.get_balance(user_id)
             if current_cents < required_cents:
                 # Raised as ValueError so the route layer can catch and return
                 # 402 with the detail payload — see create_deployment route.
@@ -855,6 +887,7 @@ class GatewayService:
                 "requested_instances": payload.requested_instances,
                 "accept_fee": payload.accept_fee,
                 "save_on_exhaustion": payload.save_on_exhaustion,
+                "resume_on_topup": payload.resume_on_topup,
                 "max_runtime_minutes": payload.max_runtime_minutes,
                 "owner_user_id": user_id,
                 "created_by_key_id": created_by_key_id,
@@ -902,9 +935,7 @@ class GatewayService:
             # One hour at the billed quantity — a single placed instance
             # (matches meter_usage's billed_instances, not requested_instances).
             required_cents = old.hourly_rate_cents * gpu_count
-            from greencompute_gateway.infrastructure.billing_repository import BillingRepository
-
-            current_cents = BillingRepository().get_balance(user_id)
+            current_cents = self.billing_repo.get_balance(user_id)
             if current_cents < required_cents:
                 # Raised as InsufficientBalanceForRentalError so the route
                 # returns 402 with the settle/top-up detail.
@@ -951,6 +982,8 @@ class GatewayService:
             raise KeyError(f"deployment not found: {deployment_id}")
         if not admin and not _owned_by(deployment.owner_user_id, actor_user_id):
             raise PermissionError(f"deployment update denied: {deployment_id}")
+        if request.resume_on_topup and not deployment.save_on_exhaustion:
+            raise ValueError(RESUME_NEEDS_SAVE)
         return self.control_plane.update_deployment(deployment_id, request)
 
     def terminate_deployment(

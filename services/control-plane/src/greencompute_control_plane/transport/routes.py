@@ -167,6 +167,11 @@ def deployment_status(
         x_miner_timestamp,
         x_miner_auth_mode=x_miner_auth_mode,
     )
+    # Why a deployment is suspended is the control plane's to say (the meter,
+    # the idle sweep), never the machine's: a stamped "balance" from a miner
+    # would drive auto-resume and its emails from the outside.
+    if payload.suspended_reason is not None:
+        payload = payload.model_copy(update={"suspended_reason": None})
     try:
         saved = service.update_deployment_status(payload)
     except InvalidDeploymentTransition as exc:

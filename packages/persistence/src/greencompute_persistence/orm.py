@@ -183,9 +183,15 @@ class DeploymentORM(Base):
     # storage_remainder_mcents: sub-cent storage-charge accumulator, mirrors
     #   metering_remainder_mcents.
     save_on_exhaustion: Mapped[bool] = mapped_column(Boolean, default=True)
+    # resume_on_topup: opt-in; the gateway's credit watch resumes this pod
+    #   once a top-up again covers an hour of it (credit_watch.auto_resume_once).
+    resume_on_topup: Mapped[bool] = mapped_column(Boolean, default=False)
     suspended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # suspended_reason: "balance" | "idle" | "resuming" | NULL — for code that
+    #   acts on WHY (auto-resume); last_error is for people and gets rewritten.
+    suspended_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     storage_remainder_mcents: Mapped[int] = mapped_column(Integer, default=0)
     deployment_fee_usd: Mapped[float] = mapped_column(Float, default=0.0)
     fee_acknowledged: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -206,6 +212,20 @@ class DeploymentORM(Base):
     # or join the head and donate GPUs (see multinode_launch.py).
     multi_node: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CreditWarningORM(Base):
+    """The low-credit email a customer last got (gateway credit_watch): the
+    level it was for (24 or 2 hours of credit left), so each level is sent
+    once per run-down; cleared once they are back above 24 hours or nothing
+    of theirs is running, so the next run-down warns again."""
+    __tablename__ = "credit_warnings"
+
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    level_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    warned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    balance_cents: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
