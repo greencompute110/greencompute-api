@@ -526,6 +526,8 @@ class ControlPlaneRepository:
                 port_mappings=_serialize_port_mappings(deployment.port_mappings),
                 hourly_rate_cents=deployment.hourly_rate_cents,
                 save_on_exhaustion=deployment.save_on_exhaustion,
+                resume_on_topup=deployment.resume_on_topup,
+                suspended_reason=deployment.suspended_reason,
                 ready_at=deployment.ready_at,
                 created_by_key_id=deployment.created_by_key_id,
                 max_runtime_minutes=deployment.max_runtime_minutes,
@@ -566,6 +568,8 @@ class ControlPlaneRepository:
             row.port_mappings = _serialize_port_mappings(deployment.port_mappings)
             row.hourly_rate_cents = deployment.hourly_rate_cents
             row.save_on_exhaustion = deployment.save_on_exhaustion
+            row.resume_on_topup = deployment.resume_on_topup
+            row.suspended_reason = deployment.suspended_reason
             row.ready_at = deployment.ready_at
             row.created_by_key_id = deployment.created_by_key_id
             row.max_runtime_minutes = deployment.max_runtime_minutes
@@ -1122,6 +1126,8 @@ class ControlPlaneRepository:
             port_mappings=_deserialize_port_mappings(row.port_mappings),
             hourly_rate_cents=row.hourly_rate_cents if row.hourly_rate_cents is not None else 10,
             save_on_exhaustion=row.save_on_exhaustion if row.save_on_exhaustion is not None else True,
+            resume_on_topup=bool(row.resume_on_topup),
+            suspended_reason=row.suspended_reason,
             ready_at=row.ready_at,
             created_by_key_id=row.created_by_key_id,
             max_runtime_minutes=row.max_runtime_minutes,

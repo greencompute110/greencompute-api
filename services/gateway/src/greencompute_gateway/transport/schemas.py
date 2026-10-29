@@ -80,6 +80,31 @@ class Balance(BaseModel):
     balance_usd: float
 
 
+class RunningCost(BaseModel):
+    deployment_id: str
+    name: str
+    label: str = Field(description="Name with its GPUs, e.g. `train-job (1× rtx4090)`.")
+    kind: str = Field(description="`rental` (pod/VM) or `model` (your private model).")
+    gpu_model: str | None
+    gpu_count: int
+    cents_per_hour: int = Field(description="What this deployment costs per hour while it runs.")
+    resume_on_topup: bool
+
+
+class Forecast(BaseModel):
+    """How long your balance lasts at the current rate. Only deployments billed
+    by the hour count (rentals and private models; shared models are per
+    request). `hours_left` is null when nothing of yours is running."""
+
+    balance_cents: int
+    balance_usd: float
+    burn_cents_per_hour: int = Field(description="What everything running costs per hour, together.")
+    burn_usd_per_hour: float
+    hours_left: float | None = Field(description="balance / burn; null when nothing is running.")
+    runs_out_at: str | None = Field(description="When the balance reaches zero at this rate (ISO 8601), or null.")
+    running: list[RunningCost]
+
+
 class LedgerItem(LedgerEntry):
     """One top-up or charge. amount_cents is negative for charges."""
 

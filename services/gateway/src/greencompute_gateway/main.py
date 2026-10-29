@@ -33,8 +33,10 @@ def _client_ip_from_request(request) -> str | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Spawn long-running background tasks at startup; cancel them on
-    shutdown: the on-chain crypto deposit watcher and the billing monitor."""
+    shutdown: the on-chain crypto deposit watcher, the billing monitor and
+    the credit watch (auto-resume after top-up, low-credit emails)."""
     from greencompute_gateway.application.billing_monitor import billing_monitor_loop
+    from greencompute_gateway.application.credit_watch import credit_watch_loop
     from greencompute_gateway.infrastructure.deposit_watcher import (
         deposit_watcher_loop,
     )
@@ -42,6 +44,7 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(deposit_watcher_loop(), name="deposit-watcher"),
         asyncio.create_task(billing_monitor_loop(), name="billing-monitor"),
+        asyncio.create_task(credit_watch_loop(), name="credit-watch"),
     ]
     try:
         yield

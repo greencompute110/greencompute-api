@@ -1403,6 +1403,8 @@ def update_deployment(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.delete("/platform/deployments/{deployment_id}", response_model=None, responses=ok(schemas.Deployment, "The deployment, now terminated"))
@@ -2444,6 +2446,23 @@ def billing_balance(
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
     return _get_billing().get_balance(api_key.user_id)
+
+
+@router.get("/platform/billing/forecast", response_model=None, responses=ok(schemas.Forecast, "How long your balance lasts at the current rate"))
+def billing_forecast(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """What your running rentals and private models cost per hour together,
+    and how long your balance lasts at that rate. You are emailed once when it
+    drops under 24 hours and once more under 2 hours; a rental created with
+    `resume_on_topup: true` comes back by itself after you top up."""
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.user_id is None:
+        raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    from greencompute_gateway.application.credit_watch import forecast
+
+    return forecast(api_key.user_id, control_plane=service.control_plane)
 
 
 @router.get("/platform/billing/ledger", response_model=None, responses=ok(list[schemas.LedgerItem], "Top-ups and charges, newest first"))
