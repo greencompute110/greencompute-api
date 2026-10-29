@@ -247,7 +247,10 @@ _INGRESS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$")
 # a job can run unattended without an SSH session.
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 # Set by the platform for every pod; a user value would break SSH or GPU access.
-_RESERVED_ENV = {"AUTHORIZED_KEYS", "GC_START_COMMAND_B64", "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES"}
+_RESERVED_ENV = {
+    "AUTHORIZED_KEYS", "GC_START_COMMAND_B64", "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES",
+    "GC_DEPLOYMENT_ID", "GC_DEPLOYMENT_NAME",  # set by the platform for every pod
+}
 _MAX_COMMAND_CHARS = 8192
 _MAX_ENV_VARS = 64
 
@@ -884,6 +887,7 @@ class GatewayService:
         return self.control_plane.create_deployment(
             {
                 "workload_id": payload.workload_id,
+                "name": payload.name,
                 "requested_instances": payload.requested_instances,
                 "accept_fee": payload.accept_fee,
                 "save_on_exhaustion": payload.save_on_exhaustion,

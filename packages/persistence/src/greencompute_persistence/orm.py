@@ -150,6 +150,8 @@ class DeploymentORM(Base):
 
     deployment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     workload_id: Mapped[str] = mapped_column(String(64), index=True)
+    # The renter's name for it (passed to a pod as GC_DEPLOYMENT_NAME).
+    name: Mapped[str | None] = mapped_column(String(48), nullable=True)
     owner_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     hotkey: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     node_id: Mapped[str | None] = mapped_column(String(128), nullable=True)

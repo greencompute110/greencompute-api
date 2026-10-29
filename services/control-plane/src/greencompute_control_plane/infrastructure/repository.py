@@ -81,6 +81,7 @@ def _deleted_snapshot(row, workload: WorkloadSpec, node_gpu_model: str | None, n
         "state": "deleted",
         "observed_at": now.isoformat(),
         "deployment_id": row.deployment_id,
+        "name": row.name,
         "last_state": row.state,
         "owner_user_id": row.owner_user_id,
         "workload_owner_user_id": workload.owner_user_id,
@@ -567,6 +568,7 @@ class ControlPlaneRepository:
             row = DeploymentORM(
                 deployment_id=deployment.deployment_id,
                 workload_id=deployment.workload_id,
+                name=deployment.name,
                 owner_user_id=deployment.owner_user_id,
                 hotkey=deployment.hotkey,
                 node_id=deployment.node_id,
@@ -611,6 +613,7 @@ class ControlPlaneRepository:
                 row = DeploymentORM(deployment_id=deployment.deployment_id, workload_id=deployment.workload_id)
             row.owner_user_id = deployment.owner_user_id
             row.hotkey = deployment.hotkey
+            row.name = deployment.name
             row.node_id = deployment.node_id
             row.state = deployment.state.value
             row.requested_instances = deployment.requested_instances
@@ -812,7 +815,7 @@ class ControlPlaneRepository:
             # ONLY from its leases, so without this the node-agent never knows a
             # deployment is one rank of a distributed replica and silently starts
             # it as an ordinary single-node runtime.
-            stmt = select(LeaseAssignmentORM, DeploymentORM.multi_node).join(
+            stmt = select(LeaseAssignmentORM, DeploymentORM.multi_node, DeploymentORM.name).join(
                 DeploymentORM,
                 DeploymentORM.deployment_id == LeaseAssignmentORM.deployment_id,
                 isouter=True,
@@ -822,8 +825,8 @@ class ControlPlaneRepository:
             if statuses:
                 stmt = stmt.where(LeaseAssignmentORM.status.in_(statuses))
             return [
-                self._to_assignment(row, multi_node=multi_node)
-                for row, multi_node in session.execute(stmt).all()
+                self._to_assignment(row, multi_node=multi_node, deployment_name=name)
+                for row, multi_node, name in session.execute(stmt).all()
             ]
 
     def update_assignment_status(self, deployment_id: str, status: str, reason: str | None = None) -> LeaseAssignment | None:
@@ -1181,6 +1184,7 @@ class ControlPlaneRepository:
             owner_user_id=row.owner_user_id,
             hotkey=row.hotkey,
             node_id=row.node_id,
+            name=row.name,
             state=row.state,
             requested_instances=row.requested_instances,
             ready_instances=row.ready_instances,
@@ -1210,7 +1214,7 @@ class ControlPlaneRepository:
 
     @staticmethod
     def _to_assignment(
-        row: LeaseAssignmentORM, *, multi_node: dict | None = None
+        row: LeaseAssignmentORM, *, multi_node: dict | None = None, deployment_name: str | None = None
     ) -> LeaseAssignment:
         return LeaseAssignment(
             assignment_id=row.assignment_id,
@@ -1222,6 +1226,7 @@ class ControlPlaneRepository:
             expires_at=row.expires_at,
             status=row.status,
             multi_node=multi_node if isinstance(multi_node, dict) else None,
+            deployment_name=deployment_name,
         )
 
     @staticmethod
