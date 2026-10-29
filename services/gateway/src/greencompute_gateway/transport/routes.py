@@ -1,9 +1,12 @@
+import contextlib
 import hashlib
 import http.client
 import json
 import logging
 import math
 import os
+import threading
+from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request, Response
@@ -1629,15 +1632,21 @@ def _lookup_miner_base_url(hotkey: str, *, timeout: float = 3.0) -> str | None:
         return None
 
 
-def _node_get(deployment, path: str, *, timeout: float, max_bytes: int, body: dict | None = None) -> dict | None:
-    """GET `path` (POST `body` as JSON, if given) from the node agent running
-    `deployment` (gateway → control plane for the machine's address → node
-    agent), or None if any hop fails. The node secret goes with it."""
+def _node_request(deployment, path: str, *, timeout: float, max_bytes: int,
+                  body: dict | None = None) -> tuple[str, int | None, Any]:
+    """Call the node agent running `deployment` (gateway → control plane for
+    the machine's address → node agent), with the node secret: GET, or POST
+    `body` as JSON. Returns (outcome, status, data):
+    - ("ok", 200, data);
+    - ("refused", status, detail): the node answered with an error;
+    - ("unreachable", None, None): no address, or no connection was made;
+    - ("unknown", None, None): sent, but no answer in time (or a broken one),
+      so a POST may or may not have taken effect."""
     if not deployment.hotkey:
-        return None
+        return "unreachable", None, None
     miner_base = _lookup_miner_base_url(deployment.hotkey)
     if not miner_base:
-        return None
+        return "unreachable", None, None
     data = json.dumps(body).encode() if body is not None else None
     req = urllib_request.Request(f"{miner_base}{path}", data=data, method="POST" if data is not None else "GET")
     if data is not None:
@@ -1647,15 +1656,29 @@ def _node_get(deployment, path: str, *, timeout: float, max_bytes: int, body: di
         req.add_header("X-Agent-Auth", agent_secret)
     try:
         with urllib_request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            if resp.status != 200:
-                return None
-            body = resp.read(max_bytes + 1)
-            if len(body) > max_bytes:
-                return None
-            data = json.loads(body.decode() or "{}")
-            return data if isinstance(data, dict) else None
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, http.client.HTTPException):
-        return None  # incl. a reply cut short (IncompleteRead) by a restarting node
+            raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                return "unknown", None, None
+            out = json.loads(raw.decode() or "{}")
+            return "ok", resp.status, out
+    except HTTPError as exc:
+        try:
+            detail = json.loads(exc.read(65536).decode() or "{}").get("detail")
+        except (ValueError, AttributeError, OSError):
+            detail = None
+        return "refused", exc.code, detail
+    except URLError as exc:
+        reason = getattr(exc, "reason", None)
+        return ("unknown" if isinstance(reason, TimeoutError) else "unreachable"), None, None
+    except (TimeoutError, OSError, ValueError, http.client.HTTPException):
+        # incl. a reply cut short (IncompleteRead) by a restarting node
+        return "unknown", None, None
+
+
+def _node_get(deployment, path: str, *, timeout: float, max_bytes: int) -> dict | None:
+    """GET from the node agent: its JSON object, or None on any failure."""
+    outcome, _, data = _node_request(deployment, path, timeout=timeout, max_bytes=max_bytes)
+    return data if outcome == "ok" and isinstance(data, dict) else None
 
 
 @router.get("/platform/deployments/{deployment_id}/stats", response_model=None,
@@ -1705,6 +1728,34 @@ def get_deployment_logs(
     return out
 
 
+#: Commands waited on at once: by this gateway, and per customer. Each holds
+#: a worker thread for up to two minutes, so they are capped.
+_EXEC_TOTAL = threading.BoundedSemaphore(16)
+_EXEC_PER_USER = 4
+_exec_running: dict[str, int] = {}
+_exec_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _exec_slot(user_id: str):
+    with _exec_lock:
+        if _exec_running.get(user_id, 0) >= _EXEC_PER_USER:
+            raise coded(429, "rate_limited", f"at most {_EXEC_PER_USER} commands can run at once; wait for one to finish",
+                        headers={"Retry-After": "5"})
+        if not _EXEC_TOTAL.acquire(blocking=False):
+            raise coded(429, "rate_limited", "too many commands are running right now; try again in a few seconds",
+                        headers={"Retry-After": "5"})
+        _exec_running[user_id] = _exec_running.get(user_id, 0) + 1
+    try:
+        yield
+    finally:
+        with _exec_lock:
+            _exec_running[user_id] -= 1
+            if not _exec_running[user_id]:
+                del _exec_running[user_id]
+        _EXEC_TOTAL.release()
+
+
 @router.post("/platform/deployments/{deployment_id}/exec", response_model=None,
              responses=ok(schemas.ExecResult, "How the command ran"))
 def run_in_deployment(
@@ -1713,16 +1764,19 @@ def run_in_deployment(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    """Run a shell command in a running rental, as root, from /workspace,
+    """Run a shell command in your running rental, as root, from /workspace,
     without SSH: e.g. update the software on every card in a loop. Returns
     its exit code and the last 64 KiB of its output. After `timeout_seconds`
-    (at most 120) we stop waiting, but the command may still be running in
-    the pod: put long jobs in the background with their own log. Needs the
-    `rentals` scope, like SSH access."""
+    (at most 120) we stop waiting, but the command may still be running.
+    A job it starts in the background keeps running and doesn't hold this
+    up. Needs the `rentals` scope, like SSH access, and only in your own
+    rentals (an admin key too). Up to 4 at once per account."""
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("deployment_exec", api_key.key_id, limit=60, window_seconds=60)
-    deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=api_key.admin)
-    if deployment is None:
+    deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=False)
+    # Root in a customer's pod is theirs alone: an admin key gets no more
+    # here than over SSH, where a customer's own keys shut it out.
+    if deployment is None or api_key.user_id is None or deployment.owner_user_id != api_key.user_id:
         raise HTTPException(status_code=404, detail="deployment not found")
     if deployment.state != DeploymentState.READY:
         raise coded(409, "conflict", f"the rental is {deployment.state.value}; commands run while it is ready")
@@ -1735,12 +1789,23 @@ def run_in_deployment(
         deployment_id, api_key.key_id, api_key.user_id, _audit_client_ip(),
         hashlib.sha256(payload.command.encode()).hexdigest()[:16], len(payload.command),
     )
-    out = _node_get(deployment, f"/pods/{deployment_id}/exec", timeout=payload.timeout_seconds + 15.0,
-                    max_bytes=1024 * 1024, body={"command": payload.command, "timeout_seconds": payload.timeout_seconds})
-    if out is None:
-        raise coded(503, "unavailable", "the machine running this rental didn't answer; try again shortly",
-                    headers={"Retry-After": "10"})
-    return out
+    with _exec_slot(api_key.user_id):
+        outcome, status, data = _node_request(
+            deployment, f"/pods/{deployment_id}/exec", timeout=payload.timeout_seconds + 15.0, max_bytes=1024 * 1024,
+            body={"command": payload.command, "timeout_seconds": payload.timeout_seconds})
+    if outcome == "ok" and isinstance(data, dict):
+        return data
+    if outcome == "refused":
+        code = {400: "invalid_request", 409: "conflict", 429: "rate_limited"}.get(status or 0, "unavailable")
+        headers = {"Retry-After": "5"} if status == 429 else None
+        raise coded(status if status in (400, 409, 429) else 503, code,
+                    data or "the machine running this rental refused the command", headers=headers)
+    if outcome == "unknown":
+        # Sent, but no answer: running it again could run it twice.
+        raise coded(504, "exec_unknown", "no answer from the machine in time: the command may or may not have run. "
+                                         "Check before running it again (e.g. its log, or a quick read-only command)")
+    raise coded(503, "unavailable", "the machine running this rental didn't answer; nothing was run. Try again shortly",
+                headers={"Retry-After": "10"})
 
 
 @router.patch("/platform/deployments/{deployment_id}")

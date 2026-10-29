@@ -64,6 +64,7 @@ CODES: dict[str, tuple[int, str]] = {
     "not_implemented": (501, "This endpoint is turned off."),
     "no_capacity": (503, "Every GPU that fits is in use; nothing was created. Retry after `retry_after_seconds`."),
     "unavailable": (503, "Temporarily unavailable."),
+    "exec_unknown": (504, "A command was sent but no answer came back in time: it may or may not have run."),
 }
 
 

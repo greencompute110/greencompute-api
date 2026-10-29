@@ -261,11 +261,11 @@ def t_run_command(auth: tuple, args: dict) -> dict:
 
     r = _routes()
     dep_id = _str(args, "deployment_id", required=True)
+    command = args.get("command")  # as given: whitespace in a script can matter
     try:
-        payload = schemas.ExecRequest(command=_str(args, "command", required=True),
-                                      timeout_seconds=_int(args, "timeout_seconds", 60, 1, 120))
+        payload = schemas.ExecRequest(command=command, timeout_seconds=args.get("timeout_seconds", 60))
     except ValidationError as exc:
-        raise ToolInputError(f"invalid command: {exc.errors()[0].get('msg')}") from exc
+        raise ToolInputError(f"invalid command: {exc.errors()[0].get('loc', [''])[-1]}: {exc.errors()[0].get('msg')}") from exc
     return _as("POST", f"/platform/deployments/{dep_id}/exec",
                lambda: r.run_in_deployment(dep_id, payload, authorization=auth[0], x_api_key=auth[1]))
 

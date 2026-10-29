@@ -23,7 +23,8 @@ class Reply(io.BytesIO):
 
 @pytest.fixture
 def relay(monkeypatch):
-    dep = SimpleNamespace(deployment_id="d1", hotkey="hk", state=DeploymentState.READY)
+    dep = SimpleNamespace(deployment_id="d1", hotkey="hk", state=DeploymentState.READY, owner_user_id="u1",
+                          endpoint="ssh://root@1.2.3.4:30001")
     seen = {}
 
     def urlopen(req, timeout):
@@ -144,3 +145,44 @@ def test_commands_only_in_running_pods(relay, monkeypatch):
         schemas.ExecRequest(command="ls\x00rm")
     with pytest.raises(ValueError):
         schemas.ExecRequest(command="ls", timeout_seconds=600)
+
+
+def _exec(**kw):
+    from greencompute_gateway.transport import schemas
+
+    return routes.run_in_deployment("d1", schemas.ExecRequest(command="ls", **kw), authorization="Bearer k", x_api_key=None)
+
+
+def test_an_admin_key_cannot_run_commands_in_someone_elses_pod(relay, monkeypatch):
+    dep, _ = relay
+    monkeypatch.setattr(routes, "enforce_rate_limit", lambda *a, **k: None)
+    monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: SimpleNamespace(user_id="admin-1", admin=True, key_id="ka"))
+    with pytest.raises(HTTPException) as exc:
+        _exec()
+    assert exc.value.status_code == 404
+
+
+def test_each_customer_runs_at_most_four_at_once(relay, monkeypatch):
+    monkeypatch.setattr(routes, "enforce_rate_limit", lambda *a, **k: None)
+    with routes._exec_slot("u1"), routes._exec_slot("u1"), routes._exec_slot("u1"), routes._exec_slot("u1"):
+        with pytest.raises(HTTPException) as exc:
+            _exec()
+        assert exc.value.status_code == 429 and exc.value.headers["Retry-After"] == "5"
+        with routes._exec_slot("u2"):  # someone else isn't held up
+            pass
+    assert routes._exec_running == {}
+
+
+@pytest.mark.parametrize("outcome, status, code, retry", [
+    (("refused", 409, "the pod isn't running"), 409, "conflict", None),
+    (("refused", 429, "this machine is running other commands"), 429, "rate_limited", "5"),
+    (("unknown", None, None), 504, "exec_unknown", None),
+    (("unreachable", None, None), 503, "unavailable", "10"),
+])
+def test_what_went_wrong_decides_whether_to_retry(relay, monkeypatch, outcome, status, code, retry):
+    monkeypatch.setattr(routes, "enforce_rate_limit", lambda *a, **k: None)
+    monkeypatch.setattr(routes, "_node_request", lambda *a, **k: outcome)
+    with pytest.raises(HTTPException) as exc:
+        _exec()
+    assert (exc.value.status_code, exc.value.error_code) == (status, code)
+    assert (exc.value.headers or {}).get("Retry-After") == retry
