@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
@@ -265,6 +265,71 @@ class BillingRepository:
             )
             rows = session.scalars(stmt).all()
             return [self._to_ledger_entry(r) for r in rows]
+
+    # --- Spending summaries and statements (application/statements.py) ---
+
+    #: Per-minute charges: summed per deployment and per day, never listed.
+    METERED_KINDS = ("usage", "storage", "inference")
+
+    @staticmethod
+    def _utc_day(session):
+        """The UTC calendar day of a ledger row, as 'YYYY-MM-DD' text."""
+        col = LedgerEntryORM.created_at
+        if session.get_bind().dialect.name == "postgresql":
+            return func.to_char(func.timezone("UTC", col), "YYYY-MM-DD")
+        return func.strftime("%Y-%m-%d", col)
+
+    def spending_rows(self, user_id: str, since: datetime, until: datetime) -> dict:
+        """Everything a statement or summary needs for [since, until), from
+        one grouped scan (an account renting a dozen GPUs writes ~4,700
+        per-minute rows a day):
+
+        - `metered`: (reference_id, kind, day, description, cents, rows,
+          first_at, last_at) for the per-minute kinds, one group per distinct
+          description so each group's rate is exact. Shared-model requests
+          (one row and one reference each) are grouped per day only;
+        - `entries`: the other rows (top-ups, refunds, adjustments) one by one;
+        - `opening_cents` / `closing_cents`: the account's real balance at
+          `since` and `until`: today's balance less everything after."""
+        with session_scope(self.session_factory) as session:
+            day = self._utc_day(session)
+            is_inference = LedgerEntryORM.kind == "inference"
+            ref = case((is_inference, None), else_=LedgerEntryORM.reference_id)
+            desc = case((is_inference, ""), else_=LedgerEntryORM.description)
+            base = (LedgerEntryORM.user_id == user_id, LedgerEntryORM.created_at >= since,
+                    LedgerEntryORM.created_at < until)
+            metered = session.execute(
+                select(ref, LedgerEntryORM.kind, day, desc,
+                       func.sum(LedgerEntryORM.amount_cents), func.count(),
+                       func.min(LedgerEntryORM.created_at), func.max(LedgerEntryORM.created_at))
+                .where(*base, LedgerEntryORM.kind.in_(self.METERED_KINDS))
+                .group_by(ref, LedgerEntryORM.kind, day, desc)
+            ).all()
+            entries = session.scalars(
+                select(LedgerEntryORM)
+                .where(*base, LedgerEntryORM.kind.not_in(self.METERED_KINDS))
+                .order_by(LedgerEntryORM.created_at.asc(), LedgerEntryORM.entry_id.asc())
+            ).all()
+            user = session.get(UserORM, user_id)
+            balance_now = int(user.balance_credits) if user is not None else 0
+
+            def total(*conditions):
+                return int(session.scalar(
+                    select(func.coalesce(func.sum(LedgerEntryORM.amount_cents), 0))
+                    .where(LedgerEntryORM.user_id == user_id, *conditions)
+                ) or 0)
+
+            closing = balance_now - total(LedgerEntryORM.created_at >= until)
+            opening = closing - total(LedgerEntryORM.created_at >= since, LedgerEntryORM.created_at < until)
+            return {
+                "metered": [
+                    (rf, k, str(d), ds or "", int(c or 0), int(n), first, last)
+                    for rf, k, d, ds, c, n, first, last in metered
+                ],
+                "entries": [self._to_ledger_entry(row) for row in entries],
+                "opening_cents": opening,
+                "closing_cents": closing,
+            }
 
     # --- Miner payout accrual (Phase 2E) ---
 

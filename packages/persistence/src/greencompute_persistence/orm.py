@@ -839,9 +839,11 @@ class MinerPayoutAccrualORM(Base):
 
 class LedgerEntryORM(Base):
     __tablename__ = "ledger_entries"
+    __table_args__ = (Index("ix_ledger_entries_user_created", "user_id", "created_at"),)
 
     entry_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    # Indexed by (user_id, created_at) below, which also serves user_id alone.
+    user_id: Mapped[str] = mapped_column(String(64))
     amount_cents: Mapped[int] = mapped_column(BigInteger)
     balance_after: Mapped[int] = mapped_column(BigInteger)
     kind: Mapped[str] = mapped_column(String(32), index=True)

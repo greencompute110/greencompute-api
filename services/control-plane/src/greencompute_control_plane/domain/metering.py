@@ -39,3 +39,10 @@ def is_private_model(owner_user_id: str | None, kind: str, workload_id: str, met
     charged per token. Takes plain values so the billing monitor can use it
     on database rows."""
     return bool(owner_user_id) and kind == "inference" and not is_catalog_workload(workload_id, metadata)
+
+
+def rental_charge_description(gpu_count: int, hourly_cents: int) -> str:
+    """The ledger text of a rental's metered charge, e.g. "GPU usage 2× GPU @
+    $0.40/hr". Monthly statements read the GPU count and rate back from it
+    (gateway application/statements.py), so change both together."""
+    return f"GPU usage {gpu_count}× GPU @ ${hourly_cents / 100:.2f}/hr"

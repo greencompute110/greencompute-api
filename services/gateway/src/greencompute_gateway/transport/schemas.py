@@ -105,6 +105,71 @@ class Forecast(BaseModel):
     running: list[RunningCost]
 
 
+class SpendingDay(BaseModel):
+    date: str
+    charged_usd: float = Field(description="Everything metered that day: rentals, private models, storage, shared models.")
+    topped_up_usd: float
+    adjustments_usd: float = Field(description="Refunds, adjustments and chargebacks, signed.")
+    gpu_rentals_usd: float
+    private_models_usd: float
+    storage_usd: float
+    shared_models_usd: float
+
+
+class SpendingDeployment(BaseModel):
+    deployment_id: str
+    name: str
+    kind: str = Field(description="`rental` or `model` (your private model).")
+    state: str = Field(description="Now: `running`, `paused`, `ended` or `deleted`.")
+    gpu_model: str | None = Field(description="The card it ran on.")
+    gpu_count: int | None
+    hours: float = Field(description="Hours it ran and was billed in the period (wall-clock; a 2-GPU pod for 1 hour is 1).")
+    gpu_usd: float
+    storage_usd: float
+    total_usd: float
+    total_cents: int
+    first_charge_at: str | None
+    last_charge_at: str | None
+
+
+class SpendingSummary(BaseModel):
+    from_: str = Field(alias="from")
+    to: str
+    opening_balance_usd: float
+    closing_balance_usd: float
+    charged_usd: float
+    topped_up_usd: float
+    adjustments_usd: float
+    shared_models_usd: float
+    shared_model_requests: int
+    days: list[SpendingDay]
+    deployments: list[SpendingDeployment] = Field(description="Most expensive first.")
+
+
+class StatementLine(BaseModel):
+    date: str
+    type: str = Field(description="GPU rental, Private model, Saved-pod storage, Shared models, Top-up, Refund, Adjustment…")
+    description: str
+    quantity: str | None = Field(description="e.g. `23.4 h` of GPU time or `3 days` of storage, where it applies.")
+    deployment_id: str | None
+    amount_cents: int = Field(description="Positive adds to your balance, negative is a charge.")
+    amount_usd: float
+
+
+class Statement(BaseModel):
+    month: str
+    from_: str = Field(alias="from")
+    to: str
+    opening_balance_cents: int
+    closing_balance_cents: int
+    credits_cents: int
+    charges_cents: int
+    charges_by_type_cents: dict[str, int]
+    lines: list[StatementLine] = Field(
+        description="opening + credits - charges = closing; closing for the current month is your balance now.",
+    )
+
+
 class LedgerItem(LedgerEntry):
     """One top-up or charge. amount_cents is negative for charges."""
 

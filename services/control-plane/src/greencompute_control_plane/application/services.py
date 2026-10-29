@@ -2015,7 +2015,7 @@ class ControlPlaneService:
                     description=(
                         self._private_model_charge_description(workload, gpu_count, hourly_cents)
                         if private_model
-                        else f"GPU usage {gpu_count}× GPU @ ${hourly_cents/100:.2f}/hr"
+                        else metering.rental_charge_description(gpu_count, hourly_cents)
                     ),
                 )
             except KeyError:
