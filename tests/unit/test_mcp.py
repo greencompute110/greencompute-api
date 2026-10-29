@@ -64,7 +64,7 @@ def test_tools_are_listed_with_schemas_and_hints(client):
     c, _, _ = client
     tools = {t["name"]: t for t in rpc(c, "tools/list").json()["result"]["tools"]}
     assert {"list_gpus", "rent_gpu", "get_rental", "stop_rental", "rental_logs", "rental_stats", "recent_events",
-            "get_balance", "list_rentals", "alert_when_free"} == set(tools)
+            "get_balance", "list_rentals", "alert_when_free", "run_command"} == set(tools)
     assert tools["rent_gpu"]["inputSchema"]["required"] == ["ssh_public_keys"]
     assert tools["stop_rental"]["annotations"]["destructiveHint"] is True
     assert tools["list_gpus"]["annotations"]["readOnlyHint"] is True
@@ -233,3 +233,14 @@ def test_unknown_methods_and_tools(client):
     assert rpc(c, "tools/call", {"name": "rm_rf"}).json()["error"]["code"] == -32602
     assert rpc(c, "ping").json()["result"] == {}
     assert c.get("/mcp").status_code == 405
+
+
+def test_run_command_runs_as_the_exec_request(client):
+    c, _, mp = client
+    seen = []
+    mp.setattr(routes, "run_in_deployment", lambda dep_id, payload, **k: seen.append(
+        (current_request_route.get(), dep_id, payload.command, payload.timeout_seconds)) or {"exit_code": 0, "output": "ok"})
+    result = call(c, "run_command", {"deployment_id": "d1", "command": "nvidia-smi", "timeout_seconds": 10})
+    assert seen == [(("POST", "/platform/deployments/d1/exec"), "d1", "nvidia-smi", 10)]
+    assert result["structuredContent"]["exit_code"] == 0
+    assert call(c, "run_command", {"deployment_id": "d1"})["isError"] is True

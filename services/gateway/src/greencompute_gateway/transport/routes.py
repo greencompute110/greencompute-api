@@ -1629,16 +1629,19 @@ def _lookup_miner_base_url(hotkey: str, *, timeout: float = 3.0) -> str | None:
         return None
 
 
-def _node_get(deployment, path: str, *, timeout: float, max_bytes: int) -> dict | None:
-    """GET `path` from the node agent running `deployment` (gateway →
-    control plane for the machine's address → node agent), or None if any
-    hop fails. The node secret goes with it."""
+def _node_get(deployment, path: str, *, timeout: float, max_bytes: int, body: dict | None = None) -> dict | None:
+    """GET `path` (POST `body` as JSON, if given) from the node agent running
+    `deployment` (gateway → control plane for the machine's address → node
+    agent), or None if any hop fails. The node secret goes with it."""
     if not deployment.hotkey:
         return None
     miner_base = _lookup_miner_base_url(deployment.hotkey)
     if not miner_base:
         return None
-    req = urllib_request.Request(f"{miner_base}{path}", method="GET")
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib_request.Request(f"{miner_base}{path}", data=data, method="POST" if data is not None else "GET")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
     agent_secret = os.environ.get("GREENCOMPUTE_INFERENCE_AUTH_SECRET")
     if agent_secret:
         req.add_header("X-Agent-Auth", agent_secret)
@@ -1696,6 +1699,44 @@ def get_deployment_logs(
     lines = max(1, min(int(lines), 2000))
     # The node keeps 256 KiB of each source's end; JSON escaping can double it.
     out = _node_get(deployment, f"/pods/{deployment_id}/logs?lines={lines}", timeout=15.0, max_bytes=8 * 1024 * 1024)
+    if out is None:
+        raise coded(503, "unavailable", "the machine running this rental didn't answer; try again shortly",
+                    headers={"Retry-After": "10"})
+    return out
+
+
+@router.post("/platform/deployments/{deployment_id}/exec", response_model=None,
+             responses=ok(schemas.ExecResult, "How the command ran"))
+def run_in_deployment(
+    deployment_id: str,
+    payload: schemas.ExecRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Run a shell command in a running rental, as root, from /workspace,
+    without SSH: e.g. update the software on every card in a loop. Returns
+    its exit code and the last 64 KiB of its output. After `timeout_seconds`
+    (at most 120) we stop waiting, but the command may still be running in
+    the pod: put long jobs in the background with their own log. Needs the
+    `rentals` scope, like SSH access."""
+    api_key = require_api_key(authorization, x_api_key)
+    enforce_rate_limit("deployment_exec", api_key.key_id, limit=60, window_seconds=60)
+    deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=api_key.admin)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="deployment not found")
+    if deployment.state != DeploymentState.READY:
+        raise coded(409, "conflict", f"the rental is {deployment.state.value}; commands run while it is ready")
+    if not str(deployment.endpoint or "").startswith("ssh://"):
+        raise coded(409, "conflict", "commands run only in rentals (pods), not in models")
+    # Who ran something where: like the SSH key hand-out, recorded (the
+    # command's hash and length, not its text, which may hold a secret).
+    log.info(
+        "secret_access event=deployment_exec deployment_id=%s key_id=%s user_id=%s ip=%s command_sha256=%s len=%d",
+        deployment_id, api_key.key_id, api_key.user_id, _audit_client_ip(),
+        hashlib.sha256(payload.command.encode()).hexdigest()[:16], len(payload.command),
+    )
+    out = _node_get(deployment, f"/pods/{deployment_id}/exec", timeout=payload.timeout_seconds + 15.0,
+                    max_bytes=1024 * 1024, body={"command": payload.command, "timeout_seconds": payload.timeout_seconds})
     if out is None:
         raise coded(503, "unavailable", "the machine running this rental didn't answer; try again shortly",
                     headers={"Retry-After": "10"})

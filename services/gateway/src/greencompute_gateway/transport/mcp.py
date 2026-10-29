@@ -254,6 +254,22 @@ def t_recent_events(auth: tuple, args: dict) -> dict:
         after=after, limit=limit, types=types, authorization=auth[0], x_api_key=auth[1]))
 
 
+def t_run_command(auth: tuple, args: dict) -> dict:
+    from pydantic import ValidationError
+
+    from greencompute_gateway.transport import schemas
+
+    r = _routes()
+    dep_id = _str(args, "deployment_id", required=True)
+    try:
+        payload = schemas.ExecRequest(command=_str(args, "command", required=True),
+                                      timeout_seconds=_int(args, "timeout_seconds", 60, 1, 120))
+    except ValidationError as exc:
+        raise ToolInputError(f"invalid command: {exc.errors()[0].get('msg')}") from exc
+    return _as("POST", f"/platform/deployments/{dep_id}/exec",
+               lambda: r.run_in_deployment(dep_id, payload, authorization=auth[0], x_api_key=auth[1]))
+
+
 def t_alert_when_free(auth: tuple, args: dict) -> dict:
     from greencompute_gateway.transport import schemas
 
@@ -313,6 +329,14 @@ TOOLS: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "after": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 500},
          "types": {"type": "string", "description": "Comma-separated event types to keep."}}}},
+    {"name": "run_command", "title": "Run a command", "handler": t_run_command, "readOnly": False, "destructive": True,
+     "description": ("Run a shell command in a running rental, as root, from /workspace (no SSH needed). Returns its "
+                     "exit code and the end of its output. Waits at most timeout_seconds (120); longer jobs: run them "
+                     "in the background with their own log."),
+     "inputSchema": {"type": "object", "properties": {
+         **_ID, "command": {"type": "string", "description": "e.g. `nvidia-smi` or `./update.sh && pkill -f miner`."},
+         "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 120}},
+         "required": ["deployment_id", "command"]}},
     {"name": "alert_when_free", "title": "Alert when free", "handler": t_alert_when_free, "readOnly": False,
      "description": "Be emailed once (and get a capacity.available event) when GPUs of a model are free. Lasts 7 days.",
      "inputSchema": {"type": "object", "properties": {

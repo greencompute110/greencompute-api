@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, create_model, field_validator
 
 from greencompute_protocol import CryptoInvoice, DeploymentRecord, LedgerEntry, WorkloadSpec
 
@@ -438,3 +438,22 @@ class PodLogs(BaseModel):
     command_log_note: str | None = Field(default=None, description="Why command_log is null or partial.")
     container_log: str | None = Field(description="End of the container's own output.")
     container_log_note: str | None = Field(default=None, description="Why container_log is null.")
+
+
+class ExecRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=8192, description="Run with `sh -c`, as root, from /workspace.")
+    timeout_seconds: int = Field(default=60, ge=1, le=120, description="How long to wait for it (1-120 s).")
+
+    @field_validator("command")
+    @classmethod
+    def _printable(cls, value: str) -> str:
+        if "\x00" in value or not value.strip():
+            raise ValueError("command must be non-empty text without NUL bytes")
+        return value
+
+
+class ExecResult(BaseModel):
+    exit_code: int | None = Field(description="Null if it was still running when we stopped waiting.")
+    output: str = Field(description="The last 64 KiB of its output (stdout and stderr).")
+    output_truncated: bool
+    timed_out: bool = Field(description="True: we stopped waiting; the command may still be running in the pod.")

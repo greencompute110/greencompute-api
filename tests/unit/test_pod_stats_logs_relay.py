@@ -31,7 +31,7 @@ def relay(monkeypatch):
         if seen.get("fail"):
             raise routes.URLError("no route to host")
         return Reply(seen.get("body", json.dumps({"cpu_pct": 12.5, "gpus": [{"index": 0, "power_w": 441.2}]}).encode()))
-    monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: SimpleNamespace(user_id="u1", admin=False))
+    monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: SimpleNamespace(user_id="u1", admin=False, key_id="k1"))
     monkeypatch.setattr(routes.service, "get_deployment", lambda *a, **k: dep)
     monkeypatch.setattr(routes, "_lookup_miner_base_url", lambda hotkey: "http://172.16.10.12:8007")
     monkeypatch.setattr(routes.urllib_request, "urlopen", urlopen)
@@ -102,3 +102,45 @@ def test_a_reply_cut_short_is_no_reading_not_a_crash(relay, monkeypatch):
         raise http.client.IncompleteRead(b"{\"cpu")
     monkeypatch.setattr(routes.urllib_request, "urlopen", cut)
     assert routes.get_deployment_stats("d1", authorization="Bearer k", x_api_key=None) == {}
+
+
+def test_a_command_is_posted_to_the_node_and_audited_without_its_text(relay, monkeypatch, caplog):
+    import logging
+
+    from greencompute_gateway.transport import schemas
+
+    dep, seen = relay
+    dep.endpoint = "ssh://root@1.2.3.4:30001"
+    seen["body"] = json.dumps({"exit_code": 0, "output": "ok", "output_truncated": False, "timed_out": False}).encode()
+    posted = {}
+    real = routes.urllib_request.urlopen
+
+    def urlopen(req, timeout):
+        posted["method"], posted["data"], posted["timeout"] = req.get_method(), json.loads(req.data), timeout
+        return real(req, timeout)
+    monkeypatch.setattr(routes.urllib_request, "urlopen", urlopen)
+    monkeypatch.setattr(routes, "enforce_rate_limit", lambda *a, **k: None)
+    with caplog.at_level(logging.INFO):
+        out = routes.run_in_deployment("d1", schemas.ExecRequest(command="export TOKEN=s3cret; ./update.sh",
+                                                                 timeout_seconds=30),
+                                       authorization="Bearer k", x_api_key=None)
+    assert out["exit_code"] == 0 and seen["url"].endswith("/pods/d1/exec")
+    assert posted == {"method": "POST", "data": {"command": "export TOKEN=s3cret; ./update.sh", "timeout_seconds": 30},
+                      "timeout": 45.0}
+    audit = [r.getMessage() for r in caplog.records if "deployment_exec" in r.getMessage()]
+    assert audit and "s3cret" not in audit[0] and "command_sha256=" in audit[0]
+
+
+def test_commands_only_in_running_pods(relay, monkeypatch):
+    from greencompute_gateway.transport import schemas
+
+    dep, _ = relay
+    monkeypatch.setattr(routes, "enforce_rate_limit", lambda *a, **k: None)
+    dep.endpoint = "http://10.0.0.1:8000"  # a model, not a pod
+    with pytest.raises(HTTPException) as exc:
+        routes.run_in_deployment("d1", schemas.ExecRequest(command="ls"), authorization="Bearer k", x_api_key=None)
+    assert exc.value.status_code == 409
+    with pytest.raises(ValueError):
+        schemas.ExecRequest(command="ls\x00rm")
+    with pytest.raises(ValueError):
+        schemas.ExecRequest(command="ls", timeout_seconds=600)
