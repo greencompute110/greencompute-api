@@ -71,3 +71,26 @@ def keys_with_spend_limits(session_factory) -> dict[str, int]:
             )
         ).all()
     return {key_id: int(limit) for key_id, limit in rows}
+
+
+def key_rental_room(
+    session_factory, key_id: str, max_active_rentals: int | None, daily_spend_limit_usd: float | None,
+) -> tuple[int | None, str | None, dict]:
+    """How many more rentals a key may start now: (room, reason, numbers).
+    room None means no limit; 0 with a reason means none ("spend" when its
+    daily spend limit is reached, "active" at its limit of rentals at once).
+    The one rule behind both the deployments route and fleets."""
+    room: int | None = None
+    numbers: dict = {}
+    if max_active_rentals is not None:
+        active = key_active_rentals(session_factory, key_id)
+        numbers["active_rentals"] = active
+        room = max_active_rentals - active
+        if room <= 0:
+            return 0, "active", numbers
+    if daily_spend_limit_usd is not None:
+        spent = key_spend_cents(session_factory, key_id)
+        numbers["spent_cents"] = spent
+        if spent >= round(daily_spend_limit_usd * 100):
+            return 0, "spend", numbers
+    return room, None, numbers

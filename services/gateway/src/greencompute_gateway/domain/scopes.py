@@ -23,7 +23,9 @@ SCOPES = {
 }
 
 _SSH = re.compile(r"^/platform/deployments/[^/]+/ssh/?$")
-_RENTAL_PREFIXES = ("/platform/workloads", "/platform/deployments", "/platform/builds", "/platform/images")
+_RENTAL_PREFIXES = (
+    "/platform/workloads", "/platform/deployments", "/platform/fleets", "/platform/builds", "/platform/images",
+)
 
 
 def normalize_scopes(scopes: list[str] | None) -> list[str]:

@@ -170,6 +170,55 @@ class Statement(BaseModel):
     )
 
 
+from greencompute_gateway.application.fleets import MAX_TARGET as MAX_FLEET_TARGET  # noqa: E402
+
+
+class FleetCreate(BaseModel):
+    workload_id: str = Field(description="A pod workload of yours.")
+    target: int = Field(ge=1, le=MAX_FLEET_TARGET, description="How many rentals the fleet keeps (or starts).")
+    replace: bool = Field(default=True, description="true: replace any that stops (keep N running). "
+                                                    "false: start `target` as GPUs free up, then stop.")
+    name_prefix: str | None = Field(default=None, description="Members are named <prefix>-01, -02, … "
+                                                              "(GC_DEPLOYMENT_NAME). Default: from the workload's name.")
+    max_runtime_minutes: int | None = Field(default=None, ge=1, le=43200, description="Per member, as on a deployment.")
+    save_on_exhaustion: bool = False
+    resume_on_topup: bool = Field(default=False, description="Needs save_on_exhaustion.")
+
+
+class FleetUpdate(BaseModel):
+    target: int | None = Field(default=None, ge=1, le=MAX_FLEET_TARGET)
+    paused: bool | None = Field(default=None, description="true: start and replace nothing; false: resume.")
+
+
+class FleetMember(BaseModel):
+    deployment_id: str
+    name: str
+    slot: int
+    state: str
+    ready_at: str | None
+    last_error: str | None
+
+
+class Fleet(BaseModel):
+    fleet_id: str
+    workload_id: str
+    name_prefix: str
+    target: int
+    replace: bool
+    state: str = Field(description="`active`, `paused`, `completed` (replace=false, all have run) or `stopped`.")
+    status: str = Field(description="What the fleet is doing or waiting for, in plain English.")
+    running: int
+    starting: int
+    paused: int = Field(description="Members paused (e.g. the balance ran out); they are not replaced.")
+    max_runtime_minutes: int | None
+    save_on_exhaustion: bool
+    resume_on_topup: bool
+    usd_per_hour_at_target: float | None
+    members: list[FleetMember] = Field(description="Live members, and those that ended in the last day; newest first.")
+    created_at: str | None
+    updated_at: str | None
+
+
 class LedgerItem(LedgerEntry):
     """One top-up or charge. amount_cents is negative for charges."""
 
