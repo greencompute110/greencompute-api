@@ -1258,3 +1258,21 @@ class WebhookORM(Base):
     last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CapacityAlertORM(Base):
+    """"Tell me when this GPU is free" (request #30): fires once, when the
+    pool has room for `count` rentals of `gpu_count` GPUs of `gpu_model`, as
+    a capacity.available account event and an email; or expires."""
+
+    __tablename__ = "capacity_alerts"
+
+    alert_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    gpu_model: Mapped[str] = mapped_column(String(64))
+    gpu_count: Mapped[int] = mapped_column(Integer, default=1)
+    count: Mapped[int] = mapped_column(Integer, default=1)
+    state: Mapped[str] = mapped_column(String(16), default="waiting", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

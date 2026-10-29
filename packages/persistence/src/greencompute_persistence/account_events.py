@@ -28,6 +28,7 @@ EVENT_TYPES: dict[str, str] = {
     "deployment.suspended": "It was paused: `suspended_reason` is `balance` (credit ran out) or `idle` (a private model nobody called).",
     "deployment.terminated": "It was stopped for good: deleted, or `max_runtime_minutes` reached.",
     "balance.low": "Your balance lasts under 24 hours at the current rate (sent again under 2 hours).",
+    "capacity.available": "GPUs you asked to hear about (POST /platform/capacity-alerts) are free now.",
 }
 _DEPLOYMENT_STATES = {"ready", "failed", "suspended", "terminated"}
 _ERROR_CHARS = 1000

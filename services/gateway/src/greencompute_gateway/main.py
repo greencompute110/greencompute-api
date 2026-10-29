@@ -41,6 +41,7 @@ async def lifespan(app: FastAPI):
     from greencompute_gateway.application.credit_watch import credit_watch_loop
     from greencompute_gateway.application.fleets import fleet_loop
     from greencompute_gateway.application.webhooks import webhook_loop
+    from greencompute_gateway.application.capacity_alerts import capacity_alert_loop
     from greencompute_gateway.infrastructure.deposit_watcher import (
         deposit_watcher_loop,
     )
@@ -51,6 +52,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(credit_watch_loop(), name="credit-watch"),
         asyncio.create_task(fleet_loop(), name="fleets"),
         asyncio.create_task(webhook_loop(), name="webhooks"),
+        asyncio.create_task(capacity_alert_loop(), name="capacity-alerts"),
     ]
     try:
         yield

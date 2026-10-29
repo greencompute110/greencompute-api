@@ -1345,6 +1345,61 @@ def test_webhook(
     return _webhook_call(lambda: webhooks.send_test(service.repository.session_factory, api_key.user_id, webhook_id))
 
 
+def _alert_call(fn):
+    from greencompute_gateway.application.capacity_alerts import CapacityAlertError, CapacityAlertNotFound
+
+    try:
+        return fn()
+    except CapacityAlertNotFound as exc:
+        raise HTTPException(status_code=404, detail="alert not found") from exc
+    except CapacityAlertError as exc:
+        raise coded(400, "invalid_request", str(exc)) from exc
+
+
+@router.post("/platform/capacity-alerts", response_model=None,
+             responses=ok(schemas.CapacityAlert, "The alert, waiting"))
+def create_capacity_alert(
+    payload: schemas.CapacityAlertCreate,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Be told once when there is room for `count` rentals of `gpu_count`
+    GPUs of `gpu_model`: a `capacity.available` event (events feed and
+    webhooks) and an email. Expires after 7 days. Asking again for the same
+    returns the alert already waiting."""
+    api_key = _user_key(authorization, x_api_key)
+    enforce_rate_limit("capacity_alert", api_key.key_id, limit=20, window_seconds=60)
+    from greencompute_gateway.application import capacity_alerts
+
+    return _alert_call(lambda: capacity_alerts.create_alert(
+        service.repository.session_factory, api_key.user_id, payload.gpu_model, payload.gpu_count, payload.count))
+
+
+@router.get("/platform/capacity-alerts", response_model=None,
+            responses=ok(list[schemas.CapacityAlert], "Waiting alerts, and those from the last 7 days"))
+def list_capacity_alerts(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import capacity_alerts
+
+    return capacity_alerts.list_alerts(service.repository.session_factory, user_id)
+
+
+@router.delete("/platform/capacity-alerts/{alert_id}", response_model=None,
+               responses=ok(schemas.CapacityAlert, "The alert, cancelled"))
+def cancel_capacity_alert(
+    alert_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import capacity_alerts
+
+    return _alert_call(lambda: capacity_alerts.cancel_alert(service.repository.session_factory, user_id, alert_id))
+
+
 @router.post("/platform/fleets", response_model=None, responses=ok(schemas.Fleet, "The new fleet"))
 def create_fleet(
     payload: schemas.FleetCreate,

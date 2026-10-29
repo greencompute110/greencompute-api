@@ -381,3 +381,20 @@ class WebhookTestResult(BaseModel):
     delivered: bool
     status_code: int | None = Field(description="Your endpoint's HTTP status, if it answered.")
     error: str | None
+
+
+class CapacityAlertCreate(BaseModel):
+    gpu_model: str = Field(description="e.g. `rtx4090`.")
+    gpu_count: int = Field(default=1, description="GPUs one rental needs together, on one machine (1-8).")
+    count: int = Field(default=1, description="How many such rentals you want room for (1-64).")
+
+
+class CapacityAlert(BaseModel):
+    alert_id: str
+    gpu_model: str
+    gpu_count: int
+    count: int
+    state: str = Field(description="`waiting`, `fired`, `expired` (after 7 days) or `cancelled`.")
+    created_at: str | None
+    expires_at: str | None
+    fired_at: str | None

@@ -25,6 +25,7 @@ SCOPES = {
 _SSH = re.compile(r"^/platform/deployments/[^/]+/ssh/?$")
 _RENTAL_PREFIXES = (
     "/platform/workloads", "/platform/deployments", "/platform/fleets", "/platform/builds", "/platform/images",
+    "/platform/capacity-alerts",
 )
 
 
