@@ -8,6 +8,7 @@ from greencompute_control_plane.config import settings
 from greencompute_protocol import MemoryReplayStore, SignedRequest, verify_payload, verify_payload_hotkey
 
 
+
 credential_store = CredentialStore(
     engine=service.repository.engine,
     session_factory=service.repository.session_factory,

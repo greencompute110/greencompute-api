@@ -43,13 +43,17 @@ def _seed_keys(repository: GatewayRepository) -> tuple[str, str]:
     return user_key.secret, admin_key.secret
 
 
-def _miner_headers(hotkey: str, secret: str, body: bytes) -> dict[str, str]:
+def _miner_headers(hotkey: str, secret: str, body: bytes) -> dict:
+    """The headers a miner sends, plus the exact body it signed (routes verify
+    the signature over the raw request body)."""
     signed = sign_payload(secret=secret, actor_id=hotkey, body=body)
     return {
+        "raw_body": body,
         "x_miner_hotkey": hotkey,
         "x_miner_signature": signed.signature,
         "x_miner_nonce": signed.nonce,
         "x_miner_timestamp": str(signed.timestamp),
+        "x_miner_auth_mode": None,
     }
 
 
@@ -289,6 +293,11 @@ def test_gateway_placeholder_routes_are_explicitly_disabled(monkeypatch: pytest.
 def test_control_plane_routes_require_miner_header_and_expose_debug_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This test is about signatures and replay, not the onboarding whitelist
+    # (added later, on by default), which would refuse the test miner.
+    from greencompute_control_plane.config import settings as cp_settings
+
+    monkeypatch.setattr(cp_settings, "whitelist_enabled", False)
     shared_db = "sqlite+pysqlite:///:memory:"
     control_repository = ControlPlaneRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
@@ -706,6 +715,9 @@ def test_control_plane_fleet_debug_view_summarizes_inventory_placements_and_fail
 
 
 def test_control_plane_placeholder_miner_jobs_route_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from greencompute_control_plane.config import settings as cp_settings
+
+    monkeypatch.setattr(cp_settings, "whitelist_enabled", False)  # not what this test is about
     shared_db = "sqlite+pysqlite:///:memory:"
     control_repository = ControlPlaneRepository(database_url=shared_db, bootstrap=True)
     workflow_repository = WorkflowEventRepository(database_url=shared_db, bootstrap=True)
@@ -725,6 +737,7 @@ def test_control_plane_placeholder_miner_jobs_route_is_disabled(monkeypatch: pyt
     )
     service.register_miner(registration)
     headers = _miner_headers("miner-a", "miner-secret", b"")
+    headers.pop("raw_body")  # a GET: the signature covers an empty body
 
     with pytest.raises(HTTPException) as exc:
         control_plane_routes.miner_list_jobs(**headers)
@@ -930,7 +943,7 @@ def test_validator_routes_require_headers_and_expose_probe_history(
         memory_gb=128,
     )
     with pytest.raises(HTTPException) as missing:
-        validator_routes.register_capability(capability)
+        validator_routes.register_capability(capability, raw_body=capability.model_dump_json().encode())
     assert missing.value.status_code == 401
 
     validator_routes.register_capability(
