@@ -127,6 +127,11 @@ class GpuPrice(BaseModel):
     vram_gb: int | None = None
     cents_per_gpu_hour: int
     usd_per_gpu_hour: float
+    usd_per_gpu_hour_paid_in_alpha: float = Field(
+        description="What an hour costs you when you top up in subnet 110 alpha, which is credited "
+                    "payment_bonuses.alpha extra: usd_per_gpu_hour / (1 + bonus). Fees your wallet or "
+                    "exchange charges to move or swap alpha are not included.",
+    )
 
 
 class GpuRentalPricing(BaseModel):
@@ -156,6 +161,10 @@ class PrivateModelPricing(BaseModel):
 
 class Pricing(BaseModel):
     currency: str
+    payment_bonuses: dict[str, float] = Field(
+        description="Extra credit per top-up method, as a fraction: {\"alpha\": 0.1} means $10 of alpha "
+                    "adds $11. Methods not listed (card, USDC, USDT, TAO) are credited at par.",
+    )
     gpu_rental: GpuRentalPricing
     inference: InferencePricing
     private_model: PrivateModelPricing = Field(

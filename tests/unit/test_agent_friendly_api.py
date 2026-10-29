@@ -394,3 +394,21 @@ def test_deleting_a_workload_with_something_running_stops_it_first(monkeypatch):
     events = cp.repository.list_deployment_events(live.deployment_id)
     assert events[-1]["state"] == "deleted" and events[-1]["last_state"] == "terminated"
     assert cp.repository.get_deployment(done.deployment_id) is None
+
+
+
+def test_pricing_shows_what_an_hour_costs_when_paid_in_alpha(monkeypatch):
+    """$0.40/hr paid in alpha (credited 10% extra) costs $0.3636: shown next to
+    the listed price, so nobody has to work it out (external API user, #18)."""
+    import greencompute_gateway.transport.routes as routes
+
+    monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
+    monkeypatch.setattr(routes, "_public_inference_model_names", lambda: [])
+    monkeypatch.setattr(routes, "_rentable_now", lambda: ["rtx4090"])
+    monkeypatch.setattr(routes, "_capacity_by_model", lambda: {})
+    body = routes.public_pricing()
+    assert body["payment_bonuses"] == {"alpha": 0.1}
+    gpus = {g["gpu_model"]: g for g in body["gpu_rental"]["gpus"]}
+    assert gpus["rtx4090"]["usd_per_gpu_hour"] == 0.4
+    assert gpus["rtx4090"]["usd_per_gpu_hour_paid_in_alpha"] == 0.3636
+    assert gpus["rtx5090"]["usd_per_gpu_hour_paid_in_alpha"] == 0.6364
