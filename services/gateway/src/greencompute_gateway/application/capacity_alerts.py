@@ -1,9 +1,9 @@
 """"Tell me when this GPU is free" (external API user, request #30: the site
 showed one 4090 left, it couldn't be rented, and they had to keep checking).
 
-An alert waits for room for `count` rentals of `gpu_count` GPUs of one model
-(the most free on one machine is what a multi-GPU rental needs), checked
-every minute against the same numbers the price list shows. It fires once:
+An alert waits for room for `count` rentals of `gpu_count` GPUs of one model,
+each rental on one machine (what placement needs), checked every minute
+against the scheduler's own count of free GPUs per machine. It fires once:
 a `capacity.available` account event (events feed, webhooks) and an email.
 It expires after 7 days. To rent the moment GPUs free up instead of being
 told, use a fleet with `replace: false`.
@@ -21,7 +21,7 @@ from sqlalchemy import select
 
 from greencompute_persistence import session_scope
 from greencompute_persistence.account_events import add_event
-from greencompute_persistence.orm import AccountEventORM, CapacityAlertORM
+from greencompute_persistence.orm import AccountEventORM, CapacityAlertORM, UserORM
 
 log = logging.getLogger(__name__)
 
@@ -47,18 +47,15 @@ def _utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
-def _families() -> list[str]:
-    raw = os.getenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", "4090,5090")
-    return [f.strip().lower() for f in raw.split(",") if f.strip()]
-
-
 def normalize_model(raw: object) -> str:
-    """`rtx4090` from "RTX 4090", "rtx-4090"…; only GPUs we rent out."""
-    model = "".join(ch for ch in str(raw or "").lower() if ch.isalnum())
-    families = _families()
-    if not model or not any(f in model for f in families):
-        choices = ", ".join(f"rtx{f}" for f in families)
-        raise CapacityAlertError(f"gpu_model must be a GPU we rent out: {choices}")
+    """The canonical name (`rtx4090` from "RTX 4090", "rtx-4090"…) of a GPU
+    we rent out: the price list's own list, so an alert can always match."""
+    from greencompute_gateway.domain.gpu_catalog import normalize_gpu_model, public_gpu_models
+
+    model = normalize_gpu_model(str(raw or ""))
+    public = [normalize_gpu_model(m) for m in public_gpu_models()]
+    if model not in public:
+        raise CapacityAlertError("gpu_model must be a GPU we rent out: " + ", ".join(public))
     return model
 
 
@@ -89,8 +86,10 @@ def create_alert(session_factory, user_id: str, gpu_model: object, gpu_count: ob
     count = _int(count, "count", MAX_COUNT)
     now = now or _now()
     with session_scope(session_factory) as session:
-        waiting = session.scalars(select(CapacityAlertORM).where(
-            CapacityAlertORM.user_id == user_id, CapacityAlertORM.state == "waiting")).all()
+        # One create per customer at a time, so two at once can't both pass
+        # the limit or both add the same alert.
+        session.get(UserORM, user_id, with_for_update=True)
+        waiting = _waiting(session, user_id, now)
         for row in waiting:
             if (row.gpu_model, row.gpu_count, row.count) == (model, gpu_count, count):
                 return _out(row)
@@ -105,10 +104,26 @@ def create_alert(session_factory, user_id: str, gpu_model: object, gpu_count: ob
         return _out(row)
 
 
+def _waiting(session, user_id: str, now: datetime) -> list[CapacityAlertORM]:
+    """The customer's waiting alerts; any past its expiry is marked expired
+    here, so the limit and the list never depend on the loop running."""
+    rows = session.scalars(select(CapacityAlertORM).where(
+        CapacityAlertORM.user_id == user_id, CapacityAlertORM.state == "waiting")).all()
+    live = []
+    for row in rows:
+        if _utc(row.expires_at) <= now:
+            row.state = "expired"
+        else:
+            live.append(row)
+    return live
+
+
 def list_alerts(session_factory, user_id: str, *, now: datetime | None = None) -> list[dict[str, Any]]:
     """Waiting alerts, and those that fired or expired in the last 7 days."""
-    since = (now or _now()) - LIFETIME
+    now = now or _now()
+    since = now - LIFETIME
     with session_scope(session_factory) as session:
+        _waiting(session, user_id, now)
         rows = session.scalars(select(CapacityAlertORM).where(
             CapacityAlertORM.user_id == user_id, CapacityAlertORM.created_at >= since - LIFETIME,
         ).order_by(CapacityAlertORM.created_at.desc())).all()
@@ -125,22 +140,32 @@ def cancel_alert(session_factory, user_id: str, alert_id: str) -> dict[str, Any]
         return _out(row)
 
 
-def _room(capacity: dict[str, dict[str, int]], model: str, gpu_count: int, count: int) -> dict[str, int] | None:
-    entry = capacity.get(model)
-    if not entry:
-        return None
-    if entry.get("max_gpus_per_deployment", 0) >= gpu_count and entry.get("available_gpus", 0) >= gpu_count * count:
-        return entry
-    return None
+def free_by_model(capacity: list[tuple[Any, int]]) -> dict[str, list[int]]:
+    """GPUs free on each machine, per model, from the control plane's
+    schedulable_capacity(): what a rental of several GPUs can really use."""
+    from greencompute_gateway.domain.gpu_catalog import normalize_gpu_model
+
+    out: dict[str, list[int]] = {}
+    for node, free in capacity:
+        if free > 0:
+            out.setdefault(normalize_gpu_model(node.gpu_model), []).append(int(free))
+    return out
 
 
-def check_once(session_factory, capacity: dict[str, dict[str, int]], *, notify: Callable | None = None,
+def _fits(free_per_machine: list[int], gpu_count: int, count: int) -> bool:
+    """`count` rentals of `gpu_count` GPUs each, each on one machine."""
+    return sum(free // gpu_count for free in free_per_machine) >= count
+
+
+def check_once(session_factory, free: dict[str, list[int]], *, notify: Callable | None = None,
                now: datetime | None = None) -> list[str]:
     """Fire every waiting alert there is room for now, expire the old ones.
     Returns the ids fired. The event is written with the change of state, so
-    an alert fires exactly once; the email follows."""
+    an alert fires exactly once; one email per customer follows, even when
+    several of their alerts fire together."""
     now = now or _now()
-    fired: list[tuple[str, dict[str, Any], str]] = []
+    fired: list[str] = []
+    emails: dict[str, dict[str, Any]] = {}
     with session_scope(session_factory) as session:
         rows = session.scalars(
             select(CapacityAlertORM).where(CapacityAlertORM.state == "waiting").with_for_update(skip_locked=True)
@@ -149,22 +174,24 @@ def check_once(session_factory, capacity: dict[str, dict[str, int]], *, notify: 
             if _utc(row.expires_at) <= now:
                 row.state = "expired"
                 continue
-            entry = _room(capacity, row.gpu_model, row.gpu_count, row.count)
-            if entry is None:
+            machines = free.get(row.gpu_model, [])
+            if not _fits(machines, row.gpu_count, row.count):
                 continue
             row.state = "fired"
             row.fired_at = now
             data = {
                 "alert_id": row.alert_id, "gpu_model": row.gpu_model, "gpu_count": row.gpu_count, "count": row.count,
-                "available_gpus": entry.get("available_gpus", 0),
-                "max_gpus_per_deployment": entry.get("max_gpus_per_deployment", 0),
+                "available_gpus": sum(machines), "max_gpus_per_deployment": max(machines),
             }
             add_event(session, AccountEventORM(user_id=row.user_id, type="capacity.available", data=data, created_at=now))
-            fired.append((row.user_id, data, row.alert_id))
-    for user_id, data, alert_id in fired:
-        if notify is not None:
-            notify(session_factory, user_id, "gpu_available", data, event_id=f"gpu_available:{alert_id}")
-    return [alert_id for _, _, alert_id in fired]
+            fired.append(row.alert_id)
+            best = emails.get(row.user_id)
+            if best is None or row.gpu_count * row.count > best["gpu_count"] * best["count"]:
+                emails[row.user_id] = data
+    if notify is not None:
+        for user_id, data in emails.items():
+            notify(session_factory, user_id, "gpu_available", data, event_id=f"gpu_available:{data['alert_id']}")
+    return fired
 
 
 async def capacity_alert_loop() -> None:
@@ -180,8 +207,8 @@ async def capacity_alert_loop() -> None:
     await asyncio.sleep(30)
     while True:
         try:
-            capacity = await asyncio.to_thread(service.control_plane.capacity_by_model)
-            fired = await asyncio.to_thread(check_once, sf, capacity, notify=notify_user)
+            capacity = await asyncio.to_thread(service.control_plane.schedulable_capacity)
+            fired = await asyncio.to_thread(check_once, sf, free_by_model(capacity), notify=notify_user)
             if fired:
                 log.info("capacity alerts: %d fired", len(fired))
         except Exception:  # noqa: BLE001
