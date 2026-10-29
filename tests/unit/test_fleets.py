@@ -81,7 +81,7 @@ def test_a_fleet_fills_its_target_with_named_members(world):
     f = _create(world)
     v = _view(world, f.fleet_id)
     assert sorted(m["name"] for m in v["members"]) == ["miner-01", "miner-02", "miner-03"]
-    assert v["status"] == "3 of 3 started." and v["state"] == "active"
+    assert v["status"] == "3 of 3 started; 0 running." and v["state"] == "active"
     assert v["usd_per_hour_at_target"] == 1.2  # 3 × $0.40
     names = {world.cp.repository.get_deployment(m["deployment_id"]).name for m in v["members"]}
     assert names == {"miner-01", "miner-02", "miner-03"}  # what the pods see as GC_DEPLOYMENT_NAME
@@ -404,3 +404,11 @@ def test_create_is_idempotent(world, monkeypatch):
     again = routes.create_fleet(body, replay, authorization="Bearer k", x_api_key=None, idempotency_key="same")
     assert again["fleet_id"] == first["fleet_id"] and replay.headers.get("Idempotent-Replayed") == "true"
     assert len(fleets.list_fleets(world.gw, "ann")) == 1
+
+
+
+def test_the_status_says_how_things_stand_now(world):
+    f = _create(world, target=2)
+    for m in _view(world, f.fleet_id)["members"]:
+        _set(world, m["deployment_id"], DeploymentState.READY)
+    assert _view(world, f.fleet_id)["status"] == "All 2 running."  # without waiting for the next pass
