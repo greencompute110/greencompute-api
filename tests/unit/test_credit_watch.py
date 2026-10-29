@@ -371,11 +371,11 @@ def test_a_machine_cannot_say_why_a_deployment_is_suspended(world, monkeypatch):
     cp.repository.update_deployment(dep)
     monkeypatch.setattr(cp_routes, "service", cp)
     monkeypatch.setattr(cp_routes, "require_miner_request", lambda *a, **k: None)
-    status_route = next(r for r in cp_routes.router.routes if r.path.endswith("/status") and "POST" in r.methods)
-    status_route.endpoint(
+    cp_routes.deployment_status(
         deployment_id=dep.deployment_id,
         payload=DeploymentStatusUpdate(deployment_id=dep.deployment_id, state=DeploymentState.SUSPENDED,
                                        suspended_reason="balance"),
+        raw_body=b"{}",
         x_miner_hotkey=None, x_miner_signature=None, x_miner_nonce=None, x_miner_timestamp=None, x_miner_auth_mode=None,
     )
     assert cp.repository.get_deployment(dep.deployment_id).suspended_reason is None

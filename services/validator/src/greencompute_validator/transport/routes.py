@@ -29,6 +29,7 @@ from greencompute_validator.application.managed_wallet_factory import (
     get_managed_wallet_service,
 )
 from greencompute_validator.domain.managed_wallet import is_valid_ss58
+from greencompute_control_plane.transport.raw_body import RawBody
 from greencompute_validator.transport.security import (
     caller_user_id,
     require_admin_api_key,
@@ -74,6 +75,7 @@ def _build_registry():
 @router.post("/validator/v1/capabilities", response_model=NodeCapability)
 def register_capability(
     payload: NodeCapability,
+    raw_body: RawBody,
     x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
     x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
     x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
@@ -82,7 +84,7 @@ def register_capability(
 ) -> NodeCapability:
     require_miner_request(
         payload.hotkey,
-        payload.model_dump_json().encode(),
+        raw_body,
         x_miner_hotkey,
         x_miner_signature,
         x_miner_nonce,
@@ -112,6 +114,7 @@ def create_probe(
 @router.post("/validator/v1/probes/results")
 def submit_probe_result(
     payload: ProbeResult,
+    raw_body: RawBody,
     x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
     x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
     x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
@@ -120,7 +123,7 @@ def submit_probe_result(
 ) -> dict:
     require_miner_request(
         payload.hotkey,
-        payload.model_dump_json().encode(),
+        raw_body,
         x_miner_hotkey,
         x_miner_signature,
         x_miner_nonce,

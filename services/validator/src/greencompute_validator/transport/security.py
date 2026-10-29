@@ -10,6 +10,7 @@ from greencompute_control_plane.infrastructure.repository import ControlPlaneRep
 from greencompute_validator.application.services import service
 
 
+
 def _env_master_admin_key() -> str:
     """Master admin key from env. Matches the gateway's break-glass logic so
     a single env var lets ops authenticate against both surfaces."""

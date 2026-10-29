@@ -6,6 +6,7 @@ from greencompute_persistence import get_metrics_store
 from greencompute_protocol import CapacityUpdate, DeploymentState, DeploymentStatusUpdate, Heartbeat, MinerRegistration
 from greencompute_control_plane.application.services import service
 from greencompute_control_plane.domain.state import InvalidDeploymentTransition
+from greencompute_control_plane.transport.raw_body import RawBody
 from greencompute_control_plane.transport.security import caller_is_admin, require_admin_api_key, require_miner_request
 
 router = APIRouter()
@@ -26,21 +27,28 @@ metrics = get_metrics_store("greencompute-control-plane")
 @router.post("/miner/v1/register", response_model=MinerRegistration)
 def register_miner(
     payload: MinerRegistration,
+    raw_body: RawBody,
     x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
     x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
     x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
     x_miner_timestamp: str | None = Header(default=None, alias="X-Miner-Timestamp"),
     x_miner_auth_mode: str | None = Header(default=None, alias="X-Miner-Auth-Mode"),
 ) -> MinerRegistration:
+    # A hotkey that is already registered must re-register as itself: with a
+    # hotkey signature, or an HMAC signature under the secret ON FILE. Trusting
+    # the secret in the request (as this did for every call) let anyone who
+    # knew a registered hotkey replace its payout address, endpoint and secret.
+    # Only a hotkey never seen before may bring its first secret.
+    known = service.repository.get_miner(payload.hotkey) is not None
     require_miner_request(
         payload.hotkey,
-        payload.model_dump_json().encode(),
+        raw_body,
         x_miner_hotkey,
         x_miner_signature,
         x_miner_nonce,
         x_miner_timestamp,
-        allow_unregistered=True,
-        registration_secret=payload.auth_secret,
+        allow_unregistered=not known,
+        registration_secret=None if known else payload.auth_secret,
         x_miner_auth_mode=x_miner_auth_mode,
     )
     return service.register_miner(payload)
@@ -49,6 +57,7 @@ def register_miner(
 @router.post("/miner/v1/heartbeat", response_model=Heartbeat)
 def heartbeat(
     payload: Heartbeat,
+    raw_body: RawBody,
     x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
     x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
     x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
@@ -57,7 +66,7 @@ def heartbeat(
 ) -> Heartbeat:
     require_miner_request(
         payload.hotkey,
-        payload.model_dump_json().encode(),
+        raw_body,
         x_miner_hotkey,
         x_miner_signature,
         x_miner_nonce,
@@ -70,6 +79,7 @@ def heartbeat(
 @router.post("/miner/v1/capacity", response_model=CapacityUpdate)
 def capacity(
     payload: CapacityUpdate,
+    raw_body: RawBody,
     x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
     x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
     x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
@@ -78,7 +88,7 @@ def capacity(
 ) -> CapacityUpdate:
     require_miner_request(
         payload.hotkey,
-        payload.model_dump_json().encode(),
+        raw_body,
         x_miner_hotkey,
         x_miner_signature,
         x_miner_nonce,
@@ -147,6 +157,7 @@ def list_leases(
 def deployment_status(
     deployment_id: str,
     payload: DeploymentStatusUpdate,
+    raw_body: RawBody,
     x_miner_hotkey: str | None = Header(default=None, alias="X-Miner-Hotkey"),
     x_miner_signature: str | None = Header(default=None, alias="X-Miner-Signature"),
     x_miner_nonce: str | None = Header(default=None, alias="X-Miner-Nonce"),
@@ -160,7 +171,7 @@ def deployment_status(
         raise HTTPException(status_code=404, detail="deployment not found")
     require_miner_request(
         deployment.hotkey,
-        payload.model_dump_json().encode(),
+        raw_body,
         x_miner_hotkey,
         x_miner_signature,
         x_miner_nonce,

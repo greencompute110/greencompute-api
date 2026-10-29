@@ -76,12 +76,16 @@ class ControlPlaneRepository:
 
     def upsert_miner(self, registration: MinerRegistration) -> MinerRegistration:
         with session_scope(self.session_factory) as session:
-            row = session.get(MinerORM, registration.hotkey) or MinerORM(hotkey=registration.hotkey)
+            existing = session.get(MinerORM, registration.hotkey)
+            row = existing or MinerORM(hotkey=registration.hotkey)
             row.payout_address = registration.payout_address
             row.api_base_url = registration.api_base_url
             row.validator_url = registration.validator_url
             row.auth_secret = registration.auth_secret
-            row.drained = registration.drained
+            # Draining is an admin decision (set_miner_drained): a miner's own
+            # re-registration, which always says drained=false, must not undo it.
+            if existing is None:
+                row.drained = registration.drained
             row.supported_workload_kinds = [item.value for item in registration.supported_workload_kinds]
             session.add(row)
         return registration
