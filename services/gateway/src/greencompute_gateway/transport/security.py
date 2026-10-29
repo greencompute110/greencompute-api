@@ -106,10 +106,9 @@ def _check_auth_failure_throttle(client_ip: str | None) -> None:
     )
     if not result.allowed:
         metrics.increment("auth.failure.rate_limited")
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="too many auth failures",
-        )
+        exc = HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="too many auth failures")
+        exc.error_code = "auth_throttled"  # see transport/errors.py
+        raise exc
 
 
 # Synthetic admin record returned when the caller presents the

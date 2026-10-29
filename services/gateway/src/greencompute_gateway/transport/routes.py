@@ -47,6 +47,7 @@ from greencompute_gateway.infrastructure.inference_client import (
 )
 from greencompute_gateway.transport import schemas
 from greencompute_gateway.transport.schemas import ok
+from greencompute_gateway.transport.errors import coded
 from greencompute_gateway.transport.security import (
     current_client_ip,
     enforce_rate_limit,
@@ -103,14 +104,11 @@ def _audit_client_ip() -> str | None:
 
 
 def _feature_disabled(feature: str) -> None:
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "status": "disabled",
-            "feature": feature,
-            "reason": "not implemented in greencompute-api",
-        },
-    )
+    raise coded(501, "not_implemented", {
+        "status": "disabled",
+        "feature": feature,
+        "reason": "not implemented in greencompute-api",
+    })
 
 
 @router.post("/platform/api-keys", include_in_schema=False)
@@ -779,15 +777,15 @@ def _with_idempotency(api_key, endpoint: str, idempotency_key: str | None, body:
         response.headers["Idempotent-Replayed"] = "true"
         return stored
     if outcome == "mismatch":
-        raise HTTPException(
-            status_code=422,
-            detail="this Idempotency-Key was already used with a different request body; use a new key",
+        raise coded(
+            422, "idempotency_key_reused",
+            "this Idempotency-Key was already used with a different request body; use a new key",
         )
     if outcome == "in_progress":
-        raise HTTPException(
-            status_code=409,
-            detail="a request with this Idempotency-Key is still being processed; retry in a moment",
-            headers={"Retry-After": "2"},
+        raise coded(
+            409, "idempotency_in_progress",
+            "a request with this Idempotency-Key is still being processed; retry in a moment",
+            {"Retry-After": "2"},
         )
     try:
         result = run()
@@ -1124,9 +1122,9 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except UnsupportedGPUError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
+        raise coded(
+            400, "gpu_unavailable",
+            {
                 "message": "none of the requested GPU models are available to rent",
                 "requested": exc.requested,
                 "available": exc.available,
@@ -1919,7 +1917,7 @@ def chat_completions(
         ) from exc
     except NoReadyDeploymentError as exc:
         metrics.increment("invoke.failure.no_ready_deployment")
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise coded(409, "model_not_ready", str(exc), {"Retry-After": "10"}) from exc
     except InferenceTimeoutError as exc:
         metrics.increment("invoke.failure.timeout")
         raise HTTPException(status_code=504, detail=str(exc)) from exc
@@ -2592,12 +2590,10 @@ def billing_topup_crypto(
     try:
         return _get_billing().create_crypto_invoice(api_key.user_id, currency, amount_usd)
     except TooManyOpenInvoices as exc:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"you already have {MAX_PENDING_INVOICES_PER_USER} unpaid invoices open; pay one "
-                "or wait for it to expire (30 minutes), or pay from a verified wallet without an invoice"
-            ),
+        raise coded(
+            429, "too_many_invoices",
+            f"you already have {MAX_PENDING_INVOICES_PER_USER} unpaid invoices open; pay one "
+            "or wait for it to expire (30 minutes), or pay from a verified wallet without an invoice",
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
