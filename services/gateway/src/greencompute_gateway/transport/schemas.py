@@ -64,6 +64,12 @@ Deployment = create_model(
 Workload = WorkloadSpec
 
 
+class SSHHostKey(BaseModel):
+    type: str = Field(description="e.g. `ssh-ed25519`.")
+    key: str = Field(description="The public key as `type base64`.")
+    fingerprint: str = Field(description="What `ssh` shows the first time it connects, e.g. `SHA256:A2j3…`.")
+
+
 class SSHAccess(BaseModel):
     ssh_host: str
     ssh_port: int
@@ -72,6 +78,21 @@ class SSHAccess(BaseModel):
     private_key: str | None = Field(
         default=None,
         description="Only for clients that supplied no ssh_public_keys; null when you brought your own key.",
+    )
+    host_keys: list[SSHHostKey] = Field(
+        default_factory=list,
+        description=(
+            "The pod's SSH host keys, read from the pod once its SSH server was up. Host ports are reused "
+            "between rentals, so check these rather than turning host-key checking off. Empty for pods "
+            "started before 30 Oct 2026."
+        ),
+    )
+    known_hosts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The same keys as `~/.ssh/known_hosts` lines for this host and port. Write them to a file of "
+            "their own and connect with `-o UserKnownHostsFile=<file> -o StrictHostKeyChecking=yes`."
+        ),
     )
 
 

@@ -161,6 +161,8 @@ class DeploymentORM(Base):
     endpoint: Mapped[str | None] = mapped_column(String(512), nullable=True)
     ssh_private_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     port_mappings: Mapped[dict[int, int]] = mapped_column(JSON, default=dict)
+    # The pod's SSH host public keys ("type base64") from its last ready report.
+    ssh_host_keys: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     # When the deployment first became ready (billing start), and the optional
     # automatic stop after that many minutes.
     ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -52,9 +52,10 @@ def test_generated_spec_has_no_internal_paths():
         assert public in paths, public
 
 
-def _ssh(monkeypatch, own_keys):
+def _ssh(monkeypatch, own_keys, host_keys=()):
     deployment = SimpleNamespace(
-        workload_id="w1", endpoint="ssh://root@203.0.113.7:40123", ssh_private_key="-----BEGIN OPENSSH PRIVATE KEY-----x"
+        workload_id="w1", endpoint="ssh://root@203.0.113.7:40123", ssh_private_key="-----BEGIN OPENSSH PRIVATE KEY-----x",
+        ssh_host_keys=list(host_keys),
     )
     workload = SimpleNamespace(metadata={"ssh_public_keys": own_keys})
     monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: SimpleNamespace(user_id="u1", admin=False, key_id="k1"))

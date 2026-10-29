@@ -578,6 +578,7 @@ class ControlPlaneRepository:
                 endpoint=deployment.endpoint,
                 ssh_private_key=deployment.ssh_private_key,
                 port_mappings=_serialize_port_mappings(deployment.port_mappings),
+                ssh_host_keys=list(deployment.ssh_host_keys) or None,
                 hourly_rate_cents=deployment.hourly_rate_cents,
                 save_on_exhaustion=deployment.save_on_exhaustion,
                 resume_on_topup=deployment.resume_on_topup,
@@ -629,6 +630,7 @@ class ControlPlaneRepository:
             row.endpoint = deployment.endpoint
             row.ssh_private_key = deployment.ssh_private_key
             row.port_mappings = _serialize_port_mappings(deployment.port_mappings)
+            row.ssh_host_keys = list(deployment.ssh_host_keys) or None
             row.hourly_rate_cents = deployment.hourly_rate_cents
             row.save_on_exhaustion = deployment.save_on_exhaustion
             row.resume_on_topup = deployment.resume_on_topup
@@ -1199,6 +1201,7 @@ class ControlPlaneRepository:
             endpoint=row.endpoint,
             ssh_private_key=row.ssh_private_key,
             port_mappings=_deserialize_port_mappings(row.port_mappings),
+            ssh_host_keys=row.ssh_host_keys or [],  # DeploymentRecord checks each one
             hourly_rate_cents=row.hourly_rate_cents if row.hourly_rate_cents is not None else 10,
             save_on_exhaustion=row.save_on_exhaustion if row.save_on_exhaustion is not None else True,
             resume_on_topup=bool(row.resume_on_topup),
