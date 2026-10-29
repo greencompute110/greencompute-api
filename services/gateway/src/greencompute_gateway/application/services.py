@@ -1363,6 +1363,17 @@ class GatewayService:
             raise KeyError(f"workload not found: {workload_id}")
         if not admin and not _owned_by(workload.owner_user_id, actor_user_id):
             raise PermissionError(f"workload delete denied: {workload_id}")
+        # Stop anything still live the normal way first (lease released, GPUs
+        # freed, metering ends, recorded as terminated), so deleting a model
+        # over the API with something running behaves like Stop then Delete,
+        # as the website does it.
+        for deployment in self.control_plane.repository.list_deployments_for_workload(workload_id):
+            if deployment.state in (DeploymentState.TERMINATED, DeploymentState.FAILED):
+                continue
+            try:
+                self.control_plane.cleanup_deployment(deployment.deployment_id, reason="workload deleted")
+            except KeyError:
+                pass
         deleted = self.control_plane.repository.delete_workload(workload_id)
         if deleted is None:
             raise KeyError(f"workload not found: {workload_id}")

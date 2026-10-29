@@ -320,3 +320,77 @@ def test_deleting_a_workload_keeps_its_usage_records():
     with session_scope(repo.session_factory) as s:
         kept = s.scalars(select(UsageRecordORM).where(UsageRecordORM.deployment_id == dep.deployment_id)).all()
         assert len(kept) == 1  # ...but the usage behind the charge stays
+
+
+def test_deleting_a_workload_keeps_what_happened_to_its_deployments():
+    """The status events and lease history stay, plus a final `deleted`
+    snapshot of the deployment row (owner, the card it ran on, rate, fee,
+    billing start, times), so a billing question or an incident about a
+    deleted model still has an answer. Deleting all of it left 10% of usage
+    records and recent charges with no deployment behind them (2026-10-29)."""
+    from datetime import UTC, datetime
+
+    from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
+    from greencompute_persistence import session_scope
+    from greencompute_persistence.orm import LeaseHistoryORM
+    from greencompute_protocol import CapacityUpdate, DeploymentState, DeploymentStatusUpdate, LeaseAssignment
+    from sqlalchemy import func, select
+
+    repo = ControlPlaneRepository(database_url="sqlite+pysqlite:///:memory:", bootstrap=True)
+    repo.upsert_capacity(CapacityUpdate(hotkey="m", nodes=[_node("rtx5090").model_copy(update={"node_id": "n1"})]))
+    wl = repo.upsert_workload(_workload(["rtx4090", "rtx5090"]))
+    started = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
+    dep = repo.create_deployment(DeploymentRecord(
+        workload_id=wl.workload_id, owner_user_id="ann", hotkey="m", node_id="n1",
+        hourly_rate_cents=70, state=DeploymentState.TERMINATED, ready_at=started,
+    ))
+    repo.save_assignment(LeaseAssignment(deployment_id=dep.deployment_id, workload_id=wl.workload_id,
+                                         hotkey="m", node_id="n1"))
+    for state in (DeploymentState.SCHEDULED, DeploymentState.READY, DeploymentState.TERMINATED):
+        repo.add_deployment_event(DeploymentStatusUpdate(deployment_id=dep.deployment_id, state=state))
+    with session_scope(repo.session_factory) as s:
+        history_before = s.scalar(select(func.count()).select_from(LeaseHistoryORM)
+                                  .where(LeaseHistoryORM.deployment_id == dep.deployment_id))
+    assert history_before >= 1
+
+    repo.delete_workload(wl.workload_id)
+
+    assert repo.get_deployment(dep.deployment_id) is None
+    events = repo.list_deployment_events(dep.deployment_id)
+    assert [e.get("state") for e in events] == ["scheduled", "ready", "terminated", "deleted"]
+    last = events[-1]
+    assert last["event"] == "deleted_with_workload" and last["last_state"] == "terminated"
+    assert (last["owner_user_id"], last["hourly_rate_cents"], last["node_id"]) == ("ann", 70, "n1")
+    assert last["gpu_model"] == "rtx5090"  # the card it ran on, not the first one it allowed
+    assert last["allowed_gpu_models"] == ["rtx4090", "rtx5090"]
+    assert last["ready_at"].startswith("2026-10-20T09:00") and last["observed_at"]
+    with session_scope(repo.session_factory) as s:
+        history_after = s.scalar(select(func.count()).select_from(LeaseHistoryORM)
+                                 .where(LeaseHistoryORM.deployment_id == dep.deployment_id))
+    assert history_after == history_before
+
+
+def test_deleting_a_workload_with_something_running_stops_it_first(monkeypatch):
+    """Over the API, Delete with a model still running behaves like Stop then
+    Delete (as the website does): a proper terminate, then the delete."""
+    from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
+    from greencompute_gateway.infrastructure.repository import GatewayRepository
+    from greencompute_protocol import DeploymentState
+
+    url = "sqlite+pysqlite:///:memory:"
+    cp = ControlPlaneService(repository=ControlPlaneRepository(database_url=url, bootstrap=True))
+    gw = GatewayService(repository=GatewayRepository(database_url=url, bootstrap=True), control_plane=cp)
+    wl = cp.repository.upsert_workload(_workload(["rtx4090"]).model_copy(update={"owner_user_id": "ann"}))
+    live = cp.repository.create_deployment(DeploymentRecord(workload_id=wl.workload_id, owner_user_id="ann",
+                                                            state=DeploymentState.READY))
+    done = cp.repository.create_deployment(DeploymentRecord(workload_id=wl.workload_id, owner_user_id="ann",
+                                                            state=DeploymentState.TERMINATED))
+    stopped = []
+    real_cleanup = cp.cleanup_deployment
+    monkeypatch.setattr(cp, "cleanup_deployment",
+                        lambda dep_id, reason="": stopped.append((dep_id, reason)) or real_cleanup(dep_id, reason=reason))
+    gw.delete_workload(wl.workload_id, actor_user_id="ann")
+    assert stopped == [(live.deployment_id, "workload deleted")]  # the terminated one is left alone
+    events = cp.repository.list_deployment_events(live.deployment_id)
+    assert events[-1]["state"] == "deleted" and events[-1]["last_state"] == "terminated"
+    assert cp.repository.get_deployment(done.deployment_id) is None

@@ -65,6 +65,51 @@ def _deserialize_port_mappings(raw: object) -> dict[int, int]:
     return out
 
 
+def _deleted_snapshot(row, workload: WorkloadSpec, node_gpu_model: str | None, now: datetime) -> dict:
+    """The last deployment_events entry of a deployment deleted with its
+    workload: who owned it, what it ran on, what it cost and when, so the
+    history still answers a billing question after the row is gone.
+    `state` is "deleted" so a timeline read by state ends here;
+    `last_state` is what the row said before."""
+    def iso(value):
+        return value.isoformat() if value is not None else None
+
+    reqs = workload.requirements
+    allowed = list(reqs.supported_gpu_models or []) if reqs else []
+    return {
+        "event": "deleted_with_workload",
+        "state": "deleted",
+        "observed_at": now.isoformat(),
+        "deployment_id": row.deployment_id,
+        "last_state": row.state,
+        "owner_user_id": row.owner_user_id,
+        "workload_owner_user_id": workload.owner_user_id,
+        "created_by_key_id": row.created_by_key_id,
+        "workload_id": workload.workload_id,
+        "workload_name": workload.display_name or workload.name,
+        "workload_kind": getattr(workload.kind, "value", str(workload.kind)),
+        # The card it actually ran on (its node), else what it allowed.
+        "gpu_model": node_gpu_model or (allowed[0] if allowed else None),
+        "allowed_gpu_models": allowed,
+        "gpu_count": reqs.gpu_count if reqs else None,
+        "requested_instances": row.requested_instances,
+        "hotkey": row.hotkey,
+        "node_id": row.node_id,
+        "hourly_rate_cents": row.hourly_rate_cents,
+        "deployment_fee_usd": row.deployment_fee_usd,
+        "fee_acknowledged": row.fee_acknowledged,
+        "metering_remainder_mcents": row.metering_remainder_mcents,
+        "max_runtime_minutes": row.max_runtime_minutes,
+        "save_on_exhaustion": row.save_on_exhaustion,
+        "created_at": iso(row.created_at),
+        "ready_at": iso(row.ready_at),
+        "billable_since": iso(row.billable_since),
+        "suspended_at": iso(row.suspended_at),
+        "updated_at": iso(row.updated_at),
+        "last_error": (row.last_error or "")[:2000] or None,
+    }
+
+
 class ControlPlaneRepository:
     def __init__(self, database_url: str | None = None, bootstrap: bool | None = None) -> None:
         self.engine = create_db_engine(database_url)
@@ -478,39 +523,42 @@ class ControlPlaneRepository:
             return [self._to_workload(row) for row in rows]
 
     def delete_workload(self, workload_id: str) -> WorkloadSpec | None:
+        """Delete a workload and its deployment rows, KEEPING the history:
+        usage_records and invocation records (the evidence behind a
+        customer's charges), lease_history and deployment_events (what
+        happened, when, on which machine), plus a last `deleted` event that
+        holds the deployment row itself. Deleting all of it left 10% of usage
+        records and recent charges with no deployment behind them (found
+        2026-10-29). None of these tables has a foreign key to deployments.
+        Live deployments should be stopped first (GatewayService does)."""
+        gpu_by_node = {n.node_id: n.gpu_model for n in self.list_nodes()}
         with session_scope(self.session_factory) as session:
             row = session.get(WorkloadORM, workload_id)
             if row is None:
                 return None
             workload = self._to_workload(row)
-            deployment_ids = [
-                r.deployment_id
-                for r in session.scalars(select(DeploymentORM).where(DeploymentORM.workload_id == workload_id)).all()
-            ]
-            for dep_id in deployment_ids:
+            deployments = session.scalars(select(DeploymentORM).where(DeploymentORM.workload_id == workload_id)).all()
+            now = datetime.now(UTC)
+            for dep in deployments:
+                dep_id = dep.deployment_id
                 for la in session.scalars(select(LeaseAssignmentORM).where(LeaseAssignmentORM.deployment_id == dep_id)).all():
                     session.delete(la)
                 for p in session.scalars(select(PlacementORM).where(PlacementORM.deployment_id == dep_id)).all():
                     session.delete(p)
-                for lh in session.scalars(select(LeaseHistoryORM).where(LeaseHistoryORM.deployment_id == dep_id)).all():
-                    session.delete(lh)
-                for de in session.scalars(select(DeploymentEventORM).where(DeploymentEventORM.deployment_id == dep_id)).all():
-                    session.delete(de)
-                # usage_records and invocation records are deliberately KEPT:
-                # they are the evidence behind a customer's charges. Deleting a
-                # workload used to erase them along with everything else, so a
-                # billing question about a deleted rental had no answer. Neither
-                # table has a foreign key to deployments, so keeping them is safe.
                 # Release the deployment's GPU reservation(s). Without this the
                 # active hold survives the deployment row that owned it, so the
                 # GPUs are subtracted from schedulable capacity forever (no
                 # release path can fire once the deployment is gone).
                 for resv in session.scalars(select(GpuReservationORM).where(GpuReservationORM.deployment_id == dep_id)).all():
                     session.delete(resv)
+                session.add(DeploymentEventORM(
+                    deployment_id=dep_id,
+                    payload=_deleted_snapshot(dep, workload, gpu_by_node.get(dep.node_id), now),
+                    observed_at=now,
+                ))
+                session.delete(dep)
             for share in session.scalars(select(WorkloadShareORM).where(WorkloadShareORM.workload_id == workload_id)).all():
                 session.delete(share)
-            for dep in session.scalars(select(DeploymentORM).where(DeploymentORM.workload_id == workload_id)).all():
-                session.delete(dep)
             session.delete(row)
             return workload
 
@@ -605,6 +653,11 @@ class ControlPlaneRepository:
                     DeploymentORM.state == DeploymentState.READY.value,
                 )
             ).all()
+            return [self._to_deployment(row) for row in rows]
+
+    def list_deployments_for_workload(self, workload_id: str) -> list[DeploymentRecord]:
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(select(DeploymentORM).where(DeploymentORM.workload_id == workload_id)).all()
             return [self._to_deployment(row) for row in rows]
 
     def list_deployments_by_state(self, state: DeploymentState) -> list[DeploymentRecord]:
@@ -939,13 +992,19 @@ class ControlPlaneRepository:
             session.add(row)
         return event
 
-    def list_deployment_events(self, deployment_id: str | None = None) -> list[dict]:
+    def list_deployment_events(self, deployment_id: str | None = None, *, limit: int = 500) -> list[dict]:
+        """One deployment's events in order (all of them), or the newest
+        `limit` across all deployments, oldest first. Ties on observed_at
+        (or a node clock ahead of ours) fall back to insertion order."""
         with session_scope(self.session_factory) as session:
             stmt = select(DeploymentEventORM)
             if deployment_id:
-                stmt = stmt.where(DeploymentEventORM.deployment_id == deployment_id)
-            rows = session.scalars(stmt.order_by(DeploymentEventORM.observed_at.asc())).all()
-            return [row.payload for row in rows]
+                stmt = stmt.where(DeploymentEventORM.deployment_id == deployment_id).order_by(
+                    DeploymentEventORM.observed_at.asc(), DeploymentEventORM.id.asc()
+                )
+                return [row.payload for row in session.scalars(stmt).all()]
+            stmt = stmt.order_by(DeploymentEventORM.id.desc()).limit(limit)
+            return [row.payload for row in reversed(session.scalars(stmt).all())]
 
     def list_servers(self) -> list[ServerRecord]:
         with session_scope(self.session_factory) as session:
