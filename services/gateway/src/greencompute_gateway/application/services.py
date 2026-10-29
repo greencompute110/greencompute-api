@@ -265,7 +265,10 @@ _RESERVED_ENV = {
     "AUTHORIZED_KEYS", "GC_START_COMMAND_B64", "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES",
     "GC_DEPLOYMENT_ID", "GC_DEPLOYMENT_NAME",  # set by the platform for every pod
     "GC_NEW_HOST_KEYS",  # each new pod gets its own SSH host keys
+    "GC_RESTART_POLICY",  # metadata.restart_policy
 }
+#: When the start command is run again after it exits (metadata.restart_policy).
+RESTART_POLICIES = ("never", "on-failure", "always")
 _MAX_COMMAND_CHARS = 8192
 _MAX_ENV_VARS = 64
 
@@ -283,6 +286,17 @@ def normalize_pod_start(metadata: dict) -> dict:
         if len(command) > _MAX_COMMAND_CHARS or "\x00" in command:
             raise ValueError(f"metadata.command must be at most {_MAX_COMMAND_CHARS} characters")
         metadata["command"] = command
+    policy = metadata.get("restart_policy")
+    if policy is not None:
+        policy = policy.strip().lower().replace("_", "-") if isinstance(policy, str) else None
+        if policy not in RESTART_POLICIES:
+            raise ValueError("metadata.restart_policy must be one of: " + ", ".join(RESTART_POLICIES))
+        if policy != "never" and not metadata.get("command"):
+            raise ValueError(
+                "metadata.restart_policy restarts metadata.command, so set that too "
+                "(an image's own start command already restarts with its container)"
+            )
+        metadata["restart_policy"] = policy
     env = metadata.get("env")
     if env is not None:
         if not isinstance(env, dict):
