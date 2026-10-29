@@ -816,7 +816,7 @@ def platform_metrics(
 # What the public sees of the pool: what can be deployed right now, not how
 # big the fleet is. Much of the capacity is rented by direct contract, so a
 # total ("14 of 16") would undersell it; larger orders go through sales.
-_PUBLIC_POOL_FIELDS = ("gpu_model", "vram_gb_per_gpu", "available_gpus", "rentable_now")
+_PUBLIC_POOL_FIELDS = ("gpu_model", "vram_gb_per_gpu", "available_gpus", "max_gpus_per_deployment", "rentable_now")
 
 
 @router.get("/platform/v1/gpu-pool")
@@ -839,12 +839,19 @@ def gpu_pool(
     from sqlalchemy import text
 
     all_nodes = service.repository.list_nodes()
+    # What the scheduler could place on each node right now. Summing the
+    # miners' raw heartbeat instead (as this did) ignored committed
+    # reservations and nodes placement skips, and advertised GPUs nobody
+    # could rent.
+    free_by_node = {node.node_id: free for node, free in service.schedulable_capacity()}
     buckets: dict[str, dict] = defaultdict(lambda: {
         "gpu_model": "",
         "vram_gb_per_gpu": 0,
         "total_gpus": 0,
         "available_gpus": 0,
+        "max_gpus_per_deployment": 0,
         "node_count": 0,
+        "schedulable_nodes": 0,
         "overridden": False,
     })
     for node in all_nodes:
@@ -855,7 +862,11 @@ def gpu_pool(
         b["gpu_model"] = node.gpu_model or "unknown"
         b["vram_gb_per_gpu"] = max(b["vram_gb_per_gpu"], node.vram_gb_per_gpu or 0)
         b["total_gpus"] += node.gpu_count or 0
-        b["available_gpus"] += node.available_gpus or 0
+        if node.node_id in free_by_node:
+            free = free_by_node[node.node_id]
+            b["schedulable_nodes"] += 1
+            b["available_gpus"] += free
+            b["max_gpus_per_deployment"] = max(b["max_gpus_per_deployment"], free)
         b["node_count"] += 1
 
     # Merge admin overrides. Wrapped so a missing table (migration not run
@@ -877,6 +888,7 @@ def gpu_pool(
                     b["gpu_model"] = row.gpu_model or "unknown"
                 b["total_gpus"] = int(row.total_gpus or 0)
                 b["available_gpus"] = int(row.available_gpus or 0)
+                b["max_gpus_per_deployment"] = b["available_gpus"]
                 b["overridden"] = True
                 if row.note:
                     b["note"] = row.note
@@ -907,9 +919,11 @@ def gpu_pool(
     # An override can advertise contracted hardware with no live node (sales
     # pre-advertising). That's fine for a human browsing the rentals page, but
     # an agent reading "8 available" will try to rent and wait forever. Say
-    # plainly whether a live node exists; `available_gpus` alone can't.
+    # plainly whether a node the scheduler would use exists (not merely a
+    # non-stale one: a drained or unhealthy miner can't take a rental either);
+    # `available_gpus` alone can't.
     for b in public:
-        b["rentable_now"] = b["node_count"] > 0
+        b["rentable_now"] = b["schedulable_nodes"] > 0
     public.sort(key=lambda b: -b["available_gpus"])
     if caller_is_admin(authorization, x_api_key):
         return public

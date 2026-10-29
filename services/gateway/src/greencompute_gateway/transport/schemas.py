@@ -86,7 +86,19 @@ class LedgerItem(LedgerEntry):
 
 class GpuPrice(BaseModel):
     gpu_model: str
-    available_now: bool = Field(description="A machine with this GPU is online and rentable right now.")
+    online: bool = Field(
+        description="A machine with this GPU is online and taking rentals. false: a create asking for it returns 400 "
+                    "(the same test as /platform/nodes/supported).",
+    )
+    available_now: bool = Field(description="At least one GPU of this model is free this instant (available_gpus > 0).")
+    available_gpus: int = Field(
+        description="GPUs of this model free this instant across all machines, net of everything already placed or "
+                    "reserved: the scheduler's own count. 0: a create is refused at once with 503 no_capacity.",
+    )
+    max_gpus_per_deployment: int = Field(
+        description="The most GPUs of this model free together on one machine: the largest gpu_count one deployment "
+                    "can get right now.",
+    )
     vram_gb: int | None = None
     cents_per_gpu_hour: int
     usd_per_gpu_hour: float

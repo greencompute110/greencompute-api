@@ -130,6 +130,48 @@ class UnsupportedGPUError(ValueError):
         )
 
 
+class NoCapacityError(Exception):
+    """Every GPU this deployment could run on is rented right now.
+
+    Raised at create time, after the request has passed every other check, so
+    an agent learns "busy, retry later" in one round trip. Before this the
+    create was accepted and the scheduler retried it ten times over ~100 s
+    before failing it with "no compatible miner capacity" -- indistinguishable,
+    to the client, from a GPU we never had. The route turns it into a 503 with
+    Retry-After; nothing is created, so a retry can't rent twice.
+    """
+
+    retry_after_seconds = 60
+
+    def __init__(
+        self, *, requested: list[str], gpu_count: int, capacity: dict[str, dict[str, int]], min_vram_gb: int = 0,
+    ) -> None:
+        from greencompute_gateway.domain.gpu_catalog import normalize_gpu_model, public_gpu_models
+
+        public = public_gpu_models()
+        wanted = {normalize_gpu_model(m) for m in requested} if requested else {normalize_gpu_model(m) for m in public}
+        self.gpu_models = [m for m in public if normalize_gpu_model(m) in wanted]
+        self.gpu_count = gpu_count
+        per_model = {m: capacity.get(normalize_gpu_model(m), {}) for m in self.gpu_models}
+        self.available_gpus = {m: c.get("available_gpus", 0) for m, c in per_model.items()}
+        self.max_gpus_per_deployment = {m: c.get("max_gpus_per_deployment", 0) for m, c in per_model.items()}
+        total_free = sum(self.available_gpus.values())
+        names = " or ".join(self.gpu_models) or "GPU"
+        if total_free == 0:
+            why = f"every {names} is rented right now"
+        else:
+            # Free cards exist, but not where this workload fits: it needs its
+            # GPUs together on one machine, with enough VRAM, CPU and memory.
+            vram = f" with {min_vram_gb} GB VRAM each" if min_vram_gb else ""
+            largest = max(self.max_gpus_per_deployment.values(), default=0)
+            why = (
+                f"{total_free} {names} GPU(s) are free, but no single machine can take this workload "
+                f"(it needs {gpu_count} GPU(s) together{vram}; the most free on one machine is {largest})"
+            )
+        self.message = f"{why}; nothing was created. Try again in {self.retry_after_seconds} seconds"
+        super().__init__(self.message)
+
+
 class InsufficientBalanceForRentalError(Exception):
     """Raised by GatewayService.create_deployment when the caller doesn't
     have enough credits to cover ≥ 1 hour of the requested workload at the
@@ -735,15 +777,9 @@ class GatewayService:
         if not admin:
             requested = list(workload.requirements.supported_gpu_models or [])
             if requested:
-                from greencompute_gateway.domain.gpu_catalog import (
-                    normalize_gpu_model,
-                    rentable_gpu_models,
-                )
+                from greencompute_gateway.domain.gpu_catalog import normalize_gpu_model
 
-                available = rentable_gpu_models(
-                    self.control_plane.repository.list_nodes(),
-                    self.control_plane._is_node_stale,
-                )
+                available = self.control_plane.online_gpu_models()
                 wanted = {normalize_gpu_model(m) for m in requested}
                 if not wanted & {normalize_gpu_model(m) for m in available}:
                     raise UnsupportedGPUError(requested, available)
@@ -769,12 +805,8 @@ class GatewayService:
                 # could provide. Must agree with the control-plane's creation
                 # quote (`_quoted_hourly_rate_cents`).
                 from greencompute_protocol import GPU_RATE_CENTS_PER_HOUR, LEGACY_FALLBACK_CENTS_PER_HOUR
-                from greencompute_gateway.domain.gpu_catalog import rentable_gpu_models
 
-                rentable = rentable_gpu_models(
-                    self.control_plane.repository.list_nodes(),
-                    self.control_plane._is_node_stale,
-                )
+                rentable = self.control_plane.online_gpu_models()
                 max_rate_cents_per_hour = max(
                     [rate_for_gpu(m) for m in rentable]
                     or list(GPU_RATE_CENTS_PER_HOUR.values()) + [LEGACY_FALLBACK_CENTS_PER_HOUR]
@@ -802,6 +834,19 @@ class GatewayService:
                     private_model=metering.is_private_model(
                         user_id, workload.kind, workload.workload_id, workload.metadata
                     ),
+                )
+
+        # Fail fast when the fleet is full, too (after the balance check, so a
+        # caller who must top up hears that first and is ready to go when a GPU
+        # frees up). Mirrors the scheduler's own ranking, net of reservations.
+        if not admin:
+            can_place, capacity = self.control_plane.placement_preview(workload)
+            if not can_place:
+                raise NoCapacityError(
+                    requested=list(workload.requirements.supported_gpu_models or []),
+                    gpu_count=workload.requirements.gpu_count or 1,
+                    capacity=capacity,
+                    min_vram_gb=workload.requirements.min_vram_gb_per_gpu or 0,
                 )
 
         return self.control_plane.create_deployment(

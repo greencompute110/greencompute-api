@@ -28,7 +28,7 @@ from greencompute_protocol import (
 from greencompute_control_plane.config import settings
 from greencompute_control_plane.domain import metering
 from greencompute_control_plane.domain.metering import UsageAggregator
-from greencompute_control_plane.domain.scheduler import PlacementPolicy
+from greencompute_control_plane.domain.scheduler import PlacementPolicy, effective_available_gpus, normalize_gpu_model
 from greencompute_control_plane.domain.state import transition_state
 from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
 
@@ -166,7 +166,7 @@ class ControlPlaneService:
             created_by_key_id=created_by_key_id,
             deployment_fee_usd=self._estimate_deployment_fee(workload, payload.requested_instances),
             fee_acknowledged=payload.accept_fee,
-            hourly_rate_cents=self._quoted_hourly_rate_cents(workload, self._live_public_gpu_models()),
+            hourly_rate_cents=self._quoted_hourly_rate_cents(workload, self.online_gpu_models()),
         )
         self.repository.create_deployment(deployment)
         self.bus.publish(
@@ -180,18 +180,41 @@ class ControlPlaneService:
         self.metrics.increment("deployment.requested")
         return deployment
 
-    def _assign_lease(self, workload: WorkloadSpec, deployment_id: str) -> LeaseAssignment | None:
+    def _schedulable_nodes(
+        self, deployment_id: str | None = None,
+    ) -> tuple[list[NodeCapability], int, dict[str, list[str]]]:
+        """The nodes the scheduler would consider right now: (nodes, how many
+        are registered in all, why each of the others was skipped).
+
+        One filter for placement AND for every "how many GPUs are free"
+        answer (the public pool, `available_gpus` in pricing, the create-time
+        check), so what we advertise can't drift from what can be placed. It
+        did: the pool summed the miners' raw heartbeat over every non-stale
+        node, while placement also skipped drained, unhealthy and cooling-down
+        nodes and subtracted committed reservations, so the site said "1 ready
+        now" while 3 of 3 creates failed with "no compatible miner capacity"
+        (external API user, 2026-10-22).
+
+        `deployment_id` scopes the cooldown check to that deployment's own
+        failed placements. A deployment not created yet has none, so None
+        skips the check.
+        """
         all_nodes = self.repository.list_nodes()
+        # One read each, not one per node: the public pool and the price list
+        # run this on every request.
+        miners = {m.hotkey: m for m in self.repository.list_miners()}
+        heartbeats = {h.hotkey: h for h in self.repository.list_heartbeats()}
+        servers = {srv.server_id: srv for srv in self.repository.list_servers()}
         nodes = []
         cooldown_only_nodes = []
         skip_reasons: dict[str, list[str]] = {}
         now_ts = datetime.now(UTC)
         for node in all_nodes:
             reasons: list[str] = []
-            miner = self.repository.get_miner(node.hotkey)
+            miner = miners.get(node.hotkey)
             if miner is not None and miner.drained:
                 reasons.append("drained")
-            heartbeat = self.repository.get_heartbeat(node.hotkey)
+            heartbeat = heartbeats.get(node.hotkey)
             if heartbeat and not heartbeat.healthy:
                 reasons.append("unhealthy")
             # Stale heartbeat — mirrors the age threshold `process_unhealthy_miners`
@@ -209,10 +232,10 @@ class ControlPlaneService:
                 reasons.append("heartbeat_missing")
             if self._is_node_stale(node):
                 reasons.append("stale")
-            if self._is_server_for_node_stale(node):
+            server = servers.get(node.server_id) if node.server_id else None
+            if server is not None and self._is_server_stale(server.observed_at, now=now_ts):
                 reasons.append("server_stale")
-            in_cooldown = self._is_node_in_cooldown(node.node_id, deployment_id=deployment_id)
-            if in_cooldown:
+            if deployment_id is not None and self._is_node_in_cooldown(node.node_id, deployment_id=deployment_id):
                 reasons.append("cooldown")
             if reasons:
                 skip_reasons[node.node_id] = reasons
@@ -227,6 +250,74 @@ class ControlPlaneService:
                 deployment_id,
             )
             nodes = cooldown_only_nodes
+        return nodes, len(all_nodes), skip_reasons
+
+    def schedulable_capacity(self) -> list[tuple[NodeCapability, int]]:
+        """Each node a new deployment could land on, with the GPUs the
+        scheduler could hand out there this instant: the heartbeat's count
+        capped by physical GPUs minus committed reservations, exactly as
+        placement computes it."""
+        return self._capacity_snapshot()[2]
+
+    def _capacity_snapshot(
+        self,
+    ) -> tuple[list[NodeCapability], dict[str, int], list[tuple[NodeCapability, int]]]:
+        nodes, _, _ = self._schedulable_nodes()
+        reserved = self.repository.reserved_gpus_by_node()
+        return nodes, reserved, [(node, max(0, effective_available_gpus(node, reserved))) for node in nodes]
+
+    @staticmethod
+    def _by_model(capacity: list[tuple[NodeCapability, int]]) -> dict[str, dict[str, int]]:
+        """Per normalised GPU model: `available_gpus`, free in all, and
+        `max_gpus_per_deployment`, the most free together on one machine,
+        which is what a multi-GPU rental actually needs."""
+        out: dict[str, dict[str, int]] = {}
+        for node, free in capacity:
+            entry = out.setdefault(
+                normalize_gpu_model(node.gpu_model), {"available_gpus": 0, "max_gpus_per_deployment": 0},
+            )
+            entry["available_gpus"] += free
+            entry["max_gpus_per_deployment"] = max(entry["max_gpus_per_deployment"], free)
+        return out
+
+    def capacity_by_model(self) -> dict[str, dict[str, int]]:
+        """The numbers behind the public pool and the price list."""
+        return self._by_model(self.schedulable_capacity())
+
+    def placement_preview(self, workload: WorkloadSpec) -> tuple[bool, dict[str, dict[str, int]]]:
+        """Would the scheduler place `workload` if it were created this
+        instant, and what is free per model, from ONE snapshot? The same
+        ranking placement runs (GPU model, `gpu_count` free on one node, VRAM,
+        CPU, memory) over the same nodes, net of reservations. Lets the gateway
+        refuse a create at once, with numbers that match the refusal, instead
+        of accepting it and failing it after ten retries. Two creates racing
+        for the last GPU can both pass this; placement then takes one and
+        retries the other, as before."""
+        nodes, reserved, capacity = self._capacity_snapshot()
+        can_place = bool(nodes) and bool(
+            self.placement_policy.rank_nodes(workload, nodes, reserved_by_node=reserved)
+        )
+        return can_place, self._by_model(capacity)
+
+    def online_gpu_models(self) -> list[str]:
+        """Normalised GPU models (`rtx4090`) with at least one node the
+        scheduler would use, within the public rental families: what
+        `/platform/nodes/supported` lists, what a create may ask for, and what
+        an unconstrained deployment is quoted on. A model that is online but
+        has 0 free is "busy" (503); one that isn't online is "never" (400).
+        The same node filter as every other answer here, so a drained or
+        unhealthy miner is offline, not "rented, try again in a minute"."""
+        families = [
+            f.strip().lower()
+            for f in os.getenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", "4090,5090").split(",")
+            if f.strip()
+        ]
+        nodes, _, _ = self._schedulable_nodes()
+        live = {normalize_gpu_model(n.gpu_model) for n in nodes}
+        return sorted(m for m in live if m and (not families or any(f in m for f in families)))
+
+    def _assign_lease(self, workload: WorkloadSpec, deployment_id: str) -> LeaseAssignment | None:
+        nodes, total_nodes, skip_reasons = self._schedulable_nodes(deployment_id)
         if not nodes:
             logger.warning(
                 "no eligible nodes for deployment %s (workload=%s kind=%s gpu=%d vram=%d): "
@@ -236,13 +327,13 @@ class ControlPlaneService:
                 workload.kind.value,
                 workload.requirements.gpu_count,
                 workload.requirements.min_vram_gb_per_gpu,
-                len(all_nodes),
+                total_nodes,
                 skip_reasons or "none registered",
             )
         else:
             logger.info(
                 "scheduling deployment %s: %d eligible nodes out of %d total",
-                deployment_id, len(nodes), len(all_nodes),
+                deployment_id, len(nodes), total_nodes,
             )
         # ORCH-C2: derive effective availability from the reservation ledger so
         # the miner heartbeat can't clobber the scheduler's committed holds. The
@@ -503,26 +594,6 @@ class ControlPlaneService:
         # field stays in the schema for existing clients.
         del workload, requested_instances
         return 0.0
-
-    def _live_public_gpu_models(self) -> list[str]:
-        """Normalised GPU models with at least one live node, within the public
-        rental families. Mirrors the gateway's `rentable_gpu_models`; kept here so
-        the control-plane needn't import gateway code."""
-        import os
-
-        from greencompute_control_plane.domain.scheduler import normalize_gpu_model
-
-        families = [
-            f.strip().lower()
-            for f in os.getenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", "4090,5090").split(",")
-            if f.strip()
-        ]
-        live = {
-            normalize_gpu_model(n.gpu_model)
-            for n in self.repository.list_nodes()
-            if not self._is_node_stale(n)
-        }
-        return sorted(m for m in live if m and (not families or any(f in m for f in families)))
 
     @staticmethod
     def _quoted_hourly_rate_cents(workload: WorkloadSpec, live_models: list[str] | None = None) -> int:
