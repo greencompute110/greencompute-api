@@ -2026,6 +2026,9 @@ def public_pricing() -> dict:
     # would use). `available_now` used to mean only "a machine with this GPU
     # is online", so it read true while every card was rented; that meaning
     # is now `online`.
+    from greencompute_gateway.application.billing_service import BONUS_RATES
+
+    alpha_bonus = BONUS_RATES.get("alpha", 0.0)
     online = set(_rentable_now())
     capacity = _capacity_by_model()
     gpus = []
@@ -2041,6 +2044,8 @@ def public_pricing() -> dict:
             "vram_gb": GPU_VRAM_GB.get(m),
             "cents_per_gpu_hour": GPU_RATE_CENTS_PER_HOUR[m],
             "usd_per_gpu_hour": round(GPU_RATE_CENTS_PER_HOUR[m] / 100, 2),
+            # An external API user had to work this out by hand (Oct 2026).
+            "usd_per_gpu_hour_paid_in_alpha": round(GPU_RATE_CENTS_PER_HOUR[m] / 100 / (1 + alpha_bonus), 4),
         })
     models = []
     for name in sorted(_public_inference_model_names()):
@@ -2052,6 +2057,7 @@ def public_pricing() -> dict:
         })
     return {
         "currency": "USD",
+        "payment_bonuses": {k: v for k, v in BONUS_RATES.items() if v > 0},
         "gpu_rental": {
             "billing": "per minute while running, per GPU",
             "deployment_fee_usd": 0,
