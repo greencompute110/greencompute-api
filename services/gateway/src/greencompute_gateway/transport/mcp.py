@@ -63,21 +63,25 @@ def _as(method: str, path: str, fn: Callable[[], Any]) -> Any:
         current_request_route.reset(token)
 
 
+class ToolInputError(ValueError):
+    """The tool's arguments are wrong; the message says how."""
+
+
 def _str(args: dict, key: str, *, required: bool = False, default: str | None = None) -> str | None:
     value = args.get(key, default)
     if value is None:
         if required:
-            raise ValueError(f"`{key}` is required")
+            raise ToolInputError(f"`{key}` is required")
         return None
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"`{key}` must be a non-empty string")
+        raise ToolInputError(f"`{key}` must be a non-empty string")
     return value.strip()
 
 
 def _int(args: dict, key: str, default: int, low: int, high: int) -> int:
     value = args.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
-        raise ValueError(f"`{key}` must be a whole number from {low} to {high}")
+        raise ToolInputError(f"`{key}` must be a whole number from {low} to {high}")
     return value
 
 
@@ -96,74 +100,93 @@ def _brief(dep: dict) -> dict:
     }
 
 
-def t_list_gpus(auth: str, args: dict) -> dict:
+def t_list_gpus(auth: tuple, args: dict) -> dict:
     r = _routes()
     pricing = _as("GET", "/platform/pricing", r.public_pricing)
     return {"gpus": pricing.get("gpus", []),
             "note": "Prices are per GPU per hour, charged by the minute while a rental is ready."}
 
 
-def t_get_balance(auth: str, args: dict) -> dict:
+def t_get_balance(auth: tuple, args: dict) -> dict:
     r = _routes()
-    return _as("GET", "/platform/billing/forecast", lambda: r.billing_forecast(authorization=auth, x_api_key=None))
+    return _as("GET", "/platform/billing/forecast", lambda: r.billing_forecast(authorization=auth[0], x_api_key=auth[1]))
 
 
-def t_list_rentals(auth: str, args: dict) -> dict:
+def t_list_rentals(auth: tuple, args: dict) -> dict:
     r = _routes()
     state = _str(args, "state") or ACTIVE_STATES
     deps = _as("GET", "/platform/deployments",
-               lambda: r.list_deployments(state=state, authorization=auth, x_api_key=None))
+               lambda: r.list_deployments(state=state, authorization=auth[0], x_api_key=auth[1]))
     return {"rentals": [_brief(d) for d in deps], "states": state}
 
 
-def t_get_rental(auth: str, args: dict) -> dict:
+def t_get_rental(auth: tuple, args: dict) -> dict:
+    """SSH details come from the rental itself (its address and host keys,
+    which the `read` scope may see), not from GET .../ssh: that route hands
+    out the platform's private key, and every call to it is audit-logged as
+    such, which an agent polling here would flood."""
+    from greencompute_protocol.ssh_host_keys import known_hosts_line
+
     r = _routes()
     dep_id = _str(args, "deployment_id", required=True)
     dep = _as("GET", f"/platform/deployments/{dep_id}",
-              lambda: r.get_deployment(dep_id, authorization=auth, x_api_key=None))
+              lambda: r.get_deployment(dep_id, authorization=auth[0], x_api_key=auth[1]))
     out: dict[str, Any] = {"rental": _brief(dep)}
-    if dep.get("state") == "ready" and str(dep.get("endpoint") or "").startswith("ssh://"):
-        try:
-            ssh = _as("GET", f"/platform/deployments/{dep_id}/ssh",
-                      lambda: r.get_deployment_ssh(dep_id, authorization=auth, x_api_key=None))
-        except HTTPException as exc:
-            out["ssh_unavailable"] = describe_error(exc.status_code, exc.detail, exc.headers,
-                                                   getattr(exc, "error_code", None))["message"]
-        else:
-            out["ssh"] = {
-                "ssh_command": ssh.get("ssh_command"),
-                "ssh_host": ssh.get("ssh_host"),
-                "ssh_port": ssh.get("ssh_port"),
-                "known_hosts": ssh.get("known_hosts", []),
-            }
-            if ssh.get("private_key"):
-                out["ssh"]["note"] = (
-                    "This rental uses a key the platform made; it isn't shown here. Fetch it with "
-                    f"GET /platform/deployments/{dep_id}/ssh, or rent with your own ssh_public_key."
-                )
+    endpoint = str(dep.get("endpoint") or "")
+    if dep.get("state") == "ready" and endpoint.startswith("ssh://"):
+        user_host = endpoint[len("ssh://"):]
+        user, _, host_port = user_host.rpartition("@")
+        host, _, port = host_port.rpartition(":")
+        port_n = int(port) if port.isdigit() else 22
+        user = user or "root"
+        out["ssh"] = {
+            "ssh_command": f"ssh {user}@{host} -p {port_n}",
+            "ssh_host": host,
+            "ssh_port": port_n,
+            "known_hosts": [known_hosts_line(host, port_n, k) for k in dep.get("ssh_host_keys") or []],
+        }
+        if not r._workload_has_own_ssh_keys(dep.get("workload_id") or ""):
+            out["ssh"]["note"] = (
+                "This rental uses a key the platform made; it isn't shown here. Fetch it with "
+                f"GET /platform/deployments/{dep_id}/ssh, or rent with your own ssh_public_keys."
+            )
     elif dep.get("state") in ("pending", "scheduled", "pulling", "starting"):
         out["next"] = "Still starting: call get_rental again in 15-30 seconds."
     return out
 
 
-def t_rent_gpu(auth: str, args: dict) -> dict:
+def t_rent_gpu(auth: tuple, args: dict) -> dict:
+    from pydantic import ValidationError
+
     from greencompute_gateway.application.services import GatewayDeploymentCreateRequest
     from greencompute_protocol import GPU_VRAM_GB
 
     r = _routes()
-    gpu_model = (_str(args, "gpu_model", default="rtx4090") or "rtx4090").lower().replace("-", "").replace(" ", "")
+    # Every argument is checked before anything is created.
+    gpu_model = "".join(ch for ch in (_str(args, "gpu_model", default="rtx4090") or "").lower() if ch.isalnum())
     gpu_count = _int(args, "gpu_count", 1, 1, 8)
     image = _str(args, "image", default="pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime")
     name = _str(args, "name")
-    keys = args.get("ssh_public_keys") or ([args["ssh_public_key"]] if args.get("ssh_public_key") else [])
-    if not isinstance(keys, list) or not all(isinstance(k, str) and k.strip() for k in keys):
-        raise ValueError("`ssh_public_keys` must be a list of public keys, e.g. [\"ssh-ed25519 AAAA… me@laptop\"]")
+    keys = args.get("ssh_public_keys")
+    if isinstance(keys, str):
+        keys = [keys]
+    if not isinstance(keys, list) or not keys or not all(isinstance(k, str) and k.strip() for k in keys):
+        raise ToolInputError(
+            "`ssh_public_keys` needs at least one SSH public key, e.g. [\"ssh-ed25519 AAAA… me@laptop\"] "
+            "(the contents of ~/.ssh/id_ed25519.pub); without one you couldn't log in")
     metadata: dict[str, Any] = {"ssh_public_keys": keys, "volume_size_gb": _int(args, "disk_gb", 50, 10, 500)}
-    for key in ("command", "restart_policy"):
+    for key in ("command", "restart_policy", "env"):
         if args.get(key) is not None:
             metadata[key] = args[key]
-    if args.get("env") is not None:
-        metadata["env"] = args["env"]
+    body: dict[str, Any] = {"workload_id": "pending"}
+    if name:
+        body["name"] = name
+    if args.get("max_runtime_minutes") is not None:
+        body["max_runtime_minutes"] = _int(args, "max_runtime_minutes", 60, 1, 60 * 24 * 30)
+    try:
+        GatewayDeploymentCreateRequest(**body)
+    except ValidationError as exc:
+        raise ToolInputError(f"invalid rental settings: {exc.errors()[0].get('msg')}") from exc
     workload = {
         "name": name or "mcp-rental",
         "kind": "pod",
@@ -179,61 +202,59 @@ def t_rent_gpu(auth: str, args: dict) -> dict:
     }
     idem = _str(args, "idempotency_key")
     wl = _as("POST", "/platform/workloads", lambda: r.create_workload(
-        workload, Response(), authorization=auth, x_api_key=None,
+        workload, Response(), authorization=auth[0], x_api_key=auth[1],
         idempotency_key=f"{idem}:workload" if idem else None))
-    body: dict[str, Any] = {"workload_id": wl["workload_id"]}
-    if name:
-        body["name"] = name
-    if args.get("max_runtime_minutes") is not None:
-        body["max_runtime_minutes"] = _int(args, "max_runtime_minutes", 60, 1, 60 * 24 * 30)
+    body["workload_id"] = wl["workload_id"]
     try:
         dep = _as("POST", "/platform/deployments", lambda: r.create_deployment(
-            GatewayDeploymentCreateRequest(**body), Response(), authorization=auth, x_api_key=None,
+            GatewayDeploymentCreateRequest(**body), Response(), authorization=auth[0], x_api_key=auth[1],
             idempotency_key=idem))
-    except HTTPException:
-        if not idem:  # nothing was created; don't leave the workload behind
+    except Exception:
+        # Nothing was rented: don't leave the workload behind. (With an
+        # idempotency key a retry must find the same workload, so it stays.)
+        if not idem:
             try:
                 _as("DELETE", f"/platform/workloads/{wl['workload_id']}",
-                    lambda: r.delete_workload(wl["workload_id"], authorization=auth, x_api_key=None))
+                    lambda: r.delete_workload(wl["workload_id"], authorization=auth[0], x_api_key=auth[1]))
             except Exception:  # noqa: BLE001
-                pass
+                log.warning("mcp rent_gpu: could not remove workload %s after a failed rent", wl["workload_id"])
         raise
     return {"rental": _brief(dep), "next": "Starting. Call get_rental in 30 seconds; it is usually ready in 1-3 minutes."}
 
 
-def t_stop_rental(auth: str, args: dict) -> dict:
+def t_stop_rental(auth: tuple, args: dict) -> dict:
     r = _routes()
     dep_id = _str(args, "deployment_id", required=True)
     dep = _as("DELETE", f"/platform/deployments/{dep_id}",
-              lambda: r.terminate_deployment(dep_id, authorization=auth, x_api_key=None))
+              lambda: r.terminate_deployment(dep_id, authorization=auth[0], x_api_key=auth[1]))
     return {"rental": _brief(dep), "note": "Stopped: billing has stopped and its disk is deleted."}
 
 
-def t_rental_logs(auth: str, args: dict) -> dict:
+def t_rental_logs(auth: tuple, args: dict) -> dict:
     r = _routes()
     dep_id = _str(args, "deployment_id", required=True)
     lines = _int(args, "lines", 100, 1, 2000)
     return _as("GET", f"/platform/deployments/{dep_id}/logs",
-               lambda: r.get_deployment_logs(dep_id, lines=lines, authorization=auth, x_api_key=None))
+               lambda: r.get_deployment_logs(dep_id, lines=lines, authorization=auth[0], x_api_key=auth[1]))
 
 
-def t_rental_stats(auth: str, args: dict) -> dict:
+def t_rental_stats(auth: tuple, args: dict) -> dict:
     r = _routes()
     dep_id = _str(args, "deployment_id", required=True)
     return _as("GET", f"/platform/deployments/{dep_id}/stats",
-               lambda: r.get_deployment_stats(dep_id, authorization=auth, x_api_key=None))
+               lambda: r.get_deployment_stats(dep_id, authorization=auth[0], x_api_key=auth[1]))
 
 
-def t_recent_events(auth: str, args: dict) -> dict:
+def t_recent_events(auth: tuple, args: dict) -> dict:
     r = _routes()
     after = _int(args, "after", 0, 0, 2**31 - 1)
     limit = _int(args, "limit", 50, 1, 500)
     types = _str(args, "types")
     return _as("GET", "/platform/events", lambda: r.list_account_events(
-        after=after, limit=limit, types=types, authorization=auth, x_api_key=None))
+        after=after, limit=limit, types=types, authorization=auth[0], x_api_key=auth[1]))
 
 
-def t_alert_when_free(auth: str, args: dict) -> dict:
+def t_alert_when_free(auth: tuple, args: dict) -> dict:
     from greencompute_gateway.transport import schemas
 
     r = _routes()
@@ -241,7 +262,7 @@ def t_alert_when_free(auth: str, args: dict) -> dict:
         gpu_model=_str(args, "gpu_model", default="rtx4090") or "rtx4090",
         gpu_count=_int(args, "gpu_count", 1, 1, 8), count=_int(args, "count", 1, 1, 64))
     return _as("POST", "/platform/capacity-alerts",
-               lambda: r.create_capacity_alert(payload, authorization=auth, x_api_key=None))
+               lambda: r.create_capacity_alert(payload, authorization=auth[0], x_api_key=auth[1]))
 
 
 _ID = {"deployment_id": {"type": "string", "description": "The rental's id (deployment_id)."}}
@@ -320,19 +341,23 @@ def _result(payload: Any, *, error: bool = False) -> dict[str, Any]:
     return out
 
 
-def call_tool(auth: str, name: str, args: dict) -> dict[str, Any]:
+def call_tool(auth: tuple, name: str, args: dict) -> dict[str, Any]:
+    from fastapi.encoders import jsonable_encoder
+
     tool = _BY_NAME.get(name)
     if tool is None:
         raise KeyError(name)
     try:
         return _result(tool["handler"](auth, args))
     except HTTPException as exc:
-        return _result({"status": exc.status_code, "error": describe_error(
+        # As the REST call answers: its `error` object and its `detail`
+        # (e.g. which scope a key lacks, or what is free).
+        return _result({"status": exc.status_code, "detail": jsonable_encoder(exc.detail), "error": describe_error(
             exc.status_code, exc.detail, exc.headers, getattr(exc, "error_code", None))}, error=True)
-    except ValueError as exc:
+    except ToolInputError as exc:
         return _result({"status": 400, "error": {"code": "invalid_request", "message": str(exc), "retryable": False}},
                        error=True)
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - our fault, not the caller's: logged, and said so
         log.exception("mcp tool %s failed", name)
         return _result({"status": 500, "error": describe_error(500, "internal server error")}, error=True)
 
@@ -344,10 +369,43 @@ def _rpc_error(rpc_id: Any, code: int, message: str, status: int = 200) -> JSONR
     return JSONResponse({"jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}}, status_code=status)
 
 
+MAX_BODY_BYTES = 1024 * 1024
+
+
+async def _body(request: Request) -> bytes | None:
+    """The request body, or None past MAX_BODY_BYTES (read no further)."""
+    data = bytearray()
+    async for chunk in request.stream():
+        data += chunk
+        if len(data) > MAX_BODY_BYTES:
+            return None
+    return bytes(data)
+
+
 @router.post("/mcp", include_in_schema=False)
 async def mcp(request: Request) -> Response:
+    # Who is calling, before anything else is read or answered. Any valid key
+    # may connect; each tool then runs as its REST request, with its scope.
+    authorization = request.headers.get("authorization")
+    x_api_key = request.headers.get("x-api-key")
     try:
-        message = json.loads(await request.body() or b"null")
+        api_key = await run_in_threadpool(require_api_key, authorization, x_api_key)
+    except HTTPException as exc:
+        body = {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": describe_error(
+            exc.status_code, exc.detail, exc.headers, getattr(exc, "error_code", None))["message"]}}
+        return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
+    try:
+        enforce_rate_limit("mcp", api_key.key_id, limit=120, window_seconds=60)
+    except HTTPException as exc:
+        return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {
+            "code": -32002, "message": "rate limit: at most 120 MCP requests a minute; wait and try again"}},
+            status_code=429, headers=exc.headers)
+
+    raw = await _body(request)
+    if raw is None:
+        return _rpc_error(None, -32600, f"request too large (over {MAX_BODY_BYTES // 1024} KiB)", 413)
+    try:
+        message = json.loads(raw or b"null")
     except ValueError:
         return _rpc_error(None, -32700, "parse error: the body must be JSON", 400)
     if isinstance(message, list):
@@ -357,26 +415,7 @@ async def mcp(request: Request) -> Response:
     method, rpc_id = message["method"], message.get("id")
     if "id" not in message:  # a notification (e.g. notifications/initialized): nothing to answer
         return Response(status_code=202)
-
-    # Who is calling. The key is only checked here; each tool runs as its
-    # REST request, where the key's scopes apply.
-    authorization = request.headers.get("authorization")
-    x_api_key = request.headers.get("x-api-key")
-    token = current_request_route.set(None)
-    try:
-        api_key = await run_in_threadpool(require_api_key, authorization, x_api_key)
-    except HTTPException as exc:
-        body = {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32001, "message": describe_error(
-            exc.status_code, exc.detail, exc.headers, getattr(exc, "error_code", None))["message"]}}
-        return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
-    finally:
-        current_request_route.reset(token)
-    auth = f"Bearer {authorization[7:].strip()}" if (authorization or "").lower().startswith("bearer ") else (
-        f"Bearer {x_api_key}" if x_api_key else "")
-    try:
-        enforce_rate_limit("mcp", api_key.key_id, limit=120, window_seconds=60)
-    except HTTPException as exc:
-        return _rpc_error(rpc_id, -32002, "rate limit: at most 120 MCP requests a minute; wait and try again", 429)
+    creds = (authorization, x_api_key)  # the tools act with exactly what was checked
 
     params = message.get("params") or {}
     if not isinstance(params, dict):
@@ -397,7 +436,7 @@ async def mcp(request: Request) -> Response:
             return _rpc_error(rpc_id, -32602, f"unknown tool {name!r}; see tools/list")
         if not isinstance(args, dict):
             return _rpc_error(rpc_id, -32602, "arguments must be an object")
-        result = await run_in_threadpool(call_tool, auth, name, args)
+        result = await run_in_threadpool(call_tool, creds, name, args)
         return JSONResponse({"jsonrpc": "2.0", "id": rpc_id, "result": result})
     return _rpc_error(rpc_id, -32601, f"method not found: {method}")
 

@@ -76,7 +76,16 @@ def test_a_bad_key_is_refused_before_anything_runs(client):
     assert r.status_code == 401 and r.json()["error"]["code"] == -32001
 
 
-def test_the_key_check_at_the_door_ignores_scopes_and_each_tool_runs_as_its_rest_call(client):
+def test_any_valid_key_may_connect_and_each_tool_runs_as_its_rest_call(client):
+    from greencompute_gateway.domain.scopes import required_scope
+    from greencompute_gateway.transport.security import _check_scopes
+
+    assert required_scope("POST", "/mcp") == "*"
+    token = current_request_route.set(("POST", "/mcp"))
+    try:
+        _check_scopes(SimpleNamespace(admin=False, scopes=["read"]))  # a scoped key gets in: no raise
+    finally:
+        current_request_route.reset(token)
     c, seen, mp = client
     calls = []
 
@@ -85,7 +94,6 @@ def test_the_key_check_at_the_door_ignores_scopes_and_each_tool_runs_as_its_rest
         return [{"deployment_id": "d1", "state": "ready", "name": "rig", "last_error": "x" * 400}]
     mp.setattr(routes, "list_deployments", fake_list)
     result = call(c, "list_rentals")
-    assert seen["scope_route_at_auth"] is None
     assert calls == [(("GET", "/platform/deployments"), mcp_module.ACTIVE_STATES, "Bearer gk_test")]
     rental = result["structuredContent"]["rentals"][0]
     assert rental["deployment_id"] == "d1" and rental["last_error"].endswith(" …") and len(rental["last_error"]) < 310
@@ -133,21 +141,71 @@ def test_rent_builds_the_quickstart_request_and_scopes_each_step(client):
     assert result["structuredContent"]["rental"]["deployment_id"] == "d9"
 
 
-def test_get_rental_gives_ssh_but_never_a_private_key(client):
+def test_get_rental_gives_ssh_from_the_rental_never_a_private_key(client):
     c, _, mp = client
-    mp.setattr(routes, "get_deployment", lambda dep_id, **k: {"deployment_id": dep_id, "state": "ready",
-                                                               "endpoint": "ssh://root@1.2.3.4:30001"})
-    seen = []
+    ed = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFDpfaWJh7dYs3/G3VaELhN36Tj0pY7oUj+Afdy7rk93"
+    mp.setattr(routes, "get_deployment", lambda dep_id, **k: {
+        "deployment_id": dep_id, "workload_id": "w1", "state": "ready", "endpoint": "ssh://root@1.2.3.4:30001",
+        "ssh_host_keys": [ed]})
 
-    def ssh(dep_id, **k):
-        seen.append(current_request_route.get())
-        return {"ssh_command": "ssh root@1.2.3.4 -p 30001", "ssh_host": "1.2.3.4", "ssh_port": 30001,
-                "known_hosts": ["[1.2.3.4]:30001 ssh-ed25519 AAAA"], "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----"}
-    mp.setattr(routes, "get_deployment_ssh", ssh)
+    def audited(*a, **k):
+        raise AssertionError("the private-key route must not be called: it audit-logs a key hand-out")
+    mp.setattr(routes, "get_deployment_ssh", audited)
+    mp.setattr(routes, "_workload_has_own_ssh_keys", lambda workload_id: False)
     result = call(c, "get_rental", {"deployment_id": "d1"})
-    assert "PRIVATE KEY" not in result["content"][0]["text"]
-    assert result["structuredContent"]["ssh"]["ssh_command"] == "ssh root@1.2.3.4 -p 30001"
-    assert seen == [("GET", "/platform/deployments/d1/ssh")]  # needs the rentals scope, like the REST call
+    ssh = result["structuredContent"]["ssh"]
+    assert ssh["ssh_command"] == "ssh root@1.2.3.4 -p 30001"
+    assert ssh["known_hosts"] == [f"[1.2.3.4]:30001 {ed}"]
+    assert "platform made" in ssh["note"] and "PRIVATE KEY" not in result["content"][0]["text"]
+
+
+def test_renting_needs_a_key_to_log_in_with_and_checks_everything_before_creating(client):
+    c, _, mp = client
+    created = []
+    mp.setattr(routes, "create_workload", lambda *a, **k: created.append(1) or {"workload_id": "w1"})
+    for args in ({}, {"ssh_public_keys": []}, {"ssh_public_keys": ["ssh-ed25519 AAAA"], "max_runtime_minutes": 0},
+                 {"ssh_public_keys": ["ssh-ed25519 AAAA"], "name": "bad name!"}):
+        result = call(c, "rent_gpu", args)
+        assert result["isError"] is True and result["structuredContent"]["status"] == 400
+    assert created == []  # nothing made for a request that was going to fail
+
+
+def test_errors_carry_the_rest_detail_too(client):
+    c, _, mp = client
+
+    def refused(*a, **k):
+        raise HTTPException(status_code=403, detail={"message": "this API key's scopes don't allow this request",
+                                                     "required_scope": "rentals", "key_scopes": ["read"]})
+    mp.setattr(routes, "terminate_deployment", refused)
+    result = call(c, "stop_rental", {"deployment_id": "d1"})
+    payload = result["structuredContent"]
+    assert payload["error"]["code"] == "scope_required" and payload["detail"]["required_scope"] == "rentals"
+
+
+def test_a_crash_is_ours_not_the_callers(client):
+    c, _, mp = client
+    mp.setattr(routes, "get_deployment_stats", lambda *a, **k: int("not a number"))
+    payload = call(c, "rental_stats", {"deployment_id": "d1"})["structuredContent"]
+    assert payload["status"] == 500 and "not a number" not in str(payload)
+
+
+def test_notifications_need_a_key_too_and_bodies_are_capped(client):
+    c, _, _ = client
+    r = c.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert r.status_code == 401
+    big = b'{"jsonrpc": "2.0", "method": "x", "params": {"p": "' + b"a" * (mcp_module.MAX_BODY_BYTES + 10) + b'"}}'
+    r = c.post("/mcp", content=big, headers={**AUTH, "Content-Type": "application/json"})
+    assert r.status_code == 413
+
+
+def test_the_rate_limit_says_when_to_retry(client, monkeypatch):
+    c, _, _ = client
+
+    def limited(*a, **k):
+        raise HTTPException(status_code=429, detail="rate limit exceeded", headers={"Retry-After": "17"})
+    monkeypatch.setattr(mcp_module, "enforce_rate_limit", limited)
+    r = rpc(c, "ping")
+    assert r.status_code == 429 and r.headers["Retry-After"] == "17"
 
 
 def test_bad_arguments_are_a_tool_error_not_a_crash(client):

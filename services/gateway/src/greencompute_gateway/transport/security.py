@@ -53,6 +53,8 @@ def _check_scopes(api_key) -> None:
 
     method, path = route
     needed = required_scope(method, path)
+    if needed == "*":  # any valid key (the MCP endpoint; its tools check their own)
+        return
     if needed is None or needed not in api_key.scopes:
         metrics.increment("auth.failure.scope")
         raise HTTPException(
