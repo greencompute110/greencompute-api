@@ -471,6 +471,10 @@ class ControlPlaneService:
             deployment.ssh_private_key = update.ssh_private_key
         if update.port_mappings is not None:
             deployment.port_mappings = update.port_mappings
+        # Sent with a pod's ready report; None (other reports, older
+        # machines) keeps the keys of the container that is still running.
+        if update.ssh_host_keys is not None:
+            deployment.ssh_host_keys = update.ssh_host_keys
         # A machine re-reporting SUSPENDED (it stopped the container the meter
         # told it to) carries no text: keep the reason the customer was given.
         if not (update.state == DeploymentState.SUSPENDED and update.error is None and deployment.last_error):
@@ -1073,6 +1077,7 @@ class ControlPlaneService:
         deployment.hotkey = None
         deployment.node_id = None
         deployment.endpoint = None
+        deployment.ssh_host_keys = []  # they belonged to that container
         deployment.ready_instances = 0
         deployment.retry_count = 0
         deployment.retry_exhausted = False
@@ -1251,6 +1256,7 @@ class ControlPlaneService:
         deployment.state = DeploymentState.TERMINATED
         deployment.ready_instances = 0
         deployment.endpoint = None
+        deployment.ssh_host_keys = []  # they belonged to that container
         deployment.last_error = reason
         deployment.failure_class = "operator_cleanup"
         deployment.updated_at = datetime.now(UTC)
@@ -1782,6 +1788,7 @@ class ControlPlaneService:
         deployment.hotkey = None
         deployment.node_id = None
         deployment.endpoint = None
+        deployment.ssh_host_keys = []  # they belonged to that container
         deployment.ready_instances = 0
         deployment.health_check_failures = 0
         deployment.retry_count += 1

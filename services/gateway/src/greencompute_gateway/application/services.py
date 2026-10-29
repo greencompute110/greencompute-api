@@ -264,6 +264,7 @@ _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _RESERVED_ENV = {
     "AUTHORIZED_KEYS", "GC_START_COMMAND_B64", "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES",
     "GC_DEPLOYMENT_ID", "GC_DEPLOYMENT_NAME",  # set by the platform for every pod
+    "GC_NEW_HOST_KEYS",  # each new pod gets its own SSH host keys
 }
 _MAX_COMMAND_CHARS = 8192
 _MAX_ENV_VARS = 64

@@ -9,6 +9,7 @@ from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Re
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
+from greencompute_protocol.ssh_host_keys import known_hosts_line, ssh_key_fingerprint
 from greencompute_protocol import (
     DeploymentState,
     APIKeyCreateRequest,
@@ -1067,7 +1068,7 @@ def _deployment_out(deployment, admin: bool, workloads: dict | None = None, *, b
             cache[deployment.workload_id] = service.control_plane.repository.get_workload(deployment.workload_id)
         return cache[deployment.workload_id]
 
-    out = deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS)
+    out = deployment.model_dump(mode="json", exclude=DEPLOYMENT_SECRET_FIELDS | ({"ssh_host_keys"} if brief else set()))
     if brief and out.get("last_error") and len(out["last_error"]) > LIST_ERROR_CHARS:
         out["last_error"] = out["last_error"][:LIST_ERROR_CHARS] + " …"
     storage_cents, deletes_at = (
@@ -1409,12 +1410,17 @@ def get_deployment_ssh(
             api_key.user_id,
             _audit_client_ip(),
         )
+    host_keys = list(deployment.ssh_host_keys or [])
     return {
         "ssh_host": host,
         "ssh_port": port,
         "ssh_username": user,
         "ssh_command": f"ssh {user}@{host} -p {port}",
         "private_key": private_key,
+        "host_keys": [
+            {"type": key.split()[0], "key": key, "fingerprint": ssh_key_fingerprint(key)} for key in host_keys
+        ],
+        "known_hosts": [known_hosts_line(host, port, key) for key in host_keys],
     }
 
 
