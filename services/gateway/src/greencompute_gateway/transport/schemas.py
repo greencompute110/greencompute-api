@@ -328,3 +328,43 @@ class CryptoInvoiceListed(CryptoInvoice):
 def ok(model, description: str = "Success") -> dict:
     """`responses=` entry declaring a 200 body of `model` (a list via list[...])."""
     return {200: {"model": model, "description": description}}
+
+
+class GpuReading(BaseModel):
+    index: int = Field(description="The GPU's number inside the pod (as `nvidia-smi` there shows it).")
+    uuid: str | None = None
+    name: str | None = None
+    util_pct: float | None = None
+    memory_used_mb: float | None = None
+    memory_total_mb: float | None = None
+    temperature_c: float | None = None
+    power_w: float | None = Field(default=None, description="Power drawn now, in watts.")
+    power_limit_w: float | None = Field(default=None, description="The card's power cap.")
+    sm_clock_mhz: float | None = None
+    mem_clock_mhz: float | None = None
+    fan_pct: float | None = Field(default=None, description="Null where the card doesn't report it.")
+
+
+class PodStats(BaseModel):
+    """Every field is left out when its reading isn't available."""
+    cpu_pct: float | None = None
+    memory_used_mb: float | None = None
+    memory_limit_mb: float | None = None
+    net_rx_bytes: float | None = None
+    net_tx_bytes: float | None = None
+    gpu_util_pct: float | None = Field(default=None, description="Average over the rental's GPUs.")
+    vram_used_mb: float | None = None
+    vram_total_mb: float | None = None
+    disk_used_gb: float | None = None
+    disk_total_gb: float | None = None
+    gpus: list[GpuReading] | None = None
+
+
+class PodLogs(BaseModel):
+    """At most the last 256 KiB of each, as text (terminal colour codes and
+    progress-bar redraws taken out)."""
+    lines: int
+    command_log: str | None = Field(description="End of /workspace/greencompute-command.log (your start command).")
+    command_log_note: str | None = Field(default=None, description="Why command_log is null or partial.")
+    container_log: str | None = Field(description="End of the container's own output.")
+    container_log_note: str | None = Field(default=None, description="Why container_log is null.")

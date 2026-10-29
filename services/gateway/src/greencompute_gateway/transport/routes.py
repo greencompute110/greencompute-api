@@ -1461,44 +1461,77 @@ def _lookup_miner_base_url(hotkey: str, *, timeout: float = 3.0) -> str | None:
         return None
 
 
-@router.get("/platform/deployments/{deployment_id}/stats")
+def _node_get(deployment, path: str, *, timeout: float, max_bytes: int) -> dict | None:
+    """GET `path` from the node agent running `deployment` (gateway →
+    control plane for the machine's address → node agent), or None if any
+    hop fails. The node secret goes with it."""
+    if not deployment.hotkey:
+        return None
+    miner_base = _lookup_miner_base_url(deployment.hotkey)
+    if not miner_base:
+        return None
+    req = urllib_request.Request(f"{miner_base}{path}", method="GET")
+    agent_secret = os.environ.get("GREENCOMPUTE_INFERENCE_AUTH_SECRET")
+    if agent_secret:
+        req.add_header("X-Agent-Auth", agent_secret)
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            if resp.status != 200:
+                return None
+            body = resp.read(max_bytes + 1)
+            if len(body) > max_bytes:
+                return None
+            data = json.loads(body.decode() or "{}")
+            return data if isinstance(data, dict) else None
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        return None
+
+
+@router.get("/platform/deployments/{deployment_id}/stats", response_model=None,
+            responses=ok(schemas.PodStats, "Live readings; {} while there are none"))
 def get_deployment_stats(
     deployment_id: str,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    """Live pod stats relay: gateway → control-plane (hotkey → miner URL)
-    → miner node-agent's /pods/{id}/stats.
-
-    On any hop failure returns 200 {} so the UI can keep polling without
-    flipping to an error state.
-    """
+    """Live readings of a running rental: CPU, memory, network, disk, and
+    each GPU's use, memory, temperature, power and clocks (`gpus`). `{}`
+    while it isn't running or its machine doesn't answer, so a dashboard can
+    keep polling."""
     api_key = require_api_key(authorization, x_api_key)
     deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=api_key.admin)
     if deployment is None:
         raise HTTPException(status_code=404, detail="deployment not found")
-    if not deployment.hotkey:
-        return {}
+    # Under the dashboard's 5 s poll, plus a little: a slow machine must not
+    # pile up requests (the node takes its readings side by side, ~2 s).
+    return _node_get(deployment, f"/pods/{deployment_id}/stats", timeout=6.0, max_bytes=256 * 1024) or {}
 
-    miner_base = _lookup_miner_base_url(deployment.hotkey)
-    if not miner_base:
-        return {}
 
-    url = f"{miner_base}/pods/{deployment_id}/stats"
-    try:
-        req = urllib_request.Request(url, method="GET")
-        # Authenticate to the node-agent the same way the inference client does,
-        # so this relay keeps working once the node :8007 secret is enforced.
-        _agent_secret = os.environ.get("GREENCOMPUTE_INFERENCE_AUTH_SECRET")
-        if _agent_secret:
-            req.add_header("X-Agent-Auth", _agent_secret)
-        with urllib_request.urlopen(req, timeout=3.0) as resp:  # noqa: S310
-            if resp.status != 200:
-                return {}
-            body = resp.read().decode() or "{}"
-            return json.loads(body)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-        return {}
+@router.get("/platform/deployments/{deployment_id}/logs", response_model=None,
+            responses=ok(schemas.PodLogs, "The last lines of the rental's output"))
+def get_deployment_logs(
+    deployment_id: str,
+    lines: int = 200,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """A running rental's recent output: the last `lines` lines (at most
+    2000) of its start command's log (/workspace/greencompute-command.log)
+    and of its container log (the image's own start command, and the pod's
+    set-up). When either is null, its `_note` says why."""
+    api_key = require_api_key(authorization, x_api_key)
+    deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=api_key.admin)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="deployment not found")
+    if deployment.state != DeploymentState.READY:
+        raise coded(409, "conflict", f"the rental is {deployment.state.value}; logs are there while it runs")
+    lines = max(1, min(int(lines), 2000))
+    # The node keeps 256 KiB of each source's end; JSON escaping can double it.
+    out = _node_get(deployment, f"/pods/{deployment_id}/logs?lines={lines}", timeout=15.0, max_bytes=8 * 1024 * 1024)
+    if out is None:
+        raise coded(503, "unavailable", "the machine running this rental didn't answer; try again shortly",
+                    headers={"Retry-After": "10"})
+    return out
 
 
 @router.patch("/platform/deployments/{deployment_id}")
