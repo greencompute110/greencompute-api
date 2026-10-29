@@ -98,7 +98,7 @@ class _Labels:
             if wl is not None:
                 allowed = list(wl.requirements.supported_gpu_models or []) if wl.requirements else []
                 info.update(
-                    name=wl.display_name or wl.name,
+                    name=dep.name or wl.display_name or wl.name,
                     kind="model" if getattr(wl.kind, "value", str(wl.kind)) == "inference" else "rental",
                     gpu_model=self._node_gpu(dep.node_id) or (allowed[0] if allowed else None),
                     gpu_count=wl.requirements.gpu_count if wl.requirements else None,
@@ -111,7 +111,7 @@ class _Labels:
             )
             if snapshot:
                 info.update(
-                    name=snapshot.get("workload_name") or info["name"],
+                    name=snapshot.get("name") or snapshot.get("workload_name") or info["name"],
                     kind="model" if snapshot.get("workload_kind") == "inference" else "rental",
                     gpu_model=snapshot.get("gpu_model"),
                     gpu_count=snapshot.get("gpu_count"),

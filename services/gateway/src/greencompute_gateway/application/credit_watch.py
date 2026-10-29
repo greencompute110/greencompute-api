@@ -94,8 +94,9 @@ def _int_env(name: str, default: int, minimum: int) -> int:
 
 
 def _label(deployment: DeploymentRecord, workload: WorkloadSpec | None) -> str:
-    """How the customer knows this deployment: "Llama-3.1-8B (1× rtx4090)"."""
-    name = (workload.display_name or workload.name) if workload else deployment.deployment_id[:8]
+    """How the customer knows this deployment: "rig-07 (1× rtx4090)", or the
+    workload's name when the rental has none of its own."""
+    name = deployment.name or ((workload.display_name or workload.name) if workload else deployment.deployment_id[:8])
     gpus = (workload.requirements.supported_gpu_models if workload else None) or []
     count = (workload.requirements.gpu_count if workload else 1) or 1
     return f"{name} ({count}× {gpus[0]})" if gpus else f"{name} ({count} GPU{'s' if count != 1 else ''})"
@@ -121,7 +122,7 @@ def _running_entry(control_plane, dep: DeploymentRecord, wl: WorkloadSpec | None
     gpus = (wl.requirements.supported_gpu_models if wl else None) or []
     return {
         "deployment_id": dep.deployment_id,
-        "name": (wl.display_name or wl.name) if wl else dep.deployment_id[:8],
+        "name": dep.name or ((wl.display_name or wl.name) if wl else dep.deployment_id[:8]),
         "label": _label(dep, wl),
         "kind": "model" if (wl is not None and wl.kind == WorkloadKind.INFERENCE) else "rental",
         "gpu_model": gpus[0] if gpus else None,

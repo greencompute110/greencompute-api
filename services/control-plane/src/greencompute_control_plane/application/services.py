@@ -159,6 +159,7 @@ class ControlPlaneService:
             raise KeyError(f"workload not found: {payload.workload_id}")
         deployment = DeploymentRecord(
             workload_id=payload.workload_id,
+            name=payload.name,
             owner_user_id=owner_user_id,
             requested_instances=payload.requested_instances,
             save_on_exhaustion=payload.save_on_exhaustion,
@@ -429,6 +430,10 @@ class ControlPlaneService:
             deployment.fee_acknowledged = request.fee_acknowledged
         if request.resume_on_topup is not None:
             deployment.resume_on_topup = request.resume_on_topup
+        if request.name is not None:
+            # "" clears it. A running pod keeps the name it started with; the
+            # pod's next start (resume after a stop, or a move) uses the new one.
+            deployment.name = request.name or None
         deployment.updated_at = datetime.now(UTC)
         return self.repository.update_deployment(deployment)
 
