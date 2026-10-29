@@ -36,6 +36,8 @@ from uuid import uuid4
 
 from greencompute_persistence import session_scope
 from greencompute_persistence.orm import (
+    AccountEventORM,
+    WebhookORM,
     AdminAccountORM,
     APIKeyORM,
     CryptoInvoiceORM,
@@ -173,6 +175,8 @@ def delete_account(session_factory, user_id: str, *, now: datetime | None = None
                 ProviderServerORM, ProviderServerORM.owner_user_id == user_id
             ),
         }
+        summary["webhooks_removed"] = remove(WebhookORM, WebhookORM.user_id == user_id)
+        remove(AccountEventORM, AccountEventORM.user_id == user_id)
         remove(AdminAccountORM, AdminAccountORM.user_id == user_id)
         remove(InferenceBalanceHoldORM, InferenceBalanceHoldORM.user_id == user_id)
 

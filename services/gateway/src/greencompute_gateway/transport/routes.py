@@ -1233,6 +1233,118 @@ def _fleet_call(fn):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _user_key(authorization: str | None, x_api_key: str | None):
+    """The caller's API key, which must belong to an account."""
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.user_id is None:
+        raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    return api_key
+
+
+def _webhook_call(fn):
+    from greencompute_gateway.application.webhooks import WebhookError, WebhookNotFound
+
+    try:
+        return fn()
+    except WebhookNotFound as exc:
+        raise HTTPException(status_code=404, detail="webhook not found") from exc
+    except WebhookError as exc:
+        raise coded(400, "invalid_request", str(exc)) from exc
+
+
+@router.get("/platform/events", response_model=None, responses=ok(schemas.EventPage, "Events after `after`"))
+def list_account_events(
+    after: int = 0,
+    limit: int = 100,
+    types: str | None = None,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Everything that happened on your account after event `after`, oldest
+    first: deployments becoming ready, failing, being suspended or ending,
+    and the balance running low. Instead of polling each deployment, poll
+    this with the `next_after` it returned last time. `types` filters, e.g.
+    `deployment.ready,deployment.failed`. Events are kept 30 days."""
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import webhooks
+
+    return _webhook_call(lambda: webhooks.list_events(
+        service.repository.session_factory, user_id, after=after, types=types, limit=limit))
+
+
+@router.post("/platform/webhooks", response_model=None, responses=ok(schemas.WebhookCreated, "The new webhook, with its secret"))
+def create_webhook(
+    payload: schemas.WebhookCreate,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Send your account's events to your HTTPS endpoint as they happen,
+    signed with the `secret` returned here (only now). At most 5 per
+    account. Use POST /platform/webhooks/{id}/test to try it."""
+    api_key = _user_key(authorization, x_api_key)
+    enforce_rate_limit("create_webhook", api_key.key_id, limit=10, window_seconds=60)
+    from greencompute_gateway.application import webhooks
+
+    return _webhook_call(lambda: webhooks.create_webhook(
+        service.repository.session_factory, api_key.user_id, payload.url, payload.events))
+
+
+@router.get("/platform/webhooks", response_model=None, responses=ok(list[schemas.Webhook], "Your webhooks"))
+def list_webhooks(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import webhooks
+
+    return webhooks.list_webhooks(service.repository.session_factory, user_id)
+
+
+@router.patch("/platform/webhooks/{webhook_id}", response_model=None, responses=ok(schemas.Webhook, "The webhook"))
+def update_webhook(
+    webhook_id: str,
+    payload: schemas.WebhookUpdate,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Change its URL or event types, or turn it off and on again."""
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import webhooks
+
+    return _webhook_call(lambda: webhooks.update_webhook(
+        service.repository.session_factory, user_id, webhook_id,
+        url=payload.url, events=payload.events, active=payload.active))
+
+
+@router.delete("/platform/webhooks/{webhook_id}", response_model=None)
+def delete_webhook(
+    webhook_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import webhooks
+
+    _webhook_call(lambda: webhooks.delete_webhook(service.repository.session_factory, user_id, webhook_id))
+    return {"deleted": webhook_id}
+
+
+@router.post("/platform/webhooks/{webhook_id}/test", response_model=None,
+             responses=ok(schemas.WebhookTestResult, "How the test delivery went"))
+def test_webhook(
+    webhook_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """POST a `webhook.test` event to the endpoint now, signed like the real
+    ones, and say whether it answered 2xx."""
+    api_key = _user_key(authorization, x_api_key)
+    enforce_rate_limit("test_webhook", api_key.key_id, limit=10, window_seconds=60)
+    from greencompute_gateway.application import webhooks
+
+    return _webhook_call(lambda: webhooks.send_test(service.repository.session_factory, api_key.user_id, webhook_id))
+
+
 @router.post("/platform/fleets", response_model=None, responses=ok(schemas.Fleet, "The new fleet"))
 def create_fleet(
     payload: schemas.FleetCreate,

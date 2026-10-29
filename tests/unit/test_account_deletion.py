@@ -135,10 +135,20 @@ def test_needs_the_confirmation_word(env):
 def test_deleting_erases_access_and_personal_data_but_keeps_payment_records(env):
     admin_key = env.svc.website_admin_key("u-ana")
     agent_key = env.key("u-ana", name="agent")
+    from greencompute_persistence.orm import AccountEventORM, WebhookORM
+
+    with session_scope(env.repo.session_factory) as s:  # a webhook and its events go too
+        s.add(WebhookORM(webhook_id="wh_ana", user_id="u-ana", url="https://ana.example.com/x", secret="whsec_x",
+                         events=[], active=True, last_event_id=0, failures=0))
+        s.add(AccountEventORM(user_id="u-ana", type="deployment.ready", data={}))
     out = routes.delete_account(CONFIRM, authorization=f"Bearer {env.ana.secret}", x_api_key=None)
     assert out["deleted"] is True and out["already_deleted"] is False
     assert out["credit_forfeited_cents"] == 1234
     assert out["api_keys_revoked"] == 3 and out["wallets_removed"] == 1 and out["secrets_deleted"] == 1
+    assert out["webhooks_removed"] == 1
+    with session_scope(env.repo.session_factory) as s:
+        assert s.query(WebhookORM).filter_by(user_id="u-ana").count() == 0
+        assert s.query(AccountEventORM).filter_by(user_id="u-ana").count() == 0
 
     # Every key of the account stops working, the website's and its admin key included.
     for secret in (env.ana.secret, agent_key.secret, admin_key):

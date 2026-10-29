@@ -1217,3 +1217,44 @@ class ProviderServerORM(Base):
     provision_log: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AccountEventORM(Base):
+    """Something that happened on a customer's account that their code may
+    act on: a deployment became ready, failed, was suspended or ended; the
+    balance runs low. Read with GET /platform/events (`id` is the cursor) and
+    pushed to the customer's webhooks. Kept 30 days."""
+
+    __tablename__ = "account_events"
+    __table_args__ = (Index("ix_account_events_user_event", "user_id", "event_id"),)
+
+    event_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64))
+    type: Mapped[str] = mapped_column(String(64))
+    deployment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class WebhookORM(Base):
+    """A customer's HTTPS endpoint for their account events. `last_event_id`
+    is how far delivery has got (events are delivered in order, at least
+    once); a webhook failing for 3 days in a row is turned off."""
+
+    __tablename__ = "webhooks"
+
+    webhook_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    url: Mapped[str] = mapped_column(String(2048))
+    secret: Mapped[str] = mapped_column(String(128))
+    events: Mapped[list[str]] = mapped_column(JSON, default=list)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    disabled_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    last_event_id: Mapped[int] = mapped_column(Integer, default=0)
+    failures: Mapped[int] = mapped_column(Integer, default=0)
+    failing_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

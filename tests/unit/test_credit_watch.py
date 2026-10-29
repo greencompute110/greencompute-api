@@ -144,6 +144,13 @@ def test_warned_once_under_24h_and_once_more_under_2h_then_rearmed_by_a_topup(wo
     assert _sweep(cp, billing, mail, 6) == ["ann"]
     assert mail.sent[-1][2]["level_hours"] == 24
     assert len({s[3] for s in mail.sent}) == len(mail.sent)  # every email its own event id
+    # Each warning is also an account event, for webhooks and the events feed.
+    from greencompute_persistence.orm import AccountEventORM
+
+    with session_scope(billing.session_factory) as s:
+        low = s.query(AccountEventORM).filter_by(user_id="ann", type="balance.low").order_by(AccountEventORM.event_id).all()
+        assert [e.data["under_hours"] for e in low] == [24, 2, 24]
+        assert low[0].data["hours_left"] == 10.0 and low[0].data["running"] == ["train (1× rtx4090)"]
 
 
 def test_a_balance_going_slightly_up_within_a_level_does_not_warn_again(world):
@@ -389,6 +396,12 @@ def test_a_resume_email_is_not_followed_by_a_low_credit_email_saying_the_same(wo
     assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=mail) != []
     assert cw.low_credit_once(now=NOW + timedelta(minutes=2), control_plane=cp, billing_repo=billing, notify=mail) == []
     assert [k for _, k, _, _ in mail.sent] == ["deployments_resumed"]
+    # No second email, but the customer's code still hears the balance is low.
+    from greencompute_persistence.orm import AccountEventORM
+
+    with session_scope(billing.session_factory) as s:
+        [low] = s.query(AccountEventORM).filter_by(user_id="ann", type="balance.low").all()
+        assert low.data["under_hours"] == 2 and low.data["hours_left"] == 1.2 and low.data["running"] is None
     _set_balance(billing, "ann", 10)  # dropped further: that is news
     assert cw.low_credit_once(now=NOW + timedelta(minutes=9), control_plane=cp, billing_repo=billing, notify=mail) == []
     # (still level 2, already told); a later top-up above 24 h re-arms as before

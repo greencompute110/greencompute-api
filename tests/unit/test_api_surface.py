@@ -46,7 +46,9 @@ def test_generated_spec_has_no_internal_paths():
     app = FastAPI()
     app.include_router(routes.router)
     paths = app.openapi()["paths"]
-    leaked = [p for p in paths if "/admin" in p or "/debug" in p or "webhook" in p]
+    # Payment-provider callbacks are internal; customers' own webhooks are not.
+    leaked = [p for p in paths if "/admin" in p or "/debug" in p
+              or ("webhook" in p and not p.startswith("/platform/webhooks"))]
     assert leaked == []
     for public in ("/platform/deployments", "/platform/billing/balance", "/platform/pricing", "/v1/chat/completions"):
         assert public in paths, public

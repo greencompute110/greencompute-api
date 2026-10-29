@@ -328,3 +328,56 @@ class CryptoInvoiceListed(CryptoInvoice):
 def ok(model, description: str = "Success") -> dict:
     """`responses=` entry declaring a 200 body of `model` (a list via list[...])."""
     return {200: {"model": model, "description": description}}
+
+
+class Event(BaseModel):
+    """Something that happened on your account. `id` grows with each event:
+    use it as the cursor (`after`), and to tell a repeated webhook delivery
+    apart. See https://www.green-compute.com/docs/events for each type's `data`."""
+    id: int
+    type: str = Field(description="`deployment.ready`, `deployment.failed`, `deployment.suspended`, "
+                                  "`deployment.terminated` or `balance.low`.")
+    created_at: str
+    data: dict = Field(description="For deployment events: deployment_id, name, workload_id, state, "
+                                   "previous_state, error, suspended_reason.")
+
+
+class EventPage(BaseModel):
+    events: list[Event] = Field(description="Oldest first.")
+    next_after: int = Field(description="Pass as `after` next time.")
+    has_more: bool = Field(description="True when more events are waiting: call again right away.")
+
+
+class WebhookCreate(BaseModel):
+    url: str = Field(description="Your HTTPS endpoint. It must resolve to a public address.")
+    events: list[str] | None = Field(default=None, description="Event types to send; all when left out.")
+
+
+class WebhookUpdate(BaseModel):
+    url: str | None = None
+    events: list[str] | None = None
+    active: bool | None = Field(default=None, description="false turns it off; true turns it back on and "
+                                                          "delivers what it missed (events are kept 30 days).")
+
+
+class Webhook(BaseModel):
+    webhook_id: str
+    url: str
+    events: list[str] = Field(description="Empty: every type.")
+    active: bool
+    disabled_reason: str | None = Field(description="Why it is off: turned off by you, or failing for 3 days.")
+    failures: int = Field(description="Failed attempts in a row.")
+    last_success_at: str | None
+    last_failure_at: str | None
+    last_error: str | None
+    created_at: str | None
+
+
+class WebhookCreated(Webhook):
+    secret: str = Field(description="Signs every delivery (see the docs). Shown only now: store it.")
+
+
+class WebhookTestResult(BaseModel):
+    delivered: bool
+    status_code: int | None = Field(description="Your endpoint's HTTP status, if it answered.")
+    error: str | None
