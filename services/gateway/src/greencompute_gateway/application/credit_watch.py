@@ -34,7 +34,8 @@ from typing import Any
 from sqlalchemy import select
 
 from greencompute_persistence import session_scope
-from greencompute_persistence.orm import CreditWarningORM
+from greencompute_persistence.account_events import add_event
+from greencompute_persistence.orm import AccountEventORM, CreditWarningORM
 from greencompute_protocol import DeploymentRecord, DeploymentState, WorkloadKind, WorkloadSpec
 
 log = logging.getLogger(__name__)
@@ -220,7 +221,7 @@ def low_credit_once(*, now: datetime | None = None, control_plane=None, billing_
             if uid not in forecasts and row.level_hours is not None:
                 row.level_hours = None  # nothing running: re-arm for the next run-down
                 row.updated_at = now
-        for uid, fc in forecasts.items():
+        for uid, fc in sorted(forecasts.items()):  # sorted: customers' event locks in one order
             row = rows.get(uid)
             level = _level_for(fc["hours_left"])
             if level is None:
@@ -239,6 +240,12 @@ def low_credit_once(*, now: datetime | None = None, control_plane=None, billing_
             row.balance_cents = fc["balance_cents"]
             row.updated_at = now
             to_send.append((uid, fc, level))
+            # For the customer's code too (events feed, webhooks); same
+            # transaction as the warning row, so once per level like the email.
+            add_event(session, _balance_low_event(
+                uid, now, level, balance_cents=fc["balance_cents"], cents_per_hour=fc["burn_cents_per_hour"],
+                hours_left=fc["hours_left"], running=_low_credit_fields(fc, level)["running"],
+            ))
     for uid, fc, level in to_send:
         notify(
             repo.session_factory, uid, "low_credit", _low_credit_fields(fc, level),
@@ -248,19 +255,41 @@ def low_credit_once(*, now: datetime | None = None, control_plane=None, billing_
     return warned
 
 
-def _mark_informed(repo, user_id: str, hours_left: float | None, now: datetime) -> None:
+def _balance_low_event(user_id: str, now: datetime, level: int, *, balance_cents: int, cents_per_hour: int,
+                       hours_left: float | None, running: list[str] | None) -> AccountEventORM:
+    """`balance.low` for the customer's code (events feed, webhooks)."""
+    return AccountEventORM(user_id=user_id, type="balance.low", created_at=now, data={
+        "balance_cents": balance_cents,
+        "balance_usd": round(balance_cents / 100, 2),
+        "usd_per_hour": round(cents_per_hour / 100, 2),
+        "hours_left": round(hours_left, 1) if hours_left is not None else None,
+        "runs_out_at": (now + timedelta(hours=hours_left)).isoformat() if hours_left is not None else None,
+        "under_hours": level,
+        "running": running,
+    })
+
+
+def _mark_informed(repo, user_id: str, balance_cents: int, cents_per_hour: int, now: datetime) -> None:
     """After a resume email that states the balance, don't follow it within
     minutes with a low-credit email for the level that balance is already
-    under: record that level as told. A further drop still warns."""
+    under: record that level as told. A further drop still warns. The
+    customer's code isn't reading that email, so it gets the balance.low
+    event here instead."""
+    hours_left = (balance_cents / cents_per_hour) if cents_per_hour > 0 else None
     level = _level_for(hours_left)
     with session_scope(repo.session_factory) as session:
         row = session.get(CreditWarningORM, user_id)
         if row is None:
             row = CreditWarningORM(user_id=user_id)
             session.add(row)
+        told = row.level_hours
         row.level_hours = level
         row.warned_at = now if level is not None else row.warned_at
         row.updated_at = now
+        if level is not None and (told is None or told > level):
+            add_event(session, _balance_low_event(
+                user_id, now, level, balance_cents=balance_cents, cents_per_hour=cents_per_hour,
+                hours_left=hours_left, running=None))
 
 
 def _committed_by_owner(control_plane, workloads: _Workloads, now: datetime) -> tuple[dict[str, int], set[str]]:
@@ -347,8 +376,7 @@ def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=
         )
         # The resume email states the balance; a low-credit email for the
         # level it is already under would say the same thing minutes later.
-        burn = committed.get(uid, 0)
-        _mark_informed(repo, uid, (balance / burn) if burn > 0 else None, now)
+        _mark_informed(repo, uid, balance, committed.get(uid, 0), now)
     return resumed
 
 

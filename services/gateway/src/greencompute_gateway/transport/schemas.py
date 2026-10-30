@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, create_model, field_validator
 
 from greencompute_protocol import CryptoInvoice, DeploymentRecord, LedgerEntry, WorkloadSpec
 
@@ -328,3 +328,132 @@ class CryptoInvoiceListed(CryptoInvoice):
 def ok(model, description: str = "Success") -> dict:
     """`responses=` entry declaring a 200 body of `model` (a list via list[...])."""
     return {200: {"model": model, "description": description}}
+
+
+class Event(BaseModel):
+    """Something that happened on your account. `id` grows with each event:
+    use it as the cursor (`after`), and to tell a repeated webhook delivery
+    apart. See https://www.green-compute.com/docs/events for each type's `data`."""
+    id: int
+    type: str = Field(description="`deployment.ready`, `deployment.failed`, `deployment.suspended`, "
+                                  "`deployment.terminated` or `balance.low`.")
+    created_at: str
+    data: dict = Field(description="For deployment events: deployment_id, name, workload_id, state, "
+                                   "previous_state, error, suspended_reason.")
+
+
+class EventPage(BaseModel):
+    events: list[Event] = Field(description="Oldest first.")
+    next_after: int = Field(description="Pass as `after` next time.")
+    has_more: bool = Field(description="True when more events are waiting: call again right away.")
+
+
+class WebhookCreate(BaseModel):
+    url: str = Field(description="Your HTTPS endpoint. It must resolve to a public address.")
+    events: list[str] | None = Field(default=None, description="Event types to send; all when left out.")
+
+
+class WebhookUpdate(BaseModel):
+    url: str | None = None
+    events: list[str] | None = None
+    active: bool | None = Field(default=None, description="false turns it off; true turns it back on and "
+                                                          "delivers what it missed (events are kept 30 days).")
+
+
+class Webhook(BaseModel):
+    webhook_id: str
+    url: str
+    events: list[str] = Field(description="Empty: every type.")
+    active: bool
+    disabled_reason: str | None = Field(description="Why it is off: turned off by you, or failing for 3 days.")
+    failures: int = Field(description="Failed attempts in a row.")
+    last_success_at: str | None
+    last_failure_at: str | None
+    last_error: str | None
+    created_at: str | None
+
+
+class WebhookCreated(Webhook):
+    secret: str = Field(description="Signs every delivery (see the docs). Shown only now: store it.")
+
+
+class WebhookTestResult(BaseModel):
+    delivered: bool
+    status_code: int | None = Field(description="Your endpoint's HTTP status, if it answered.")
+    error: str | None
+
+
+class CapacityAlertCreate(BaseModel):
+    gpu_model: str = Field(description="e.g. `rtx4090`.")
+    gpu_count: int = Field(default=1, description="GPUs one rental needs together, on one machine (1-8).")
+    count: int = Field(default=1, description="How many such rentals you want room for (1-64).")
+
+
+class CapacityAlert(BaseModel):
+    alert_id: str
+    gpu_model: str
+    gpu_count: int
+    count: int
+    state: str = Field(description="`waiting`, `fired`, `expired` (after 7 days) or `cancelled`.")
+    created_at: str | None
+    expires_at: str | None
+    fired_at: str | None
+
+class GpuReading(BaseModel):
+    index: int = Field(description="The GPU's number inside the pod (as `nvidia-smi` there shows it).")
+    uuid: str | None = None
+    name: str | None = None
+    util_pct: float | None = None
+    memory_used_mb: float | None = None
+    memory_total_mb: float | None = None
+    temperature_c: float | None = None
+    power_w: float | None = Field(default=None, description="Power drawn now, in watts.")
+    power_limit_w: float | None = Field(default=None, description="The card's power cap.")
+    sm_clock_mhz: float | None = None
+    mem_clock_mhz: float | None = None
+    fan_pct: float | None = Field(default=None, description="Null where the card doesn't report it.")
+    error: str | None = Field(default=None, description="Set, with no readings, when this GPU didn't answer.")
+
+
+class PodStats(BaseModel):
+    """Every field is left out when its reading isn't available."""
+    cpu_pct: float | None = None
+    memory_used_mb: float | None = None
+    memory_limit_mb: float | None = None
+    net_rx_bytes: float | None = None
+    net_tx_bytes: float | None = None
+    gpu_util_pct: float | None = Field(default=None, description="Average over the rental's GPUs.")
+    vram_used_mb: float | None = None
+    vram_total_mb: float | None = None
+    disk_used_gb: float | None = None
+    disk_total_gb: float | None = None
+    gpus: list[GpuReading] | None = None
+
+
+class PodLogs(BaseModel):
+    """At most the last 256 KiB of each, as text (terminal colour codes and
+    progress-bar redraws taken out)."""
+    lines: int
+    command_log: str | None = Field(description="End of /workspace/greencompute-command.log (your start command).")
+    command_log_note: str | None = Field(default=None, description="Why command_log is null or partial.")
+    container_log: str | None = Field(description="End of the container's own output.")
+    container_log_note: str | None = Field(default=None, description="Why container_log is null.")
+
+
+class ExecRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=8192, description="Run with `sh -c`, as root, from /workspace.")
+    timeout_seconds: int = Field(default=60, ge=1, le=120, description="How long to wait for it (1-120 s).")
+
+    @field_validator("command")
+    @classmethod
+    def _printable(cls, value: str) -> str:
+        if "\x00" in value or not value.strip():
+            raise ValueError("command must be non-empty text without NUL bytes")
+        return value
+
+
+class ExecResult(BaseModel):
+    exit_code: int | None = Field(description="Null if it was still running when we stopped waiting.")
+    output: str = Field(description="The last 64 KiB of its output (stdout and stderr).")
+    output_truncated: bool
+    timed_out: bool = Field(description="True: we stopped waiting; the command may still be running in the pod.")

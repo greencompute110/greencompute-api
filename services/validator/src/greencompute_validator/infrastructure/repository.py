@@ -926,9 +926,13 @@ class ValidatorRepository:
                 return False
             if dep.state == "failed" and not force:
                 return False
+            previous_state = dep.state
             dep.state = "terminated"
             dep.updated_at = datetime.now(UTC)
             session.add(dep)
+            from greencompute_persistence.account_events import add_event, deployment_event
+
+            add_event(session, deployment_event(dep, previous_state))
             lease = session.scalar(
                 select(LeaseAssignmentORM).where(
                     LeaseAssignmentORM.deployment_id == deployment_id

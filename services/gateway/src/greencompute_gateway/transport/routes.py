@@ -1,8 +1,12 @@
+import contextlib
 import hashlib
+import http.client
 import json
 import logging
 import math
 import os
+import threading
+from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request, Response
@@ -1233,6 +1237,173 @@ def _fleet_call(fn):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _user_key(authorization: str | None, x_api_key: str | None):
+    """The caller's API key, which must belong to an account."""
+    api_key = require_api_key(authorization, x_api_key)
+    if api_key.user_id is None:
+        raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    return api_key
+
+
+def _webhook_call(fn):
+    from greencompute_gateway.application.webhooks import WebhookError, WebhookNotFound
+
+    try:
+        return fn()
+    except WebhookNotFound as exc:
+        raise HTTPException(status_code=404, detail="webhook not found") from exc
+    except WebhookError as exc:
+        raise coded(400, "invalid_request", str(exc)) from exc
+
+
+@router.get("/platform/events", response_model=None, responses=ok(schemas.EventPage, "Events after `after`"))
+def list_account_events(
+    after: int = 0,
+    limit: int = 100,
+    types: str | None = None,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Everything that happened on your account after event `after`, oldest
+    first: deployments becoming ready, failing, being suspended or ending,
+    and the balance running low. Instead of polling each deployment, poll
+    this with the `next_after` it returned last time. `types` filters, e.g.
+    `deployment.ready,deployment.failed`. Events are kept 30 days."""
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import webhooks
+
+    return _webhook_call(lambda: webhooks.list_events(
+        service.repository.session_factory, user_id, after=after, types=types, limit=limit))
+
+
+@router.post("/platform/webhooks", response_model=None, responses=ok(schemas.WebhookCreated, "The new webhook, with its secret"))
+def create_webhook(
+    payload: schemas.WebhookCreate,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Send your account's events to your HTTPS endpoint as they happen,
+    signed with the `secret` returned here (only now). At most 5 per
+    account. Use POST /platform/webhooks/{id}/test to try it."""
+    api_key = _user_key(authorization, x_api_key)
+    enforce_rate_limit("create_webhook", api_key.key_id, limit=10, window_seconds=60)
+    from greencompute_gateway.application import webhooks
+
+    return _webhook_call(lambda: webhooks.create_webhook(
+        service.repository.session_factory, api_key.user_id, payload.url, payload.events))
+
+
+@router.get("/platform/webhooks", response_model=None, responses=ok(list[schemas.Webhook], "Your webhooks"))
+def list_webhooks(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import webhooks
+
+    return webhooks.list_webhooks(service.repository.session_factory, user_id)
+
+
+@router.patch("/platform/webhooks/{webhook_id}", response_model=None, responses=ok(schemas.Webhook, "The webhook"))
+def update_webhook(
+    webhook_id: str,
+    payload: schemas.WebhookUpdate,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Change its URL or event types, or turn it off and on again."""
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import webhooks
+
+    return _webhook_call(lambda: webhooks.update_webhook(
+        service.repository.session_factory, user_id, webhook_id,
+        url=payload.url, events=payload.events, active=payload.active))
+
+
+@router.delete("/platform/webhooks/{webhook_id}", response_model=None)
+def delete_webhook(
+    webhook_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import webhooks
+
+    _webhook_call(lambda: webhooks.delete_webhook(service.repository.session_factory, user_id, webhook_id))
+    return {"deleted": webhook_id}
+
+
+@router.post("/platform/webhooks/{webhook_id}/test", response_model=None,
+             responses=ok(schemas.WebhookTestResult, "How the test delivery went"))
+def test_webhook(
+    webhook_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """POST a `webhook.test` event to the endpoint now, signed like the real
+    ones, and say whether it answered 2xx."""
+    api_key = _user_key(authorization, x_api_key)
+    enforce_rate_limit("test_webhook", api_key.key_id, limit=10, window_seconds=60)
+    from greencompute_gateway.application import webhooks
+
+    return _webhook_call(lambda: webhooks.send_test(service.repository.session_factory, api_key.user_id, webhook_id))
+
+
+def _alert_call(fn):
+    from greencompute_gateway.application.capacity_alerts import CapacityAlertError, CapacityAlertNotFound
+
+    try:
+        return fn()
+    except CapacityAlertNotFound as exc:
+        raise HTTPException(status_code=404, detail="alert not found") from exc
+    except CapacityAlertError as exc:
+        raise coded(400, "invalid_request", str(exc)) from exc
+
+
+@router.post("/platform/capacity-alerts", response_model=None,
+             responses=ok(schemas.CapacityAlert, "The alert, waiting"))
+def create_capacity_alert(
+    payload: schemas.CapacityAlertCreate,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Be told once when there is room for `count` rentals of `gpu_count`
+    GPUs of `gpu_model`: a `capacity.available` event (events feed and
+    webhooks) and an email. Expires after 7 days. Asking again for the same
+    returns the alert already waiting."""
+    api_key = _user_key(authorization, x_api_key)
+    enforce_rate_limit("capacity_alert", api_key.key_id, limit=20, window_seconds=60)
+    from greencompute_gateway.application import capacity_alerts
+
+    return _alert_call(lambda: capacity_alerts.create_alert(
+        service.repository.session_factory, api_key.user_id, payload.gpu_model, payload.gpu_count, payload.count))
+
+
+@router.get("/platform/capacity-alerts", response_model=None,
+            responses=ok(list[schemas.CapacityAlert], "Waiting alerts, and those from the last 7 days"))
+def list_capacity_alerts(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import capacity_alerts
+
+    return capacity_alerts.list_alerts(service.repository.session_factory, user_id)
+
+
+@router.delete("/platform/capacity-alerts/{alert_id}", response_model=None,
+               responses=ok(schemas.CapacityAlert, "The alert, cancelled"))
+def cancel_capacity_alert(
+    alert_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    user_id = _require_user(authorization, x_api_key)
+    from greencompute_gateway.application import capacity_alerts
+
+    return _alert_call(lambda: capacity_alerts.cancel_alert(service.repository.session_factory, user_id, alert_id))
+
+
 @router.post("/platform/fleets", response_model=None, responses=ok(schemas.Fleet, "The new fleet"))
 def create_fleet(
     payload: schemas.FleetCreate,
@@ -1461,44 +1632,180 @@ def _lookup_miner_base_url(hotkey: str, *, timeout: float = 3.0) -> str | None:
         return None
 
 
-@router.get("/platform/deployments/{deployment_id}/stats")
+def _node_request(deployment, path: str, *, timeout: float, max_bytes: int,
+                  body: dict | None = None) -> tuple[str, int | None, Any]:
+    """Call the node agent running `deployment` (gateway → control plane for
+    the machine's address → node agent), with the node secret: GET, or POST
+    `body` as JSON. Returns (outcome, status, data):
+    - ("ok", 200, data);
+    - ("refused", status, detail): the node answered with an error;
+    - ("unreachable", None, None): no address, or no connection was made;
+    - ("unknown", None, None): sent, but no answer in time (or a broken one),
+      so a POST may or may not have taken effect."""
+    if not deployment.hotkey:
+        return "unreachable", None, None
+    miner_base = _lookup_miner_base_url(deployment.hotkey)
+    if not miner_base:
+        return "unreachable", None, None
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib_request.Request(f"{miner_base}{path}", data=data, method="POST" if data is not None else "GET")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    agent_secret = os.environ.get("GREENCOMPUTE_INFERENCE_AUTH_SECRET")
+    if agent_secret:
+        req.add_header("X-Agent-Auth", agent_secret)
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                return "unknown", None, None
+            out = json.loads(raw.decode() or "{}")
+            return "ok", resp.status, out
+    except HTTPError as exc:
+        try:
+            detail = json.loads(exc.read(65536).decode() or "{}").get("detail")
+        except (ValueError, AttributeError, OSError):
+            detail = None
+        return "refused", exc.code, detail
+    except URLError as exc:
+        reason = getattr(exc, "reason", None)
+        return ("unknown" if isinstance(reason, TimeoutError) else "unreachable"), None, None
+    except (TimeoutError, OSError, ValueError, http.client.HTTPException):
+        # incl. a reply cut short (IncompleteRead) by a restarting node
+        return "unknown", None, None
+
+
+def _node_get(deployment, path: str, *, timeout: float, max_bytes: int) -> dict | None:
+    """GET from the node agent: its JSON object, or None on any failure."""
+    outcome, _, data = _node_request(deployment, path, timeout=timeout, max_bytes=max_bytes)
+    return data if outcome == "ok" and isinstance(data, dict) else None
+
+
+@router.get("/platform/deployments/{deployment_id}/stats", response_model=None,
+            responses=ok(schemas.PodStats, "Live readings; {} while there are none"))
 def get_deployment_stats(
     deployment_id: str,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    """Live pod stats relay: gateway → control-plane (hotkey → miner URL)
-    → miner node-agent's /pods/{id}/stats.
-
-    On any hop failure returns 200 {} so the UI can keep polling without
-    flipping to an error state.
-    """
+    """Live readings of a running rental: CPU, memory, network, disk, and
+    each GPU's use, memory, temperature, power and clocks (`gpus`). `{}`
+    while it isn't running or its machine doesn't answer, so a dashboard can
+    keep polling."""
     api_key = require_api_key(authorization, x_api_key)
     deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=api_key.admin)
     if deployment is None:
         raise HTTPException(status_code=404, detail="deployment not found")
-    if not deployment.hotkey:
-        return {}
+    # Under the dashboard's 5 s poll, plus a little: a slow machine must not
+    # pile up requests (the node takes its readings side by side, ~2 s).
+    return _node_get(deployment, f"/pods/{deployment_id}/stats", timeout=6.0, max_bytes=256 * 1024) or {}
 
-    miner_base = _lookup_miner_base_url(deployment.hotkey)
-    if not miner_base:
-        return {}
 
-    url = f"{miner_base}/pods/{deployment_id}/stats"
+@router.get("/platform/deployments/{deployment_id}/logs", response_model=None,
+            responses=ok(schemas.PodLogs, "The last lines of the rental's output"))
+def get_deployment_logs(
+    deployment_id: str,
+    lines: int = 200,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """A running rental's recent output: the last `lines` lines (at most
+    2000) of its start command's log (/workspace/greencompute-command.log)
+    and of its container log (the image's own start command, and the pod's
+    set-up). When either is null, its `_note` says why."""
+    api_key = require_api_key(authorization, x_api_key)
+    deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=api_key.admin)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="deployment not found")
+    if deployment.state != DeploymentState.READY:
+        raise coded(409, "conflict", f"the rental is {deployment.state.value}; logs are there while it runs")
+    lines = max(1, min(int(lines), 2000))
+    # The node keeps 256 KiB of each source's end; JSON escaping can double it.
+    out = _node_get(deployment, f"/pods/{deployment_id}/logs?lines={lines}", timeout=15.0, max_bytes=8 * 1024 * 1024)
+    if out is None:
+        raise coded(503, "unavailable", "the machine running this rental didn't answer; try again shortly",
+                    headers={"Retry-After": "10"})
+    return out
+
+
+#: Commands waited on at once: by this gateway, and per customer. Each holds
+#: a worker thread for up to two minutes, so they are capped.
+_EXEC_TOTAL = threading.BoundedSemaphore(16)
+_EXEC_PER_USER = 4
+_exec_running: dict[str, int] = {}
+_exec_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _exec_slot(user_id: str):
+    with _exec_lock:
+        if _exec_running.get(user_id, 0) >= _EXEC_PER_USER:
+            raise coded(429, "rate_limited", f"at most {_EXEC_PER_USER} commands can run at once; wait for one to finish",
+                        headers={"Retry-After": "5"})
+        if not _EXEC_TOTAL.acquire(blocking=False):
+            raise coded(429, "rate_limited", "too many commands are running right now; try again in a few seconds",
+                        headers={"Retry-After": "5"})
+        _exec_running[user_id] = _exec_running.get(user_id, 0) + 1
     try:
-        req = urllib_request.Request(url, method="GET")
-        # Authenticate to the node-agent the same way the inference client does,
-        # so this relay keeps working once the node :8007 secret is enforced.
-        _agent_secret = os.environ.get("GREENCOMPUTE_INFERENCE_AUTH_SECRET")
-        if _agent_secret:
-            req.add_header("X-Agent-Auth", _agent_secret)
-        with urllib_request.urlopen(req, timeout=3.0) as resp:  # noqa: S310
-            if resp.status != 200:
-                return {}
-            body = resp.read().decode() or "{}"
-            return json.loads(body)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-        return {}
+        yield
+    finally:
+        with _exec_lock:
+            _exec_running[user_id] -= 1
+            if not _exec_running[user_id]:
+                del _exec_running[user_id]
+        _EXEC_TOTAL.release()
+
+
+@router.post("/platform/deployments/{deployment_id}/exec", response_model=None,
+             responses=ok(schemas.ExecResult, "How the command ran"))
+def run_in_deployment(
+    deployment_id: str,
+    payload: schemas.ExecRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Run a shell command in your running rental, as root, from /workspace,
+    without SSH: e.g. update the software on every card in a loop. Returns
+    its exit code and the last 64 KiB of its output. After `timeout_seconds`
+    (at most 120) we stop waiting, but the command may still be running.
+    A job it starts in the background keeps running and doesn't hold this
+    up. Needs the `rentals` scope, like SSH access, and only in your own
+    rentals (an admin key too). Up to 4 at once per account."""
+    api_key = require_api_key(authorization, x_api_key)
+    enforce_rate_limit("deployment_exec", api_key.key_id, limit=60, window_seconds=60)
+    deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=False)
+    # Root in a customer's pod is theirs alone: an admin key gets no more
+    # here than over SSH, where a customer's own keys shut it out.
+    if deployment is None or api_key.user_id is None or deployment.owner_user_id != api_key.user_id:
+        raise HTTPException(status_code=404, detail="deployment not found")
+    if deployment.state != DeploymentState.READY:
+        raise coded(409, "conflict", f"the rental is {deployment.state.value}; commands run while it is ready")
+    if not str(deployment.endpoint or "").startswith("ssh://"):
+        raise coded(409, "conflict", "commands run only in rentals (pods), not in models")
+    # Who ran something where: like the SSH key hand-out, recorded (the
+    # command's hash and length, not its text, which may hold a secret).
+    log.info(
+        "secret_access event=deployment_exec deployment_id=%s key_id=%s user_id=%s ip=%s command_sha256=%s len=%d",
+        deployment_id, api_key.key_id, api_key.user_id, _audit_client_ip(),
+        hashlib.sha256(payload.command.encode()).hexdigest()[:16], len(payload.command),
+    )
+    with _exec_slot(api_key.user_id):
+        outcome, status, data = _node_request(
+            deployment, f"/pods/{deployment_id}/exec", timeout=payload.timeout_seconds + 15.0, max_bytes=1024 * 1024,
+            body={"command": payload.command, "timeout_seconds": payload.timeout_seconds})
+    if outcome == "ok" and isinstance(data, dict):
+        return data
+    if outcome == "refused":
+        code = {400: "invalid_request", 409: "conflict", 429: "rate_limited"}.get(status or 0, "unavailable")
+        headers = {"Retry-After": "5"} if status == 429 else None
+        raise coded(status if status in (400, 409, 429) else 503, code,
+                    data or "the machine running this rental refused the command", headers=headers)
+    if outcome == "unknown":
+        # Sent, but no answer: running it again could run it twice.
+        raise coded(504, "exec_unknown", "no answer from the machine in time: the command may or may not have run. "
+                                         "Check before running it again (e.g. its log, or a quick read-only command)")
+    raise coded(503, "unavailable", "the machine running this rental didn't answer; nothing was run. Try again shortly",
+                headers={"Retry-After": "10"})
 
 
 @router.patch("/platform/deployments/{deployment_id}")

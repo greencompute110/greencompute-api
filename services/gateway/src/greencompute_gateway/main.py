@@ -9,6 +9,7 @@ from starlette.middleware.cors import CORSMiddleware
 from greencompute_persistence import database_ready, load_runtime_settings, render_prometheus_text
 from greencompute_gateway.transport.security import current_client_ip, current_request_route
 from greencompute_gateway.transport.security import metrics as gateway_metrics
+from greencompute_gateway.transport.mcp import router as mcp_router
 from greencompute_gateway.transport.routes import router
 from greencompute_gateway.transport.errors import CrashToJSON, install_error_handlers
 
@@ -34,11 +35,15 @@ def _client_ip_from_request(request) -> str | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Spawn long-running background tasks at startup; cancel them on
-    shutdown: the on-chain crypto deposit watcher, the billing monitor and
-    the credit watch (auto-resume after top-up, low-credit emails)."""
+    shutdown: the on-chain crypto deposit watcher, the billing monitor,
+    the credit watch (auto-resume after top-up, low-credit emails), fleets
+    and webhook delivery."""
     from greencompute_gateway.application.billing_monitor import billing_monitor_loop
     from greencompute_gateway.application.credit_watch import credit_watch_loop
     from greencompute_gateway.application.fleets import fleet_loop
+    from greencompute_gateway.application.webhooks import webhook_loop
+    from greencompute_gateway.application.capacity_alerts import capacity_alert_loop
+    from greencompute_gateway.application.stopped_alerts import stopped_alert_loop
     from greencompute_gateway.infrastructure.deposit_watcher import (
         deposit_watcher_loop,
     )
@@ -48,6 +53,9 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(billing_monitor_loop(), name="billing-monitor"),
         asyncio.create_task(credit_watch_loop(), name="credit-watch"),
         asyncio.create_task(fleet_loop(), name="fleets"),
+        asyncio.create_task(webhook_loop(), name="webhooks"),
+        asyncio.create_task(capacity_alert_loop(), name="capacity-alerts"),
+        asyncio.create_task(stopped_alert_loop(), name="stopped-emails"),
     ]
     try:
         yield
@@ -108,6 +116,7 @@ async def _stash_client_ip(request, call_next):
 
 
 app.include_router(router)
+app.include_router(mcp_router)  # POST /mcp: the API as an MCP server
 install_error_handlers(app)
 
 

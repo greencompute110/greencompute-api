@@ -7,6 +7,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from greencompute_persistence.account_events import add_event, deployment_event
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
 from greencompute_persistence.db import needs_bootstrap
 from greencompute_persistence.orm import (
@@ -617,7 +618,10 @@ class ControlPlaneRepository:
 
     def update_deployment(self, deployment: DeploymentRecord) -> DeploymentRecord:
         with session_scope(self.session_factory) as session:
-            row = session.get(DeploymentORM, deployment.deployment_id)
+            # Locked: two saves at once must not both see the old state and
+            # both record the change.
+            row = session.get(DeploymentORM, deployment.deployment_id, with_for_update=True)
+            previous_state = row.state if row is not None else None
             if row is None:
                 row = DeploymentORM(deployment_id=deployment.deployment_id, workload_id=deployment.workload_id)
             row.owner_user_id = deployment.owner_user_id
@@ -651,6 +655,8 @@ class ControlPlaneRepository:
             row.created_at = deployment.created_at
             row.updated_at = deployment.updated_at
             session.add(row)
+            # Same transaction: the event exists exactly when the change does.
+            add_event(session, deployment_event(row, previous_state))
         return deployment
 
     def list_deployments(self) -> list[DeploymentRecord]:
