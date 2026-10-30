@@ -1060,6 +1060,14 @@ class ControlPlaneRepository:
                 observed_at=row.observed_at,
             )
 
+    def node_api_base_url(self, node_id: str) -> str | None:
+        """The agent API address a node reported with its capacity (None for
+        nodes that don't send it yet)."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(NodeInventoryORM, node_id)
+            value = (row.payload or {}).get("api_base_url") if row is not None else None
+            return value if isinstance(value, str) and value else None
+
     def list_nodes(self) -> list[NodeCapability]:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(select(NodeInventoryORM).order_by(NodeInventoryORM.observed_at.desc())).all()

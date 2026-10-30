@@ -109,3 +109,15 @@ def test_pods_cannot_turn_off_their_own_host_keys():
     from greencompute_gateway.application.services import _RESERVED_ENV
 
     assert "GC_NEW_HOST_KEYS" in _RESERVED_ENV
+
+
+def test_a_nodes_own_api_address_is_kept_from_its_capacity(svc):
+    from greencompute_protocol import CapacityUpdate, MinerRegistration, NodeCapability
+
+    svc.repository.upsert_miner(MinerRegistration(hotkey="hk", payout_address="p", api_base_url="http://172.16.10.12:8007",
+                                                  validator_url="http://v", auth_secret="s3cret-test"))
+    node = NodeCapability(hotkey="hk", node_id="node-a", gpu_model="rtx4090", gpu_count=8, available_gpus=8,
+                          vram_gb_per_gpu=24, cpu_cores=64, memory_gb=256, api_base_url="http://172.16.10.24:8007/")
+    svc.repository.upsert_capacity(CapacityUpdate(hotkey="hk", nodes=[node]))
+    assert svc.repository.node_api_base_url("node-a") == "http://172.16.10.24:8007"
+    assert svc.repository.node_api_base_url("node-b") is None

@@ -1644,7 +1644,16 @@ def _node_request(deployment, path: str, *, timeout: float, max_bytes: int,
       so a POST may or may not have taken effect."""
     if not deployment.hotkey:
         return "unreachable", None, None
-    miner_base = _lookup_miner_base_url(deployment.hotkey)
+    # The box the deployment runs on, by node: several boxes share a hotkey
+    # and the miner record holds one address. The hotkey's address is the
+    # fallback for nodes that don't report their own yet.
+    miner_base = None
+    if getattr(deployment, "node_id", None):
+        try:
+            miner_base = service.control_plane.repository.node_api_base_url(deployment.node_id)
+        except Exception:  # noqa: BLE001
+            miner_base = None
+    miner_base = miner_base or _lookup_miner_base_url(deployment.hotkey)
     if not miner_base:
         return "unreachable", None, None
     data = json.dumps(body).encode() if body is not None else None
