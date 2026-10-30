@@ -244,3 +244,18 @@ def test_run_command_runs_as_the_exec_request(client):
     assert seen == [(("POST", "/platform/deployments/d1/exec"), "d1", "nvidia-smi", 10)]
     assert result["structuredContent"]["exit_code"] == 0
     assert call(c, "run_command", {"deployment_id": "d1"})["isError"] is True
+
+
+def test_list_gpus_reads_the_real_price_list(client):
+    """Against the real /platform/pricing builder, not a stand-in: the GPUs
+    sit under gpu_rental.gpus (a stand-in hid that the tool read `gpus`)."""
+    c, _, mp = client
+    mp.setattr(routes, "_capacity_by_model", lambda: {"rtx4090": {"available_gpus": 5, "max_gpus_per_deployment": 3}})
+    mp.setattr(routes, "_rentable_now", lambda: ["rtx4090"])
+    mp.setattr(routes, "_public_inference_model_names", lambda: [])
+    result = call(c, "list_gpus")
+    assert result["isError"] is False, result
+    gpus = result["structuredContent"]["gpus"]
+    by_model = {g["gpu_model"]: g for g in gpus}
+    assert by_model["rtx4090"]["available_gpus"] == 5 and by_model["rtx4090"]["max_gpus_per_deployment"] == 3
+    assert by_model["rtx4090"]["usd_per_gpu_hour"] > 0
