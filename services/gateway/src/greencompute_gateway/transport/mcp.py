@@ -103,7 +103,7 @@ def _brief(dep: dict) -> dict:
 def t_list_gpus(auth: tuple, args: dict) -> dict:
     r = _routes()
     pricing = _as("GET", "/platform/pricing", r.public_pricing)
-    return {"gpus": pricing.get("gpus", []),
+    return {"gpus": (pricing.get("gpu_rental") or {}).get("gpus", []),
             "note": "Prices are per GPU per hour, charged by the minute while a rental is ready."}
 
 
