@@ -186,3 +186,16 @@ def test_what_went_wrong_decides_whether_to_retry(relay, monkeypatch, outcome, s
         _exec()
     assert (exc.value.status_code, exc.value.error_code) == (status, code)
     assert (exc.value.headers or {}).get("Retry-After") == retry
+
+
+def test_the_relay_finds_the_box_by_node_not_by_the_shared_hotkey(relay, monkeypatch):
+    dep, seen = relay
+    dep.node_id = "node-8x4090-001"
+    monkeypatch.setattr(routes.service.control_plane.repository, "node_api_base_url",
+                        lambda node_id: "http://172.16.10.24:8007" if node_id == "node-8x4090-001" else None,
+                        raising=False)
+    routes.get_deployment_stats("d1", authorization="Bearer k", x_api_key=None)
+    assert seen["url"] == "http://172.16.10.24:8007/pods/d1/stats"
+    dep.node_id = "node-unknown"  # a node that doesn't report its address yet: the hotkey's
+    routes.get_deployment_stats("d1", authorization="Bearer k", x_api_key=None)
+    assert seen["url"] == "http://172.16.10.12:8007/pods/d1/stats"
