@@ -699,3 +699,12 @@ def test_wildcards_in_a_typed_hash_match_nothing(svc, api):
     for typed in ("%", "_", "0xbobspaymen_", "\\"):
         assert svc.repo.tx_credit_owner(typed) is None
         assert svc.repo.tx_credited_to("bob", typed) is False
+
+
+def test_a_review_of_a_payment_already_added_does_not_say_we_did_not_add_it(svc, api):
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    expire(svc, inv["invoice_id"])
+    api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xdup"})
+    api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "dismiss", "reason": "already_credited"})
+    entry = _invoice_entry(api, inv["invoice_id"])
+    assert entry["status_message"] == "We checked the payment you reported. That payment had already been added to your balance."

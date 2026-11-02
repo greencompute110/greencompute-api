@@ -223,7 +223,11 @@ def describe_invoice(inv: dict, received: dict | None = None) -> tuple[str | Non
         )
     if review == "dismissed":
         why, step = explain_reason(inv.get("decision_reason"), inv.get("decision_note"), currency)
-        head = "We checked the payment you reported and didn't add it."
+        head = (
+            "We checked the payment you reported."
+            if inv.get("decision_reason") == "already_credited"
+            else "We checked the payment you reported and didn't add it."
+        )
         return (f"{head} {why}".strip(), step)
     if status == "expired":
         return (
