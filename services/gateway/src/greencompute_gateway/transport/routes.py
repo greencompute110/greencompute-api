@@ -3224,16 +3224,25 @@ def billing_confirm_crypto(
 @router.post("/platform/billing/crypto/{invoice_id}/reject", include_in_schema=False)
 def billing_reject_crypto(
     invoice_id: str,
+    payload: dict | None = None,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     """Admin — reject a crypto invoice. Does NOT credit the user. Marks
-    status as 'rejected' so it drops out of the pending queue. Idempotent.
-    Rejecting a confirmed invoice returns 409 — use admin debit to reverse
-    that flow instead.
+    status as 'rejected' so it drops out of the pending queue, and emails the
+    customer why. Body: {"reason": a code from
+    GET /platform/billing/admin/crypto/reasons, "note": your own words
+    (required for "other")}. Idempotent. Rejecting a confirmed invoice
+    returns 404 — use admin debit to reverse that flow instead.
     """
     require_api_key(authorization, x_api_key, admin_required=True)
-    result = _get_billing().repo.reject_crypto_invoice(invoice_id)
+    from greencompute_gateway.domain.payment_decisions import DecisionError
+
+    payload = payload or {}
+    try:
+        result = _get_billing().reject_invoice(invoice_id, payload.get("reason"), payload.get("note"))
+    except DecisionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if result is None:
         # Either doesn't exist or already confirmed — both look like 409/404.
         # Using 404 for simplicity; admin can refresh to see current state.
@@ -3241,7 +3250,7 @@ def billing_reject_crypto(
             status_code=404,
             detail="invoice not found or already confirmed",
         )
-    return {"rejected": True, "invoice_id": result.invoice_id}
+    return result
 
 
 @router.get("/platform/billing/crypto/invoices", response_model=None, responses=ok(list[schemas.CryptoInvoiceListed]))
@@ -3255,16 +3264,27 @@ def billing_list_crypto_invoices(
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
+    from greencompute_gateway.domain.payment_decisions import describe_invoice
+
     repo = _get_billing().repo
-    reviews = repo.invoice_review_statuses(api_key.user_id)
-    return [
-        {
+    outcomes = repo.invoice_outcomes(api_key.user_id)
+    out = []
+    for inv in repo.list_crypto_invoices(api_key.user_id):
+        extra = outcomes.get(inv.invoice_id, {})
+        item = {
             **inv.model_dump(mode="json"),
             "amount_to_send": f"{inv.amount_crypto:.6f}",
-            "review_status": reviews.get(inv.invoice_id),
+            "review_status": extra.get("review_status"),
+            "decision_reason": extra.get("decision_reason"),
         }
-        for inv in repo.list_crypto_invoices(api_key.user_id)
-    ]
+        message, next_step = describe_invoice(
+            {**item, "amount_crypto": inv.amount_crypto, "decision_note": extra.get("decision_note")},
+            extra.get("received"),
+        )
+        item["status_message"] = message
+        item["next_step"] = next_step
+        out.append(item)
+    return out
 
 
 def _require_user(authorization: str | None, x_api_key: str | None) -> str:
@@ -3442,6 +3462,19 @@ def billing_admin_list_deposits(
     return _get_billing().repo.list_deposits_for_admin(status=status, limit=max(1, min(limit, 500)))
 
 
+@router.get("/platform/billing/admin/crypto/reasons", include_in_schema=False)
+def billing_admin_payment_reasons(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> list[dict]:
+    """Admin — the reasons a review can be dismissed ("review") or an invoice
+    rejected ("reject") with; the customer is emailed the matching text."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    from greencompute_gateway.domain.payment_decisions import reason_list
+
+    return reason_list()
+
+
 @router.get("/platform/billing/admin/crypto/reviews", include_in_schema=False)
 def billing_admin_list_reviews(
     authorization: str | None = Header(default=None),
@@ -3461,13 +3494,16 @@ def billing_admin_resolve_review(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     """Admin — close a review. Body: {"action": "credit_deposit" (with
-    "deposit_ref") | "confirm_invoice" | "dismiss"}."""
+    "deposit_ref") | "confirm_invoice" | "dismiss" (with "reason" from
+    GET /platform/billing/admin/crypto/reasons, and "note", required for
+    "other")}. A dismissal emails the customer the reason."""
     require_api_key(authorization, x_api_key, admin_required=True)
     from greencompute_gateway.application.billing_service import ReviewError
 
     try:
         return _get_billing().resolve_review(
-            invoice_id, str(payload.get("action") or ""), payload.get("deposit_ref")
+            invoice_id, str(payload.get("action") or ""), payload.get("deposit_ref"),
+            reason=payload.get("reason"), note=payload.get("note"),
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="invoice not found") from exc

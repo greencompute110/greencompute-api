@@ -285,7 +285,7 @@ def test_dismissed_review_says_we_could_not_match_it(svc, sent, api):
     inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
     api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xnope"})
     sent.clear()
-    api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "dismiss"})
+    api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "dismiss", "reason": "tx_not_found"})
     [email] = sent
     assert (email["type"], email["outcome"], email["amount_usd"], email["balance_usd"]) == ("review_resolved", "dismissed", None, None)
     assert (email["invoice_amount_usd"], email["crypto_amount"], email["tx_hash"]) == (20.0, inv["amount_to_send"], "0xnope")
@@ -299,7 +299,7 @@ def test_dismissing_a_review_paid_some_other_way_sends_no_couldnt_match(svc, sen
     link(svc, "alice", payer)
     svc.resolve_deposit(deposit("tao:3:1", "tao", 90_000_000, sender=payer.ss58_address, tx="0xwrongamount"))
     sent.clear()
-    api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "dismiss"})
+    api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "dismiss", "reason": "tx_not_found"})
     assert sent == []
 
 
@@ -420,3 +420,151 @@ def test_an_error_building_the_email_never_reaches_the_payment(monkeypatch):
     svc.repo = None
     assert svc._email_deposit("u1", {"deposit_ref": "x"}, 100, 200) is None
     assert svc._email_review_resolved({}, "credited") is None
+
+
+# --- why a payment wasn't added, or was added at another amount ---------------------
+
+
+def _invoice_entry(api, invoice_id):
+    return next(i for i in api.call("billing_list_crypto_invoices") if i["invoice_id"] == invoice_id)
+
+
+def test_dismissing_a_review_needs_a_reason_the_customer_is_told(svc, sent, api):
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xnope"})
+    for body in ({"action": "dismiss"}, {"action": "dismiss", "reason": "bogus"},
+                 {"action": "dismiss", "reason": "not_paid"},  # a reason for rejecting invoices only
+                 {"action": "dismiss", "reason": "other"}):  # "other" needs the words
+        with pytest.raises(Exception) as exc:
+            api.call("billing_admin_resolve_review", inv["invoice_id"], body)
+        assert getattr(exc.value, "status_code", None) == 409
+    assert _invoice_entry(api, inv["invoice_id"])["review_status"] == "open"
+
+    sent.clear()
+    api.call("billing_admin_resolve_review", inv["invoice_id"],
+             {"action": "dismiss", "reason": "tx_not_found", "note": "Hash ends in a typo?"})
+    [email] = sent
+    assert email["reason"] == ("We couldn't find that transaction on the Base network. "
+                               "Note from our team: Hash ends in a typo?")
+    assert email["next_step"].startswith("Check the transaction hash") and "on Base" in email["next_step"]
+
+    entry = _invoice_entry(api, inv["invoice_id"])
+    assert (entry["review_status"], entry["decision_reason"]) == ("dismissed", "tx_not_found")
+    assert entry["status_message"] == f"We checked the payment you reported and didn't add it. {email['reason']}"
+    assert entry["next_step"] == email["next_step"]
+
+
+def test_other_reason_is_the_staff_note(svc, sent, api):
+    inv = svc.create_crypto_invoice("alice", "tao", 30)
+    api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xmixer"})
+    sent.clear()
+    api.call("billing_admin_resolve_review", inv["invoice_id"],
+             {"action": "dismiss", "reason": "other", "note": "The transfer was reversed by your exchange."})
+    [email] = sent
+    assert email["reason"] == "The transfer was reversed by your exchange."
+    assert "support@green-compute.com" in email["next_step"]
+
+
+def test_rejecting_an_invoice_needs_a_reason_and_emails_it_once(svc, sent, api):
+    inv = svc.create_crypto_invoice("alice", "alpha", 25)
+    with pytest.raises(Exception) as exc:
+        api.call("billing_reject_crypto", inv["invoice_id"], {})
+    assert exc.value.status_code == 400
+    with pytest.raises(Exception) as exc:
+        api.call("billing_reject_crypto", inv["invoice_id"], {"reason": "tx_not_found"})  # review-only reason
+    assert exc.value.status_code == 400
+
+    sent.clear()
+    res = api.call("billing_reject_crypto", inv["invoice_id"], {"reason": "duplicate"})
+    assert res == {"rejected": True, "invoice_id": inv["invoice_id"], "reason": "duplicate"}
+    [email] = sent
+    assert (email["type"], email["invoice_amount_usd"], email["currency"]) == ("invoice_rejected", 25.0, "alpha")
+    assert email["crypto_amount"] == inv["amount_to_send"]
+    assert email["reason"] == "It duplicated another of your invoices, which is the one we used."
+    assert email["next_step"] is None
+
+    api.call("billing_reject_crypto", inv["invoice_id"], {"reason": "not_paid"})  # again: nothing new
+    assert len(sent) == 1
+    entry = _invoice_entry(api, inv["invoice_id"])
+    assert (entry["status"], entry["decision_reason"]) == ("rejected", "duplicate")
+    assert entry["status_message"] == "This invoice was cancelled. " + email["reason"]
+
+
+def test_a_credited_invoice_cannot_be_rejected(svc, sent, api):
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    svc.resolve_deposit(deposit("usdc-base:0xok:0", "usdc-base", units(svc, inv["invoice_id"]), tx="0xok"))
+    sent.clear()
+    with pytest.raises(Exception) as exc:
+        api.call("billing_reject_crypto", inv["invoice_id"], {"reason": "duplicate"})
+    assert exc.value.status_code == 404
+    assert sent == []
+
+
+def test_an_exact_payment_needs_no_explanation(svc, sent, api):
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    svc.resolve_deposit(deposit("usdc-base:0xok:0", "usdc-base", units(svc, inv["invoice_id"]), tx="0xok"))
+    [email] = sent
+    assert email["note"] is None
+    entry = _invoice_entry(api, inv["invoice_id"])
+    assert (entry["status"], entry["status_message"], entry["next_step"]) == ("confirmed", None, None)
+
+
+def test_paying_less_than_the_invoice_says_so(svc, sent, api):
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    assert svc.resolve_deposit(deposit("usdc-base:0xless:0", "usdc-base", 15_000_000, tx="0xless")) == "invoice_underpay"
+    [email] = sent
+    assert email["amount_usd"] == 15.0
+    assert email["note"] == (
+        f"15.000000 USDC on Base arrived, less than the {inv['amount_to_send']} USDC on Base the invoice asked "
+        "for, so we added what arrived, at the invoice's rate."
+    )
+    assert _invoice_entry(api, inv["invoice_id"])["status_message"] == email["note"]
+
+
+def test_paying_after_expiry_says_it_was_valued_on_arrival(svc, sent, api):
+    inv = svc.create_crypto_invoice("alice", "tao", 30)
+    expire(svc, inv["invoice_id"])
+    svc.resolve_deposit(deposit("tao:9:1", "tao", units(svc, inv["invoice_id"]) * 1000, tx="0xlate"))
+    [email] = sent
+    assert "arrived after the invoice had expired" in email["note"]
+    assert "arrived after the invoice had expired" in _invoice_entry(api, inv["invoice_id"])["status_message"]
+
+
+def test_a_review_credited_at_another_amount_explains_it(svc, sent, api):
+    inv = svc.create_crypto_invoice("alice", "usdc-base", 10)
+    expire(svc, inv["invoice_id"])
+    # 25 USDC is outside 50%-200% of a $10 invoice: left unmatched.
+    assert svc.resolve_deposit(deposit("usdc-base:0xbig:0", "usdc-base", 25_000_000, tx="0xbig")) == "unmatched"
+    api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xbig"})
+    sent.clear()
+    api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "credit_deposit", "deposit_ref": "usdc-base:0xbig:0"})
+    [email] = sent
+    assert (email["type"], email["outcome"], email["amount_usd"]) == ("review_resolved", "credited", 25.0)
+    assert email["note"].startswith("25.000000 USDC on Base arrived, more than the")
+    entry = _invoice_entry(api, inv["invoice_id"])
+    assert (entry["status"], entry["status_message"]) == ("confirmed", email["note"])
+
+
+def test_open_review_and_expired_invoice_say_where_things_stand(svc, api):
+    waiting = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    expire(svc, waiting["invoice_id"])
+    lapsed = svc.create_crypto_invoice("alice", "usdc-base", 30)
+    expire(svc, lapsed["invoice_id"])
+    pending = svc.create_crypto_invoice("alice", "usdc-base", 40)
+    api.call("billing_request_review", waiting["invoice_id"], {"tx_hash": "0xchk"})
+
+    entry = _invoice_entry(api, waiting["invoice_id"])
+    assert entry["status_message"].startswith("We're checking the payment you reported")
+    assert entry["next_step"] is None
+    entry = _invoice_entry(api, lapsed["invoice_id"])
+    assert entry["status_message"] == "This invoice expired without a payment we could match to it."
+    assert "verify the wallet you paid from" in entry["next_step"]
+    entry = _invoice_entry(api, pending["invoice_id"])
+    assert (entry["status_message"], entry["next_step"]) == (None, None)
+
+
+def test_admin_reason_list(api):
+    reasons = {r["code"]: r for r in api.call("billing_admin_payment_reasons")}
+    assert set(reasons["tx_not_found"]["applies"]) == {"review"}
+    assert set(reasons["not_paid"]["applies"]) == {"reject"}
+    assert set(reasons["other"]["applies"]) == {"review", "reject"}

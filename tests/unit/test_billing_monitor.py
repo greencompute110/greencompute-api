@@ -10,6 +10,8 @@ from greencompute_gateway.application import billing_monitor as mon
 from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 from greencompute_persistence import session_scope
 from greencompute_persistence.orm import (
+    CryptoDepositORM,
+    CryptoInvoiceORM,
     DeploymentORM,
     KeyValueStateORM,
     LedgerEntryORM,
@@ -205,3 +207,38 @@ def test_snapshot_reports_without_remembering(sf):
     assert snap["today"]["topups"]["manual"] == {"count": 1, "cents": 5000}
     with session_scope(sf) as s:
         assert s.query(KeyValueStateORM).filter(KeyValueStateORM.key.like("monitor:%")).count() == 0
+
+
+def test_money_waiting_on_us_is_reported_daily_until_handled(sf):
+    with session_scope(sf) as s:
+        s.add(CryptoInvoiceORM(
+            invoice_id="inv-old", user_id="alice", currency="usdt-eth", amount_crypto=10.0, amount_usd=10.0,
+            total_credits=1000, deposit_address="0xours", status="expired", tx_hash="0xfacffa85e65a2395",
+            expires_at=NOW - timedelta(days=9), created_at=NOW - timedelta(days=9),
+            review_status="open", review_requested_at=NOW - timedelta(days=9),
+        ))
+        s.add(CryptoInvoiceORM(  # asked an hour ago: not overdue yet
+            invoice_id="inv-new", user_id="bob", currency="tao", amount_crypto=0.1, amount_usd=30.0,
+            total_credits=3000, deposit_address="5ours", status="expired", tx_hash="0xabc",
+            expires_at=NOW - timedelta(hours=2), created_at=NOW - timedelta(hours=2),
+            review_status="open", review_requested_at=NOW - timedelta(hours=1),
+        ))
+        s.add(CryptoDepositORM(
+            deposit_ref="usdt-eth:0xfacffa85:65", currency="usdt-eth", tx_hash="0xfacffa85", sender="0x18e296053cbd",
+            deposit_address="0xours", amount_raw=11_000_000, decimals=6, block_number=1,
+            status="unmatched", observed_at=NOW - timedelta(days=9),
+        ))
+    result, text = run(sf)
+    assert checks(result) == ["waiting_deposit", "waiting_review"]
+    assert "alice has waited 9 days for a payment review (invoice inv-old, USDT-ETH $10.00" in text
+    assert "a payment of 11 USDT-ETH from 0x18e296053c has been credited to nobody for 9 days" in text
+
+    assert checks(run(sf, NOW + timedelta(hours=6))[0]) == []  # not every pass
+    assert checks(run(sf, NOW + timedelta(hours=25))[0]) == ["waiting_deposit", "waiting_review", "waiting_review"]
+
+    with session_scope(sf) as s:  # handled
+        s.get(CryptoInvoiceORM, "inv-old").review_status = "resolved"
+        s.get(CryptoInvoiceORM, "inv-new").review_status = "dismissed"
+        s.get(CryptoDepositORM, "usdt-eth:0xfacffa85:65").status = "credited"
+    assert checks(run(sf, NOW + timedelta(hours=50))[0]) == []
+    assert mon.snapshot(sf, NOW + timedelta(hours=50))["problems"] == []

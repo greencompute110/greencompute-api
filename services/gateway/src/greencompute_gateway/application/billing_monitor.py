@@ -12,6 +12,8 @@ rather than at the end of the month. Every few minutes it checks:
   - credits worth a look: manual ones, large ones, and new accounts topping
     up repeatedly; plus refunds and admin debits;
   - spend spikes: an account spending far above its usual rate;
+  - customers' money waiting on us: a payment review nobody has closed, or a
+    payment nobody was credited for, after a day (re-reported daily);
 
 and once a day it posts a summary of top-ups, spend and balances. Findings go
 to the team's alert channel (see infrastructure/alerts.py) and the log;
@@ -51,6 +53,8 @@ NEW_ACCOUNT = timedelta(days=7)
 REPEAT_TOPUPS = 3  # top-ups within 24h by a new account
 SPIKE_FACTOR = 3  # times the account's usual hourly spend
 REALERT_AFTER = timedelta(hours=6)  # a problem still there is reported again
+WAITING_AFTER = timedelta(hours=24)  # a review or unmatched payment this old is overdue
+REALERT_WAITING = timedelta(hours=24)  # …and reported again once a day until handled
 FIRST_RUN_LOOKBACK = timedelta(hours=1)
 CURSOR_OVERLAP = timedelta(minutes=5)  # ledger rows commit slightly out of order
 SENT_RETENTION = timedelta(days=7)
@@ -202,6 +206,48 @@ def stalled_watchers(session, now: datetime) -> list[Finding]:
             "stalled_watcher", f"watcher:{chain}:{row.value}", PROBLEM,
             f"payments on {label} aren't being detected: the deposit watcher has been stuck at block "
             f"{row.value} for {hours:.1f} h (gateway logs: 'watcher {chain}')",
+        ))
+    return out
+
+
+def _waited(delta: timedelta) -> str:
+    hours = delta.total_seconds() / 3600
+    return f"{hours:.0f} h" if hours < 48 else f"{hours / 24:.0f} days"
+
+
+def waiting_payments(session, now: datetime) -> list[Finding]:
+    """Customers' money waiting on us for more than WAITING_AFTER: a payment
+    review still open, or a payment logged but credited to nobody. (Four
+    reviews sat for up to 18 days in October 2026, one of them a real
+    customer's 11 USDT, with only the first email ever sent about them.)"""
+    cutoff = now - WAITING_AFTER
+    out = []
+    reviews = session.execute(
+        select(CryptoInvoiceORM).where(
+            CryptoInvoiceORM.review_status == "open",
+            CryptoInvoiceORM.review_requested_at < cutoff,
+        ).order_by(CryptoInvoiceORM.review_requested_at)
+    ).scalars().all()
+    names = _names(session, [r.user_id for r in reviews])
+    for inv in reviews:
+        out.append(Finding(
+            "waiting_review", f"waiting:review:{inv.invoice_id}", PROBLEM,
+            f"{names.get(inv.user_id, inv.user_id[:8])} has waited {_waited(now - _aware(inv.review_requested_at))} "
+            f"for a payment review (invoice {inv.invoice_id[:8]}, {inv.currency.upper()} ${inv.amount_usd:,.2f}, "
+            f"tx {(inv.tx_hash or '?')[:14]}): close it under Billing admin > Review requests",
+        ))
+    for dep in session.execute(
+        select(CryptoDepositORM).where(
+            CryptoDepositORM.status == "unmatched",
+            CryptoDepositORM.observed_at < cutoff,
+        ).order_by(CryptoDepositORM.observed_at)
+    ).scalars().all():
+        amount = dep.amount_raw / (10 ** dep.decimals)
+        out.append(Finding(
+            "waiting_deposit", f"waiting:deposit:{dep.deposit_ref}", PROBLEM,
+            f"a payment of {amount:g} {dep.currency.upper()} from {dep.sender[:12]} has been credited to nobody "
+            f"for {_waited(now - _aware(dep.observed_at))} (tx {(dep.tx_hash or dep.deposit_ref)[:14]}): "
+            "assign it under Billing admin > Unmatched deposits",
         ))
     return out
 
@@ -432,7 +478,8 @@ class _State:
         """Report a finding once; a recurring problem again after REALERT_AFTER."""
         sent = self.get(f"sent:{finding.key}")
         once = finding.key.startswith(("credit:", "neg:", "repeat:"))
-        if sent is not None and (once or _aware(sent.updated_at) > now - REALERT_AFTER):
+        again = REALERT_WAITING if finding.key.startswith("waiting:") else REALERT_AFTER
+        if sent is not None and (once or _aware(sent.updated_at) > now - again):
             return False
         self.put(f"sent:{finding.key}", finding.check, now)
         return True
@@ -497,6 +544,7 @@ def run_once(session_factory, now: datetime | None = None, send=None) -> dict:
             + notable_credits(session, since, now)
             + spend_spikes(session, now)
             + stalled_watchers(session, now)
+            + waiting_payments(session, now)
         )
         new = [f for f in findings if state.due(f, now)]
         state.put("cursor:ledger", now.isoformat(), now)
@@ -536,6 +584,7 @@ def snapshot(session_factory, now: datetime | None = None) -> dict:
             + notable_credits(session, day_ago, now)
             + spend_spikes(session, now)
             + stalled_watchers(session, now)
+            + waiting_payments(session, now)
         )
         today = summary(session, datetime.combine(now.date(), time(), tzinfo=UTC), now)
     return {

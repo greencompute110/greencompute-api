@@ -322,7 +322,19 @@ class CryptoInvoiceCreated(BaseModel):
 
 class CryptoInvoiceListed(CryptoInvoice):
     amount_to_send: str
-    review_status: str | None = None
+    review_status: str | None = Field(
+        default=None, description="`open`, `resolved` or `dismissed` once you asked us to check a payment."
+    )
+    decision_reason: str | None = Field(
+        default=None, description="Why we dismissed your review or rejected the invoice, as a code; "
+                                  "`status_message` says it in words.",
+    )
+    status_message: str | None = Field(
+        default=None, description="What happened to this invoice, in words, when there is more to say than "
+                                  "`status`: a review in progress or closed, a rejection, or a payment added "
+                                  "at a different amount.",
+    )
+    next_step: str | None = Field(default=None, description="What you can do about it, if anything.")
 
 
 def ok(model, description: str = "Success") -> dict:

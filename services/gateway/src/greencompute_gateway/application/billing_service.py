@@ -10,6 +10,7 @@ import random
 from sqlalchemy.exc import IntegrityError
 
 from greencompute_protocol import CryptoInvoice, LedgerEntry, StripeSession
+from greencompute_gateway.domain.payment_decisions import DecisionError, check_reason, credited_note, explain_reason
 from greencompute_gateway.infrastructure.billing_repository import BillingRepository, InsufficientBalanceError
 from greencompute_gateway.infrastructure.wallet_signatures import (
     CURRENCY_CHAIN,
@@ -674,9 +675,11 @@ class BillingService:
                 invoice_id=inv["invoice_id"], user_id=inv["user_id"],
                 credited_cents=result["total_credits"],
             )
+            amount = deposit["amount_raw"] / (10 ** deposit["decimals"])
             self._email_deposit(
                 inv["user_id"], deposit, result["total_credits"], result.get("balance_after"),
                 bonus_pct=inv["bonus_pct"],
+                note=credited_note(how, asked=_invoice_token_amount(inv), received=amount, currency=inv["currency"]),
             )
             return how
         # Already credited by an earlier tick.
@@ -685,14 +688,24 @@ class BillingService:
 
     # --- Payment reviews ---
 
-    def resolve_review(self, invoice_id: str, action: str, deposit_ref: str | None = None) -> dict:
+    def resolve_review(
+        self,
+        invoice_id: str,
+        action: str,
+        deposit_ref: str | None = None,
+        *,
+        reason: str | None = None,
+        note: str | None = None,
+    ) -> dict:
         """Admin: close a user's review request.
 
         - "credit_deposit": credit the logged deposit `deposit_ref` to the
           invoice's owner, at what actually arrived (bonus included).
         - "confirm_invoice": credit the invoice's own amount against the
           reported transaction, even if the invoice expired meanwhile.
-        - "dismiss": close it without crediting anything.
+        - "dismiss": close it without crediting anything. Needs a `reason`
+          from domain/payment_decisions.REASONS (and `note` for "other"):
+          the customer is told why and what to do next.
         """
         review = self.repo.get_invoice_review(invoice_id)
         if review is None:
@@ -701,10 +714,14 @@ class BillingService:
             raise ReviewError("this review is not open")
 
         if action == "dismiss":
-            self.repo.set_review_status(invoice_id, "dismissed")
+            try:
+                reason, note = check_reason(reason, note, "review")
+            except DecisionError as exc:
+                raise ReviewError(str(exc)) from exc
+            self.repo.set_review_status(invoice_id, "dismissed", reason=reason, note=note)
             if not self._paid_elsewhere(review):
-                self._email_review_resolved(review, "dismissed")
-            return {"invoice_id": invoice_id, "review_status": "dismissed"}
+                self._email_review_resolved({**review, "decision_reason": reason, "decision_note": note}, "dismissed")
+            return {"invoice_id": invoice_id, "review_status": "dismissed", "reason": reason}
 
         if action == "credit_deposit":
             # One email for this, the review's: not payment_received as well.
@@ -714,9 +731,15 @@ class BillingService:
             if not result or not result.get("credited"):
                 raise ReviewError("that deposit was already credited")
             self.repo.set_review_status(invoice_id, "resolved", paid_tx=dep["tx_hash"] or "")
+            # The deposit paid this invoice: its list entry can then explain a
+            # different amount.
+            self.repo.mark_deposit(dep["deposit_ref"], invoice_id=invoice_id)
             self._email_review_resolved(
                 review, "credited", cents=result["amount_cents"], balance_cents=result.get("balance_after"),
                 currency=dep["currency"], crypto_amount=_token_amount(dep["amount"]), tx_hash=dep["tx_hash"],
+                note=credited_note(
+                    "admin", asked=_invoice_token_amount(review), received=dep["amount"], currency=dep["currency"],
+                ),
             )
             return {"invoice_id": invoice_id, "review_status": "resolved", "credited_cents": result["amount_cents"]}
 
@@ -749,6 +772,21 @@ class BillingService:
             return {"invoice_id": invoice_id, "review_status": "resolved", "credited_cents": review["total_credits"]}
 
         raise ReviewError("action must be credit_deposit, confirm_invoice or dismiss")
+
+    def reject_invoice(self, invoice_id: str, reason: str | None, note: str | None) -> dict | None:
+        """Admin: reject an invoice so it is never credited, with a reason the
+        customer is emailed. None if it doesn't exist or was already credited.
+        Rejecting it again changes nothing and sends nothing."""
+        reason, note = check_reason(reason, note, "reject")
+        before = self.repo.get_invoice_review(invoice_id)
+        if before is None or before["status"] == "confirmed":
+            return None
+        inv = self.repo.reject_crypto_invoice(invoice_id, reason=reason, note=note)
+        if inv is None:
+            return None
+        if before["status"] != "rejected":
+            self._email_invoice_rejected({**before, "decision_reason": reason, "decision_note": note})
+        return {"rejected": True, "invoice_id": invoice_id, "reason": reason}
 
     # --- Verified wallets ---
 
@@ -923,10 +961,13 @@ class BillingService:
         tx_hash: str | None = None,
         bonus_pct: float = 0.0,
         via_review: bool = False,
+        note: str | None = None,
     ) -> None:
-        """payment_received: `cents` were added to the balance (bonus included)."""
+        """payment_received: `cents` were added to the balance (bonus included).
+        `note` says why that differs from the invoice, when it does."""
         self._email(
             user_id, "payment_received", event_id,
+            note=note,
             amount_usd=_usd(cents),
             method=method,
             currency=currency,
@@ -940,7 +981,13 @@ class BillingService:
 
     @_email_safely
     def _email_deposit(
-        self, user_id: str, dep: dict, cents: int, balance_cents: int | None, bonus_pct: float | None = None
+        self,
+        user_id: str,
+        dep: dict,
+        cents: int,
+        balance_cents: int | None,
+        bonus_pct: float | None = None,
+        note: str | None = None,
     ) -> None:
         """payment_received for a logged on-chain transfer. One email per
         transfer: its deposit_ref is the ledger's unique key."""
@@ -951,6 +998,7 @@ class BillingService:
             crypto_amount=_token_amount(dep["amount_raw"] / (10 ** dep["decimals"])),
             tx_hash=dep.get("tx_hash"),
             bonus_pct=BONUS_RATES.get(_base_currency(dep["currency"]), 0.0) if bonus_pct is None else bonus_pct,
+            note=note,
         )
 
     def _invoice_review(self, invoice_id: str) -> dict | None:
@@ -999,18 +1047,39 @@ class BillingService:
         currency: str | None = None,
         crypto_amount: str | None = None,
         tx_hash: str | None = None,
+        note: str | None = None,
     ) -> None:
-        """review_resolved: "credited" (what was added) or "dismissed". When
-        the review credits, this is the only email: no payment_received."""
+        """review_resolved: "credited" (what was added) or "dismissed" (with
+        why and what to do next). When the review credits, this is the only
+        email: no payment_received."""
+        why = next_step = None
+        if outcome == "dismissed":
+            why, next_step = explain_reason(review.get("decision_reason"), review.get("decision_note"), review["currency"])
         self._email(
             review["user_id"], "review_resolved", None,
             outcome=outcome,
+            reason=why or None,
+            next_step=next_step,
+            note=note,
             amount_usd=_usd(cents),
             balance_usd=_usd(balance_cents),
             invoice_amount_usd=round(review["amount_usd"], 2),
             currency=currency or review["currency"],
             crypto_amount=crypto_amount or _invoice_token_amount(review),
             tx_hash=(tx_hash if tx_hash is not None else review["tx_hash"]) or None,
+        )
+
+    @_email_safely
+    def _email_invoice_rejected(self, inv: dict) -> None:
+        """invoice_rejected: staff rejected an invoice; why and what to do next."""
+        why, next_step = explain_reason(inv.get("decision_reason"), inv.get("decision_note"), inv["currency"])
+        self._email(
+            inv["user_id"], "invoice_rejected", f"invoice_rejected:{inv['invoice_id']}",
+            invoice_amount_usd=round(inv["amount_usd"], 2),
+            currency=inv["currency"],
+            crypto_amount=_invoice_token_amount(inv),
+            reason=why or None,
+            next_step=next_step,
         )
 
     # --- Usage deduction ---

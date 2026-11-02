@@ -566,7 +566,7 @@ def test_admin_confirms_an_expired_invoice_after_review_and_nothing_pays_twice(a
 def test_dismissed_review_credits_nothing(api, svc):
     inv = svc.create_crypto_invoice("alice", "usdc-base", 20)
     api.call("billing_request_review", inv["invoice_id"], {"tx_hash": "0xnope"})
-    assert api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "dismiss"})["review_status"] == "dismissed"
+    assert api.call("billing_admin_resolve_review", inv["invoice_id"], {"action": "dismiss", "reason": "tx_not_found"})["review_status"] == "dismissed"
     assert balance(svc, "alice") == 0
     assert api.status("billing_admin_resolve_review", inv["invoice_id"], {"action": "confirm_invoice"}) == 409
 

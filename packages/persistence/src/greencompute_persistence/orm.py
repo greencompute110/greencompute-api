@@ -957,6 +957,11 @@ class CryptoInvoiceORM(Base):
     review_status: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     review_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Why staff dismissed the review or rejected the invoice: a code from the
+    # gateway's domain/payment_decisions.REASONS, their own words, and when.
+    decision_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class CryptoDepositORM(Base):

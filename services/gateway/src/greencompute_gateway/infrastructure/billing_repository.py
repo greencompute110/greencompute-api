@@ -636,12 +636,15 @@ class BillingRepository:
             )
             return result.rowcount or 0
 
-    def reject_crypto_invoice(self, invoice_id: str) -> CryptoInvoice | None:
-        """Admin action: mark invoice as rejected and never credit it.
+    def reject_crypto_invoice(
+        self, invoice_id: str, *, reason: str | None = None, note: str | None = None
+    ) -> CryptoInvoice | None:
+        """Admin action: mark invoice as rejected and never credit it, with
+        why (see domain/payment_decisions.py).
 
-        Idempotent — rejecting a rejected invoice is a no-op. Rejecting a
-        confirmed invoice returns None (can't undo a credited invoice here;
-        use admin debit if you need to claw back funds).
+        Idempotent — rejecting a rejected invoice is a no-op and keeps the
+        first reason. Rejecting a confirmed invoice returns None (can't undo a
+        credited invoice here; use admin debit if you need to claw back funds).
         """
         with session_scope(self.session_factory) as session:
             row = session.get(CryptoInvoiceORM, invoice_id)
@@ -649,7 +652,11 @@ class BillingRepository:
                 return None
             if row.status == "confirmed":
                 return None
-            row.status = "rejected"
+            if row.status != "rejected":
+                row.status = "rejected"
+                if reason:
+                    row.decision_reason, row.decision_note = reason, note
+                    row.decided_at = datetime.now(UTC)
             session.add(row)
             return self._to_crypto_invoice(row)
 
@@ -715,15 +722,40 @@ class BillingRepository:
                 ).limit(1)
             )
 
-    def invoice_review_statuses(self, user_id: str) -> dict[str, str]:
+    def invoice_outcomes(self, user_id: str) -> dict[str, dict]:
+        """Per invoice of this user that has something to explain: its review
+        status, staff decision, and the deposit credited for it (amount, how it
+        was matched). Feeds describe_invoice for the invoice list."""
         with session_scope(self.session_factory) as session:
-            rows = session.execute(
-                select(CryptoInvoiceORM.invoice_id, CryptoInvoiceORM.review_status).where(
-                    CryptoInvoiceORM.user_id == user_id,
-                    CryptoInvoiceORM.review_status.is_not(None),
+            invoices = session.execute(
+                select(
+                    CryptoInvoiceORM.invoice_id, CryptoInvoiceORM.review_status,
+                    CryptoInvoiceORM.decision_reason, CryptoInvoiceORM.decision_note,
+                    CryptoInvoiceORM.tx_hash, CryptoInvoiceORM.status,
+                ).where(CryptoInvoiceORM.user_id == user_id)
+            ).all()
+            out = {
+                inv_id: {"review_status": review, "decision_reason": reason, "decision_note": note}
+                for inv_id, review, reason, note, _tx, _status in invoices
+            }
+            deposits = session.scalars(
+                select(CryptoDepositORM).where(
+                    CryptoDepositORM.user_id == user_id, CryptoDepositORM.status == "credited"
                 )
             ).all()
-            return {invoice_id: status for invoice_id, status in rows}
+            by_invoice = {d.invoice_id: d for d in deposits if d.invoice_id}
+            by_tx = {(d.tx_hash or "").lower(): d for d in deposits if d.tx_hash}
+            for inv_id, _review, _reason, _note, tx, status in invoices:
+                if status != "confirmed":
+                    continue
+                dep = by_invoice.get(inv_id) or by_tx.get((tx or "").lower())
+                if dep is not None:
+                    out[inv_id]["received"] = {
+                        "amount": dep.amount_raw / (10 ** dep.decimals),
+                        "matched_by": dep.matched_by,
+                        "credited_cents": dep.credited_cents,
+                    }
+            return out
 
     def get_invoice_review(self, invoice_id: str) -> dict | None:
         with session_scope(self.session_factory) as session:
@@ -742,16 +774,30 @@ class BillingRepository:
                 "status": row.status,
                 "tx_hash": row.tx_hash,
                 "review_status": row.review_status,
+                "decision_reason": row.decision_reason,
+                "decision_note": row.decision_note,
             }
 
-    def set_review_status(self, invoice_id: str, review_status: str, *, paid_tx: str | None = None) -> None:
-        """Close a review. With `paid_tx`, also mark the invoice confirmed:
-        its payment has been credited (possibly at a different amount)."""
+    def set_review_status(
+        self,
+        invoice_id: str,
+        review_status: str,
+        *,
+        paid_tx: str | None = None,
+        reason: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Close a review, with why when it was dismissed. With `paid_tx`,
+        also mark the invoice confirmed: its payment has been credited
+        (possibly at a different amount)."""
         with session_scope(self.session_factory) as session:
             row = session.get(CryptoInvoiceORM, invoice_id)
             if row is None:
                 return
             row.review_status = review_status
+            if reason:
+                row.decision_reason, row.decision_note = reason, note
+                row.decided_at = datetime.now(UTC)
             if paid_tx is not None and row.status != "confirmed":
                 row.status = "confirmed"
                 row.tx_hash = paid_tx or row.tx_hash
