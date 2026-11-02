@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
@@ -1027,12 +1027,15 @@ class BillingRepository:
     @staticmethod
     def _manual_credit_row(session, currency: str, tx_hash: str | None):
         # Any currency: the user may have paid in a different token than the
-        # invoice they were credited for. Hashes are hex, so LIKE is safe.
+        # invoice they were credited for.
         if not tx_hash:
             return None
+        # A customer types the hash: escape LIKE's wildcards and escape
+        # character so "%" can't match every manual credit.
+        tx = tx_hash.strip().lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return session.scalar(
             select(LedgerEntryORM).where(
-                func.lower(LedgerEntryORM.deposit_ref).like(f"manual:%:{tx_hash.strip().lower()}")
+                func.lower(LedgerEntryORM.deposit_ref).like(f"manual:%:{tx}", escape="\\")
             )
         )
 
@@ -1043,17 +1046,26 @@ class BillingRepository:
         if not tx:
             return None
         with session_scope(self.session_factory) as session:
-            user_id = session.scalar(
-                select(CryptoDepositORM.user_id).where(
-                    func.lower(CryptoDepositORM.tx_hash) == tx,
-                    CryptoDepositORM.status == "credited",
-                ).limit(1)
-            )
+            logged = session.execute(
+                select(CryptoDepositORM.deposit_ref, CryptoDepositORM.status, CryptoDepositORM.user_id).where(
+                    func.lower(CryptoDepositORM.tx_hash) == tx
+                )
+            ).all()
+            # The ledger first: it is written with the credit itself, while a
+            # deposit row is marked credited (and given its user) afterwards.
+            refs = [ref for ref, _status, _user in logged]
+            entry = session.scalar(
+                select(LedgerEntryORM).where(LedgerEntryORM.deposit_ref.in_(refs)).limit(1)
+            ) if refs else None
+            entry = entry or self._manual_credit_row(session, "", tx)
+            user_id = entry.user_id if entry is not None else None
             if user_id is None:
-                manual = self._manual_credit_row(session, "", tx)
-                user_id = manual.user_id if manual is not None else None
-            if user_id is None:
-                return None
+                credited = [user for _ref, status, user in logged if status == "credited"]
+                if not credited:
+                    return None
+                user_id = next((u for u in credited if u), None)
+                if user_id is None:
+                    return "another account"
             user = session.get(UserORM, user_id)
             return (user.username if user is not None else None) or user_id
 
@@ -1178,7 +1190,12 @@ class BillingRepository:
                 .where(
                     CryptoDepositORM.sender == sender,
                     CryptoDepositORM.currency.in_(currencies),
-                    CryptoDepositORM.status == "unmatched",
+                    # Staff marking a payment "not a top-up" must not stop
+                    # its sender from proving it was theirs.
+                    or_(
+                        CryptoDepositORM.status == "unmatched",
+                        and_(CryptoDepositORM.status == "ignored", CryptoDepositORM.matched_by == "admin_ignored"),
+                    ),
                     CryptoDepositORM.observed_at >= since,
                 )
                 .order_by(CryptoDepositORM.observed_at.asc())

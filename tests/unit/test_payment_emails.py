@@ -665,3 +665,37 @@ def test_a_tiny_underpayment_shows_enough_decimals(svc):
 
     note = credited_note("invoice_underpay", asked="0.200000", received=0.1999997, currency="tao")
     assert note.startswith("0.199999700 TAO arrived, less than the 0.200000 TAO")
+
+
+# --- review round 2 ----------------------------------------------------------------
+
+
+def test_an_ignored_deposit_can_still_be_claimed_by_its_sender(svc, api):
+    payer = Keypair.create_from_uri("//AliceUnknownSender")
+    assert svc.resolve_deposit(deposit("tao:7:1", "tao", 50_000_000, sender=payer.ss58_address, tx="0xstray")) == "unmatched"
+    api.call("billing_admin_ignore_deposit", "tao:7:1")
+    credited = link(svc, "alice", payer)["credited"]
+    assert [c["deposit_ref"] for c in credited] == ["tao:7:1"]
+    assert svc.get_balance("alice")["balance_credits"] == 1500  # 0.05 TAO at $300
+
+
+def test_the_guard_sees_a_credit_whose_deposit_row_has_no_owner_yet(svc, sent, api):
+    from greencompute_persistence.orm import CryptoDepositORM
+
+    first = svc.create_crypto_invoice("alice", "usdc-base", 20)
+    svc.resolve_deposit(deposit("usdc-base:0xrace:0", "usdc-base", units(svc, first["invoice_id"]), tx="0xrace"))
+    with session_scope(svc.repo.session_factory) as s:  # as the "earlier tick" branch leaves it
+        s.get(CryptoDepositORM, "usdc-base:0xrace:0").user_id = None
+    second = svc.create_crypto_invoice("bob", "usdc-base", 20)
+    with pytest.raises(Exception) as exc:
+        api.call("billing_confirm_crypto", second["invoice_id"], {"tx_hash": "0xrace"})
+    assert exc.value.status_code == 409 and "(to alice)" in exc.value.detail
+
+
+def test_wildcards_in_a_typed_hash_match_nothing(svc, api):
+    inv = svc.create_crypto_invoice("bob", "usdc-base", 20)
+    api.call("billing_confirm_crypto", inv["invoice_id"], {"tx_hash": "0xbobspayment"})  # a manual credit row
+    assert svc.repo.tx_credit_owner("0xbobspayment") == "bob"
+    for typed in ("%", "_", "0xbobspaymen_", "\\"):
+        assert svc.repo.tx_credit_owner(typed) is None
+        assert svc.repo.tx_credited_to("bob", typed) is False
