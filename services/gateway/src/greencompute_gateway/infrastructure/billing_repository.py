@@ -647,13 +647,18 @@ class BillingRepository:
         credited invoice here; use admin debit if you need to claw back funds).
         """
         with session_scope(self.session_factory) as session:
-            row = session.get(CryptoInvoiceORM, invoice_id)
+            # Locked like confirm_and_credit_invoice, so a reject racing the
+            # watcher can't turn a just-credited invoice into "rejected".
+            row = session.get(CryptoInvoiceORM, invoice_id, with_for_update=True)
             if row is None:
                 return None
             if row.status == "confirmed":
                 return None
             if row.status != "rejected":
                 row.status = "rejected"
+                if row.review_status == "open":
+                    # The rejection email answers the review too.
+                    row.review_status = "dismissed"
                 if reason:
                     row.decision_reason, row.decision_note = reason, note
                     row.decided_at = datetime.now(UTC)
@@ -700,6 +705,8 @@ class BillingRepository:
             row.review_status = "open"
             row.review_note = (note or "").strip()[:1000] or None
             row.review_requested_at = datetime.now(UTC)
+            # A new review: what we decided about the last one no longer holds.
+            row.decision_reason = row.decision_note = row.decided_at = None
             return {
                 "invoice_id": invoice_id,
                 "status": row.status,
@@ -752,6 +759,7 @@ class BillingRepository:
                 if dep is not None:
                     out[inv_id]["received"] = {
                         "amount": dep.amount_raw / (10 ** dep.decimals),
+                        "currency": dep.currency,
                         "matched_by": dep.matched_by,
                         "credited_cents": dep.credited_cents,
                     }
@@ -798,6 +806,8 @@ class BillingRepository:
             if reason:
                 row.decision_reason, row.decision_note = reason, note
                 row.decided_at = datetime.now(UTC)
+            elif review_status == "resolved":  # credited: no reason to explain
+                row.decision_reason = row.decision_note = None
             if paid_tx is not None and row.status != "confirmed":
                 row.status = "confirmed"
                 row.tx_hash = paid_tx or row.tx_hash
@@ -1008,7 +1018,7 @@ class BillingRepository:
             row = session.scalar(select(LedgerEntryORM).where(LedgerEntryORM.deposit_ref == deposit_ref))
             by = "invoice"
             if row is None:
-                row, by = self._manual_credit_row(session, currency, tx_hash), "admin"
+                row, by = self._manual_credit_row(session, currency, tx_hash), "admin_invoice"
             if row is None:
                 return None
             return {"user_id": row.user_id, "amount_cents": row.amount_cents, "invoice_id": row.reference_id,
@@ -1025,6 +1035,41 @@ class BillingRepository:
                 func.lower(LedgerEntryORM.deposit_ref).like(f"manual:%:{tx_hash.strip().lower()}")
             )
         )
+
+    def tx_credit_owner(self, tx_hash: str | None) -> str | None:
+        """Whose balance a transfer in this transaction was credited to, by
+        any path (watcher, wallet, staff), as their username; None if nobody's."""
+        tx = (tx_hash or "").strip().lower()
+        if not tx:
+            return None
+        with session_scope(self.session_factory) as session:
+            user_id = session.scalar(
+                select(CryptoDepositORM.user_id).where(
+                    func.lower(CryptoDepositORM.tx_hash) == tx,
+                    CryptoDepositORM.status == "credited",
+                ).limit(1)
+            )
+            if user_id is None:
+                manual = self._manual_credit_row(session, "", tx)
+                user_id = manual.user_id if manual is not None else None
+            if user_id is None:
+                return None
+            user = session.get(UserORM, user_id)
+            return (user.username if user is not None else None) or user_id
+
+    def ignore_deposit(self, deposit_ref: str) -> dict | None:
+        """Admin: an unmatched transfer that is nobody's top-up (our own
+        transfer, a refund, dust). It stops being alerted and offered for
+        assignment. None if it isn't logged; {"refused": status} unless
+        it is unmatched."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(CryptoDepositORM, deposit_ref, with_for_update=True)
+            if row is None:
+                return None
+            if row.status != "unmatched":
+                return {"refused": True, "status": row.status}
+            row.status, row.matched_by = "ignored", "admin_ignored"
+            return self._deposit_dict(row)
 
     def tx_credited_to(self, user_id: str, tx_hash: str | None) -> bool:
         """Has a transfer in this transaction been credited to this user: by

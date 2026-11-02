@@ -97,6 +97,10 @@ class WalletProofError(ValueError):
     """The wallet-link request doesn't prove control of the wallet."""
 
 
+class AlreadyCreditedError(ValueError):
+    """A staff confirm against a transaction that already paid someone."""
+
+
 class ReviewError(ValueError):
     """A review can't be resolved that way (not open, deposit already
     credited, unknown action...)."""
@@ -738,13 +742,19 @@ class BillingService:
                 review, "credited", cents=result["amount_cents"], balance_cents=result.get("balance_after"),
                 currency=dep["currency"], crypto_amount=_token_amount(dep["amount"]), tx_hash=dep["tx_hash"],
                 note=credited_note(
-                    "admin", asked=_invoice_token_amount(review), received=dep["amount"], currency=dep["currency"],
+                    "admin", asked=_invoice_token_amount(review), received=dep["amount"], currency=review["currency"],
+                    paid_currency=dep["currency"],
                 ),
             )
             return {"invoice_id": invoice_id, "review_status": "resolved", "credited_cents": result["amount_cents"]}
 
         if action == "confirm_invoice":
             tx_hash = review["tx_hash"] or ""
+            paid = self.repo.tx_credit_owner(tx_hash)
+            if paid is not None:
+                raise ReviewError(
+                    f"transaction {tx_hash[:14]} was already credited (to {paid}); confirming it again would pay twice"
+                )
             result = self.repo.confirm_and_credit_invoice(
                 invoice_id=invoice_id,
                 tx_hash=tx_hash,
@@ -761,7 +771,7 @@ class BillingService:
                 raise ReviewError("not credited: the invoice or this transaction was already credited")
             if tx_hash:
                 self.repo.mark_deposits_by_tx(
-                    None, tx_hash, status="credited", matched_by="admin",
+                    None, tx_hash, status="credited", matched_by="admin_invoice",
                     invoice_id=invoice_id, user_id=review["user_id"],
                     credited_cents=review["total_credits"],
                 )
@@ -876,6 +886,14 @@ class BillingService:
         invoice = self.repo.get_crypto_invoice(invoice_id)
         if invoice is None:
             return None
+        # The watcher (or another confirm) may already have credited this
+        # transaction under its own deposit_ref, which the "manual:" key below
+        # can't see: confirming it again would pay twice.
+        paid = self.repo.tx_credit_owner(tx_hash)
+        if paid is not None and invoice.status != "confirmed":
+            raise AlreadyCreditedError(
+                f"transaction {tx_hash[:14]} was already credited (to {paid}); confirming it again would pay twice"
+            )
         description = (
             f"Crypto deposit {invoice.currency.upper()} "
             f"${invoice.amount_usd:.2f} "
@@ -902,7 +920,7 @@ class BillingService:
             return None
         if result.get("credited") and tx_hash:
             self.repo.mark_deposits_by_tx(
-                None, tx_hash, status="credited", matched_by="admin",
+                None, tx_hash, status="credited", matched_by="admin_invoice",
                 invoice_id=invoice_id, user_id=invoice.user_id,
                 credited_cents=invoice.total_credits,
             )

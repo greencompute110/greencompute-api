@@ -3210,7 +3210,12 @@ def billing_confirm_crypto(
     tx_hash = payload.get("tx_hash", "")
     if not tx_hash:
         raise HTTPException(status_code=400, detail="tx_hash required")
-    result = _get_billing().confirm_crypto_deposit(invoice_id, tx_hash)
+    from greencompute_gateway.application.billing_service import AlreadyCreditedError
+
+    try:
+        result = _get_billing().confirm_crypto_deposit(invoice_id, tx_hash)
+    except AlreadyCreditedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result is None:
         raise HTTPException(status_code=404, detail="invoice not found")
     if result.get("refused"):
@@ -3534,6 +3539,23 @@ def billing_admin_assign_deposit(
         raise HTTPException(status_code=404, detail="deposit not found")
     if result.get("already_credited"):
         raise HTTPException(status_code=409, detail="deposit was already credited")
+    return result
+
+
+@router.post("/platform/billing/admin/crypto/deposits/{deposit_ref}/ignore", include_in_schema=False)
+def billing_admin_ignore_deposit(
+    deposit_ref: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — mark an unmatched deposit as nobody's top-up (our own transfer,
+    a refund, dust): it is no longer alerted or offered for assignment."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    result = _get_billing().repo.ignore_deposit(deposit_ref)
+    if result is None:
+        raise HTTPException(status_code=404, detail="deposit not found")
+    if result.get("refused"):
+        raise HTTPException(status_code=409, detail=f"deposit is {result['status']}, not unmatched")
     return result
 
 

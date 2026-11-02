@@ -144,34 +144,49 @@ def _tokens(amount: float | str, currency: str) -> str:
     return f"{text} {currency_label(currency)}"
 
 
-def credited_note(how: str | None, *, asked: str, received: float | str, currency: str) -> str | None:
+def credited_note(
+    how: str | None,
+    *,
+    asked: str,
+    received: float | str,
+    currency: str,
+    paid_currency: str | None = None,
+) -> str | None:
     """Why a credit differs from the invoice, or None when it doesn't.
     `asked` and `received` are token amounts; `how` is how the deposit was
-    matched (crypto_deposits.matched_by)."""
+    matched (crypto_deposits.matched_by). A payment in another currency than
+    the invoice's (`paid_currency`) can't be compared, so it gets no note."""
+    if paid_currency and paid_currency != currency:
+        return None
+    try:
+        got, want = float(received), float(asked)
+    except (TypeError, ValueError):
+        return None
+    # Six decimals would print 0.199999999 TAO as 0.200000: show enough to
+    # see the difference.
+    received_text = f"{got:.9f}" if f"{got:.6f}" == f"{want:.6f}" and got != want else f"{got:.6f}"
     if how == "invoice_underpay":
         return (
-            f"{_tokens(received, currency)} arrived, less than the {_tokens(asked, currency)} the invoice asked "
+            f"{_tokens(received_text, currency)} arrived, less than the {_tokens(asked, currency)} the invoice asked "
             "for, so we added what arrived, at the invoice's rate."
         )
     if how == "invoice_overpay":
         return (
-            f"{_tokens(received, currency)} arrived, more than the {_tokens(asked, currency)} the invoice asked "
+            f"{_tokens(received_text, currency)} arrived, more than the {_tokens(asked, currency)} the invoice asked "
             "for, so we added all of it, at the invoice's rate."
         )
     if how == "invoice_late":
         return (
-            f"{_tokens(received, currency)} arrived after the invoice had expired, so we added its value when it "
+            f"{_tokens(received_text, currency)} arrived after the invoice had expired, so we added its value when it "
             "arrived rather than the invoice's amount."
         )
+    # "admin" credited what arrived; "admin_invoice" (a staff confirm) the
+    # invoice's own amount, so it needs no note.
     if how in ("admin", "wallet", "wallet_link"):
-        try:
-            diff = float(received) - float(asked)
-        except (TypeError, ValueError):
-            return None
-        if abs(diff) < 0.0000005:
+        if abs(got - want) < 0.0000005:
             return None
         return (
-            f"{_tokens(received, currency)} arrived, {'less' if diff < 0 else 'more'} than the "
+            f"{_tokens(received_text, currency)} arrived, {'less' if got < want else 'more'} than the "
             f"{_tokens(asked, currency)} the invoice asked for, so we added what arrived, at its value when it "
             "arrived."
         )
@@ -187,6 +202,20 @@ def describe_invoice(inv: dict, received: dict | None = None) -> tuple[str | Non
     currency = inv["currency"]
     status = inv["status"]
     review = inv.get("review_status")
+    # Paid wins over whatever a review said before: the watcher or a wallet
+    # link can credit an invoice after its review was dismissed.
+    if status == "confirmed":
+        if not received:
+            return (None, None)
+        asked = inv.get("amount_to_send") or f"{inv['amount_crypto']:.6f}"
+        note = credited_note(
+            received.get("matched_by"), asked=asked, received=received["amount"], currency=currency,
+            paid_currency=received.get("currency"),
+        )
+        return (note, None)
+    if status == "rejected":
+        why, step = explain_reason(inv.get("decision_reason"), inv.get("decision_note"), currency)
+        return (f"This invoice was cancelled. {why}".strip(), step)
     if review == "open":
         return (
             "We're checking the payment you reported. We'll email you when it's done.",
@@ -196,13 +225,6 @@ def describe_invoice(inv: dict, received: dict | None = None) -> tuple[str | Non
         why, step = explain_reason(inv.get("decision_reason"), inv.get("decision_note"), currency)
         head = "We checked the payment you reported and didn't add it."
         return (f"{head} {why}".strip(), step)
-    if status == "rejected":
-        why, step = explain_reason(inv.get("decision_reason"), inv.get("decision_note"), currency)
-        return (f"This invoice was cancelled. {why}".strip(), step)
-    if status == "confirmed" and received:
-        asked = inv.get("amount_to_send") or f"{inv['amount_crypto']:.6f}"
-        note = credited_note(received.get("matched_by"), asked=asked, received=received["amount"], currency=currency)
-        return (note, None)
     if status == "expired":
         return (
             "This invoice expired without a payment we could match to it.",
