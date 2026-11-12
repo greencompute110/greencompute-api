@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import math
 import time
 
 log = logging.getLogger(__name__)
@@ -143,6 +144,12 @@ def _fetch_alpha_in_tao(netuid: int, subtensor_url: str) -> float | None:
                 pass
 
 
+def _usable(price: float) -> bool:
+    """A price of 0 (an empty pool, a bad answer) would value a payment at
+    nothing and file it as dust: treat it as no price."""
+    return math.isfinite(price) and price > 0
+
+
 def _stale(currency: str) -> float:
     """The last price seen, if it is recent enough to use; else raise."""
     if currency in _cache:
@@ -193,6 +200,9 @@ def get_price(currency: str) -> float:
             return _stale(currency)
         tao_usd = get_price("tao")
         price = ratio * tao_usd
+        if not _usable(price):
+            log.warning("Price feed: alpha came out as %r; not using it", price)
+            return _stale(currency)
         _cache[currency] = (price, time.time())
         log.info(
             "Price feed: alpha = $%.6f  (alpha-in-TAO=%.6f * TAO=$%.2f, netuid=%d)",
@@ -214,6 +224,8 @@ def get_price(currency: str) -> float:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
         price = float(data[cg_id]["usd"])
+        if not _usable(price):
+            raise ValueError(f"price {price!r}")
         _cache[currency] = (price, time.time())
         log.info("Price feed: %s = $%.2f", currency, price)
         return price

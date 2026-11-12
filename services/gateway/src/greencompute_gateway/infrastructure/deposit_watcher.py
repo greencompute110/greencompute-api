@@ -720,47 +720,24 @@ def scan_bittensor(repo: BillingRepository) -> int:
         return prices[currency]
 
     last_seen_str = _kv_get(repo, BITTENSOR_STATE_KEY)
-    substrate: SubstrateInterface | None = None
-    credited = 0
-    try:
-        failures = []
-        for rpc_url in subtensor_urls():
-            try:
-                substrate = SubstrateInterface(
-                    url=rpc_url, ss58_format=42,
-                    type_registry_preset="substrate-node-template",
-                )
-                break
-            except Exception as exc:
-                failures.append(f"{rpc_url.split('//')[-1].split('/')[0]}: {type(exc).__name__}: {exc}")
-        if substrate is None:
-            # One line, not a traceback per tick: the billing monitor reports
-            # the stalled cursor to the team.
-            log.warning("watcher bittensor: no endpoint reachable (%s); cursor stays put", "; ".join(failures))
-            return 0
-        head_num = substrate.get_block_number(substrate.get_chain_head())
-        safe_head = head_num - 10  # reorg-safety buffer (Bittensor finalizes fast)
-        if safe_head <= 0:
-            return 0
-        from_block = int(last_seen_str) if last_seen_str else max(0, safe_head - 1800)  # ~6h
-        to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
-        if to_block <= from_block:
-            return 0
+    from greencompute_gateway.infrastructure.price_feed import PriceUnavailable
 
-        # Advance the cursor only across blocks fully handled. On a failed
-        # block we STOP (not skip) so the next tick resumes from it — skipping
-        # would silently lose any deposit in that block.
+    credited = 0
+
+    def scan(substrate, from_block: int, to_block: int) -> tuple[int, bool]:
+        """Handle blocks from_block+1..to_block; (last block fully handled,
+        whether a block couldn't be read). On a failed block we STOP (not
+        skip) so the next tick resumes from it: skipping would silently lose
+        any deposit in that block."""
+        nonlocal credited
         scanned_through = from_block
         for block_num in range(from_block + 1, to_block + 1):
             try:
                 block_hash = substrate.get_block_hash(block_num)
                 events = substrate.get_events(block_hash) or []
             except Exception as exc:
-                log.warning(
-                    "watcher bittensor: get_events block %d failed: %s — stopping; "
-                    "will resume here next tick", block_num, exc
-                )
-                break
+                log.warning("watcher bittensor: get_events block %d failed: %s", block_num, exc)
+                return scanned_through, True
 
             found = [("tao", *t) for t in _tao_transfers(events, watched["tao"])]
             found += [("alpha", *a) for a in _alpha_deposits(events, watched["alpha"], want_netuid)]
@@ -786,20 +763,59 @@ def scan_bittensor(repo: BillingRepository) -> int:
                         )
                         if outcome in CREDITED:
                             credited += 1
+                except PriceUnavailable as exc:
+                    # Not the endpoint's fault: wait here for a price.
+                    log.warning("watcher bittensor: block %d waits for a price (%s)", block_num, exc)
+                    return scanned_through, False
                 except Exception:
                     log.exception("watcher bittensor: handling block %d failed — will retry", block_num)
-                    break
+                    return scanned_through, False
 
             # Block fully handled — safe to advance the cursor through it.
             scanned_through = block_num
+        return scanned_through, False
 
+    failures = []
+    from_block = to_block = scanned_through = None
+    for rpc_url in subtensor_urls():
+        host = rpc_url.split("//")[-1].split("/")[0]
+        substrate: SubstrateInterface | None = None
+        try:
+            substrate = SubstrateInterface(
+                url=rpc_url, ss58_format=42,
+                type_registry_preset="substrate-node-template",
+            )
+            if from_block is None:
+                head_num = substrate.get_block_number(substrate.get_chain_head())
+                safe_head = head_num - 10  # reorg-safety buffer (Bittensor finalizes fast)
+                if safe_head <= 0:
+                    return 0
+                from_block = int(last_seen_str) if last_seen_str else max(0, safe_head - 1800)  # ~6h
+                to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
+                if to_block <= from_block:
+                    return 0
+            scanned_through, unreadable = scan(substrate, from_block, to_block)
+            if scanned_through > from_block or not unreadable:
+                break
+            # Connected, but can't read the blocks we need (say a node that
+            # discards old state): try the next endpoint.
+            failures.append(f"{host}: can't read block {from_block + 1}")
+        except Exception as exc:
+            failures.append(f"{host}: {type(exc).__name__}: {exc}")
+        finally:
+            if substrate is not None:
+                try:
+                    substrate.close()
+                except Exception:
+                    pass
+
+    if scanned_through is not None and scanned_through > from_block:
+        # Only real progress moves the cursor's timestamp, so the billing
+        # monitor sees a watcher stuck for any reason (no endpoint, no price,
+        # a block that won't read) as stalled.
         _kv_set(repo, BITTENSOR_STATE_KEY, str(scanned_through))
-    finally:
-        if substrate is not None:
-            try:
-                substrate.close()
-            except Exception:
-                pass
+    elif failures:
+        log.warning("watcher bittensor: no endpoint could scan (%s); cursor stays put", "; ".join(failures))
     return credited
 
 

@@ -984,6 +984,10 @@ class BillingRepository:
         with session_scope(self.session_factory) as session:
             existing = session.get(CryptoDepositORM, deposit["deposit_ref"])
             if existing is not None:
+                if existing.usd_price is None and deposit.get("usd_price") and existing.status == "unmatched":
+                    # First seen while no price was available: value it at
+                    # (close to) arrival, not whenever it is claimed.
+                    existing.usd_price = deposit["usd_price"]
                 return existing.status
             session.add(CryptoDepositORM(status="unmatched", observed_at=datetime.now(UTC), **deposit))
             try:

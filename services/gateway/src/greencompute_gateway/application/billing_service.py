@@ -194,6 +194,9 @@ def _email_safely(fn):
 class BillingService:
     def __init__(self, billing_repo: BillingRepository) -> None:
         self.repo = billing_repo
+        # Unmatched payments already alerted on (by deposit_ref) in this
+        # process: a block retried while a price is missing re-resolves them.
+        self._alerted_unmatched: set[str] = set()
 
     # --- Balance ---
 
@@ -602,6 +605,9 @@ class BillingService:
         if self.deposit_value_cents(currency, amount, deposit.get("usd_price")) < 1:
             self.repo.mark_deposit(ref, status="ignored")
             return "ignored"
+        if ref in self._alerted_unmatched:
+            return "unmatched"  # its block is being retried: alerted already
+        self._alerted_unmatched.add(ref)
         from greencompute_gateway.infrastructure.alerts import send_payment_alert
 
         send_payment_alert(
