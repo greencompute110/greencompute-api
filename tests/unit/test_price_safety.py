@@ -23,6 +23,9 @@ TAO_ADDR = Keypair.create_from_uri("//GreenComputeDeposit").ss58_address
 
 @pytest.fixture(autouse=True)
 def clean(monkeypatch):
+    from greencompute_gateway.application import billing_service as bs
+
+    bs._ALERTED_UNMATCHED.clear()
     pf._cache.clear()
     for name in ("BILLING_PRICE_TAO", "BILLING_PRICE_ALPHA", "SUBTENSOR_URL"):
         monkeypatch.delenv(name, raising=False)
@@ -152,22 +155,25 @@ class FakeChain:
 
     instances: list = []
 
-    def __init__(self, url, events=None, unreadable=False):
+    def __init__(self, url, events=None, unreadable=False, head=200, head_events=None, missing=()):
         self.url, self.events, self.unreadable = url, events or {}, unreadable
+        self.head, self.head_events, self.missing = head, head_events or [], set(missing)
 
     def get_chain_head(self):
         return "head"
 
     def get_block_number(self, h):
-        return 200
+        return self.head
 
     def get_block_hash(self, n):
         if self.unreadable:
             raise RuntimeError("State already discarded")
-        return n
+        # Like substrate-interface: None for a block this node doesn't have.
+        return None if n > self.head or n in self.missing else n
 
     def get_events(self, n):
-        return self.events.get(n, [])
+        # Like substrate-interface: get_events(None) is the node's head block.
+        return self.head_events if n is None else self.events.get(n, [])
 
     def get_block(self, block_hash):
         raise RuntimeError("no extrinsics in the fake")
@@ -241,3 +247,51 @@ def test_a_missing_price_holds_the_cursor_without_touching_its_timestamp(chain, 
     chain.cursor["value"] = "119"
     chain.run([lambda u: FakeChain(u, events)])
     assert len(sent) == 1
+
+
+# --- review round 2 ----------------------------------------------------------------
+
+
+def _deposit_refs(svc):
+    with session_scope(svc.repo.session_factory) as s:
+        return sorted(r.deposit_ref for r in s.query(CryptoDepositORM).all())
+
+
+def test_a_lagging_endpoint_is_read_only_up_to_its_own_head(chain, svc):
+    head_transfer = [_transfer(TAO_ADDR, 100_000_000)]
+    chain.run([lambda u: FakeChain(u, unreadable=True), lambda u: FakeChain(u, head=140, head_events=head_transfer)])
+    assert chain.cursor["value"] == "130"  # B's own safe head, not A's
+    assert _deposit_refs(svc) == []  # B's head block was never read under another number
+
+
+def test_a_missing_block_is_unreadable_not_the_heads_events(chain, svc):
+    head_transfer = [_transfer(TAO_ADDR, 100_000_000)]
+    chain.run([lambda u: FakeChain(u, missing={105}, head_events=head_transfer)])
+    assert chain.cursor["value"] == "104"
+    assert _deposit_refs(svc) == []
+
+
+def test_an_endpoint_behind_the_cursor_does_not_block_the_next(chain):
+    chain.run([lambda u: FakeChain(u, head=50), lambda u: FakeChain(u)])
+    assert chain.cursor["value"] == "150"
+
+
+def test_the_alert_is_sent_once_across_ticks_with_a_new_service_each(chain, svc, monkeypatch):
+    monkeypatch.setattr(dw, "_service", lambda repo: BillingService(svc.repo))  # as in production
+    monkeypatch.setattr(pf, "get_price", lambda c: 210.0)
+    sent = []
+    monkeypatch.setattr("greencompute_gateway.infrastructure.alerts.send_payment_alert", lambda text, **_: sent.append(text))
+    events = {120: [_transfer(TAO_ADDR, 4_000_000_000, sender="5Stranger")]}
+    for _ in range(3):
+        chain.cursor["value"] = "100"
+        chain.run([lambda u: FakeChain(u, events)])
+    assert len(sent) == 1
+
+
+def test_a_first_run_pins_its_start_so_a_stuck_first_block_is_retried(chain, svc):
+    chain.cursor["value"] = None
+    events = {1: [_transfer(TAO_ADDR, 4_000_000_000)]}  # stuck: no price
+    chain.run([lambda u: FakeChain(u, events)])
+    assert chain.cursor["value"] == "0"
+    chain.run([lambda u: FakeChain(u, events, head=230)])  # a later tick, the chain moved on
+    assert chain.cursor["value"] == "0"  # still waiting at block 1, not skipped

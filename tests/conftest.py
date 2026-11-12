@@ -24,3 +24,16 @@ SRC_PATHS = [
 
 for path in SRC_PATHS:
     sys.path.insert(0, str(path))
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fresh_unmatched_alerts():
+    """The gateway remembers, per process, which unmatched payments it already
+    alerted on; tests reuse deposit refs, so each starts with none."""
+    from greencompute_gateway.application import billing_service
+
+    billing_service._ALERTED_UNMATCHED.clear()
+    yield

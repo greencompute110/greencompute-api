@@ -734,6 +734,12 @@ def scan_bittensor(repo: BillingRepository) -> int:
         for block_num in range(from_block + 1, to_block + 1):
             try:
                 block_hash = substrate.get_block_hash(block_num)
+                if not block_hash:
+                    # A node without this block answers None, and
+                    # get_events(None) returns ITS head's events: read under
+                    # this block's number, one transfer would be credited again
+                    # for every block it lags.
+                    raise LookupError(f"no block {block_num} on this endpoint")
                 events = substrate.get_events(block_hash) or []
             except Exception as exc:
                 log.warning("watcher bittensor: get_events block %d failed: %s", block_num, exc)
@@ -776,7 +782,8 @@ def scan_bittensor(repo: BillingRepository) -> int:
         return scanned_through, False
 
     failures = []
-    from_block = to_block = scanned_through = None
+    from_block = int(last_seen_str) if last_seen_str else None
+    scanned_through = None
     for rpc_url in subtensor_urls():
         host = rpc_url.split("//")[-1].split("/")[0]
         substrate: SubstrateInterface | None = None
@@ -785,15 +792,24 @@ def scan_bittensor(repo: BillingRepository) -> int:
                 url=rpc_url, ss58_format=42,
                 type_registry_preset="substrate-node-template",
             )
+            # Each endpoint only up to its own head: one that lags must never
+            # be asked for blocks it doesn't have yet.
+            safe_head = substrate.get_block_number(substrate.get_chain_head()) - 10  # reorg-safety buffer
             if from_block is None:
-                head_num = substrate.get_block_number(substrate.get_chain_head())
-                safe_head = head_num - 10  # reorg-safety buffer (Bittensor finalizes fast)
                 if safe_head <= 0:
-                    return 0
-                from_block = int(last_seen_str) if last_seen_str else max(0, safe_head - 1800)  # ~6h
-                to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
-                if to_block <= from_block:
-                    return 0
+                    failures.append(f"{host}: no usable head")
+                    continue
+                from_block = max(0, safe_head - 1800)  # first run: ~6h back
+                # Pinned at once, so a first block that is stuck is retried
+                # rather than left behind by the next tick's later window.
+                _kv_set(repo, BITTENSOR_STATE_KEY, str(from_block))
+            to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
+            if to_block <= from_block:
+                if safe_head >= from_block:
+                    scanned_through = from_block
+                    break  # caught up: nothing new yet
+                failures.append(f"{host}: head {safe_head} is behind block {from_block}")
+                continue
             scanned_through, unreadable = scan(substrate, from_block, to_block)
             if scanned_through > from_block or not unreadable:
                 break
