@@ -445,8 +445,11 @@ class BillingService:
         if base in ("usdt", "usdc"):
             amount_crypto = amount_usd
         else:
-            from greencompute_gateway.infrastructure.price_feed import get_price
-            price = get_price(base)
+            from greencompute_gateway.infrastructure.price_feed import PriceUnavailable, get_price
+            try:
+                price = get_price(base)
+            except PriceUnavailable:
+                price = 0.0  # refused just below, with a message to retry
             amount_crypto = round(amount_usd / price, 6) if price > 0 else 0.0
 
         # Never hand out an invoice that can't be paid: no address to send to,
@@ -505,7 +508,10 @@ class BillingService:
     # --- On-chain deposits ---
 
     def deposit_value_cents(self, currency: str, amount: float, usd_price: float | None) -> int:
-        """Credits for a deposit of `amount` tokens, bonus included."""
+        """Credits for a deposit of `amount` tokens, bonus included. Raises
+        price_feed.PriceUnavailable when there is no price to value it at: the
+        watcher then retries the block later, rather than valuing it at 0
+        (and filing a real payment as dust)."""
         base = _base_currency(currency)
         if usd_price is None:
             if base in ("usdt", "usdc"):
@@ -835,8 +841,15 @@ class BillingService:
         currencies = tuple(c for c, ch in CURRENCY_CHAIN.items() if ch == chain)
         since = datetime.now(UTC) - WALLET_LINK_LOOKBACK
         credited = []
+        from greencompute_gateway.infrastructure.price_feed import PriceUnavailable
+
         for dep in self.repo.unmatched_deposits_from(address, currencies, since):
-            cents = self.deposit_value_cents(dep["currency"], dep["amount"], dep["usd_price"])
+            try:
+                cents = self.deposit_value_cents(dep["currency"], dep["amount"], dep["usd_price"])
+            except PriceUnavailable:
+                # Stays claimable: linking again, or the admin, adds it later.
+                log.warning("wallet claim: no %s price for %s; left unmatched", dep["currency"], dep["deposit_ref"])
+                continue
             if cents < 1:
                 continue
             result = self.repo.credit_deposit(

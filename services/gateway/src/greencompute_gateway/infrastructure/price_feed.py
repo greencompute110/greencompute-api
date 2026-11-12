@@ -20,6 +20,14 @@ log = logging.getLogger(__name__)
 
 # Cache TTL in seconds
 CACHE_TTL = 300  # 5 minutes
+# When the source is down, a price this old is still used; an older one is not.
+# There is no made-up price: an invoice priced off a guess asks for the wrong
+# amount (a $400 TAO guess against a $210 market credits nearly double).
+STALE_MAX = 3600
+
+
+class PriceUnavailable(RuntimeError):
+    """No price for this currency right now, not even a recent one."""
 
 # CoinGecko IDs — only for tokens with real exchange listings.
 COINGECKO_IDS = {
@@ -49,12 +57,20 @@ _STORAGE_PREFIX_SUBNET_TAO = (
 )
 
 
-def _subtensor_url() -> str:
-    return (
+def subtensor_urls() -> list[str]:
+    """The Bittensor endpoints to try, in order. GREENCOMPUTE_SUBTENSOR_URL may
+    list several, comma-separated, so one going away (archive.minersunion.ai
+    stopped resolving on 2026-11-10 and took payments with it) isn't an outage."""
+    raw = (
         os.environ.get("GREENCOMPUTE_SUBTENSOR_URL")
         or os.environ.get("SUBTENSOR_URL")
         or "wss://entrypoint-finney.opentensor.ai:443/"
     )
+    return [u.strip() for u in raw.split(",") if u.strip()]
+
+
+def _subtensor_url() -> str:
+    return subtensor_urls()[0]
 
 
 def _subnet_netuid() -> int:
@@ -127,8 +143,19 @@ def _fetch_alpha_in_tao(netuid: int, subtensor_url: str) -> float | None:
                 pass
 
 
+def _stale(currency: str) -> float:
+    """The last price seen, if it is recent enough to use; else raise."""
+    if currency in _cache:
+        price, ts = _cache[currency]
+        if time.time() - ts < STALE_MAX:
+            log.warning("Price feed: using %s price from %ds ago", currency, int(time.time() - ts))
+            return price
+    raise PriceUnavailable(f"no {currency.upper()} price available right now, try again shortly")
+
+
 def get_price(currency: str) -> float:
-    """Get USD price for a crypto currency. Returns cached value if fresh."""
+    """USD price of a crypto currency: cached if fresh, else fetched, else the
+    last price seen within STALE_MAX. Raises PriceUnavailable otherwise."""
     currency = currency.lower()
 
     # Stablecoins
@@ -156,11 +183,14 @@ def get_price(currency: str) -> float:
     # the on-chain pool ratio, not a CoinGecko listing.
     if currency == "alpha":
         netuid = _subnet_netuid()
-        url = _subtensor_url()
-        ratio = _fetch_alpha_in_tao(netuid, url)
+        ratio = None
+        for url in subtensor_urls():
+            ratio = _fetch_alpha_in_tao(netuid, url)
+            if ratio is not None:
+                break
         if ratio is None:
-            log.warning("Could not derive alpha-in-TAO; using fallback price")
-            return _fallback_price(currency)
+            log.warning("Could not derive alpha-in-TAO from any endpoint")
+            return _stale(currency)
         tao_usd = get_price("tao")
         price = ratio * tao_usd
         _cache[currency] = (price, time.time())
@@ -173,8 +203,7 @@ def get_price(currency: str) -> float:
     # Other tokens go through CoinGecko.
     cg_id = COINGECKO_IDS.get(currency)
     if not cg_id:
-        log.warning("No price source for currency=%s, using fallback", currency)
-        return _fallback_price(currency)
+        raise PriceUnavailable(f"no price source for {currency}")
 
     try:
         import urllib.request
@@ -190,16 +219,4 @@ def get_price(currency: str) -> float:
         return price
     except Exception as exc:
         log.warning("Price feed fetch failed for %s: %s", currency, exc)
-        # Return cached stale value if available
-        if currency in _cache:
-            return _cache[currency][0]
-        return _fallback_price(currency)
-
-
-def _fallback_price(currency: str) -> float:
-    """Conservative fallback prices when feed is unavailable."""
-    # Alpha fallback is intentionally tiny — subnet alphas are typically
-    # priced at 0.01–0.1 TAO at launch (so $4–$40 at $400/TAO), and we'd
-    # rather under-credit than over-credit if the on-chain query fails.
-    defaults = {"tao": 400.0, "alpha": 5.0}
-    return defaults.get(currency, 1.0)
+        return _stale(currency)

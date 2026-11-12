@@ -3504,6 +3504,7 @@ def billing_admin_resolve_review(
     "other")}. A dismissal emails the customer the reason."""
     require_api_key(authorization, x_api_key, admin_required=True)
     from greencompute_gateway.application.billing_service import ReviewError
+    from greencompute_gateway.infrastructure.price_feed import PriceUnavailable
 
     try:
         return _get_billing().resolve_review(
@@ -3514,6 +3515,8 @@ def billing_admin_resolve_review(
         raise HTTPException(status_code=404, detail="invoice not found") from exc
     except ReviewError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PriceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=f"{exc}: the deposit can't be valued yet") from exc
 
 
 @router.post("/platform/billing/admin/crypto/deposits/{deposit_ref}/assign", include_in_schema=False)
@@ -3534,7 +3537,12 @@ def billing_admin_assign_deposit(
     user_id = billing.repo.find_user_id(ident)
     if user_id is None:
         raise HTTPException(status_code=404, detail=f"no single account matches {ident!r}")
-    result = billing.assign_deposit(deposit_ref, user_id)
+    from greencompute_gateway.infrastructure.price_feed import PriceUnavailable
+
+    try:
+        result = billing.assign_deposit(deposit_ref, user_id)
+    except PriceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=f"{exc}: it can't be valued yet") from exc
     if result is None:
         raise HTTPException(status_code=404, detail="deposit not found")
     if result.get("already_credited"):

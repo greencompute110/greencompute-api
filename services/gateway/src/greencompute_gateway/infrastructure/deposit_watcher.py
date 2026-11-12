@@ -703,14 +703,9 @@ def scan_bittensor(repo: BillingRepository) -> int:
     watched = _deposit_addresses(repo, ["tao", "alpha"])
     if not (watched["tao"] or watched["alpha"]):
         return 0
-    rpc_url = (
-        os.environ.get("GREENCOMPUTE_SUBTENSOR_URL")
-        or os.environ.get("SUBTENSOR_URL")
-        or "wss://entrypoint-finney.opentensor.ai:443/"
-    )
     # Same subnet the invoice was priced against (price_feed). Single source of
     # truth so the credit netuid can never drift from the pricing netuid.
-    from greencompute_gateway.infrastructure.price_feed import _subnet_netuid, get_price
+    from greencompute_gateway.infrastructure.price_feed import _subnet_netuid, get_price, subtensor_urls
     want_netuid = _subnet_netuid()
     service = _service(repo)
 
@@ -728,10 +723,21 @@ def scan_bittensor(repo: BillingRepository) -> int:
     substrate: SubstrateInterface | None = None
     credited = 0
     try:
-        substrate = SubstrateInterface(
-            url=rpc_url, ss58_format=42,
-            type_registry_preset="substrate-node-template",
-        )
+        failures = []
+        for rpc_url in subtensor_urls():
+            try:
+                substrate = SubstrateInterface(
+                    url=rpc_url, ss58_format=42,
+                    type_registry_preset="substrate-node-template",
+                )
+                break
+            except Exception as exc:
+                failures.append(f"{rpc_url.split('//')[-1].split('/')[0]}: {type(exc).__name__}: {exc}")
+        if substrate is None:
+            # One line, not a traceback per tick: the billing monitor reports
+            # the stalled cursor to the team.
+            log.warning("watcher bittensor: no endpoint reachable (%s); cursor stays put", "; ".join(failures))
+            return 0
         head_num = substrate.get_block_number(substrate.get_chain_head())
         safe_head = head_num - 10  # reorg-safety buffer (Bittensor finalizes fast)
         if safe_head <= 0:
