@@ -295,3 +295,9 @@ def test_a_first_run_pins_its_start_so_a_stuck_first_block_is_retried(chain, svc
     assert chain.cursor["value"] == "0"
     chain.run([lambda u: FakeChain(u, events, head=230)])  # a later tick, the chain moved on
     assert chain.cursor["value"] == "0"  # still waiting at block 1, not skipped
+
+
+def test_an_endpoint_that_stopped_moving_does_not_hide_the_next(chain):
+    # Endpoint 1 is frozen level with the cursor (safe head 100); endpoint 2 is current.
+    chain.run([lambda u: FakeChain(u, head=110), lambda u: FakeChain(u)])
+    assert chain.cursor["value"] == "150"

@@ -805,10 +805,11 @@ def scan_bittensor(repo: BillingRepository) -> int:
                 _kv_set(repo, BITTENSOR_STATE_KEY, str(from_block))
             to_block = min(safe_head, from_block + MAX_BLOCKS_PER_TICK)
             if to_block <= from_block:
-                if safe_head >= from_block:
-                    scanned_through = from_block
-                    break  # caught up: nothing new yet
-                failures.append(f"{host}: head {safe_head} is behind block {from_block}")
+                # Nothing new here. It may simply be caught up, or it may have
+                # stopped importing blocks while still answering: ask the
+                # next endpoint either way.
+                if safe_head < from_block:
+                    failures.append(f"{host}: head {safe_head} is behind block {from_block}")
                 continue
             scanned_through, unreadable = scan(substrate, from_block, to_block)
             if scanned_through > from_block or not unreadable:
