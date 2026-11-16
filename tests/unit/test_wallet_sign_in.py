@@ -550,3 +550,62 @@ def test_the_two_calls_are_in_the_openapi_spec_and_the_website_ones_are_not():
         schemas["WalletVerifyRequest"]["properties"])
     assert "/platform/auth/wallet/website-session" not in paths
     assert "/platform/account/verified-email" not in paths
+
+
+# --- what a free wallet account must not be able to do ------------------------------------
+
+
+def test_a_wallet_account_cant_claim_someone_elses_email(env):
+    """Squatting: a wallet account setting victim@ as its email would be handed
+    the victim's later website sign-up (register_user joins by email)."""
+    out = sign_in_evm()
+    status, body = call("PATCH", f"/platform/users/{out['user_id']}", {"email": "victim@example.com"}, key=out["api_key"])
+    assert status == 403 and "Settings" in body["error"]["message"]
+    status, _ = call("PATCH", f"/platform/users/{out['user_id']}", {"display_name": "Agent 7"}, key=out["api_key"])
+    assert status == 200
+    # Even with the address set some other way, sign-up never joins an unconfirmed wallet account.
+    with session_scope(env.sf) as s:
+        s.get(UserORM, out["user_id"]).email = "victim@example.com"
+    status, reg = call("POST", "/platform/register", {"username": "victim", "email": "victim@example.com"}, key=PROVISION)
+    assert status == 200 and reg["user_id"] != out["user_id"]
+    # A confirmed one is the account's own: sign-up joins it.
+    call("POST", "/platform/account/verified-email", {"user_id": out["user_id"], "email": "agent@example.com"}, key=PROVISION)
+    status, reg = call("POST", "/platform/register", {"username": "agent", "email": "agent@example.com"}, key=PROVISION)
+    assert reg["user_id"] == out["user_id"]
+
+
+def test_admin_accounts_cant_sign_in_on_the_website_with_a_wallet(env):
+    uid = _email_account(env)
+    env.billing.repo.add_verified_wallet(uid, "evm", EVM_ADDR.lower())
+    from greencompute_persistence.orm import AdminAccountORM
+
+    with session_scope(env.sf) as s:
+        s.add(AdminAccountORM(user_id=uid, email="ada@example.com", added_at=datetime.now(UTC)))
+    ch = challenge(EVM_ADDR)
+    status, body = call("POST", "/platform/auth/wallet/website-session",
+                        {"nonce": ch["nonce"], "signature": evm_sign(ch["message"])}, key=PROVISION)
+    assert status == 403 and "email or Google" in body["error"]["message"]
+
+
+def test_adding_an_admin_by_an_email_two_accounts_share_is_refused(env):
+    from greencompute_gateway.application.services import GatewayService
+
+    _email_account(env, "a1", "dup@example.com")
+    with session_scope(env.sf) as s:
+        s.add(UserORM(user_id="a2", username="dup2", email="DUP@example.com", balance_credits=0, profile_metadata={}))
+    svc = GatewayService(repository=routes.service.repository)
+    with pytest.raises(ValueError, match="more than one"):
+        svc.add_admin("dup@example.com", added_by="k")
+
+
+def test_a_flagged_wallet_cant_be_unlinked_to_lift_the_block(env):
+    uid = _email_account(env)
+    other = keys.PrivateKey(bytes.fromhex("c1" * 32))
+    addr = other.public_key.to_checksum_address().lower()
+    env.billing.repo.add_verified_wallet(uid, "evm", addr)
+    issued = sign_in_evm(other)
+    sanctions.store_list(env.sf, sanctions.OFAC, {("evm", addr): "Listed", ("evm", LISTED_EVM): "x"})
+    [w] = env.billing.repo.list_verified_wallets(uid)
+    status, body = call("DELETE", f"/platform/billing/wallets/{w['wallet_id']}", key=issued["api_key"])
+    assert status == 409 and "support@green-compute.com" in body["error"]["message"]
+    assert sanctions.account_blocked(env.sf, uid) == "list"

@@ -37,6 +37,11 @@ class InvalidAddress(ValueError):
 _SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 
+def wallet_tag(chain: str, address: str) -> str:
+    """api_keys.issued_by_wallet for keys a wallet's sign-ins issued."""
+    return f"{chain}:{address}"
+
+
 def detect_chain(address: str) -> str:
     """"evm" for a 0x address, else "bittensor": what a sign-in request means
     when it names only the address."""

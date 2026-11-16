@@ -571,6 +571,10 @@ class BillingService:
                 ref, status="credited", matched_by=earlier["matched_by"], invoice_id=earlier["invoice_id"],
                 user_id=earlier["user_id"], credited_cents=earlier["amount_cents"],
             )
+            # Staff can confirm a transaction before the watcher has seen (and
+            # screened) it: screen it now, and tell them if they paid a
+            # sanctioned sender, so the credit can be taken back.
+            self._alert_if_credited_sanctioned(deposit, earlier["user_id"])
             return "seen"
         amount = deposit["amount_raw"] / (10 ** deposit["decimals"])
         # Before any rule can credit it: a payment from a sanctioned wallet
@@ -637,8 +641,13 @@ class BillingService:
     def _block_if_sanctioned(self, deposit: dict, amount: float) -> bool:
         """Screen the sender; if a list or the oracle names it, mark the
         deposit blocked (staff see it under status=blocked), flag the wallet
-        if an account verified it, and alert support. True when blocked."""
+        if an account verified it, and alert support. True when blocked.
+
+        A sender that isn't an address at all (the watcher always reports
+        one, so this would be a watcher bug) can't be on a list: it is logged
+        and goes on, rather than stopping every payment such a bug touches."""
         from greencompute_gateway.application import sanctions
+        from greencompute_gateway.infrastructure.alerts import send_payment_alert
 
         chain = CURRENCY_CHAIN.get(deposit["currency"])
         if not chain:
@@ -646,6 +655,8 @@ class BillingService:
         try:
             sender = normalize_address(chain, deposit["sender"])
         except InvalidAddress:
+            log.warning("deposit %s: sender %r isn't a %s address; not screened",
+                        deposit["deposit_ref"], deposit["sender"], chain)
             return False
         source = sanctions.screen(self.repo.session_factory, chain, sender)
         if not source:
@@ -655,8 +666,6 @@ class BillingService:
         owner = self.repo.wallet_owner(chain, sender)
         if owner:
             sanctions.flag_wallet(self.repo.session_factory, chain, sender, source)
-        from greencompute_gateway.infrastructure.alerts import send_payment_alert
-
         send_payment_alert(
             f"Blocked payment: {amount:g} {deposit['currency'].upper()} from {deposit['sender']} "
             f"(tx {deposit.get('tx_hash') or deposit['deposit_ref']}) was NOT credited: sanctions screening "
@@ -666,6 +675,31 @@ class BillingService:
         )
         log.warning("deposit %s blocked: sender named by %s", deposit["deposit_ref"], source)
         return True
+
+    def _sanctioned_sender(self, deposit: dict) -> str | None:
+        """The source naming this deposit's sender, or None (also when the
+        sender can't be read as an address)."""
+        from greencompute_gateway.application import sanctions
+
+        chain = CURRENCY_CHAIN.get(deposit["currency"])
+        try:
+            sender = normalize_address(chain, deposit["sender"]) if chain else None
+        except InvalidAddress:
+            sender = None
+        return sanctions.screen(self.repo.session_factory, chain, sender) if sender else None
+
+    def _alert_if_credited_sanctioned(self, deposit: dict, user_id: str | None) -> None:
+        source = self._sanctioned_sender(deposit)
+        if not source or deposit["deposit_ref"] in _ALERTED_UNMATCHED:
+            return
+        _ALERTED_UNMATCHED.add(deposit["deposit_ref"])
+        from greencompute_gateway.infrastructure.alerts import send_payment_alert
+
+        send_payment_alert(
+            f"A payment credited before it was screened came from a sanctioned sender ({source}): "
+            f"{deposit['currency'].upper()} from {deposit['sender']} (tx {deposit.get('tx_hash') or deposit['deposit_ref']}), "
+            f"credited to account {user_id}. Review it and take the credit back (admin debit)."
+        )
 
     def _credit_one_customers_invoice(self, deposit: dict, amount: float, open_invoices: list[dict]) -> str | None:
         """Rule 4 of resolve_deposit: the transfer isn't any invoice's exact
@@ -952,6 +986,18 @@ class BillingService:
         dep = self.repo.get_deposit(deposit_ref)
         if dep is None:
             return None, None
+        # Logged before its sender was listed (or before screening existed):
+        # screen it now, as the watcher would, before staff can credit it.
+        source = self._sanctioned_sender(dep) if dep["status"] == "unmatched" or dep["status"] == "ignored" else None
+        if source and self.repo.block_deposit(deposit_ref, source):
+            from greencompute_gateway.infrastructure.alerts import send_payment_alert
+
+            send_payment_alert(
+                f"Blocked payment: staff tried to credit {dep['amount']:g} {dep['currency'].upper()} from "
+                f"{dep['sender']} (deposit {deposit_ref}), but sanctions screening ({source}) names the sender. "
+                "It was not credited."
+            )
+            return dep, {"blocked": True, "deposit_ref": deposit_ref}
         cents = self.deposit_value_cents(dep["currency"], dep["amount"], dep["usd_price"])
         return dep, self.repo.credit_deposit(
             deposit_ref, user_id, cents,

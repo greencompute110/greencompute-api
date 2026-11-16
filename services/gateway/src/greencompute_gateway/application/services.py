@@ -7,6 +7,7 @@ import re
 import shlex
 import secrets
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from json import loads
 from time import perf_counter
@@ -414,6 +415,28 @@ def _owned_by(owner_user_id: str | None, user_id: str | None) -> bool:
     return user_id is not None and owner_user_id == user_id
 
 
+@contextmanager
+def _account_rental_lock(service, user_id: str | None):
+    """Hold a Postgres advisory lock for this account while a deployment is
+    checked against its limits and created. Only new wallet accounts take it
+    (user_id None: no lock); elsewhere than Postgres a no-op."""
+    engine = getattr(getattr(service, "repository", None), "engine", None) if user_id else None
+    if engine is None or engine.dialect.name != "postgresql":
+        yield
+        return
+    from sqlalchemy import text
+
+    key = int.from_bytes(hashlib.sha256(f"account-rentals:{user_id}".encode()).digest()[:8], "big", signed=True)
+    with engine.connect() as conn:
+        conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": key})
+        conn.commit()
+        try:
+            yield
+        finally:
+            conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+            conn.commit()
+
+
 class GatewayService:
     def __init__(
         self,
@@ -452,7 +475,7 @@ class GatewayService:
         # OAuth signup, and email collisions would otherwise 500 out — which
         # breaks the sign-in flow via the JWT callback.
         if request.email:
-            existing = self.repository.get_user_by_email(request.email)
+            existing = self._registered_by_email(request.email)
             if existing is not None:
                 return existing
         # `username` carries a UNIQUE index but the UI sends the user's DISPLAY
@@ -464,6 +487,27 @@ class GatewayService:
         username = self._unique_username(request.username, request.email)
         user = UserRecord(username=username, email=request.email)
         return self.repository.save_user(user)
+
+    def _registered_by_email(self, email: str) -> UserRecord | None:
+        """The account a website sign-up with this email joins: the oldest
+        made through the website, or a wallet account whose email the website
+        confirmed. Never a wallet account that merely has the address."""
+        from sqlalchemy import or_, select
+
+        from greencompute_persistence import session_scope
+        from greencompute_persistence.orm import UserORM
+
+        with session_scope(self.repository.session_factory) as session:
+            user_id = session.scalar(
+                select(UserORM.user_id)
+                .where(
+                    UserORM.email == email,
+                    or_(UserORM.signup_method.is_(None), UserORM.email_verified_at.is_not(None)),
+                )
+                .order_by(UserORM.created_at)
+                .limit(1)
+            )
+        return self.repository.get_user(user_id) if user_id else None
 
     def _unique_username(self, desired: str | None, email: str | None) -> str:
         """Pick a username not already taken (ix_users_username is UNIQUE).
@@ -671,6 +715,8 @@ class GatewayService:
         user = self.repository.find_user_by_email(address)
         if user is None:
             raise KeyError(f"no account uses {address}; they need to sign up on the website first")
+        if self.repository.count_users_with_email(address) > 1:
+            raise ValueError(f"more than one account uses {address}; add the admin by user id with support's help")
         self.repository.add_admin_account(user.user_id, user.email or address, added_by)
         return next(a for a in self.repository.list_admin_accounts() if a["user_id"] == user.user_id)
 
@@ -969,40 +1015,44 @@ class GatewayService:
                                         daily_spend_limit_usd=key.daily_spend_limit_usd, numbers=numbers)
 
         # A wallet account's first week: the account's own limits, whichever
-        # key it uses.
-        if not admin and user_id is not None:
-            from greencompute_persistence.key_limits import new_account_room
+        # key it uses. Checked and created under a per-account lock, so
+        # requests sent at once can't each see room for one more.
+        from greencompute_persistence.key_limits import new_account_limits, new_account_room
 
-            why, numbers = new_account_room(self.repository.session_factory, user_id)
-            if why:
-                raise NewAccountLimitError(why, numbers)
+        limited = not admin and user_id is not None and new_account_limits(self.repository.session_factory, user_id)
+        with _account_rental_lock(self, user_id if limited else None):
+            if limited:
+                why, numbers = new_account_room(self.repository.session_factory, user_id)
+                if why:
+                    raise NewAccountLimitError(why, numbers)
 
-        # Fail fast when the fleet is full, too (after the balance check, so a
-        # caller who must top up hears that first and is ready to go when a GPU
-        # frees up). Mirrors the scheduler's own ranking, net of reservations.
-        if not admin:
-            can_place, capacity = self.control_plane.placement_preview(workload)
-            if not can_place:
-                raise NoCapacityError(
-                    requested=list(workload.requirements.supported_gpu_models or []),
-                    gpu_count=workload.requirements.gpu_count or 1,
-                    capacity=capacity,
-                    min_vram_gb=workload.requirements.min_vram_gb_per_gpu or 0,
-                )
+            # Fail fast when the fleet is full, too (after the balance check, so a
+            # caller who must top up hears that first and is ready to go when a GPU
+            # frees up). Mirrors the scheduler's own ranking, net of reservations.
+            if not admin:
+                can_place, capacity = self.control_plane.placement_preview(workload)
+                if not can_place:
+                    raise NoCapacityError(
+                        requested=list(workload.requirements.supported_gpu_models or []),
+                        gpu_count=workload.requirements.gpu_count or 1,
+                        capacity=capacity,
+                        min_vram_gb=workload.requirements.min_vram_gb_per_gpu or 0,
+                    )
 
-        return self.control_plane.create_deployment(
-            {
-                "workload_id": payload.workload_id,
-                "name": payload.name,
-                "requested_instances": payload.requested_instances,
-                "accept_fee": payload.accept_fee,
-                "save_on_exhaustion": payload.save_on_exhaustion,
-                "resume_on_topup": payload.resume_on_topup,
-                "max_runtime_minutes": payload.max_runtime_minutes,
-                "owner_user_id": user_id,
-                "created_by_key_id": created_by_key_id,
-            }
-        )
+            return self.control_plane.create_deployment(
+                {
+                    "workload_id": payload.workload_id,
+                    "name": payload.name,
+                    "requested_instances": payload.requested_instances,
+                    "accept_fee": payload.accept_fee,
+                    "save_on_exhaustion": payload.save_on_exhaustion,
+                    "resume_on_topup": payload.resume_on_topup,
+                    "max_runtime_minutes": payload.max_runtime_minutes,
+                    "owner_user_id": user_id,
+                    "created_by_key_id": created_by_key_id,
+                }
+            )
+
 
     def resume_deployment(
         self,

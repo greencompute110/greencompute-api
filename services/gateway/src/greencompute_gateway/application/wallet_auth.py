@@ -30,7 +30,13 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from greencompute_persistence import session_scope
-from greencompute_persistence.orm import APIKeyORM, UserORM, VerifiedWalletORM, WalletAuthChallengeORM
+from greencompute_persistence.orm import (
+    AdminAccountORM,
+    APIKeyORM,
+    UserORM,
+    VerifiedWalletORM,
+    WalletAuthChallengeORM,
+)
 from greencompute_gateway.application import sanctions
 from greencompute_gateway.domain import wallet_auth as msg
 from greencompute_gateway.infrastructure.wallet_signatures import (
@@ -41,13 +47,15 @@ from greencompute_gateway.infrastructure.wallet_signatures import (
     normalize_address_strict,
     signature_problem,
     verify_signature,
+    wallet_tag,
 )
 
 log = logging.getLogger(__name__)
 
 DEFAULT_KEY_NAME = "wallet sign-in"
 # Expired challenges are kept this long (for support questions), then pruned.
-_KEEP_EXPIRED = timedelta(days=1)
+# Short, so the table stays small whatever rate challenges are asked for at.
+_KEEP_EXPIRED = timedelta(hours=1)
 _NONCE = re.compile(r"^[0-9A-Za-z]{8,64}$")
 # Wallets a sanctions hit was already alerted on, in this process.
 _ALERTED: set[str] = set()
@@ -71,11 +79,6 @@ def _now() -> datetime:
 
 def _iso(value: datetime) -> str:
     return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def wallet_tag(chain: str, address: str) -> str:
-    """api_keys.issued_by_wallet for keys this wallet's sign-in issued."""
-    return f"{chain}:{address}"
 
 
 def short_address(address: str) -> str:
@@ -422,6 +425,15 @@ def verify_for_website(session_factory, *, nonce: str, signature: str) -> dict:
     _check_signature(challenge, signature)
     user_id, created = _account_for(session_factory, challenge.chain, challenge.address)
     user = _user_or_conflict(session_factory, user_id)
+    with session_scope(session_factory) as session:
+        is_admin = session.get(AdminAccountORM, user_id) is not None
+    if is_admin:
+        # The website hands an admin account its admin key. A wallet verified
+        # for payments isn't a strong enough way in for that: a phished
+        # signature (Bittensor extensions don't check the site) would be one.
+        raise WalletAuthError(
+            403, "forbidden", "Admin accounts sign in with email or Google, not a wallet.",
+        )
     return {
         "user_id": user_id,
         "account_created": created,
@@ -430,4 +442,7 @@ def verify_for_website(session_factory, *, nonce: str, signature: str) -> dict:
         "username": user.username,
         "display_name": user.display_name or short_address(challenge.address),
         "email": (user.email or "").strip() or None,
+        # Made on the website, or a wallet account whose email the website
+        # confirmed: only then may the email tie it to a website user.
+        "email_confirmed": user.signup_method != "wallet" or user.email_verified_at is not None,
     }

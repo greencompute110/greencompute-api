@@ -72,6 +72,12 @@ class GatewayRepository:
             ).first()
             return self._to_user(row) if row else None
 
+    def count_users_with_email(self, email: str) -> int:
+        with session_scope(self.session_factory) as session:
+            return session.scalar(
+                select(func.count()).select_from(UserORM).where(func.lower(UserORM.email) == email.strip().lower())
+            ) or 0
+
     def list_admin_accounts(self) -> list[dict]:
         with session_scope(self.session_factory) as session:
             rows = session.execute(

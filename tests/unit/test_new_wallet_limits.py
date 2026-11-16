@@ -127,3 +127,32 @@ def test_the_route_says_what_the_limit_is_and_how_it_ends(sf, monkeypatch):
     assert detail["daily_spend_limit_usd"] == 50 and detail["spent_last_24h_usd"] == 50.0
     assert "$50.00" in detail["message"] and "first 7 days" in detail["message"]
     assert detail["until"] and "email" in detail["hint"]
+
+
+def test_a_new_wallet_account_s_creates_take_turns_on_postgres():
+    """Requests sent at once must not each see room for one more rental."""
+    from greencompute_gateway.application.services import _account_rental_lock
+
+    seen = []
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, statement, params):
+            seen.append(str(statement).split("(")[0].replace("SELECT ", ""))
+
+        def commit(self):
+            pass
+
+    engine = types.SimpleNamespace(dialect=types.SimpleNamespace(name="postgresql"), connect=Conn)
+    svc = types.SimpleNamespace(repository=types.SimpleNamespace(engine=engine))
+    with _account_rental_lock(svc, "w1"):
+        seen.append("create")
+    assert seen == ["pg_advisory_lock", "create", "pg_advisory_unlock"]
+    with _account_rental_lock(svc, None):  # accounts without the limits never wait
+        pass
+    assert len(seen) == 3

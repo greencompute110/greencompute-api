@@ -561,6 +561,16 @@ def update_user(
     api_key = require_api_key(authorization, x_api_key)
     if not api_key.admin and api_key.user_id != user_id:
         raise HTTPException(status_code=403, detail="user access denied")
+    if payload.email is not None and not api_key.admin:
+        # An account's email decides which account a website sign-up with that
+        # address joins (register_user), so it can't be set by typing it in:
+        # a free wallet account could otherwise claim someone's address and be
+        # handed their sign-up. The website confirms an email by a link.
+        raise coded(
+            403, "forbidden",
+            "an account's email can't be changed over the API; add or change it on the website (Settings), "
+            "which confirms it by email",
+        )
     try:
         return service.update_user_profile(user_id, payload).model_dump(mode="json")
     except KeyError as exc:
@@ -3664,23 +3674,23 @@ def billing_unlink_wallet(
     wallet of an account with no email can't be unlinked: nothing else
     signs in to it."""
     user_id = _require_user(authorization, x_api_key)
-    repo = _get_billing().repo
-    wallets = repo.list_verified_wallets(user_id)
-    wallet = next((w for w in wallets if w["wallet_id"] == wallet_id), None)
-    if wallet is None:
-        raise HTTPException(status_code=404, detail="wallet not found")
-    if len(wallets) == 1 and not repo.signs_in_without_a_wallet(user_id):
+    from greencompute_gateway.infrastructure.billing_repository import WalletIsTheSignIn, WalletUnderSanctions
+
+    try:
+        result = _get_billing().repo.unlink_wallet(user_id, wallet_id)
+    except WalletIsTheSignIn as exc:
         raise coded(
             409, "conflict",
             "this wallet is how this account signs in, and the account has no email: add an email on the "
             "website (Settings) or verify another wallet first",
-        )
-    if not repo.delete_verified_wallet(user_id, wallet_id):
+        ) from exc
+    except WalletUnderSanctions as exc:
+        raise coded(
+            409, "conflict", "This wallet can't be removed from the account. Contact support@green-compute.com.",
+        ) from exc
+    if result is None:
         raise HTTPException(status_code=404, detail="wallet not found")
-    from greencompute_gateway.application.wallet_auth import revoke_wallet_keys
-
-    revoked = revoke_wallet_keys(repo.session_factory, user_id, wallet["chain"], wallet["address"])
-    return {"deleted": True, "wallet_id": wallet_id, "revoked_key_ids": revoked}
+    return result
 
 
 @router.get("/platform/billing/admin/crypto/invoices", include_in_schema=False)

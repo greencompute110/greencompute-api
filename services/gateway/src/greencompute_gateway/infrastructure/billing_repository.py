@@ -3,19 +3,21 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import and_, case, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
 from greencompute_persistence.account_events import add_event, payment_event
 from greencompute_persistence.db import needs_bootstrap
 from greencompute_persistence.orm import (
+    APIKeyORM,
     CryptoDepositORM,
     CryptoInvoiceORM,
     InferenceBalanceHoldORM,
     InferenceDemandStatsORM,
     LedgerEntryORM,
     MinerPayoutAccrualORM,
+    SanctionedAddressORM,
     StripeSessionORM,
     UserORM,
     VerifiedWalletORM,
@@ -33,6 +35,14 @@ class WalletLinkedElsewhere(Exception):
 
 class TooManyWallets(Exception):
     pass
+
+
+class WalletIsTheSignIn(Exception):
+    """Unlinking it would leave a wallet account with no way to sign in."""
+
+
+class WalletUnderSanctions(Exception):
+    """Screening named this wallet: unlinking it would lift its account's block."""
 
 
 MAX_WALLETS_PER_USER = 10
@@ -1146,7 +1156,10 @@ class BillingRepository:
         `currency` None matches any currency."""
         with session_scope(self.session_factory) as session:
             q = select(CryptoDepositORM).where(
-                func.lower(CryptoDepositORM.tx_hash) == (tx_hash or "").strip().lower()
+                func.lower(CryptoDepositORM.tx_hash) == (tx_hash or "").strip().lower(),
+                # A transfer screening blocked stays blocked, whatever else
+                # was credited against the same transaction.
+                CryptoDepositORM.status != "blocked",
             )
             if currency:
                 q = q.where(CryptoDepositORM.currency == currency)
@@ -1311,6 +1324,38 @@ class BillingRepository:
             ).all()
             return [self._wallet_dict(r) for r in rows]
 
+    def unlink_wallet(self, user_id: str, wallet_id: str) -> dict | None:
+        """Unlink a verified wallet and revoke the API keys its sign-ins
+        issued, in one transaction with the account row locked, so two
+        unlinks at once can't both pass the checks. None if it isn't this
+        account's. Raises WalletUnderSanctions for a wallet screening named
+        (the account's block stays until staff lift it) and WalletIsTheSignIn
+        for a wallet account's only wallet when it has no confirmed email."""
+        from greencompute_gateway.infrastructure.wallet_signatures import wallet_tag
+
+        with session_scope(self.session_factory) as session:
+            user = session.get(UserORM, user_id, with_for_update=True)
+            wallets = session.scalars(select(VerifiedWalletORM).where(VerifiedWalletORM.user_id == user_id)).all()
+            wallet = next((w for w in wallets if w.wallet_id == wallet_id), None)
+            if wallet is None:
+                return None
+            listed = session.scalar(
+                select(SanctionedAddressORM.source).where(
+                    SanctionedAddressORM.chain == wallet.chain, SanctionedAddressORM.address == wallet.address,
+                ).limit(1)
+            )
+            if wallet.sanctions_hit or listed:
+                raise WalletUnderSanctions(wallet_id)
+            if len(wallets) == 1 and user is not None and user.signup_method == "wallet" and user.email_verified_at is None:
+                raise WalletIsTheSignIn(wallet_id)
+            tag = wallet_tag(wallet.chain, wallet.address)
+            revoked = list(session.scalars(select(APIKeyORM.key_id).where(
+                APIKeyORM.user_id == user_id, APIKeyORM.issued_by_wallet == tag)).all())
+            if revoked:
+                session.execute(delete(APIKeyORM).where(APIKeyORM.key_id.in_(revoked)))
+            session.delete(wallet)
+            return {"deleted": True, "wallet_id": wallet_id, "revoked_key_ids": revoked}
+
     def delete_verified_wallet(self, user_id: str, wallet_id: str) -> bool:
         with session_scope(self.session_factory) as session:
             row = session.get(VerifiedWalletORM, wallet_id)
@@ -1343,14 +1388,6 @@ class BillingRepository:
                 )
             ).all()
             return ids[0] if len(ids) == 1 else None
-
-    def signs_in_without_a_wallet(self, user_id: str) -> bool:
-        """Can this account sign in some other way than a wallet: it was made
-        on the website (email or Google), or the website has since confirmed
-        an email for it?"""
-        with session_scope(self.session_factory) as session:
-            row = session.get(UserORM, user_id)
-            return bool(row and (row.signup_method != "wallet" or row.email_verified_at is not None))
 
     def get_username(self, user_id: str) -> str | None:
         with session_scope(self.session_factory) as session:

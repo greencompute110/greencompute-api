@@ -356,3 +356,28 @@ def test_an_account_with_a_sanctioned_wallet_cant_rent_or_resume(db, monkeypatch
     assert exc.value.detail["message"] == sanctions.BLOCKED_MESSAGE
     with session_scope(db.sf) as s:
         assert s.query(SanctionedAddressORM).count() == 1
+
+
+def test_staff_cant_credit_a_payment_logged_before_its_sender_was_listed(db, billing):
+    clean = "0x" + "c4" * 20
+    billing.resolve_deposit(_deposit("usdc-base:0xu:0", clean, tx="0xu"))
+    assert _status(db, "usdc-base:0xu:0")[0] == "unmatched"
+    sanctions.store_list(db.sf, "ofac_sdn", {("evm", clean): "Listed later", ("evm", EVM_A): "x"})
+    assert billing.assign_deposit("usdc-base:0xu:0", "alice") == {"blocked": True, "deposit_ref": "usdc-base:0xu:0"}
+    assert _status(db, "usdc-base:0xu:0") == ("blocked", "sanctions:ofac_sdn")
+    assert db.repo.get_balance("alice") == 0 and "staff tried to credit" in db.alerts[-1]
+
+
+def test_a_payment_staff_credited_before_the_watcher_saw_it_is_screened_when_it_does(db, billing):
+    inv = billing.create_crypto_invoice("alice", "usdc-base", 10)
+    billing.confirm_crypto_deposit(inv["invoice_id"], "0xstaff")
+    assert db.repo.get_balance("alice") == 1000
+    dep = _deposit("usdc-base:0xstaff:0", EVM_A, tx="0xstaff")
+    assert billing.resolve_deposit(dep) == "seen"
+    assert "take the credit back" in db.alerts[-1] and "alice" in db.alerts[-1]
+
+
+def test_marking_a_transaction_credited_leaves_a_blocked_transfer_blocked(db, billing):
+    billing.resolve_deposit(_deposit("usdc-base:0xm:0", EVM_A, tx="0xm"))
+    db.repo.mark_deposits_by_tx(None, "0xm", status="credited", user_id="alice")
+    assert _status(db, "usdc-base:0xm:0")[0] == "blocked"
