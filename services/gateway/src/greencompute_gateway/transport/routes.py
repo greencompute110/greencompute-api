@@ -535,6 +535,28 @@ def wallet_auth_website_session(
     return result
 
 
+@router.post("/platform/auth/wallet/website-session/check", include_in_schema=False)
+def wallet_auth_website_session_check(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """For the website (provision secret only): may a session that began
+    with this wallet carry on? Body: {"user_id", "chain", "address"}. The
+    website asks every few minutes and ends the session on false."""
+    from greencompute_gateway.application import wallet_auth
+
+    require_provision_or_admin(authorization, x_api_key)
+    if not is_provision_secret(authorization, x_api_key):
+        raise HTTPException(status_code=403, detail="only the website server may call this")
+    return {"ok": wallet_auth.website_session_ok(
+        service.repository.session_factory,
+        user_id=str(payload.get("user_id") or ""),
+        chain=str(payload.get("chain") or ""),
+        address=str(payload.get("address") or ""),
+    )}
+
+
 @router.post("/platform/account/verified-email", include_in_schema=False)
 def set_verified_email(
     payload: dict,

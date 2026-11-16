@@ -431,6 +431,26 @@ def verify(
     }
 
 
+def website_session_ok(session_factory, *, user_id: str, chain: str, address: str) -> bool:
+    """Is a website session that began with this wallet still allowed? Only
+    while the wallet is still this account's, may still sign in, and isn't
+    named by sanctions screening: otherwise turning sign-in off, unlinking
+    the wallet or a phished signature's owner shutting it out would leave a
+    30-day website session running."""
+    try:
+        chain_n = chain if chain in ("evm", "bittensor") else ""
+        address_n = normalize_address_strict(chain_n, address) if chain_n else ""
+    except Exception:  # noqa: BLE001 - an address we can't read is no session
+        return False
+    if not address_n:
+        return False
+    with session_scope(session_factory) as session:
+        row = session.scalar(select(VerifiedWalletORM).where(
+            VerifiedWalletORM.chain == chain_n, VerifiedWalletORM.address == address_n))
+        ok = row is not None and row.user_id == user_id and bool(row.sign_in) and not row.sanctions_hit
+    return ok and not sanctions.listed(session_factory, chain_n, address_n)
+
+
 def verify_for_website(session_factory, *, nonce: str, signature: str) -> dict:
     """Step 3 for the website's sign-in: the same checks, the account id
     back and no key issued or revoked (the website keeps its own key per

@@ -716,3 +716,30 @@ def test_a_sanctions_blocked_account_cant_use_paid_inference(env):
     status, body = call("POST", "/v1/chat/completions",
                         {"model": "any", "messages": [{"role": "user", "content": "hi"}]}, key=out["api_key"])
     assert status == 403 and body["error"]["code"] == "wallet_blocked"
+
+
+def test_a_website_wallet_session_lasts_only_while_the_wallet_may_sign_in(env):
+    ch = challenge(EVM_ADDR)
+    status, sess = call("POST", "/platform/auth/wallet/website-session",
+                        {"nonce": ch["nonce"], "signature": evm_sign(ch["message"])}, key=PROVISION)
+    assert status == 200
+    ask = {"user_id": sess["user_id"], "chain": "evm", "address": EVM_ADDR}
+
+    def ok(body=ask, key=PROVISION):
+        return call("POST", "/platform/auth/wallet/website-session/check", body, key=key)
+
+    assert ok() == (200, {"ok": True})
+    assert ok({**ask, "user_id": "someone-else"})[1] == {"ok": False}
+    assert ok(key=sess.get("api_key") or "gk_nope")[0] in (401, 403)  # the website's secret only
+    # The owner adds a second way in, then turns this wallet's sign-in off: the session ends.
+    second = keys.PrivateKey(bytes.fromhex("e5" * 32))
+    w2, _ = env.billing.repo.add_verified_wallet(sess["user_id"], "evm", second.public_key.to_checksum_address().lower())
+    env.billing.repo.set_wallet_sign_in(sess["user_id"], w2["wallet_id"], True)
+    w1 = next(w for w in env.billing.repo.list_verified_wallets(sess["user_id"]) if w["address"] == EVM_ADDR.lower())
+    env.billing.repo.set_wallet_sign_in(sess["user_id"], w1["wallet_id"], False)
+    assert ok()[1] == {"ok": False}
+    # Listed by sanctions screening: ended too.
+    env.billing.repo.set_wallet_sign_in(sess["user_id"], w1["wallet_id"], True)
+    assert ok()[1] == {"ok": True}
+    sanctions.store_list(env.sf, sanctions.OFAC, {("evm", EVM_ADDR.lower()): "Listed", ("evm", LISTED_EVM): "x"})
+    assert ok()[1] == {"ok": False}
