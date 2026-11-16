@@ -104,7 +104,7 @@ def test_api_errors_become_tool_errors_with_the_code(client):
     c, _, mp = client
 
     def full(*a, **k):
-        raise coded(503, "no_capacity", {"message": "Every rtx4090 is rented"}, headers={"Retry-After": "60"})
+        raise coded(503, "no_capacity", {"message": "Every RTX 4090 is rented out"}, headers={"Retry-After": "60"})
     mp.setattr(routes, "create_workload", lambda *a, **k: {"workload_id": "w1"})
     mp.setattr(routes, "create_deployment", full)
     deleted = []
@@ -250,12 +250,17 @@ def test_list_gpus_reads_the_real_price_list(client):
     """Against the real /platform/pricing builder, not a stand-in: the GPUs
     sit under gpu_rental.gpus (a stand-in hid that the tool read `gpus`)."""
     c, _, mp = client
-    mp.setattr(routes, "_capacity_by_model", lambda: {"rtx4090": {"available_gpus": 5, "max_gpus_per_deployment": 3}})
-    mp.setattr(routes, "_rentable_now", lambda: ["rtx4090"])
+    mp.setattr(routes, "_capacity_by_model", lambda: {
+        "rtx4090": {"available_gpus": 1, "max_gpus_per_deployment": 1, "total_gpus": 16},
+    })
     mp.setattr(routes, "_public_inference_model_names", lambda: [])
     result = call(c, "list_gpus")
     assert result["isError"] is False, result
     gpus = result["structuredContent"]["gpus"]
     by_model = {g["gpu_model"]: g for g in gpus}
-    assert by_model["rtx4090"]["available_gpus"] == 5 and by_model["rtx4090"]["max_gpus_per_deployment"] == 3
+    assert by_model["rtx4090"]["availability"] == "almost_fully_rented"
+    assert by_model["rtx4090"]["available_now"] is True
     assert by_model["rtx4090"]["usd_per_gpu_hour"] > 0
+    # An assistant sees what a person sees: a state, never a count.
+    for g in gpus:
+        assert not {"available_gpus", "max_gpus_per_deployment", "total_gpus"} & set(g)

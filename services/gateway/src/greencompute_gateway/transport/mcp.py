@@ -35,10 +35,11 @@ router = APIRouter()
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 SERVER_INFO = {"name": "green-compute", "title": "Green Compute", "version": "1.0.0"}
 INSTRUCTIONS = (
-    "Rent NVIDIA GPUs by the minute (billed only while `ready`). Typical flow: list_gpus to see what is free "
-    "and its price; rent_gpu with your SSH public key; poll get_rental until state is `ready` (usually 1-3 "
-    "minutes), then SSH in with its ssh_command; stop_rental when done, which stops billing and deletes the "
-    "disk. A 503 `no_capacity` error means nothing is free: retry later or call alert_when_free. "
+    "Rent NVIDIA GPUs by the minute (billed only while `ready`). Typical flow: list_gpus to see which GPUs "
+    "are available now and their price; rent_gpu with your SSH public key; poll get_rental until state is "
+    "`ready` (usually 1-3 minutes), then SSH in with its ssh_command; stop_rental when done, which stops "
+    "billing and deletes the disk. A 503 `no_capacity` error means nothing that fits is free: call "
+    "alert_when_free (the waitlist) or retry later; for more GPUs, write to support@green-compute.com. "
     "recent_events lists every change since a cursor instead of polling each rental. Docs: "
     "https://www.green-compute.com/docs"
 )
@@ -284,7 +285,9 @@ def t_alert_when_free(auth: tuple, args: dict) -> dict:
 _ID = {"deployment_id": {"type": "string", "description": "The rental's id (deployment_id)."}}
 TOOLS: list[dict[str, Any]] = [
     {"name": "list_gpus", "title": "List GPUs", "handler": t_list_gpus, "readOnly": True,
-     "description": "GPU models for rent: how many are free now, the most free together on one machine, VRAM and the price per GPU-hour.",
+     "description": ("GPU models for rent: whether each can be rented now (`availability`: available, "
+                     "almost_fully_rented, fully_rented or on_request; `available_now`), VRAM and the price per "
+                     "GPU-hour. Counts of free GPUs are not published."),
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "get_balance", "title": "Balance and forecast", "handler": t_get_balance, "readOnly": True,
      "description": "Your balance, what everything running costs per hour, and how many hours the balance lasts.",
@@ -338,7 +341,8 @@ TOOLS: list[dict[str, Any]] = [
          "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 120}},
          "required": ["deployment_id", "command"]}},
     {"name": "alert_when_free", "title": "Alert when free", "handler": t_alert_when_free, "readOnly": False,
-     "description": "Be emailed once (and get a capacity.available event) when GPUs of a model are free. Lasts 7 days.",
+     "description": ("Join the waitlist for a GPU model: be emailed once (and get a capacity.available event) "
+                     "when there is room for what you asked for. Lasts 7 days."),
      "inputSchema": {"type": "object", "properties": {
          "gpu_model": {"type": "string"}, "gpu_count": {"type": "integer", "minimum": 1, "maximum": 8},
          "count": {"type": "integer", "minimum": 1, "maximum": 64}}}},

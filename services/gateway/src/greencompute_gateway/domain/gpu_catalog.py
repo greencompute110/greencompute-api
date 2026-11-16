@@ -6,6 +6,7 @@ the two can't drift apart again.
 from __future__ import annotations
 
 import os
+import re
 
 
 def normalize_gpu_model(raw: str | None) -> str:
@@ -15,6 +16,13 @@ def normalize_gpu_model(raw: str | None) -> str:
     and the control-plane scheduler, or a GPU can be priced but never placed.
     """
     return "".join(ch for ch in (raw or "").lower() if ch.isalnum())
+
+
+def display_gpu_name(model: str) -> str:
+    """"rtx4090" -> "RTX 4090": how the website names a GPU, for messages
+    people read."""
+    m = re.fullmatch(r"([a-z]{2,})(\d\w*)", normalize_gpu_model(model))
+    return f"{m[1].upper()} {m[2].upper()}" if m else model.upper()
 
 
 def public_gpu_models() -> list[str]:

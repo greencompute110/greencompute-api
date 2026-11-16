@@ -848,10 +848,11 @@ def platform_metrics(
     return metrics.snapshot()
 
 
-# What the public sees of the pool: what can be deployed right now, not how
-# big the fleet is. Much of the capacity is rented by direct contract, so a
-# total ("14 of 16") would undersell it; larger orders go through sales.
-_PUBLIC_POOL_FIELDS = ("gpu_model", "vram_gb_per_gpu", "available_gpus", "max_gpus_per_deployment", "rentable_now")
+# What the public sees of the pool: whether each GPU class can be deployed
+# right now, as a state (domain.availability), never a count. Much of the
+# capacity is rented by direct contract, so a total ("14 of 16") would
+# undersell it, and the owner keeps free counts private too ("only 3 left").
+_PUBLIC_POOL_FIELDS = ("gpu_model", "vram_gb_per_gpu", "rentable_now", "availability")
 
 
 @router.get("/platform/v1/gpu-pool")
@@ -859,26 +860,35 @@ def gpu_pool(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
-    """Public endpoint: aggregated GPU availability for the rental page.
+    """Public endpoint: GPU availability for the rental and capacity pages.
 
-    The public gets each class's GPUs available to deploy now; admins also
-    get total_gpus, node_count and override details.
+    The public gets each class's `availability` ("available",
+    "almost_fully_rented", "fully_rented" or "on_request"), worked out from
+    the scheduler's count exactly as /platform/pricing does, so the site and
+    the API can't disagree. Admins also get the counts: available_gpus,
+    max_gpus_per_deployment, total_gpus, node_count and override details.
 
     If an admin set a `gpu_capacity_overrides` row for a GPU class, the
-    override REPLACES the measured count — sales uses this to advertise
-    contracted cluster size before miners are fully live. Without an
-    override, falls back to the measured count. Reads overrides via raw
+    override REPLACES the measured counts in the admin view — sales uses this
+    to see contracted cluster size before miners are fully live. It never
+    changes the public `availability`: a state from numbers no machine backs
+    would put a Rent button on GPUs nobody can rent. Reads overrides via raw
     SQL so the control-plane doesn't have to import gateway code.
     """
     from collections import defaultdict
     from sqlalchemy import text
 
+    from greencompute_control_plane.domain.availability import availability_of
+    from greencompute_control_plane.domain.scheduler import normalize_gpu_model
+
     all_nodes = service.repository.list_nodes()
     # What the scheduler could place on each node right now. Summing the
     # miners' raw heartbeat instead (as this did) ignored committed
     # reservations and nodes placement skips, and advertised GPUs nobody
-    # could rent.
-    free_by_node = {node.node_id: free for node, free in service.schedulable_capacity()}
+    # could rent. One snapshot for the counts and the public state.
+    capacity = service.schedulable_capacity()
+    free_by_node = {node.node_id: free for node, free in capacity}
+    by_model = service._by_model(capacity)
     buckets: dict[str, dict] = defaultdict(lambda: {
         "gpu_model": "",
         "vram_gb_per_gpu": 0,
@@ -959,7 +969,10 @@ def gpu_pool(
     # `available_gpus` alone can't.
     for b in public:
         b["rentable_now"] = b["schedulable_nodes"] > 0
-    public.sort(key=lambda b: -b["available_gpus"])
+        b["availability"] = availability_of(by_model.get(normalize_gpu_model(b["gpu_model"])))
     if caller_is_admin(authorization, x_api_key):
+        public.sort(key=lambda b: -b["available_gpus"])
         return public
+    # By name, not by free count, so the order says nothing either.
+    public.sort(key=lambda b: normalize_gpu_model(b["gpu_model"]))
     return [{k: b[k] for k in _PUBLIC_POOL_FIELDS} for b in public]

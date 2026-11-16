@@ -44,6 +44,10 @@ services:
       # Gateway and control-plane must agree. Set PUBLIC_RENTAL_GPU_FAMILIES=4090
       # to pause RTX 5090 rentals without touching the price table.
       GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES: ${PUBLIC_RENTAL_GPU_FAMILIES:-4090,5090}
+      # A GPU model reads "almost fully rented" on the price list and the site
+      # at or below this % of its live fleet free. Gateway and control-plane
+      # must agree, or the site and the API would disagree.
+      GREENCOMPUTE_ALMOST_FULLY_RENTED_PERCENT: ${ALMOST_FULLY_RENTED_PERCENT:-20}
       GREENCOMPUTE_CORS_ALLOW_ORIGINS: ${GREENCOMPUTE_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:${POSTGRES_PASSWORD:-greencompute123}@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"
@@ -96,6 +100,10 @@ services:
       # Gateway and control-plane must agree. Set PUBLIC_RENTAL_GPU_FAMILIES=4090
       # to pause RTX 5090 rentals without touching the price table.
       GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES: ${PUBLIC_RENTAL_GPU_FAMILIES:-4090,5090}
+      # A GPU model reads "almost fully rented" on the price list and the site
+      # at or below this % of its live fleet free. Gateway and control-plane
+      # must agree, or the site and the API would disagree.
+      GREENCOMPUTE_ALMOST_FULLY_RENTED_PERCENT: ${ALMOST_FULLY_RENTED_PERCENT:-20}
       GREENCOMPUTE_CORS_ALLOW_ORIGINS: ${GREENCOMPUTE_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       GREENCOMPUTE_DATABASE_URL: postgresql+psycopg://greencompute:${POSTGRES_PASSWORD:-greencompute123}@postgres:5432/greencompute
       GREENCOMPUTE_DB_BOOTSTRAP: "false"

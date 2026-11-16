@@ -167,8 +167,9 @@ def test_a_full_fleet_is_refused_at_create_time(monkeypatch):
         GatewayService.create_deployment(svc, {"workload_id": wl.workload_id}, user_id="u1")
     assert exc.value.available_gpus == {"rtx4090": 0}
     assert exc.value.gpu_count == 1
-    assert "every rtx4090 is rented right now" in exc.value.message
+    assert "every RTX 4090 is rented out right now" in exc.value.message
     assert "nothing was created" in exc.value.message
+    assert "Join the waitlist" in exc.value.message and "support@green-compute.com" in exc.value.message
 
 
 def test_free_gpus_mean_the_create_goes_through():
@@ -196,9 +197,11 @@ def test_the_message_says_when_the_gpus_exist_but_the_workload_does_not_fit(monk
     exc = NoCapacityError(requested=["RTX 4090"], gpu_count=8, capacity=capacity, min_vram_gb=24)
     assert exc.gpu_models == ["rtx4090"]
     assert exc.max_gpus_per_deployment == {"rtx4090": 4}
-    assert exc.message.startswith(
-        "6 rtx4090 GPU(s) are free, but no single machine can take this workload "
-        "(it needs 8 GPU(s) together with 24 GB VRAM each; the most free on one machine is 4)"
+    # The request's own numbers, never the fleet's (6 free, 4 on one machine).
+    assert exc.message == (
+        "no single machine has room for this rental right now (it needs 8 GPUs together with 24 GB VRAM each); "
+        "nothing was created. Join the waitlist to hear the moment there is room, or write to "
+        "support@green-compute.com for more capacity"
     )
 
 
@@ -220,10 +223,13 @@ def test_the_route_answers_503_with_retry_after(monkeypatch):
     detail = exc.value.detail
     assert detail["code"] == "no_capacity"
     assert detail["requested_gpus"] == 2
-    assert detail["available_gpus"] == {"rtx4090": 0}
-    assert detail["max_gpus_per_deployment"] == {"rtx4090": 0}
     assert detail["retry_after_seconds"] == 60
     assert "nothing was created" in detail["hint"]
+    # No counts: the way out is the waitlist or the team.
+    assert "available_gpus" not in detail and "max_gpus_per_deployment" not in detail
+    assert detail["waitlist"] == "POST /platform/capacity-alerts"
+    assert detail["contact"] == "support@green-compute.com"
+    assert "every RTX 4090 is rented out" in detail["message"]
 
 
 def test_a_refused_create_is_not_remembered_as_idempotent(monkeypatch):

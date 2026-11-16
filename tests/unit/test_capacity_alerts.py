@@ -53,10 +53,12 @@ def test_it_fires_once_when_there_is_room_with_an_event_and_an_email(sf):
     assert ca.check_once(sf, room, notify=mail, now=NOW) == [alert["alert_id"]]
     assert ca.check_once(sf, room, notify=mail, now=NOW) == []  # once
     [(uid, kind, fields, event_id)] = mail.sent
-    assert (uid, kind, fields["available_gpus"], event_id) == ("u1", "gpu_available", 3, f"gpu_available:{alert['alert_id']}")
-    assert fields["max_gpus_per_deployment"] == 2
+    assert (uid, kind, event_id) == ("u1", "gpu_available", f"gpu_available:{alert['alert_id']}")
+    # What was asked for, never how many are free: the owner keeps fleet
+    # numbers private, and the email and the event reach the customer.
+    assert fields == {"alert_id": alert["alert_id"], "gpu_model": "rtx4090", "gpu_count": 1, "count": 2}
     [event] = wh.list_events(sf, "u1")["events"]
-    assert event["type"] == "capacity.available" and event["data"]["gpu_model"] == "rtx4090"
+    assert event["type"] == "capacity.available" and event["data"] == fields
     assert ca.list_alerts(sf, "u1", now=NOW)[0]["state"] == "fired"
 
 

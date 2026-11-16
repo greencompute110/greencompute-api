@@ -188,7 +188,9 @@ def test_pricing_endpoint_matches_what_billing_charges(monkeypatch):
     monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
     monkeypatch.setattr(routes, "_public_inference_model_names", lambda: [])
     monkeypatch.setattr(routes, "_rentable_now", lambda: ["rtx4090"])
-    monkeypatch.setattr(routes, "_capacity_by_model", lambda: {"rtx4090": {"available_gpus": 3, "max_gpus_per_deployment": 3}})
+    monkeypatch.setattr(routes, "_capacity_by_model", lambda: {
+        "rtx4090": {"available_gpus": 3, "max_gpus_per_deployment": 3, "total_gpus": 8},
+    })
     body = public_pricing()
     gpus = {g["gpu_model"]: g for g in body["gpu_rental"]["gpus"]}
     assert set(gpus) == {"rtx4090", "rtx5090"}
@@ -286,16 +288,15 @@ def test_pricing_flags_which_gpus_are_available_now(monkeypatch):
     monkeypatch.delenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", raising=False)
     monkeypatch.setattr(routes, "_public_inference_model_names", lambda: [])
     # Two 4090 machines with 3 and 2 free; a 5090 machine online but full.
-    monkeypatch.setattr(routes, "_rentable_now", lambda: ["rtx4090", "rtx5090"])
     monkeypatch.setattr(routes, "_capacity_by_model", lambda: {
-        "rtx4090": {"available_gpus": 5, "max_gpus_per_deployment": 3},
-        "rtx5090": {"available_gpus": 0, "max_gpus_per_deployment": 0},
+        "rtx4090": {"available_gpus": 5, "max_gpus_per_deployment": 3, "total_gpus": 16},
+        "rtx5090": {"available_gpus": 0, "max_gpus_per_deployment": 0, "total_gpus": 8},
     })
     gpus = {g["gpu_model"]: g for g in routes.public_pricing()["gpu_rental"]["gpus"]}
     g = gpus["rtx4090"]
-    assert (g["online"], g["available_now"], g["available_gpus"], g["max_gpus_per_deployment"]) == (True, True, 5, 3)
+    assert (g["online"], g["available_now"], g["availability"]) == (True, True, "available")
     g = gpus["rtx5090"]
-    assert (g["online"], g["available_now"], g["available_gpus"], g["max_gpus_per_deployment"]) == (True, False, 0, 0)
+    assert (g["online"], g["available_now"], g["availability"]) == (True, False, "fully_rented")
 
 
 # --- 7. Deleting a workload keeps the evidence behind its charges ------------
