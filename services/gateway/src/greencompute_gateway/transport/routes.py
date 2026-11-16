@@ -387,7 +387,14 @@ def register_user(
 # Challenges, and verifies, per minute per client IP. Not also per wallet: a
 # limit keyed on the address would let anyone lock a wallet out of signing in
 # by asking for its challenges, and protects nothing the per-IP one doesn't.
-WALLET_AUTH_PER_IP = 30
+#
+# In production the host's network rewrites every incoming connection's source
+# to its gateway (172.16.110.1: nginx sees nothing else), so this is in effect
+# one limit for the whole internet. Sized for that: high enough that a busy
+# launch or one noisy client can't lock everyone out of wallet sign-in, still
+# a cap on challenge rows and signature checks. Lower it per IP if the host
+# ever passes real client addresses through.
+WALLET_AUTH_PER_IP = int(os.environ.get("GREENCOMPUTE_WALLET_AUTH_PER_MINUTE", "600") or 600)
 
 
 def _wallet_auth_error(exc) -> HTTPException:
