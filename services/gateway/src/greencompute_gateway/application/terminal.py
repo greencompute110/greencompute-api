@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -56,6 +57,8 @@ SHELLS = ("auto", "bash", "sh")
 MIN_SIZE, MAX_COLS, MAX_ROWS = 2, 500, 200
 
 _TICKET_PREFIX = "term:"
+_TICKET_SHAPE = re.compile(r"[A-Za-z0-9_-]{43}")  # secrets.token_urlsafe(32)
+CONNECTS_PER_IP = 30  # WebSocket connections a minute from one address, so bad tickets can't hammer the database
 
 
 def enabled() -> bool:
@@ -101,15 +104,19 @@ def consume_ticket(session_factory, ticket: str, *, now: datetime | None = None)
     """The ticket's record, taken so nobody can use it again; None if it is
     unknown, already used or expired. Under the row's lock: of two requests
     with the same ticket, the second finds it gone."""
-    if not ticket or len(ticket) > 256:
+    if not well_formed(ticket):
         return None
     now = now or datetime.now(UTC)
+    key = _row_key(ticket)
     with session_scope(session_factory) as session:
-        row = session.get(KeyValueStateORM, _row_key(ticket), with_for_update=True)
-        if row is None:
+        value = session.execute(
+            select(KeyValueStateORM.value).where(KeyValueStateORM.key == key).with_for_update()).scalar()
+        if value is None:
             return None
-        value = row.value
-        session.delete(row)
+        # Whoever deletes the row has the ticket: a second request deletes
+        # nothing (Postgres waits on the row lock, SQLite on the write lock).
+        if session.execute(delete(KeyValueStateORM).where(KeyValueStateORM.key == key)).rowcount != 1:
+            return None
     try:
         record = json.loads(value or "{}")
         expires = datetime.fromisoformat(record["expires_at"])
@@ -118,6 +125,11 @@ def consume_ticket(session_factory, ticket: str, *, now: datetime | None = None)
     except (ValueError, KeyError, TypeError):
         return None
     return out if now < out.expires_at else None
+
+
+def well_formed(ticket: str) -> bool:
+    """Shaped like a ticket we issue: anything else isn't looked up."""
+    return bool(ticket) and _TICKET_SHAPE.fullmatch(ticket) is not None
 
 
 def key_still_allows(session_factory, key_id: str, user_id: str) -> bool:
@@ -192,7 +204,7 @@ def clamp_size(cols: object, rows: object, default: tuple[int, int] = (80, 24)) 
             return fallback
         try:
             n = int(value)  # type: ignore[call-overload]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):  # OverflowError: JSON's Infinity
             return fallback
         return max(MIN_SIZE, min(n, top))
     return num(cols, default[0], MAX_COLS), num(rows, default[1], MAX_ROWS)
@@ -376,7 +388,7 @@ async def relay(client: Any, node: NodeLink, session: Session,
                 session.touch()
                 await node.send(json.dumps({"type": "resize", "cols": cols, "rows": rows}))
             elif kind == "input" and isinstance(ctl.get("data"), str):
-                raw = ctl["data"].encode()
+                raw = ctl["data"].encode("utf-8", "replace")  # a lone surrogate (a broken paste) isn't an error
                 session.bytes_in += len(raw)
                 session.touch()
                 await node.send(raw)
@@ -447,7 +459,8 @@ async def relay(client: Any, node: NodeLink, session: Session,
         # The customer's socket broke while we wrote to it: nobody to tell.
         session.end_reason = "client_gone"
         if not isinstance(exc, (OSError, RuntimeError)) and type(exc).__name__ != "WebSocketDisconnect":
-            log.warning("terminal %s: relay ended by %r", session.session_id, exc)
+            # The type only: an exception's text can quote what was typed.
+            log.warning("terminal %s: relay ended by %s", session.session_id, type(exc).__name__)
         return None
     outcome, detail = finished.result()
     session.end_reason = outcome

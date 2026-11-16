@@ -242,6 +242,21 @@ def test_a_terminal_session_end_to_end(env, caplog):
     assert not any("s3cret" in m for m in logs)  # who, where, when and how much: never what
 
 
+def test_odd_input_neither_crashes_nor_ends_the_session(env):
+    t = ticket(env).json()["ticket"]
+    with env.client.websocket_connect(ws_path("d1", t), headers={"origin": SITE}) as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_text('{"type": "input", "data": "ok\\ud800\\n"}')  # a lone surrogate, from a broken paste
+        assert ws.receive_bytes() == b"out:ok?\n"
+        ws.send_text('{"type": "resize", "cols": Infinity, "rows": NaN}')
+        ws.send_text('{"type": "resize", "cols": "120", "rows": [1]}')
+        ws.send_bytes(b"exit\n")
+        frames, code = until_closed(ws)
+    assert code == 1000
+    resizes = [json.loads(x) for x in env.nodes[0].sent if isinstance(x, str)]
+    assert resizes == [{"type": "resize", "cols": 80, "rows": 24}, {"type": "resize", "cols": 120, "rows": 24}]
+
+
 def test_a_ticket_works_once(env):
     t = ticket(env).json()["ticket"]
     with env.client.websocket_connect(ws_path("d1", t), headers={"origin": SITE}) as ws:
@@ -289,6 +304,39 @@ def test_an_expired_ticket_is_refused(env):
     for bad in ("", "x" * 300, "not-a-ticket"):
         frames, code = refused(env, ws_path("d1", bad))
         assert code == 4401
+
+
+def test_two_requests_racing_with_one_ticket_get_one_terminal(env):
+    """Whoever deletes the row has the ticket, on SQLite (no row locks) too."""
+    import threading
+
+    t, _ = terminal.issue_ticket(env.sf, user_id="u1", key_id="k1", deployment_id="d1", shell="auto")
+    barrier, got = threading.Barrier(8), []
+
+    def take():
+        barrier.wait()
+        got.append(terminal.consume_ticket(env.sf, t))
+    threads = [threading.Thread(target=take) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=20)
+    assert len(got) == 8 and sum(g is not None for g in got) == 1
+
+
+def test_a_flood_of_connections_from_one_address_is_cut_off_before_the_database(env, monkeypatch):
+    monkeypatch.setattr(terminal, "CONNECTS_PER_IP", 3)
+    looked_up = []
+    real = terminal.consume_ticket
+    monkeypatch.setattr(terminal, "consume_ticket", lambda *a, **k: looked_up.append(1) or real(*a, **k))
+    for _ in range(3):
+        frames, code = refused(env, ws_path("d1", "A" * 43))
+        assert code == 4401
+    frames, code = refused(env, ws_path("d1", "A" * 43))
+    assert (frames[0]["code"], code) == ("rate_limited", 4429)
+    assert len(looked_up) == 3
+    frames, code = refused(env, ws_path("d1", "not-a-ticket"))
+    assert len(looked_up) == 3  # malformed: never looked up
 
 
 def test_unused_tickets_are_cleared_out(env):

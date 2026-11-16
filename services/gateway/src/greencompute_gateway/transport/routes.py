@@ -2354,6 +2354,7 @@ async def deployment_terminal(websocket: WebSocket, deployment_id: str) -> None:
     the checks run in the thread pool, the relay is async I/O."""
     from greencompute_gateway import main
     from greencompute_gateway.application import terminal
+    from greencompute_gateway.transport import security
     from greencompute_gateway.transport.security import extract_api_key_secret
 
     origin = websocket.headers.get("origin")
@@ -2366,9 +2367,20 @@ async def deployment_terminal(websocket: WebSocket, deployment_id: str) -> None:
     if not terminal.enabled():
         await terminal.refuse(websocket, 4501, "not_implemented", "the browser terminal is turned off")
         return
+    if not security.rate_limiter.check("terminal_connect", ip or "unknown", limit=terminal.CONNECTS_PER_IP,
+                                       window_seconds=60).allowed:
+        await terminal.refuse(websocket, 4429, "rate_limited", "too many terminal connections from your address; "
+                                                                "wait a minute")
+        return
+    ticket_value = websocket.query_params.get("ticket") or ""
+    if not terminal.well_formed(ticket_value):  # not worth a trip to the database
+        await terminal.refuse(websocket, 4401, "terminal_ticket_invalid", "this terminal ticket is unknown, already "
+                                                                           "used, expired or for another rental; "
+                                                                           "request a new one")
+        return
     presented = extract_api_key_secret(websocket.headers.get("authorization"), websocket.headers.get("x-api-key"))
     ticket, deployment, problem = await run_in_threadpool(
-        _terminal_admission, websocket.query_params.get("ticket") or "", deployment_id, presented)
+        _terminal_admission, ticket_value, deployment_id, presented)
     if problem is not None:
         log.info("secret_access event=deployment_terminal_refused deployment_id=%s user_id=%s ip=%s code=%s",
                  deployment_id, ticket.user_id if ticket else None, ip, problem[1])
@@ -2423,9 +2435,9 @@ async def deployment_terminal(websocket: WebSocket, deployment_id: str) -> None:
             else:
                 await terminal.refuse(websocket, close_code, code, message)
     finally:
+        terminal.release_slot(ticket.user_id)  # first: closing the node's end can be cut short
         if node is not None:
             await node.close()
-        terminal.release_slot(ticket.user_id)
         log.info("secret_access event=deployment_terminal_end session=%s deployment_id=%s key_id=%s user_id=%s "
                  "ip=%s reason=%s duration_s=%d bytes_in=%d bytes_out=%d", session.session_id,
                  deployment.deployment_id, ticket.key_id, ticket.user_id, ip, session.end_reason,
