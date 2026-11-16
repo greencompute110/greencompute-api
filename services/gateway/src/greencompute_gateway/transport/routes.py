@@ -2354,25 +2354,33 @@ async def deployment_terminal(websocket: WebSocket, deployment_id: str) -> None:
     the checks run in the thread pool, the relay is async I/O."""
     from greencompute_gateway import main
     from greencompute_gateway.application import terminal
-    from greencompute_gateway.transport import security
     from greencompute_gateway.transport.security import extract_api_key_secret
+
+    ticket_value = websocket.query_params.get("ticket") or ""
+
+    async def spend() -> None:
+        # A connection refused before its ticket is checked still uses it
+        # up: the URL, ticket and all, may be in a log someone reads.
+        if terminal.well_formed(ticket_value):
+            with contextlib.suppress(Exception):
+                await run_in_threadpool(terminal.consume_ticket, service.repository.session_factory, ticket_value)
 
     origin = websocket.headers.get("origin")
     if not terminal.origin_allowed(origin):
         log.warning("terminal refused: origin %r deployment_id=%s", (origin or "")[:200], deployment_id)
+        await spend()
         await websocket.close(code=1008)  # before accepting: the handshake is refused (HTTP 403)
         return
     await websocket.accept()
     ip = main._client_ip_from_request(websocket)
     if not terminal.enabled():
+        await spend()
         await terminal.refuse(websocket, 4501, "not_implemented", "the browser terminal is turned off")
         return
-    if not security.rate_limiter.check("terminal_connect", ip or "unknown", limit=terminal.CONNECTS_PER_IP,
-                                       window_seconds=60).allowed:
-        await terminal.refuse(websocket, 4429, "rate_limited", "too many terminal connections from your address; "
-                                                                "wait a minute")
-        return
-    ticket_value = websocket.query_params.get("ticket") or ""
+    # No limit per address here: behind the host's NAT every visitor has the
+    # same one, so it would let anyone shut the terminal for everybody. A
+    # ticket is 256 random bits, made at most 30 a minute per key, and
+    # anything not shaped like one never reaches the database.
     if not terminal.well_formed(ticket_value):  # not worth a trip to the database
         await terminal.refuse(websocket, 4401, "terminal_ticket_invalid", "this terminal ticket is unknown, already "
                                                                            "used, expired or for another rental; "

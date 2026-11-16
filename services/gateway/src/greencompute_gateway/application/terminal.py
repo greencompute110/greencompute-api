@@ -58,7 +58,45 @@ MIN_SIZE, MAX_COLS, MAX_ROWS = 2, 500, 200
 
 _TICKET_PREFIX = "term:"
 _TICKET_SHAPE = re.compile(r"[A-Za-z0-9_-]{43}")  # secrets.token_urlsafe(32)
-CONNECTS_PER_IP = 30  # WebSocket connections a minute from one address, so bad tickets can't hammer the database
+
+
+# --- tickets out of the logs ----------------------------------------------------------
+
+_TICKET_IN_TEXT = re.compile(r"(ticket=)[^&\s\"']+")
+
+
+def redact_tickets(text: str) -> str:
+    return _TICKET_IN_TEXT.sub(r"\1[redacted]", text) if "ticket=" in text else text
+
+
+class RedactTickets(logging.Filter):
+    """uvicorn logs each WebSocket handshake with its query string
+    (`"WebSocket /platform/deployments/<id>/terminal?ticket=..." [accepted]`,
+    or 403), and every request on its access log. A ticket is spent within
+    a second, but not one in a log line someone reads first: blank it.
+    Argument by argument, so uvicorn's access formatter (which unpacks the
+    arguments) still works."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        with contextlib.suppress(Exception):
+            if isinstance(record.msg, str):
+                record.msg = redact_tickets(record.msg)
+            if isinstance(record.args, tuple):
+                record.args = tuple(redact_tickets(a) if isinstance(a, str) else a for a in record.args)
+            elif isinstance(record.args, dict):
+                record.args = {k: redact_tickets(v) if isinstance(v, str) else v for k, v in record.args.items()}
+            color = record.__dict__.get("color_message")
+            if isinstance(color, str):
+                record.__dict__["color_message"] = redact_tickets(color)
+        return True
+
+
+def install_log_redaction() -> None:
+    """On uvicorn's loggers; once, however often it is called."""
+    for name in ("uvicorn.error", "uvicorn.access"):
+        logger = logging.getLogger(name)
+        if not any(isinstance(f, RedactTickets) for f in logger.filters):
+            logger.addFilter(RedactTickets())
 
 
 def enabled() -> bool:
@@ -297,6 +335,11 @@ _NODE_REFUSALS = {
                                "the terminal reached its time limit; open a new one"),
     "invalid_request": (4400, "invalid_request", "the machine refused the terminal's settings"),
 }
+#: The node's notices passed on to the customer, in our words.
+_NODE_NOTICES = {
+    "input_dropped": "The program in your terminal isn't reading input, so some of what you typed or pasted was "
+                     "dropped. Press Ctrl-C to stop it, or wait for it to finish.",
+}
 _UNAVAILABLE = (4503, "unavailable", "the machine running this rental didn't answer; try again shortly")
 
 
@@ -353,7 +396,8 @@ async def relay(client: Any, node: NodeLink, session: Session,
     {"type": "resize", "cols", "rows"}, {"type": "ping"} (answered with
     {"type": "pong"}; not activity). To them: binary (output), and JSON
     {"type": "exit", "code"} and {"type": "notice", "code", "message",
-    "seconds_left"} (idle_warning, session_ending). Every RECHECK_SECONDS,
+    "seconds_left"} (idle_warning, session_ending; input_dropped, from the
+    node, without seconds_left). Every RECHECK_SECONDS,
     `recheck` says whether the terminal may stay open (None) or why not."""
     send_lock = asyncio.Lock()
 
@@ -408,6 +452,9 @@ async def relay(client: Any, node: NodeLink, session: Session,
                     return "exit", message.get("code")
                 if isinstance(message, dict) and message.get("type") == "error":
                     return "node_error", message
+                if isinstance(message, dict) and message.get("type") == "notice" and message.get("code") in _NODE_NOTICES:
+                    await to_client(json.dumps({"type": "notice", "code": message["code"],
+                                                "message": _NODE_NOTICES[message["code"]]}))
 
     async def watchdog() -> tuple[str, Any]:
         ends = session.started + MAX_SESSION_SECONDS

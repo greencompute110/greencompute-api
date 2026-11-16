@@ -324,19 +324,52 @@ def test_two_requests_racing_with_one_ticket_get_one_terminal(env):
     assert len(got) == 8 and sum(g is not None for g in got) == 1
 
 
-def test_a_flood_of_connections_from_one_address_is_cut_off_before_the_database(env, monkeypatch):
-    monkeypatch.setattr(terminal, "CONNECTS_PER_IP", 3)
+def test_junk_connections_never_lock_out_a_real_ticket(env, monkeypatch):
+    # Behind the host's NAT every visitor shares one address: a limit per
+    # address would let anyone shut the terminal for everybody.
     looked_up = []
     real = terminal.consume_ticket
     monkeypatch.setattr(terminal, "consume_ticket", lambda *a, **k: looked_up.append(1) or real(*a, **k))
-    for _ in range(3):
+    for _ in range(60):
         frames, code = refused(env, ws_path("d1", "A" * 43))
         assert code == 4401
-    frames, code = refused(env, ws_path("d1", "A" * 43))
-    assert (frames[0]["code"], code) == ("rate_limited", 4429)
-    assert len(looked_up) == 3
+    assert len(looked_up) == 60
     frames, code = refused(env, ws_path("d1", "not-a-ticket"))
-    assert len(looked_up) == 3  # malformed: never looked up
+    assert code == 4401 and len(looked_up) == 60  # malformed: never looked up
+    t = ticket(env).json()["ticket"]
+    with env.client.websocket_connect(ws_path("d1", t), headers={"origin": SITE}) as ws:
+        assert ws.receive_json()["type"] == "ready"
+
+
+def test_a_connection_refused_before_its_check_still_spends_the_ticket(env, monkeypatch):
+    t = ticket(env).json()["ticket"]
+    monkeypatch.setenv("GREENCOMPUTE_TERMINAL_ENABLED", "false")
+    frames, code = refused(env, ws_path("d1", t))
+    assert (frames[0]["code"], code) == ("not_implemented", 4501)
+    monkeypatch.setenv("GREENCOMPUTE_TERMINAL_ENABLED", "true")
+    frames, code = refused(env, ws_path("d1", t))
+    assert (frames[0]["code"], code) == ("terminal_ticket_invalid", 4401)
+
+
+def test_tickets_never_reach_uvicorns_log_lines():
+    terminal.install_log_redaction()
+    terminal.install_log_redaction()  # once, however often
+    error_log = logging.getLogger("uvicorn.error")
+    assert sum(isinstance(f, terminal.RedactTickets) for f in error_log.filters) == 1
+    t = "Ab-_" * 10 + "xyz"
+    record = logging.LogRecord("uvicorn.error", logging.INFO, __file__, 1, '%s - "WebSocket %s" [accepted]',
+                               ("172.18.0.1:5000", f"/platform/deployments/d1/terminal?ticket={t}&cols=80"), None)
+    for f in error_log.filters:
+        f.filter(record)
+    message = record.getMessage()
+    assert t not in message and "ticket=[redacted]&cols=80" in message
+    # The access formatter unpacks the arguments: they stay five.
+    access = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                               ("172.18.0.1:5000", "GET", f"/platform/deployments/d1/terminal?ticket={t}", "1.1", 404),
+                               None)
+    for f in logging.getLogger("uvicorn.access").filters:
+        f.filter(access)
+    assert len(access.args) == 5 and access.args[4] == 404 and t not in access.args[2]
 
 
 def test_unused_tickets_are_cleared_out(env):
@@ -403,9 +436,9 @@ def test_the_websocket_refuses_other_origins(env, origin):
     # Closed before being accepted: uvicorn answers the handshake with 403.
     assert sent == [{"type": "websocket.close", "code": 1008, "reason": ""}]
     assert env.opened == []
-    # The page on the other site didn't even spend the ticket.
-    with env.client.websocket_connect(ws_path("d1", t), headers={"origin": SITE}) as ws:
-        assert ws.receive_json()["type"] == "ready"
+    # The ticket is spent all the same: its URL may be in a log by now.
+    frames, code = refused(env, ws_path("d1", t))
+    assert (frames[0]["code"], code) == ("terminal_ticket_invalid", 4401)
 
 
 def test_at_most_three_terminals_per_account(env):
@@ -506,6 +539,20 @@ def test_the_machine_refusing_is_passed_on(env, node_code, close_code, code):
     frames, got = refused(env, ws_path("d1", t))
     assert (frames[0]["code"], got) == (code, close_code)
     assert "internal detail" not in frames[0]["message"]
+
+
+def test_the_machines_notices_reach_the_customer_in_our_words(env):
+    t = ticket(env).json()["ticket"]
+    with env.client.websocket_connect(ws_path("d1", t), headers={"origin": SITE}) as ws:
+        assert ws.receive_json()["type"] == "ready"
+        env.nodes[0].inject(json.dumps({"type": "notice", "code": "made-up", "message": "<b>hi</b>"}))
+        env.nodes[0].inject(json.dumps({"type": "notice", "code": "input_dropped", "message": "node words"}))
+        notice = ws.receive_json()
+        assert (notice["type"], notice["code"]) == ("notice", "input_dropped")
+        assert "isn't reading input" in notice["message"] and "node words" not in notice["message"]
+        ws.send_bytes(b"exit\n")
+        frames, code = until_closed(ws)
+    assert code == 1000 and not any(isinstance(f, dict) and f.get("code") == "made-up" for f in frames)
 
 
 def test_losing_the_machine_mid_session_says_so(env):

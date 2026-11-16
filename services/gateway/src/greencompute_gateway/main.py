@@ -78,6 +78,13 @@ async def lifespan(app: FastAPI):
                 pass
 
 
+
+# Terminal tickets never reach uvicorn's log lines (its WebSocket handshake
+# lines carry the query string).
+from greencompute_gateway.application.terminal import install_log_redaction  # noqa: E402
+
+install_log_redaction()
+
 app = FastAPI(
     title="Green Compute API",
     version="0.1.0",
