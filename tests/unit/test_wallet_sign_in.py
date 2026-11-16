@@ -919,3 +919,56 @@ def test_a_wallet_account_adding_an_email_needs_its_wallets_signature(env):
     status, body = call("POST", "/platform/account/email-approval", {"user_id": uid, "email": "x@example.com"},
                         key=PROVISION)
     assert body == {"approved": True, "needed": False}
+
+
+# --- security review round 3 -----------------------------------------------------------------
+
+
+def test_a_key_minted_after_its_parent_was_shut_out_is_refused_and_deleted(env, monkeypatch):
+    """The race: the wallet is shut out between the mint's key check and its
+    tagging. The new key must not survive untagged."""
+    uid = _email_account(env)
+    _link_for_sign_in(env, uid, EVM_ADDR.lower())
+    first = sign_in_evm()
+    real = routes.service.create_api_key
+
+    def create_then_shut_out(*a, **k):
+        created = real(*a, **k)
+        [w] = env.billing.repo.list_verified_wallets(uid)
+        env.billing.repo.set_wallet_sign_in(uid, w["wallet_id"], False)  # the owner, in between
+        return created
+
+    monkeypatch.setattr(routes.service, "create_api_key", create_then_shut_out)
+    status, _ = call("POST", "/platform/api-keys", {"name": "planted"}, key=first["api_key"])
+    assert status == 401
+    from greencompute_persistence.orm import APIKeyORM
+
+    with session_scope(env.sf) as s:
+        assert s.scalars(select(APIKeyORM).where(APIKeyORM.name == "planted")).all() == []
+
+
+def test_a_wallet_cant_be_turned_on_with_a_key_shut_out_mid_request(env):
+    uid = _email_account(env)
+    _link_for_sign_in(env, uid, EVM_ADDR.lower())
+    phished = sign_in_evm()
+    attacker = keys.PrivateKey(bytes.fromhex("f6" * 32))
+    w_att, _ = env.billing.repo.add_verified_wallet(uid, "evm", attacker.public_key.to_checksum_address().lower())
+    [w_v] = [w for w in env.billing.repo.list_verified_wallets(uid) if w["address"] == EVM_ADDR.lower()]
+    env.billing.repo.set_wallet_sign_in(uid, w_v["wallet_id"], False)  # the owner shuts V out first...
+    from greencompute_gateway.infrastructure.billing_repository import CallerShutOut
+
+    with pytest.raises(CallerShutOut):  # ...so V's key can't turn the attacker's wallet on
+        env.billing.repo.set_wallet_sign_in(uid, w_att["wallet_id"], True, caller_key_id=phished["key_id"])
+    assert all(not w["sign_in"] for w in env.billing.repo.list_verified_wallets(uid))
+
+
+def test_a_wallet_session_needs_an_approval_to_add_an_email_to_any_account(env):
+    with session_scope(env.sf) as s:  # a GitHub account with a private email: none on file
+        s.add(UserORM(user_id="gh-user", username="gh", email=None, balance_credits=0, profile_metadata={},
+                      signup_method="website"))
+    status, body = call("POST", "/platform/account/email-approval",
+                        {"user_id": "gh-user", "email": "x@evil.test", "wallet_session": True}, key=PROVISION)
+    assert status == 403 and body["error"]["code"] == "approval_required"
+    status, body = call("POST", "/platform/account/email-approval",
+                        {"user_id": "gh-user", "email": "x@evil.test"}, key=PROVISION)
+    assert status == 200 and body == {"approved": True, "needed": False}

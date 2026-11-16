@@ -145,25 +145,37 @@ def _refuse_blocked_account(api_key) -> None:
         raise coded(403, "wallet_blocked", sanctions.BLOCKED_MESSAGE)
 
 
-def _inherit_wallet_tag(parent_key_id: str | None, child_key_id: str | None) -> None:
+def _inherit_wallet_tag(user_id: str | None, parent_key_id: str | None, child_key_id: str | None) -> bool:
     """A key made with a key a wallet's sign-in issued is that wallet's too, so
     signing in again, revoking, unlinking the wallet or turning its sign-in off
     ends it as well: a phished signature can't leave a key behind that outlives
-    every way of shutting the wallet out."""
-    if not parent_key_id or not child_key_id:
-        return
+    every way of shutting the wallet out.
+
+    Under the account's row lock, which every shut-out takes too: if the
+    parent was shut out while this request ran, the new key is deleted and
+    False returned (its secret never leaves). Only a database the lock and
+    table don't exist in (a test store) skips it."""
+    if not parent_key_id or not child_key_id or not user_id:
+        return True
     from greencompute_persistence import session_scope
-    from greencompute_persistence.orm import APIKeyORM
+    from greencompute_persistence.orm import APIKeyORM, UserORM
+    from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 
     try:
         with session_scope(service.repository.session_factory) as session:
+            session.get(UserORM, user_id, with_for_update=True)
             parent = session.get(APIKeyORM, parent_key_id)
-            if parent is not None and parent.issued_by_wallet:
-                child = session.get(APIKeyORM, child_key_id)
+            child = session.get(APIKeyORM, child_key_id)
+            if parent is None or not BillingRepository.caller_still_in(session, user_id, parent_key_id):
                 if child is not None:
-                    child.issued_by_wallet = parent.issued_by_wallet
-    except Exception:  # noqa: BLE001 - the key was made; don't fail the request over its tag
+                    session.delete(child)
+                return False
+            if parent.issued_by_wallet and child is not None:
+                child.issued_by_wallet = parent.issued_by_wallet
+            return True
+    except Exception:  # noqa: BLE001 - a store without these tables: nothing to tag
         log.exception("api keys: couldn't carry the wallet tag from %s to %s", parent_key_id, child_key_id)
+        return True
 
 
 @router.post("/platform/api-keys", include_in_schema=False)
@@ -202,7 +214,8 @@ def create_api_key(
                 caller_scopes=list(api_key.scopes or []),
                 caller_limits=api_key,
             )
-            _inherit_wallet_tag(api_key.key_id, created.key_id)
+            if not _inherit_wallet_tag(api_key.user_id, api_key.key_id, created.key_id):
+                raise HTTPException(status_code=401, detail="invalid api key")
             return created.model_dump(mode="json")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -569,8 +582,10 @@ def approve_account_email(
     """For the website (provision secret only), before it emails a link to
     add an email to an account: a wallet account needs a signature from one
     of its sign-in wallets over an `add_email` challenge naming the email
-    (claimed here, once). Body: {"user_id", "email", "nonce", "signature"}.
-    Accounts made on the website need none: {"approved": true, "needed": false}."""
+    (claimed here, once), and so does any account when the request comes from
+    a wallet session ("wallet_session": true). Body: {"user_id", "email",
+    "nonce", "signature", "wallet_session"}. Otherwise none is needed:
+    {"approved": true, "needed": false}."""
     from greencompute_gateway.application import wallet_auth
 
     require_provision_or_admin(authorization, x_api_key)
@@ -580,6 +595,7 @@ def approve_account_email(
         return wallet_auth.approve_email(
             service.repository.session_factory, user_id=str(payload.get("user_id") or ""),
             email=str(payload.get("email") or ""), nonce=payload.get("nonce"), signature=payload.get("signature"),
+            wallet_session=payload.get("wallet_session") is True,
         )
     except wallet_auth.WalletAuthError as exc:
         raise _wallet_auth_error(exc) from exc
@@ -3799,7 +3815,7 @@ def billing_update_wallet(
     if not isinstance(enabling, bool):
         raise coded(400, "invalid_request", 'send {"sign_in": true} or {"sign_in": false}')
     from greencompute_gateway.application import wallet_auth
-    from greencompute_gateway.infrastructure.billing_repository import ApprovalNeeded, WalletIsTheSignIn
+    from greencompute_gateway.infrastructure.billing_repository import ApprovalNeeded, CallerShutOut, WalletIsTheSignIn
     from greencompute_gateway.infrastructure.wallet_signatures import wallet_tag
 
     repo = _get_billing().repo
@@ -3827,7 +3843,10 @@ def billing_update_wallet(
             except wallet_auth.WalletAuthError as exc:
                 raise _wallet_auth_error(exc) from exc
     try:
-        result = repo.set_wallet_sign_in(user_id, wallet_id, enabling, approved_by=approved_by)
+        result = repo.set_wallet_sign_in(user_id, wallet_id, enabling, approved_by=approved_by,
+                                         caller_key_id=api_key.key_id)
+    except CallerShutOut as exc:
+        raise HTTPException(status_code=401, detail="invalid api key") from exc
     except WalletIsTheSignIn as exc:
         raise coded(
             409, "conflict",

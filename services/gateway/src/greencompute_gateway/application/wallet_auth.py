@@ -426,6 +426,10 @@ def revoke_wallet_keys(session_factory, user_id: str, chain: str, address: str, 
     the website sessions')."""
     tags = wallet_tags(chain, address)[1:] if web_only else wallet_tags(chain, address)
     with session_scope(session_factory) as session:
+        # The account's lock, as every shut-out and every key made with a
+        # wallet's key take it: a key being made from one of these can't slip
+        # in untagged between the check and the delete.
+        session.get(UserORM, user_id, with_for_update=True)
         ids = list(session.scalars(select(APIKeyORM.key_id).where(
             APIKeyORM.user_id == user_id, APIKeyORM.issued_by_wallet.in_(tags))).all())
         if ids:
@@ -642,18 +646,23 @@ def approve(session_factory, *, user_id: str, action: str, subject: str, nonce: 
     return wallet_tag(challenge.chain, challenge.address)
 
 
-def approve_email(session_factory, *, user_id: str, email: str, nonce: str | None, signature: str | None) -> dict:
+def approve_email(
+    session_factory, *, user_id: str, email: str, nonce: str | None, signature: str | None,
+    wallet_session: bool = False,
+) -> dict:
     """For the website before it emails a confirmation link: a wallet
     account adding an email needs one of its sign-in wallets to sign for it
-    (an email is another way in: password resets go there). Accounts made
-    on the website need nothing. Raises WalletAuthError."""
+    (an email is another way in: password resets go there), and so does any
+    account the request comes from a wallet session of (a phished wallet
+    session must not redirect the account's mail). Others need nothing.
+    Raises WalletAuthError."""
     subject = _canonical_subject("add_email", email)
     with session_scope(session_factory) as session:
         user = session.get(UserORM, user_id)
         if user is None:
             raise WalletAuthError(404, "not_found", "No such account.")
         wallet_account = user.signup_method == "wallet"
-    if not wallet_account:
+    if not (wallet_account or wallet_session):
         return {"approved": True, "needed": False}
     signer = approve(session_factory, user_id=user_id, action="add_email", subject=subject,
                      nonce=nonce or "", signature=signature or "")

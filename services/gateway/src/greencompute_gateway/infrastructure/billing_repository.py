@@ -45,6 +45,10 @@ class WalletUnderSanctions(Exception):
     """Screening named this wallet: unlinking it would lift its account's block."""
 
 
+class CallerShutOut(Exception):
+    """The request's key was revoked, or its wallet shut out, while it ran."""
+
+
 class ApprovalNeeded(Exception):
     """Turning on another wallet's sign-in needs a signature from a wallet
     that already signs in to the account."""
@@ -1358,8 +1362,28 @@ class BillingRepository:
             session.delete(wallet)
             return {"deleted": True, "wallet_id": wallet_id, "revoked_key_ids": revoked}
 
+    @staticmethod
+    def caller_still_in(session, user_id: str, key_id: str | None) -> bool:
+        """Inside a transaction holding the account's row lock: does the
+        caller's key still exist, and if a wallet's sign-in issued it, does
+        that wallet still sign in to this account? A request authenticated just
+        before its wallet was shut out must not act after the shut-out."""
+        if not key_id:
+            return True
+        key = session.get(APIKeyORM, key_id)
+        if key is None or key.user_id != user_id:
+            return False
+        tag = (key.issued_by_wallet or "").removesuffix("#web")
+        if not tag:
+            return True
+        chain, _, address = tag.partition(":")
+        return bool(session.scalar(select(VerifiedWalletORM.sign_in).where(
+            VerifiedWalletORM.user_id == user_id, VerifiedWalletORM.chain == chain,
+            VerifiedWalletORM.address == address)))
+
     def set_wallet_sign_in(
         self, user_id: str, wallet_id: str, enabled: bool, *, approved_by: str | None = None,
+        caller_key_id: str | None = None,
     ) -> dict | None:
         """Turn signing in with this wallet on or off. Off revokes the keys its
         sign-ins issued, over the API and on the website. On, when the account
@@ -1372,6 +1396,8 @@ class BillingRepository:
 
         with session_scope(self.session_factory) as session:
             user = session.get(UserORM, user_id, with_for_update=True)
+            if enabled and not self.caller_still_in(session, user_id, caller_key_id):
+                raise CallerShutOut(caller_key_id)
             wallets = session.scalars(select(VerifiedWalletORM).where(VerifiedWalletORM.user_id == user_id)).all()
             wallet = next((w for w in wallets if w.wallet_id == wallet_id), None)
             if wallet is None:
