@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -84,6 +85,12 @@ async def lifespan(app: FastAPI):
 from greencompute_gateway.application.terminal import install_log_redaction  # noqa: E402
 
 install_log_redaction()
+
+# The audit trail: routes.py logs `secret_access event=...` at INFO (who
+# revealed an SSH key, ran exec, opened a terminal: never what), and nothing
+# else at INFO. Python's default level is WARNING, so without this none of it
+# was ever written. Keep INFO in that module for audit lines only.
+logging.getLogger("greencompute_gateway.transport.routes").setLevel(logging.INFO)
 
 app = FastAPI(
     title="Green Compute API",

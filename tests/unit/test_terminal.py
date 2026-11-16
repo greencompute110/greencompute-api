@@ -657,3 +657,11 @@ def test_the_node_link_speaks_to_a_real_websocket_server():
     finally:
         server.should_exit = True
         thread.join(timeout=10)
+
+
+def test_the_audit_lines_are_written_in_production():
+    # Python's default level is WARNING: without this, no secret_access line
+    # (SSH key reveals, exec, terminals) was ever logged.
+    import greencompute_gateway.main  # noqa: F401
+
+    assert logging.getLogger("greencompute_gateway.transport.routes").getEffectiveLevel() == logging.INFO
