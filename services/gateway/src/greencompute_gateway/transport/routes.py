@@ -2189,12 +2189,10 @@ def delete_secret(
 
 
 def _client_ip(request: Request) -> str:
-    """Prefer X-Forwarded-For (set by nginx) over request.client.host so we
-    rate-limit by real client IP, not the proxy."""
-    fwd = request.headers.get("x-forwarded-for", "").strip()
-    if fwd:
-        return fwd.split(",")[0].strip()[:64]
-    return (request.client.host if request.client else "")[:64]
+    """The real client address, as the request middleware worked it out
+    (X-Real-IP from nginx when GREENCOMPUTE_TRUSTED_PROXY is on; the first
+    X-Forwarded-For entry is whatever the client wrote, so it is never used)."""
+    return (current_client_ip.get() or (request.client.host if request.client else "") or "")[:64]
 
 
 # Allowed sales-inquiry statuses (free-string column, validated here).

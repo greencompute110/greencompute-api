@@ -15,19 +15,26 @@ from greencompute_gateway.transport.errors import CrashToJSON, install_error_han
 
 settings = load_runtime_settings("greencompute-gateway")
 
-# Trust the first X-Forwarded-For hop only when explicitly enabled — otherwise
-# a client could spoof the rate-limit key by sending its own XFF header. The
-# gateway sits behind a proxy in prod, so ops set this to "1".
+# Trust the proxy's view of the client only when explicitly enabled: without
+# a proxy a client could set these headers itself. In prod nginx sets
+# X-Real-IP to $remote_addr (overwriting whatever the client sent) and appends
+# $remote_addr to X-Forwarded-For, so the trustworthy hop is X-Real-IP, or the
+# LAST X-Forwarded-For entry; the first is whatever the client wrote there.
+# Without it every request looks like the docker bridge (one address for the
+# whole internet), so per-IP limits would be global.
 _TRUST_PROXY = (os.getenv("GREENCOMPUTE_TRUSTED_PROXY", "") or "").strip() in ("1", "true", "yes", "on")
 
 
 def _client_ip_from_request(request) -> str | None:
     if _TRUST_PROXY:
+        real = (request.headers.get("x-real-ip") or "").strip()
+        if real:
+            return real[:64]
         xff = request.headers.get("x-forwarded-for")
         if xff:
-            first = xff.split(",", 1)[0].strip()
-            if first:
-                return first
+            last = xff.rsplit(",", 1)[-1].strip()
+            if last:
+                return last[:64]
     client = request.client
     return client.host if client else None
 
