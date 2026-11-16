@@ -8,6 +8,7 @@ describing every response as "any object". Agents generating clients from
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, create_model, field_validator
 
@@ -250,14 +251,17 @@ class GpuPrice(BaseModel):
         description="A machine with this GPU is online and taking rentals. false: a create asking for it returns 400 "
                     "(the same test as /platform/nodes/supported).",
     )
-    available_now: bool = Field(description="At least one GPU of this model is free this instant (available_gpus > 0).")
-    available_gpus: int = Field(
-        description="GPUs of this model free this instant across all machines, net of everything already placed or "
-                    "reserved: the scheduler's own count. 0: a create is refused at once with 503 no_capacity.",
+    available_now: bool = Field(
+        description="At least one GPU of this model is free this instant: `availability` is available or "
+                    "almost_fully_rented. false while it is fully_rented (a create is refused at once with 503 "
+                    "no_capacity) or on_request.",
     )
-    max_gpus_per_deployment: int = Field(
-        description="The most GPUs of this model free together on one machine: the largest gpu_count one deployment "
-                    "can get right now.",
+    availability: Literal["available", "almost_fully_rented", "fully_rented", "on_request"] = Field(
+        description="How rented out this model is, from the scheduler's own count of free GPUs (net of everything "
+                    "placed or reserved) against its live fleet; counts themselves are not published. "
+                    "`almost_fully_rented`: some are free, but few. `fully_rented`: none are free right now; "
+                    "POST /platform/capacity-alerts to be told when one is. `on_request`: no machine with it is "
+                    "taking rentals (online is false); write to support@green-compute.com.",
     )
     vram_gb: int | None = None
     cents_per_gpu_hour: int

@@ -34,6 +34,14 @@ from greencompute_control_plane.infrastructure.repository import ControlPlaneRep
 
 logger = logging.getLogger(__name__)
 
+# What a customer whose rental found no GPU should do next: the waitlist (a
+# capacity alert) or the team, never a count of what is free.
+NO_CAPACITY_NEXT_STEP = (
+    "No GPU it fits on came free. Join the waitlist (on the rentals page, or POST "
+    "/platform/capacity-alerts) to hear the moment one does, or write to support@green-compute.com "
+    "for more capacity"
+)
+
 
 class ControlPlaneService:
     def __init__(
@@ -270,20 +278,25 @@ class ControlPlaneService:
 
     @staticmethod
     def _by_model(capacity: list[tuple[NodeCapability, int]]) -> dict[str, dict[str, int]]:
-        """Per normalised GPU model: `available_gpus`, free in all, and
+        """Per normalised GPU model: `available_gpus`, free in all,
         `max_gpus_per_deployment`, the most free together on one machine,
-        which is what a multi-GPU rental actually needs."""
+        which is what a multi-GPU rental actually needs, and `total_gpus`, the
+        live fleet those come from (what "almost fully rented" is a share of).
+        Internal: the public sees only domain.availability's state of these."""
         out: dict[str, dict[str, int]] = {}
         for node, free in capacity:
             entry = out.setdefault(
-                normalize_gpu_model(node.gpu_model), {"available_gpus": 0, "max_gpus_per_deployment": 0},
+                normalize_gpu_model(node.gpu_model),
+                {"available_gpus": 0, "max_gpus_per_deployment": 0, "total_gpus": 0},
             )
             entry["available_gpus"] += free
             entry["max_gpus_per_deployment"] = max(entry["max_gpus_per_deployment"], free)
+            entry["total_gpus"] += node.gpu_count
         return out
 
     def capacity_by_model(self) -> dict[str, dict[str, int]]:
-        """The numbers behind the public pool and the price list."""
+        """The numbers behind the public pool's and the price list's
+        availability states (see domain.availability)."""
         return self._by_model(self.schedulable_capacity())
 
     def placement_preview(self, workload: WorkloadSpec) -> tuple[bool, dict[str, dict[str, int]]]:
@@ -1149,9 +1162,16 @@ class ControlPlaneService:
         reserved_by_node = self.repository.reserved_gpus_by_node()
         available = effective_available_gpus(node, reserved_by_node)
         if available < gpu_count:
+            # The customer reads this message (the resume 409), so the free
+            # count stays in the log: the public never sees GPU counts.
+            logger.info(
+                "resume %s refused: node %s has %d effective free, needs %d",
+                deployment_id, deployment.node_id, available, gpu_count,
+            )
             raise ValueError(
-                f"insufficient capacity to resume deployment {deployment_id} on node "
-                f"{deployment.node_id} (need {gpu_count}, effective available {available})"
+                f"insufficient capacity to resume deployment {deployment_id}: the machine it was on "
+                f"doesn't have room for its {gpu_count} GPU(s) right now. Try again later, or write to "
+                "support@green-compute.com"
             )
 
         self.repository.reserve_gpus(
@@ -1651,6 +1671,9 @@ class ControlPlaneService:
                         "no compatible miner capacity available after "
                         f"{settings.deployment_request_retry_limit} attempts"
                     )
+                # The customer reads last_error; the prefix above stays as it
+                # was (analytics and the website match on it).
+                give_up_reason += f". {NO_CAPACITY_NEXT_STEP}"
                 failed = self.update_deployment_status(
                     DeploymentStatusUpdate(
                         deployment_id=deployment.deployment_id,

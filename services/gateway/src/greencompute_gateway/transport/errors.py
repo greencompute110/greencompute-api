@@ -66,7 +66,8 @@ CODES: dict[str, tuple[int, str]] = {
     "auth_throttled": (429, "Too many failed API-key checks from this address; fix the key, then wait."),
     "server_error": (500, "Something failed on our side."),
     "not_implemented": (501, "This endpoint is turned off."),
-    "no_capacity": (503, "Every GPU that fits is in use; nothing was created. Retry after `retry_after_seconds`."),
+    "no_capacity": (503, "No GPU that fits is free; nothing was created. Join the waitlist (capacity alerts), "
+                         "retry after `retry_after_seconds`, or ask the team for more."),
     "unavailable": (503, "Temporarily unavailable."),
     "screening_unavailable": (503, "New wallets can't be checked right now; request a new challenge and try again in a few minutes."),
     "exec_unknown": (504, "A command was sent but no answer came back in time: it may or may not have run."),

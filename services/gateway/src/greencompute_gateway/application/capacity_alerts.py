@@ -1,5 +1,6 @@
 """"Tell me when this GPU is free" (external API user, request #30: the site
 showed one 4090 left, it couldn't be rented, and they had to keep checking).
+The website calls it the waitlist: "Join the waitlist" on a fully rented GPU.
 
 An alert waits for room for `count` rentals of `gpu_count` GPUs of one model,
 each rental on one machine (what placement needs), checked every minute
@@ -179,9 +180,10 @@ def check_once(session_factory, free: dict[str, list[int]], *, notify: Callable 
                 continue
             row.state = "fired"
             row.fired_at = now
+            # What was asked for, not how many are free: the event and the
+            # email reach the customer, and fleet counts stay private.
             data = {
                 "alert_id": row.alert_id, "gpu_model": row.gpu_model, "gpu_count": row.gpu_count, "count": row.count,
-                "available_gpus": sum(machines), "max_gpus_per_deployment": max(machines),
             }
             add_event(session, AccountEventORM(user_id=row.user_id, type="capacity.available", data=data, created_at=now))
             fired.append(row.alert_id)

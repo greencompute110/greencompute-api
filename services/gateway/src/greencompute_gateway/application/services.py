@@ -162,6 +162,10 @@ class NoCapacityError(Exception):
     before failing it with "no compatible miner capacity" -- indistinguishable,
     to the client, from a GPU we never had. The route turns it into a 503 with
     Retry-After; nothing is created, so a retry can't rent twice.
+
+    The message never says how many GPUs are free (the owner keeps fleet
+    numbers private); it says what to do instead: join the waitlist or ask
+    the team for more. The counts stay on the exception for logs and tests.
     """
 
     retry_after_seconds = 60
@@ -169,7 +173,7 @@ class NoCapacityError(Exception):
     def __init__(
         self, *, requested: list[str], gpu_count: int, capacity: dict[str, dict[str, int]], min_vram_gb: int = 0,
     ) -> None:
-        from greencompute_gateway.domain.gpu_catalog import normalize_gpu_model, public_gpu_models
+        from greencompute_gateway.domain.gpu_catalog import display_gpu_name, normalize_gpu_model, public_gpu_models
 
         public = public_gpu_models()
         wanted = {normalize_gpu_model(m) for m in requested} if requested else {normalize_gpu_model(m) for m in public}
@@ -178,20 +182,19 @@ class NoCapacityError(Exception):
         per_model = {m: capacity.get(normalize_gpu_model(m), {}) for m in self.gpu_models}
         self.available_gpus = {m: c.get("available_gpus", 0) for m, c in per_model.items()}
         self.max_gpus_per_deployment = {m: c.get("max_gpus_per_deployment", 0) for m, c in per_model.items()}
-        total_free = sum(self.available_gpus.values())
-        names = " or ".join(self.gpu_models) or "GPU"
-        if total_free == 0:
-            why = f"every {names} is rented right now"
+        names = " or ".join(display_gpu_name(m) for m in self.gpu_models) or "GPU"
+        if sum(self.available_gpus.values()) == 0:
+            why = f"every {names} is rented out right now"
         else:
             # Free cards exist, but not where this workload fits: it needs its
             # GPUs together on one machine, with enough VRAM, CPU and memory.
             vram = f" with {min_vram_gb} GB VRAM each" if min_vram_gb else ""
-            largest = max(self.max_gpus_per_deployment.values(), default=0)
-            why = (
-                f"{total_free} {names} GPU(s) are free, but no single machine can take this workload "
-                f"(it needs {gpu_count} GPU(s) together{vram}; the most free on one machine is {largest})"
-            )
-        self.message = f"{why}; nothing was created. Try again in {self.retry_after_seconds} seconds"
+            gpus = "1 GPU" if gpu_count == 1 else f"{gpu_count} GPUs"
+            why = f"no single machine has room for this rental right now (it needs {gpus} together{vram})"
+        self.message = (
+            f"{why}; nothing was created. Join the waitlist to hear the moment there is room, "
+            f"or write to support@green-compute.com for more capacity"
+        )
         super().__init__(self.message)
 
 

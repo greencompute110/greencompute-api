@@ -30,7 +30,7 @@ def client():
     @app.get("/raise/{status}")
     def raise_(status: int, kind: str = Query(default="")):
         details = {
-            "no_capacity": ({"code": "no_capacity", "message": "every rtx4090 is rented right now; nothing was created"},
+            "no_capacity": ({"code": "no_capacity", "message": "every RTX 4090 is rented out right now; nothing was created"},
                             {"Retry-After": "60"}),
             "rate": ({"message": "rate limit exceeded", "retry_after_seconds": 12}, {"Retry-After": "12"}),
             "balance": ({"message": "insufficient balance to start this rental", "required_cents": 40,
@@ -68,7 +68,7 @@ def test_no_capacity_keeps_its_code_detail_and_retry_after(client):
     body = res.json()
     assert body["detail"]["code"] == "no_capacity"  # detail unchanged
     assert body["error"] == {"code": "no_capacity", "retryable": True, "retry_after_seconds": 60,
-                             "message": "Every rtx4090 is rented right now; nothing was created."}
+                             "message": "Every RTX 4090 is rented out right now; nothing was created."}
 
 
 @pytest.mark.parametrize("status, kind, code, retryable, says", [

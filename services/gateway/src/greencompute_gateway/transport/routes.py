@@ -53,7 +53,7 @@ from greencompute_gateway.infrastructure.inference_client import (
 )
 from greencompute_gateway.transport import schemas
 from greencompute_gateway.transport.schemas import ok
-from greencompute_gateway.transport.errors import coded
+from greencompute_gateway.transport.errors import SUPPORT, coded
 from greencompute_gateway.transport.security import (
     current_client_ip,
     enforce_rate_limit,
@@ -1394,7 +1394,8 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         raise HTTPException(status_code=403, detail={"message": str(exc), "code": "key_limit"}) from exc
     except NoCapacityError as exc:
         # 503 + Retry-After: "busy", as distinct from the 400 "never" above.
-        # `code` is for programs; `message` is for people.
+        # `code` is for programs; `message` is for people. No free counts:
+        # the owner keeps those private, so the way out is the waitlist.
         raise HTTPException(
             status_code=503,
             detail={
@@ -1402,11 +1403,13 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
                 "message": exc.message,
                 "gpu_models": exc.gpu_models,
                 "requested_gpus": exc.gpu_count,
-                "available_gpus": exc.available_gpus,
-                "max_gpus_per_deployment": exc.max_gpus_per_deployment,
                 "retry_after_seconds": exc.retry_after_seconds,
-                "hint": "nothing was created. Poll GET /platform/pricing (available_gpus per GPU) "
-                        "and resend this request once it is at least requested_gpus",
+                "waitlist": "POST /platform/capacity-alerts",
+                "contact": SUPPORT,
+                "hint": "nothing was created. POST /platform/capacity-alerts with this gpu_model and gpu_count "
+                        "to be told (email and a capacity.available event) when there is room, or resend after "
+                        "Retry-After; GET /platform/pricing says when a GPU's availability is no longer "
+                        "fully_rented. For more capacity, write to " + SUPPORT,
             },
             headers={"Retry-After": str(exc.retry_after_seconds)},
         ) from exc
@@ -2346,7 +2349,8 @@ def update_bare_metal_inquiry(
 
 
 # ---------------------------------------------------------------------------
-# GPU capacity overrides — admin-controlled cluster size for /capacity & /rental
+# GPU capacity overrides — admin-controlled cluster size, shown in the admin
+# view of the GPU pool only (the public sees availability from the scheduler)
 # ---------------------------------------------------------------------------
 
 
@@ -2671,7 +2675,8 @@ def _rentable_now() -> list[str]:
 
 
 def _capacity_by_model() -> dict[str, dict[str, int]]:
-    """Normalised GPU model -> available_gpus / max_gpus_per_deployment, as the scheduler counts them."""
+    """Normalised GPU model -> the scheduler's counts (free, most free on one
+    machine, live fleet). Internal: only their availability state is public."""
     return service.control_plane.capacity_by_model()
 
 
@@ -2683,7 +2688,7 @@ def list_supported_gpus() -> list[str]:
     all. Any spelling is accepted on input ("RTX 4090", "rtx-4090"); these are
     the canonical forms. A GPU we price but have no usable node for is omitted
     -- advertising it made agents create deployments that could never
-    schedule. Whether any are FREE is `available_gpus` in /platform/pricing.
+    schedule. Whether any are FREE is `available_now` in /platform/pricing.
     """
     return _rentable_now()
 
@@ -2705,25 +2710,26 @@ def public_pricing() -> dict:
         rates_for_model,
     )
 
-    # Free GPUs as the scheduler counts them (net of reservations, on nodes it
-    # would use). `available_now` used to mean only "a machine with this GPU
-    # is online", so it read true while every card was rented; that meaning
-    # is now `online`.
+    # How rented out each model is, from the scheduler's count (net of
+    # reservations, on nodes it would use), as a state and never a number:
+    # the owner keeps fleet and free counts private. One snapshot gives
+    # `online` (a node of the model exists), `availability` and
+    # `available_now`, so they always agree with each other, with the GPU
+    # pool, and with what a create is told.
+    from greencompute_control_plane.domain.availability import RENTABLE, availability_of
     from greencompute_gateway.application.billing_service import BONUS_RATES
 
     alpha_bonus = BONUS_RATES.get("alpha", 0.0)
-    online = set(_rentable_now())
     capacity = _capacity_by_model()
     gpus = []
     for m in _public_gpu_models():
-        c = capacity.get(_normalize_gpu_model(m), {})
-        n = c.get("available_gpus", 0)
+        c = capacity.get(_normalize_gpu_model(m))
+        state = availability_of(c)
         gpus.append({
             "gpu_model": m,
-            "online": m in online,
-            "available_now": n > 0,
-            "available_gpus": n,
-            "max_gpus_per_deployment": c.get("max_gpus_per_deployment", 0),
+            "online": c is not None,
+            "available_now": state in RENTABLE,
+            "availability": state,
             "vram_gb": GPU_VRAM_GB.get(m),
             "cents_per_gpu_hour": GPU_RATE_CENTS_PER_HOUR[m],
             "usd_per_gpu_hour": round(GPU_RATE_CENTS_PER_HOUR[m] / 100, 2),
