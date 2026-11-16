@@ -494,7 +494,7 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
     if streak >= FAILURES_BEFORE_PAUSE:
         _set_status(service, fleet_id, state="paused", reason=(
             f"Paused: the last {streak} rentals failed before they were ready"
-            + (f" ({(last_error or '')[:200].rstrip('.')})" if last_error else "")
+            + (f" ({(last_error or '')[:400].rstrip('.')})" if last_error else "")
             + ". Fix the workload, then resume the fleet."))
         return
 
