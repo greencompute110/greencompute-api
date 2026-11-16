@@ -55,12 +55,16 @@ SOURCES = (OFAC, UK)
 MIN_ADDRESSES = {OFAC: 20, UK: 1}
 STALE_AFTER = timedelta(days=3)
 ORACLE_CACHE_SECONDS = 6 * 3600
+# After the oracle fails to answer, don't ask again for this long: a dead RPC
+# must not add its timeout to every deposit and sign-in meanwhile.
+ORACLE_BACKOFF_SECONDS = 60
 
 _REFRESH_LOCK_KEY = int.from_bytes(hashlib.sha256(b"sanctions-refresh").digest()[:8], "big", signed=True)
 # Another process started a refresh this recently: don't download it again.
 _REFRESH_CLAIM = timedelta(minutes=30)
 
 _oracle_cache: dict[str, tuple[float, bool]] = {}
+_oracle_failed_at: list[float] = []
 _oracle_lock = threading.Lock()
 _stale_alerted: dict[str, float] = {}
 
@@ -215,10 +219,14 @@ def oracle_says(address: str) -> bool | None:
         cached = _oracle_cache.get(address)
         if cached and now - cached[0] < ORACLE_CACHE_SECONDS:
             return cached[1]
+        if _oracle_failed_at and now - _oracle_failed_at[-1] < ORACLE_BACKOFF_SECONDS:
+            return None
     try:
         answer = sanctions_lists.oracle_is_sanctioned(address)
-    except Exception as exc:  # noqa: BLE001 - unknown, not cached: ask again next time
+    except Exception as exc:  # noqa: BLE001 - unknown, not cached: ask again after the backoff
         log.warning("sanctions: oracle unavailable (%s); screening on the lists alone", type(exc).__name__)
+        with _oracle_lock:
+            _oracle_failed_at[:] = [now]
         return None
     with _oracle_lock:
         if len(_oracle_cache) > 50_000:

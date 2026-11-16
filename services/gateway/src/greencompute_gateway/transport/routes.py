@@ -320,8 +320,10 @@ def register_user(
 # application/wallet_auth.py has the rules; these routes add rate limits and
 # what an agent needs next (where to pay, the account's limits).
 
-WALLET_AUTH_PER_IP = 30  # challenges, and verifies, per minute per address
-WALLET_CHALLENGES_PER_WALLET = 20  # per 5 minutes
+# Challenges, and verifies, per minute per client IP. Not also per wallet: a
+# limit keyed on the address would let anyone lock a wallet out of signing in
+# by asking for its challenges, and protects nothing the per-IP one doesn't.
+WALLET_AUTH_PER_IP = 30
 
 
 def _wallet_auth_error(exc) -> HTTPException:
@@ -376,8 +378,6 @@ def wallet_auth_challenge(
     from greencompute_gateway.application import wallet_auth
 
     _wallet_auth_rate_limit("wallet_challenge", authorization, x_api_key)
-    enforce_rate_limit("wallet_challenge_wallet", payload.address.strip().lower(),
-                       limit=WALLET_CHALLENGES_PER_WALLET, window_seconds=300)
     try:
         return wallet_auth.issue_challenge(
             service.repository.session_factory, address=payload.address, chain=payload.chain,

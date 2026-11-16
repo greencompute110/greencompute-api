@@ -108,6 +108,7 @@ def db(tmp_path, monkeypatch):
                         lambda text, **kw: alerts.append(text))
     monkeypatch.setattr("greencompute_gateway.infrastructure.notify_website.notify_user", lambda *a, **k: None)
     sanctions._oracle_cache.clear()
+    sanctions._oracle_failed_at.clear()
     return types.SimpleNamespace(repo=repo, sf=repo.session_factory, alerts=alerts)
 
 
@@ -199,6 +200,9 @@ def test_screen_uses_the_lists_then_the_oracle_and_survives_an_oracle_outage(db,
     assert sanctions.screen(db.sf, "evm", EVM_B) == "chainalysis_oracle"
     assert calls.count(EVM_B) == 1  # cached
     assert sanctions.screen(db.sf, "evm", "0x" + "ee" * 20) is None  # unknown: the lists decide
+    before = len(calls)
+    assert sanctions.screen(db.sf, "evm", "0x" + "dd" * 20) is None  # backing off: not asked again yet
+    assert len(calls) == before
     assert sanctions.screen(db.sf, "bittensor", COLDKEY.ss58_address) is None
     monkeypatch.setenv("GREENCOMPUTE_SANCTIONS_ENABLED", "false")
     assert sanctions.screen(db.sf, "evm", EVM_A) is None

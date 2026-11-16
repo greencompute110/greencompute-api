@@ -58,6 +58,7 @@ def env(tmp_path, monkeypatch):
                         lambda sf, uid, kind, fields, **kw: emails.append((uid, kind, fields)))
     wallet_auth._ALERTED.clear()
     sanctions._oracle_cache.clear()
+    sanctions._oracle_failed_at.clear()
     # The lists have loaded once (one listed address), as they have in production.
     sanctions.store_list(repo.session_factory, sanctions.OFAC, {("evm", LISTED_EVM): "Listed Party"})
     return types.SimpleNamespace(sf=repo.session_factory, billing=billing, alerts=alerts, emails=emails)
@@ -364,7 +365,7 @@ def test_challenges_say_nothing_about_whether_a_wallet_has_an_account(env):
     assert a == b
 
 
-def test_rate_limits_per_ip_and_per_wallet(env, monkeypatch):
+def test_rate_limits_per_ip_and_none_per_wallet(env, monkeypatch):
     monkeypatch.setattr(routes, "WALLET_AUTH_PER_IP", 3)
     for _ in range(3):
         challenge(EVM_ADDR)
@@ -377,12 +378,14 @@ def test_rate_limits_per_ip_and_per_wallet(env, monkeypatch):
                     ip="198.51.100.2")[0] == 400
     assert call("POST", "/platform/auth/wallet/verify", {"nonce": "x" * 32, "signature": "0x00"},
                 ip="198.51.100.2")[0] == 429
-    monkeypatch.setattr(routes, "WALLET_CHALLENGES_PER_WALLET", 2)
-    monkeypatch.setattr(security, "rate_limiter", FixedWindowRateLimiter())
-    target = keys.PrivateKey(bytes.fromhex("81" * 32)).public_key.to_checksum_address()
-    for ip in ("192.0.2.1", "192.0.2.2"):
-        call("POST", "/platform/auth/wallet/challenge", {"address": target}, ip=ip)
-    assert call("POST", "/platform/auth/wallet/challenge", {"address": target}, ip="192.0.2.3")[0] == 429
+    # Strangers asking for one wallet's challenges from many addresses can't
+    # lock its owner out: there is no per-wallet limit to use up.
+    target = keys.PrivateKey(bytes.fromhex("81" * 32))
+    for i in range(10):
+        call("POST", "/platform/auth/wallet/challenge", {"address": target.public_key.to_checksum_address()},
+             ip=f"192.0.2.{i}")
+    monkeypatch.setattr(security, "rate_limiter", FixedWindowRateLimiter())  # a new minute for this IP
+    assert sign_in_evm(target)["account_created"] is True
 
 
 # --- sanctions at sign-in ------------------------------------------------------------------------
