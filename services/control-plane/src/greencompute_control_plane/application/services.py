@@ -2322,6 +2322,45 @@ class ControlPlaneService:
                 logger.error("Failed to stop deployment %s at its key's limit: %s", deployment.deployment_id, exc)
         return stopped
 
+    def stop_rentals_over_account_limits(self) -> list[str]:
+        """Terminate the running deployments of a new wallet account that has
+        spent its first-week daily limit (key_limits.new_account_limits), so
+        "$50 of spend per 24 hours" holds for rentals already running, not only
+        for new ones. Returns the stopped deployment ids."""
+        from greencompute_persistence.key_limits import account_spend_cents, new_account_limits
+
+        verdict: dict[str, int | None] = {}  # user -> limit in cents when over it, else None
+        stopped: list[str] = []
+        for deployment in self.repository.list_deployments_by_state(DeploymentState.READY):
+            user_id = deployment.owner_user_id
+            if not user_id:
+                continue
+            if user_id not in verdict:
+                limits = new_account_limits(self.repository.session_factory, user_id)
+                limit = round(limits["daily_spend_limit_usd"] * 100) if limits else None
+                over = limit is not None and account_spend_cents(self.repository.session_factory, user_id) >= limit
+                verdict[user_id] = limit if over else None
+            if verdict[user_id] is None:
+                continue
+            reason = (
+                f"stopped: a new wallet account can spend ${verdict[user_id] / 100:.2f} in 24 hours in its first "
+                "week, and this one has; add an email to the account (Settings) to lift the limit"
+            )
+            try:
+                self.update_deployment_status(
+                    DeploymentStatusUpdate(
+                        deployment_id=deployment.deployment_id,
+                        state=DeploymentState.TERMINATED,
+                        error=reason,
+                    )
+                )
+                self.metrics.increment("deployment.stopped.account_limit")
+                stopped.append(deployment.deployment_id)
+                logger.info("Stopped deployment %s: %s", deployment.deployment_id, reason)
+            except Exception as exc:
+                logger.error("Failed to stop deployment %s at its account's limit: %s", deployment.deployment_id, exc)
+        return stopped
+
     def stop_expired_runtimes(self, now: datetime | None = None) -> list[str]:
         """Terminate ready deployments that have run for their
         max_runtime_minutes since ready_at, so a crashed or forgotten client

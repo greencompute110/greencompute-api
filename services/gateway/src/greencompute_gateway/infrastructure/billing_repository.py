@@ -1346,7 +1346,10 @@ class BillingRepository:
             )
             if wallet.sanctions_hit or listed:
                 raise WalletUnderSanctions(wallet_id)
-            if len(wallets) == 1 and user is not None and user.signup_method == "wallet" and user.email_verified_at is None:
+            # Payments-only wallets don't sign in: what must stay is one way in.
+            other_ways_in = [w for w in wallets if w.wallet_id != wallet_id and w.sign_in]
+            no_email = user is not None and user.signup_method == "wallet" and user.email_verified_at is None
+            if no_email and wallet.sign_in and not other_ways_in:
                 raise WalletIsTheSignIn(wallet_id)
             tag = wallet_tag(wallet.chain, wallet.address)
             revoked = list(session.scalars(select(APIKeyORM.key_id).where(

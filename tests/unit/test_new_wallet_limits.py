@@ -129,11 +129,14 @@ def test_the_route_says_what_the_limit_is_and_how_it_ends(sf, monkeypatch):
     assert detail["until"] and "email" in detail["hint"]
 
 
-def test_a_new_wallet_account_s_creates_take_turns_on_postgres():
-    """Requests sent at once must not each see room for one more rental."""
-    from greencompute_gateway.application.services import _account_rental_lock
+def test_a_new_wallet_account_s_creates_take_turns_on_postgres_without_waiting():
+    """Requests sent at once must not each see room for one more rental, and a
+    second one is refused at once rather than parked on a pooled connection
+    (15 parked waiters for one free account would stall every customer)."""
+    from greencompute_gateway.application.services import NewAccountBusyError, _account_rental_lock
 
     seen = []
+    held = {"now": False}
 
     class Conn:
         def __enter__(self):
@@ -143,7 +146,14 @@ def test_a_new_wallet_account_s_creates_take_turns_on_postgres():
             return False
 
         def execute(self, statement, params):
-            seen.append(str(statement).split("(")[0].replace("SELECT ", ""))
+            name = str(statement).split("(")[0].replace("SELECT ", "")
+            seen.append(name)
+            got = name == "pg_try_advisory_lock" and not held["now"]
+            if got:
+                held["now"] = True
+            if name == "pg_advisory_unlock":
+                held["now"] = False
+            return types.SimpleNamespace(scalar=lambda: got)
 
         def commit(self):
             pass
@@ -152,7 +162,46 @@ def test_a_new_wallet_account_s_creates_take_turns_on_postgres():
     svc = types.SimpleNamespace(repository=types.SimpleNamespace(engine=engine))
     with _account_rental_lock(svc, "w1"):
         seen.append("create")
-    assert seen == ["pg_advisory_lock", "create", "pg_advisory_unlock"]
-    with _account_rental_lock(svc, None):  # accounts without the limits never wait
+        with pytest.raises(NewAccountBusyError):  # a second request while the first is inside
+            with _account_rental_lock(svc, "w1"):
+                seen.append("never")
+    assert seen == ["pg_try_advisory_lock", "create", "pg_try_advisory_lock", "pg_advisory_unlock"]
+    with _account_rental_lock(svc, None):  # accounts without the limits never lock
         pass
-    assert len(seen) == 3
+    assert len(seen) == 4
+
+
+def test_a_busy_new_account_hears_to_send_it_again(monkeypatch):
+    from greencompute_gateway.application.services import NewAccountBusyError
+
+    def busy(*a, **k):
+        raise NewAccountBusyError("w1")
+
+    monkeypatch.setattr(routes, "service", types.SimpleNamespace(create_deployment=busy))
+    key = types.SimpleNamespace(user_id="w1", admin=False, key_id="k1", max_active_rentals=None,
+                                daily_spend_limit_usd=None, scopes=[])
+    with pytest.raises(HTTPException) as exc:
+        routes._create_deployment(DeploymentCreateRequest(workload_id="w"), key)
+    assert (exc.value.status_code, exc.value.headers["Retry-After"]) == (409, "2")
+    assert "again in a moment" in exc.value.detail
+
+
+def test_running_rentals_stop_when_a_new_wallet_account_reaches_its_daily_spend(tmp_path):
+    """"$50 in 24 hours" holds for rentals already running, not only new ones."""
+    from greencompute_control_plane.application.services import ControlPlaneService
+    from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
+    from greencompute_protocol import DeploymentState
+
+    cp = ControlPlaneRepository(database_url=f"sqlite:///{tmp_path / 'cp.sqlite'}", bootstrap=True)
+    sf = cp.session_factory
+    over, fine, old = _account(sf, "w-over"), _account(sf, "w-fine"), _account(sf, "w-old", age=timedelta(days=9))
+    for uid, cents in ((over, 5000), (fine, 4999), (old, 9999)):
+        _rental(sf, uid)
+        _charge(sf, uid, cents)
+    svc = ControlPlaneService(repository=cp)
+    stopped = svc.stop_rentals_over_account_limits()
+    assert len(stopped) == 1
+    dep = cp.get_deployment(stopped[0])
+    assert dep.owner_user_id == over and dep.state == DeploymentState.TERMINATED
+    assert "$50.00 in 24 hours" in dep.last_error and "email" in dep.last_error
+    assert svc.stop_rentals_over_account_limits() == []  # nothing left over the limit

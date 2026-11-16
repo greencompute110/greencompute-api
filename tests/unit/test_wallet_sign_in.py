@@ -280,16 +280,18 @@ def test_lowercase_and_checksummed_addresses_are_one_account_and_a_bad_checksum_
 
 def test_signing_in_again_revokes_only_keys_wallet_sign_in_issued(env):
     first = sign_in_evm()
-    # A key the account made itself, and the website's own key: never revoked.
+    # A key made WITH the wallet's key is the wallet's too (revoked with it);
+    # the website's own key never is.
     status, own = call("POST", "/platform/api-keys", {"name": "mine"}, key=first["api_key"])
     assert status == 200
     status, site = call("POST", "/platform/api-keys", {"name": "default", "user_id": first["user_id"]}, key=PROVISION)
     assert status == 200
 
     second = sign_in_evm()
-    assert second["revoked_key_ids"] == [first["key_id"]]
-    assert call("GET", "/platform/billing/balance", key=first["api_key"])[0] == 401
-    for working in (second["api_key"], own["secret"], site["secret"]):
+    assert set(second["revoked_key_ids"]) == {first["key_id"], own["key_id"]}
+    for gone in (first["api_key"], own["secret"]):
+        assert call("GET", "/platform/billing/balance", key=gone)[0] == 401
+    for working in (second["api_key"], site["secret"]):
         assert call("GET", "/platform/billing/balance", key=working)[0] == 200
 
     third = sign_in_evm(keep_existing_keys=True)
@@ -658,3 +660,59 @@ def test_a_wallet_accounts_own_wallet_signs_in_and_cant_be_switched_off_alone(en
     status, body = call("PATCH", f"/platform/billing/wallets/{w2['wallet_id']}", {"sign_in": True}, key=out["api_key"])
     assert status == 200 and body["sign_in"] is True and body["revoked_key_ids"] == []
     assert sign_in_evm(second)["user_id"] == out["user_id"]
+
+
+# --- security review round 1 -----------------------------------------------------------------
+
+
+def test_keys_made_with_a_wallet_key_go_when_the_wallet_is_shut_out(env):
+    """A phished signature must not leave a key behind that outlives signing in
+    again, revoking, unlinking or turning the wallet's sign-in off."""
+    first = sign_in_evm()
+    status, child = call("POST", "/platform/api-keys", {"name": "made by the agent"}, key=first["api_key"])
+    assert status == 200, child
+    assert call("GET", "/platform/billing/balance", key=child["secret"])[0] == 200
+    again = sign_in_evm()  # the owner signs in again after a leak
+    assert set(again["revoked_key_ids"]) == {first["key_id"], child["key_id"]}
+    assert call("GET", "/platform/billing/balance", key=child["secret"])[0] == 401
+
+
+def test_unlinking_the_last_wallet_that_signs_in_is_refused_even_with_a_payments_wallet(env):
+    out = sign_in_evm()
+    second = keys.PrivateKey(bytes.fromhex("d4" * 32))
+    env.billing.repo.add_verified_wallet(out["user_id"], "evm", second.public_key.to_checksum_address().lower())
+    wallets = {w["sign_in"]: w for w in env.billing.repo.list_verified_wallets(out["user_id"])}
+    status, body = call("DELETE", f"/platform/billing/wallets/{wallets[True]['wallet_id']}", key=out["api_key"])
+    assert status == 409 and "signs in" in body["error"]["message"]
+    # The payments-only one can go: it was never a way in.
+    status, _ = call("DELETE", f"/platform/billing/wallets/{wallets[False]['wallet_id']}", key=out["api_key"])
+    assert status == 200
+
+
+def test_a_key_name_that_would_silence_the_sign_in_notice_is_made_printable(env):
+    uid = _email_account(env)
+    _link_for_sign_in(env, uid, EVM_ADDR.lower())
+    out = sign_in_evm(key_name="café ☃\n")
+    assert out["key_name"] == "caf"
+    assert env.emails[-1][2]["key_name"] == "caf"
+    assert sign_in_evm(key_name="☃☃")["key_name"] == wallet_auth.DEFAULT_KEY_NAME
+
+
+def test_live_oracle_calls_are_capped_per_minute(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sanctions.sanctions_lists, "oracle_is_sanctioned", lambda a, **k: calls.append(a) or False)
+    monkeypatch.setattr(sanctions, "ORACLE_MAX_PER_MINUTE", 2)
+    sanctions._oracle_cache.clear()
+    sanctions._oracle_calls.clear()
+    sanctions._oracle_failed_at[:] = []
+    answers = [sanctions.oracle_says(f"0x{n:040x}") for n in range(3)]
+    assert answers == [False, False, None] and len(calls) == 2  # the third: the lists decide
+
+
+def test_a_sanctions_blocked_account_cant_use_paid_inference(env):
+    out = sign_in_evm()
+    routes._BLOCKED_CACHE.clear()
+    sanctions.store_list(env.sf, sanctions.OFAC, {("evm", EVM_ADDR.lower()): "Listed", ("evm", LISTED_EVM): "x"})
+    status, body = call("POST", "/v1/chat/completions",
+                        {"model": "any", "messages": [{"role": "user", "content": "hi"}]}, key=out["api_key"])
+    assert status == 403 and body["error"]["code"] == "wallet_blocked"

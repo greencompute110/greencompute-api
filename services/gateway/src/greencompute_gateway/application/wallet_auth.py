@@ -397,7 +397,9 @@ def verify(
         scopes = normalize_scopes(scopes)
     except ValueError as exc:
         raise WalletAuthError(400, "invalid_request", f"{exc}.") from exc
-    name = (key_name or DEFAULT_KEY_NAME).strip()[:64] or DEFAULT_KEY_NAME
+    # Printable ASCII only: the name goes into the "a wallet signed in" notice,
+    # whose sender refuses anything else, and a refused notice is a silent one.
+    name = "".join(c for c in (key_name or "") if " " <= c <= "~").strip()[:64] or DEFAULT_KEY_NAME
 
     challenge = _claim(session_factory, (nonce or "").strip())
     _check_signature(challenge, signature)

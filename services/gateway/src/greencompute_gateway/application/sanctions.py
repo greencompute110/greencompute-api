@@ -33,6 +33,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, exists, or_, select, text
@@ -64,6 +65,10 @@ _REFRESH_LOCK_KEY = int.from_bytes(hashlib.sha256(b"sanctions-refresh").digest()
 _REFRESH_CLAIM = timedelta(minutes=30)
 
 _oracle_cache: dict[str, tuple[float, bool]] = {}
+
+# Live oracle calls in the last minute (monotonic times), capped below.
+_oracle_calls: deque[float] = deque()
+ORACLE_MAX_PER_MINUTE = int(os.environ.get("GREENCOMPUTE_SANCTIONS_ORACLE_PER_MINUTE", "60") or 60)
 _oracle_failed_at: list[float] = []
 _oracle_lock = threading.Lock()
 _stale_alerted: dict[str, float] = {}
@@ -221,6 +226,14 @@ def oracle_says(address: str) -> bool | None:
             return cached[1]
         if _oracle_failed_at and now - _oracle_failed_at[-1] < ORACLE_BACKOFF_SECONDS:
             return None
+        # A cap on live calls: they share ETH_RPC_URL with the deposit watcher,
+        # and fresh addresses cost nothing to make, so a flood of sign-ins
+        # mustn't get our RPC rate-limited. Over it, the lists decide.
+        while _oracle_calls and now - _oracle_calls[0] > 60:
+            _oracle_calls.popleft()
+        if len(_oracle_calls) >= ORACLE_MAX_PER_MINUTE:
+            return None
+        _oracle_calls.append(now)
     try:
         answer = sanctions_lists.oracle_is_sanctioned(address)
     except Exception as exc:  # noqa: BLE001 - unknown, not cached: ask again after the backoff

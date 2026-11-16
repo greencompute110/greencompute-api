@@ -94,6 +94,14 @@ async def _control_plane_worker_loop() -> None:
                     )
                     _worker_state["last_error"] = f"key limits: {limit_exc}"
                 try:
+                    service.stop_rentals_over_account_limits()
+                except Exception as account_exc:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "account-limit cycle failed: %s", account_exc
+                    )
+                    _worker_state["last_error"] = f"account limits: {account_exc}"
+                try:
                     service.prune_capacity_history()
                 except Exception as prune_exc:
                     import logging

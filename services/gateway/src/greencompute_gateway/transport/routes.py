@@ -117,6 +117,55 @@ def _feature_disabled(feature: str) -> None:
     })
 
 
+# Accounts sanctions screening blocked, by user id, re-checked once a minute:
+# paid inference is a service too, and asking the database on every request
+# would cost more than the request.
+_BLOCKED_CACHE: dict[str, tuple[float, bool]] = {}
+
+
+def _refuse_blocked_account(api_key) -> None:
+    if api_key.user_id is None or api_key.admin:
+        return
+    import time as _time
+
+    from greencompute_gateway.application import sanctions
+
+    now = _time.monotonic()
+    cached = _BLOCKED_CACHE.get(api_key.user_id)
+    if cached is None or now - cached[0] > 60:
+        try:
+            blocked = bool(sanctions.account_blocked(service.repository.session_factory, api_key.user_id))
+        except Exception:  # noqa: BLE001 - a screening fault mustn't take inference down
+            blocked = bool(cached and cached[1])
+        if len(_BLOCKED_CACHE) > 100_000:
+            _BLOCKED_CACHE.clear()
+        _BLOCKED_CACHE[api_key.user_id] = (now, blocked)
+        cached = _BLOCKED_CACHE[api_key.user_id]
+    if cached[1]:
+        raise coded(403, "wallet_blocked", sanctions.BLOCKED_MESSAGE)
+
+
+def _inherit_wallet_tag(parent_key_id: str | None, child_key_id: str | None) -> None:
+    """A key made with a key a wallet's sign-in issued is that wallet's too, so
+    signing in again, revoking, unlinking the wallet or turning its sign-in off
+    ends it as well: a phished signature can't leave a key behind that outlives
+    every way of shutting the wallet out."""
+    if not parent_key_id or not child_key_id:
+        return
+    from greencompute_persistence import session_scope
+    from greencompute_persistence.orm import APIKeyORM
+
+    try:
+        with session_scope(service.repository.session_factory) as session:
+            parent = session.get(APIKeyORM, parent_key_id)
+            if parent is not None and parent.issued_by_wallet:
+                child = session.get(APIKeyORM, child_key_id)
+                if child is not None:
+                    child.issued_by_wallet = parent.issued_by_wallet
+    except Exception:  # noqa: BLE001 - the key was made; don't fail the request over its tag
+        log.exception("api keys: couldn't carry the wallet tag from %s to %s", parent_key_id, child_key_id)
+
+
 @router.post("/platform/api-keys", include_in_schema=False)
 def create_api_key(
     payload: APIKeyCreateRequest,
@@ -145,14 +194,16 @@ def create_api_key(
             raise
         api_key = require_api_key(authorization, x_api_key)
         try:
-            return service.create_api_key(
+            created = service.create_api_key(
                 payload,
                 caller_user_id=api_key.user_id,
                 allow_user_id_override=False,  # bound to own user_id
                 allow_admin_grant=False,
                 caller_scopes=list(api_key.scopes or []),
                 caller_limits=api_key,
-            ).model_dump(mode="json")
+            )
+            _inherit_wallet_tag(api_key.key_id, created.key_id)
+            return created.model_dump(mode="json")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except PermissionError as exc:
@@ -1350,6 +1401,7 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
     from greencompute_gateway.application.services import (
         InsufficientBalanceForRentalError,
         KeyLimitError,
+        NewAccountBusyError,
         NewAccountLimitError,
         NoCapacityError,
         SanctionedAccountError,
@@ -1368,6 +1420,12 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         raise _wallet_blocked() from exc
     except NewAccountLimitError as exc:
         raise _new_account_limit(exc.reason, exc.numbers) from exc
+    except NewAccountBusyError as exc:
+        raise coded(
+            409, "conflict",
+            "another rental is being started for this account right now; send this one again in a moment",
+            headers={"Retry-After": "2"},
+        ) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -2553,6 +2611,7 @@ def chat_completions(
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("chat_completions", api_key.key_id, limit=60, window_seconds=60)
     _enforce_key_limits(api_key)
+    _refuse_blocked_account(api_key)
 
     # Pre-flight balance gate: require any positive balance. Per-request cost
     # is fractions of a cent for small prompts, so we don't need a large

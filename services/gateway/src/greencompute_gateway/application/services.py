@@ -216,6 +216,10 @@ class EmailTakenError(ValueError):
     """The email belongs to another account."""
 
 
+class NewAccountBusyError(Exception):
+    """Another rental is being started for this new wallet account right now."""
+
+
 class NewAccountLimitError(Exception):
     """A wallet account in its first week is at the limits new wallet
     accounts have (key_limits.new_account_limits): `reason` "active" (rentals
@@ -422,7 +426,12 @@ def _owned_by(owner_user_id: str | None, user_id: str | None) -> bool:
 def _account_rental_lock(service, user_id: str | None):
     """Hold a Postgres advisory lock for this account while a deployment is
     checked against its limits and created. Only new wallet accounts take it
-    (user_id None: no lock); elsewhere than Postgres a no-op."""
+    (user_id None: no lock); elsewhere than Postgres a no-op.
+
+    Never waits: a second create for the same account while one is under way
+    gets NewAccountBusyError at once. Waiting would park a pooled connection
+    per request (the checks inside need more from the same pool), and 15
+    requests in flight for one free account would stall every customer."""
     engine = getattr(getattr(service, "repository", None), "engine", None) if user_id else None
     if engine is None or engine.dialect.name != "postgresql":
         yield
@@ -431,8 +440,10 @@ def _account_rental_lock(service, user_id: str | None):
 
     key = int.from_bytes(hashlib.sha256(f"account-rentals:{user_id}".encode()).digest()[:8], "big", signed=True)
     with engine.connect() as conn:
-        conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": key})
+        got = conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar()
         conn.commit()
+        if not got:
+            raise NewAccountBusyError(user_id)
         try:
             yield
         finally:
