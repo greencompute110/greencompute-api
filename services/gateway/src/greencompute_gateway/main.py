@@ -89,8 +89,17 @@ install_log_redaction()
 # The audit trail: routes.py logs `secret_access event=...` at INFO (who
 # revealed an SSH key, ran exec, opened a terminal: never what), and nothing
 # else at INFO. Python's default level is WARNING, so without this none of it
-# was ever written. Keep INFO in that module for audit lines only.
-logging.getLogger("greencompute_gateway.transport.routes").setLevel(logging.INFO)
+# was ever written. Keep INFO in that module for audit lines only. Its own
+# handler, since nothing on the root logger prints INFO; below WARNING only,
+# so warnings and errors still print once, the way they do now.
+_audit_log = logging.getLogger("greencompute_gateway.transport.routes")
+_audit_log.setLevel(logging.INFO)
+if not any(getattr(h, "greencompute_audit", False) for h in _audit_log.handlers):
+    _audit_handler = logging.StreamHandler()
+    _audit_handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    _audit_handler.addFilter(lambda record: record.levelno < logging.WARNING)
+    _audit_handler.greencompute_audit = True  # type: ignore[attr-defined]
+    _audit_log.addHandler(_audit_handler)
 
 app = FastAPI(
     title="Green Compute API",

@@ -664,4 +664,12 @@ def test_the_audit_lines_are_written_in_production():
     # (SSH key reveals, exec, terminals) was ever logged.
     import greencompute_gateway.main  # noqa: F401
 
-    assert logging.getLogger("greencompute_gateway.transport.routes").getEffectiveLevel() == logging.INFO
+    audit = logging.getLogger("greencompute_gateway.transport.routes")
+    assert audit.getEffectiveLevel() == logging.INFO
+    # Printed by its own handler (the root logger prints no INFO), warnings left to the usual path.
+    mine = [h for h in audit.handlers if getattr(h, "greencompute_audit", False)]
+    assert len(mine) == 1
+    info = logging.LogRecord(audit.name, logging.INFO, __file__, 1, "secret_access event=x", None, None)
+    warning = logging.LogRecord(audit.name, logging.WARNING, __file__, 1, "something", None, None)
+    assert mine[0].filter(info) and not mine[0].filter(warning)
+    assert audit.propagate
