@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, JSON, Boolean, DateTime, Float, Index, Integer, String, Text, text
+from sqlalchemy import BigInteger, JSON, Boolean, DateTime, Float, Index, Integer, String, Text, false, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -1031,6 +1031,12 @@ class VerifiedWalletORM(Base):
     # delisting there takes effect on the next refresh.
     sanctions_hit: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sanctions_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Whether a signature from this wallet signs in to the account. On for the
+    # wallet a wallet account was made with; off for a wallet an account linked
+    # to receive payments, until its owner turns it on: a signature phished
+    # from a payments wallet (Bittensor extensions don't check the site) must
+    # not open the account.
+    sign_in: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 
 class WalletAuthChallengeORM(Base):

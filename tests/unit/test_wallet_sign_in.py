@@ -324,9 +324,16 @@ def _email_account(env, user_id="email-user", email="ada@example.com"):
     return user_id
 
 
+def _link_for_sign_in(env, user_id, address):
+    """A wallet the account linked to pay in, with signing in turned on."""
+    wallet, _ = env.billing.repo.add_verified_wallet(user_id, "evm", address)
+    env.billing.repo.set_wallet_sign_in(user_id, wallet["wallet_id"], True)
+    return wallet
+
+
 def test_a_wallet_verified_on_an_email_account_signs_in_to_that_account_and_the_owner_is_told(env):
     uid = _email_account(env)
-    env.billing.repo.add_verified_wallet(uid, "evm", EVM_ADDR.lower())
+    _link_for_sign_in(env, uid, EVM_ADDR.lower())
     out = sign_in_evm()
     assert (out["user_id"], out["account_created"], out["has_email"]) == (uid, False, True)
     assert out["account_limits"] is None  # not a new wallet account
@@ -504,7 +511,7 @@ def test_the_only_wallet_of_a_wallet_account_cant_be_unlinked_and_unlinking_revo
     # An email account's wallet: unlinking it also ends the keys it signed in for.
     uid = _email_account(env)
     other = keys.PrivateKey(bytes.fromhex("b1" * 32))
-    env.billing.repo.add_verified_wallet(uid, "evm", other.public_key.to_checksum_address().lower())
+    _link_for_sign_in(env, uid, other.public_key.to_checksum_address().lower())
     issued = sign_in_evm(other)
     [w] = env.billing.repo.list_verified_wallets(uid)
     status, body = call("DELETE", f"/platform/billing/wallets/{w['wallet_id']}", key=issued["api_key"])
@@ -576,7 +583,7 @@ def test_a_wallet_account_cant_claim_someone_elses_email(env):
 
 def test_admin_accounts_cant_sign_in_on_the_website_with_a_wallet(env):
     uid = _email_account(env)
-    env.billing.repo.add_verified_wallet(uid, "evm", EVM_ADDR.lower())
+    _link_for_sign_in(env, uid, EVM_ADDR.lower())
     from greencompute_persistence.orm import AdminAccountORM
 
     with session_scope(env.sf) as s:
@@ -602,10 +609,52 @@ def test_a_flagged_wallet_cant_be_unlinked_to_lift_the_block(env):
     uid = _email_account(env)
     other = keys.PrivateKey(bytes.fromhex("c1" * 32))
     addr = other.public_key.to_checksum_address().lower()
-    env.billing.repo.add_verified_wallet(uid, "evm", addr)
+    _link_for_sign_in(env, uid, addr)
     issued = sign_in_evm(other)
     sanctions.store_list(env.sf, sanctions.OFAC, {("evm", addr): "Listed", ("evm", LISTED_EVM): "x"})
     [w] = env.billing.repo.list_verified_wallets(uid)
     status, body = call("DELETE", f"/platform/billing/wallets/{w['wallet_id']}", key=issued["api_key"])
     assert status == 409 and "support@green-compute.com" in body["error"]["message"]
     assert sanctions.account_blocked(env.sf, uid) == "list"
+
+
+
+def test_a_wallet_linked_to_pay_in_signs_in_only_once_its_owner_turns_that_on(env):
+    """A payments wallet isn't a way in by default: a signature phished from it
+    (Bittensor extensions don't check the site) must not open the account."""
+    uid = _email_account(env)
+    wallet, _ = env.billing.repo.add_verified_wallet(uid, "evm", EVM_ADDR.lower())
+    ch = challenge(EVM_ADDR)
+    status, body = verify(ch["nonce"], evm_sign(ch["message"]))
+    assert status == 403 and body["error"]["code"] == "wallet_sign_in_off"
+    assert "Billing > Verified wallets" in body["error"]["message"]
+    assert [w["sign_in"] for w in env.billing.repo.list_verified_wallets(uid)] == [False]
+
+    env.billing.repo.set_wallet_sign_in(uid, wallet["wallet_id"], True)  # the owner turns it on
+    out = sign_in_evm()
+    assert out["user_id"] == uid
+
+    # Off again: the keys its sign-ins issued stop working, and it can't sign in.
+    result = env.billing.repo.set_wallet_sign_in(uid, wallet["wallet_id"], False)
+    assert result["revoked_key_ids"] == [out["key_id"]]
+    assert call("GET", "/platform/billing/balance", key=out["api_key"])[0] == 401
+    ch = challenge(EVM_ADDR)
+    assert verify(ch["nonce"], evm_sign(ch["message"]))[0] == 403
+
+
+def test_a_wallet_accounts_own_wallet_signs_in_and_cant_be_switched_off_alone(env):
+    out = sign_in_evm()
+    [wallet] = env.billing.repo.list_verified_wallets(out["user_id"])
+    assert wallet["sign_in"] is True
+    status, body = call("PATCH", f"/platform/billing/wallets/{wallet['wallet_id']}", {"sign_in": False}, key=out["api_key"])
+    assert status == 409 and "signs in" in body["error"]["message"]
+    status, body = call("PATCH", f"/platform/billing/wallets/{wallet['wallet_id']}", {"sign_in": "yes"}, key=out["api_key"])
+    assert status == 400
+    status, _ = call("PATCH", "/platform/billing/wallets/not-mine", {"sign_in": True}, key=out["api_key"])
+    assert status == 404
+    # A second wallet, linked to pay in: the owner turns signing in on over the API.
+    second = keys.PrivateKey(bytes.fromhex("c3" * 32))
+    w2, _ = env.billing.repo.add_verified_wallet(out["user_id"], "evm", second.public_key.to_checksum_address().lower())
+    status, body = call("PATCH", f"/platform/billing/wallets/{w2['wallet_id']}", {"sign_in": True}, key=out["api_key"])
+    assert status == 200 and body["sign_in"] is True and body["revoked_key_ids"] == []
+    assert sign_in_evm(second)["user_id"] == out["user_id"]

@@ -3668,6 +3668,34 @@ def billing_link_wallet(
         ) from exc
 
 
+@router.patch("/platform/billing/wallets/{wallet_id}")
+def billing_update_wallet(
+    wallet_id: str,
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Turn signing in with a verified wallet on or off: {"sign_in": true}.
+    A wallet linked to receive payments can't sign in to the account until
+    this is on; turning it off revokes the API keys its sign-ins issued."""
+    user_id = _require_user(authorization, x_api_key)
+    if not isinstance(payload.get("sign_in"), bool):
+        raise coded(400, "invalid_request", 'send {"sign_in": true} or {"sign_in": false}')
+    from greencompute_gateway.infrastructure.billing_repository import WalletIsTheSignIn
+
+    try:
+        result = _get_billing().repo.set_wallet_sign_in(user_id, wallet_id, payload["sign_in"])
+    except WalletIsTheSignIn as exc:
+        raise coded(
+            409, "conflict",
+            "this wallet is how this account signs in, and the account has no email: add an email on the "
+            "website (Settings) or turn on signing in with another wallet first",
+        ) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="wallet not found")
+    return result
+
+
 @router.delete("/platform/billing/wallets/{wallet_id}")
 def billing_unlink_wallet(
     wallet_id: str,

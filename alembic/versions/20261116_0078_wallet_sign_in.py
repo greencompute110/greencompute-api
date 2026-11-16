@@ -57,12 +57,16 @@ def upgrade() -> None:
     op.create_index("ix_api_keys_issued_by_wallet", "api_keys", ["issued_by_wallet"])
     op.add_column("verified_wallets", sa.Column("sanctions_hit", sa.String(length=32), nullable=True))
     op.add_column("verified_wallets", sa.Column("sanctions_checked_at", sa.DateTime(timezone=True), nullable=True))
+    # Off for every wallet linked so far (all linked to receive payments):
+    # each owner opts in before the wallet can sign in to their account.
+    op.add_column("verified_wallets", sa.Column("sign_in", sa.Boolean(), nullable=False, server_default=sa.false()))
 
 
 def downgrade() -> None:
     # batch_alter_table so the drops also work on SQLite (no DROP COLUMN
     # before 3.35); on Postgres it issues plain ALTER TABLE statements.
     with op.batch_alter_table("verified_wallets") as batch:
+        batch.drop_column("sign_in")
         batch.drop_column("sanctions_checked_at")
         batch.drop_column("sanctions_hit")
     op.drop_index("ix_api_keys_issued_by_wallet", table_name="api_keys")

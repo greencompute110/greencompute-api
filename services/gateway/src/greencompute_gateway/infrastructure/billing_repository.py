@@ -1356,6 +1356,32 @@ class BillingRepository:
             session.delete(wallet)
             return {"deleted": True, "wallet_id": wallet_id, "revoked_key_ids": revoked}
 
+    def set_wallet_sign_in(self, user_id: str, wallet_id: str, enabled: bool) -> dict | None:
+        """Turn signing in with this wallet on or off. Off revokes the keys its
+        sign-ins issued. None if it isn't this account's; WalletIsTheSignIn
+        for a wallet account's only way in."""
+        from greencompute_gateway.infrastructure.wallet_signatures import wallet_tag
+
+        with session_scope(self.session_factory) as session:
+            user = session.get(UserORM, user_id, with_for_update=True)
+            wallets = session.scalars(select(VerifiedWalletORM).where(VerifiedWalletORM.user_id == user_id)).all()
+            wallet = next((w for w in wallets if w.wallet_id == wallet_id), None)
+            if wallet is None:
+                return None
+            revoked: list[str] = []
+            if not enabled and wallet.sign_in:
+                others = [w for w in wallets if w.wallet_id != wallet_id and w.sign_in]
+                no_email = user is not None and user.signup_method == "wallet" and user.email_verified_at is None
+                if no_email and not others:
+                    raise WalletIsTheSignIn(wallet_id)
+                tag = wallet_tag(wallet.chain, wallet.address)
+                revoked = list(session.scalars(select(APIKeyORM.key_id).where(
+                    APIKeyORM.user_id == user_id, APIKeyORM.issued_by_wallet == tag)).all())
+                if revoked:
+                    session.execute(delete(APIKeyORM).where(APIKeyORM.key_id.in_(revoked)))
+            wallet.sign_in = enabled
+            return {**self._wallet_dict(wallet), "revoked_key_ids": revoked}
+
     def delete_verified_wallet(self, user_id: str, wallet_id: str) -> bool:
         with session_scope(self.session_factory) as session:
             row = session.get(VerifiedWalletORM, wallet_id)
@@ -1724,6 +1750,7 @@ class BillingRepository:
             "chain": row.chain,
             "address": row.address,
             "created_at": row.created_at.isoformat() if row.created_at else None,
+            "sign_in": bool(row.sign_in),
         }
 
     @staticmethod

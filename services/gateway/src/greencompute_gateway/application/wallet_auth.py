@@ -225,6 +225,12 @@ def wallet_owner(session_factory, chain: str, address: str) -> str | None:
             VerifiedWalletORM.chain == chain, VerifiedWalletORM.address == address))
 
 
+def _signs_in(session_factory, chain: str, address: str) -> bool:
+    with session_scope(session_factory) as session:
+        return bool(session.scalar(select(VerifiedWalletORM.sign_in).where(
+            VerifiedWalletORM.chain == chain, VerifiedWalletORM.address == address)))
+
+
 def _free_username(session, address: str) -> str:
     # The address itself (unique already: one account per wallet), unless an
     # account somehow took that name first.
@@ -249,7 +255,7 @@ def _create_account(session_factory, chain: str, address: str) -> str | None:
             ))
             session.add(VerifiedWalletORM(
                 wallet_id=str(uuid4()), user_id=user_id, chain=chain, address=address, created_at=now,
-                sanctions_checked_at=now,
+                sanctions_checked_at=now, sign_in=True,
             ))
     except IntegrityError:
         return None
@@ -288,6 +294,14 @@ def _account_for(session_factory, chain: str, address: str) -> tuple[str, bool]:
     if hit:
         raise _blocked(session_factory, chain, address, hit, owner)
     if owner is not None:
+        if not _signs_in(session_factory, chain, address):
+            # The caller just proved they hold this wallet, so saying it is
+            # linked tells them nothing they don't own.
+            raise WalletAuthError(
+                403, "wallet_sign_in_off",
+                "This wallet is linked to an account to pay in, not to sign in. Sign in with that account's "
+                "email or Google, then turn on \"Sign in with this wallet\" under Billing > Verified wallets.",
+            )
         return owner, False
     created = _create_account(session_factory, chain, address)
     if created is None:
