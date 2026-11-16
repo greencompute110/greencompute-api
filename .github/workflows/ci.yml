@@ -52,6 +52,9 @@ jobs:
       # Deliberately NOT guarded with a skipif in the test module: these tests
       # protect the encryption of keys that control real funds, so a missing
       # dependency must fail CI loudly rather than silently skip the suite.
+      #
+      # `websockets` (a gateway dependency, listed for clarity) lets the
+      # terminal test drive the gateway's WebSocket client against a real server.
       - name: Unit tests
         working-directory: greencompute-api
-        run: uv run --package greencompute-gateway --with pytest --with cryptography --with substrate-interface pytest tests/unit -q
+        run: uv run --package greencompute-gateway --with pytest --with cryptography --with substrate-interface --with websockets pytest tests/unit -q

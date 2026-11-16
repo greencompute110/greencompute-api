@@ -11,6 +11,9 @@ dependencies = [
   "greencompute-control-plane",
   "greencompute-builder",
   "stripe>=8.0.0",
+  # The browser terminal: uvicorn serves WebSockets with it, and the gateway
+  # relays them to the node agents with its client (proxy=None needs 15+).
+  "websockets>=15,<18",
 ]
 
 [tool.uv.sources]
