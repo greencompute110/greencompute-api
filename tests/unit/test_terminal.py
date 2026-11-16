@@ -671,5 +671,13 @@ def test_the_audit_lines_are_written_in_production():
     assert len(mine) == 1
     info = logging.LogRecord(audit.name, logging.INFO, __file__, 1, "secret_access event=x", None, None)
     warning = logging.LogRecord(audit.name, logging.WARNING, __file__, 1, "something", None, None)
-    assert mine[0].filter(info) and not mine[0].filter(warning)
+    root = logging.getLogger()
+    saved = root.handlers[:]
+    try:
+        root.handlers = []
+        assert mine[0].filter(info) and not mine[0].filter(warning)
+        root.handlers = [logging.StreamHandler()]  # a library added one: it prints the line, not us twice
+        assert not mine[0].filter(info)
+    finally:
+        root.handlers = saved
     assert audit.propagate

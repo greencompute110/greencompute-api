@@ -90,14 +90,23 @@ install_log_redaction()
 # revealed an SSH key, ran exec, opened a terminal: never what), and nothing
 # else at INFO. Python's default level is WARNING, so without this none of it
 # was ever written. Keep INFO in that module for audit lines only. Its own
-# handler, since nothing on the root logger prints INFO; below WARNING only,
-# so warnings and errors still print once, the way they do now.
+# handler prints them while nothing else would: the root logger has no
+# handler at first, and a library adds one later at runtime (then that one
+# prints them). Warnings and errors are left to the usual path either way.
 _audit_log = logging.getLogger("greencompute_gateway.transport.routes")
 _audit_log.setLevel(logging.INFO)
+
+
+def _audit_unprinted(record: logging.LogRecord) -> bool:
+    if record.levelno >= logging.WARNING:
+        return False
+    return not any(h.level <= record.levelno for h in logging.getLogger().handlers)
+
+
 if not any(getattr(h, "greencompute_audit", False) for h in _audit_log.handlers):
     _audit_handler = logging.StreamHandler()
     _audit_handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
-    _audit_handler.addFilter(lambda record: record.levelno < logging.WARNING)
+    _audit_handler.addFilter(_audit_unprinted)
     _audit_handler.greencompute_audit = True  # type: ignore[attr-defined]
     _audit_log.addHandler(_audit_handler)
 
