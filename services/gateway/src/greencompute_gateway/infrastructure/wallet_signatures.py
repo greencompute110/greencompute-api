@@ -38,8 +38,22 @@ _SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD036414
 
 
 def wallet_tag(chain: str, address: str) -> str:
-    """api_keys.issued_by_wallet for keys a wallet's sign-ins issued."""
+    """api_keys.issued_by_wallet for keys a wallet's sign-ins over the API
+    issued (and keys made with them)."""
     return f"{chain}:{address}"
+
+
+#: Appended to wallet_tag for the keys of website sessions the wallet began
+#: (and keys made with them). An agent signing in again over the API
+#: replaces only its own keys, never a person's website session.
+WEB_TAG_SUFFIX = "#web"
+
+
+def wallet_tags(chain: str, address: str) -> tuple[str, str]:
+    """Both tags of a wallet's keys: what unlinking it, turning its sign-in
+    off or a revoke_keys signature ends."""
+    tag = wallet_tag(chain, address)
+    return tag, tag + WEB_TAG_SUFFIX
 
 
 def detect_chain(address: str) -> str:

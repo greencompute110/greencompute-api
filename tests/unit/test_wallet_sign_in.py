@@ -326,6 +326,14 @@ def _email_account(env, user_id="email-user", email="ada@example.com"):
     return user_id
 
 
+def _approve_sign_in(approver, wallet) -> dict:
+    """The PATCH body that turns on `wallet`'s sign-in, signed by `approver`
+    (an EVM key that signs in to the account already)."""
+    subject = f"{wallet['chain']}:{wallet['address']}"
+    ch = challenge(approver.public_key.to_checksum_address(), action="approve_sign_in", subject=subject)
+    return {"sign_in": True, "nonce": ch["nonce"], "signature": evm_sign(ch["message"], approver)}
+
+
 def _link_for_sign_in(env, user_id, address):
     """A wallet the account linked to pay in, with signing in turned on."""
     wallet, _ = env.billing.repo.add_verified_wallet(user_id, "evm", address)
@@ -446,7 +454,10 @@ def test_the_website_session_needs_the_provision_secret_and_leaves_keys_alone(en
     status, out = call("POST", "/platform/auth/wallet/website-session", body, key=PROVISION)
     assert status == 200, out
     assert (out["user_id"], out["address"], out["account_created"]) == (agent["user_id"], EVM_ADDR.lower(), False)
-    assert "api_key" not in out
+    # A key for this website session alone, tagged apart from the agent's.
+    assert out["api_key"].startswith("gk_") and out["api_key"] != agent["api_key"]
+    with session_scope(env.sf) as s:
+        assert s.get(APIKeyORM, out["key_id"]).issued_by_wallet == f"evm:{EVM_ADDR.lower()}#web"
     assert call("GET", "/platform/billing/balance", key=agent["api_key"])[0] == 200  # nothing revoked
 
 
@@ -654,11 +665,13 @@ def test_a_wallet_accounts_own_wallet_signs_in_and_cant_be_switched_off_alone(en
     assert status == 400
     status, _ = call("PATCH", "/platform/billing/wallets/not-mine", {"sign_in": True}, key=out["api_key"])
     assert status == 404
-    # A second wallet, linked to pay in: the owner turns signing in on over the API.
+    # A second wallet, linked to pay in: the owner turns signing in on over the
+    # API, approved by a signature from the wallet that signs in already.
     second = keys.PrivateKey(bytes.fromhex("c3" * 32))
     w2, _ = env.billing.repo.add_verified_wallet(out["user_id"], "evm", second.public_key.to_checksum_address().lower())
-    status, body = call("PATCH", f"/platform/billing/wallets/{w2['wallet_id']}", {"sign_in": True}, key=out["api_key"])
-    assert status == 200 and body["sign_in"] is True and body["revoked_key_ids"] == []
+    body = _approve_sign_in(EVM_KEY, w2)
+    status, result = call("PATCH", f"/platform/billing/wallets/{w2['wallet_id']}", body, key=out["api_key"])
+    assert status == 200 and result["sign_in"] is True and result["revoked_key_ids"] == []
     assert sign_in_evm(second)["user_id"] == out["user_id"]
 
 
@@ -734,12 +747,175 @@ def test_a_website_wallet_session_lasts_only_while_the_wallet_may_sign_in(env):
     # The owner adds a second way in, then turns this wallet's sign-in off: the session ends.
     second = keys.PrivateKey(bytes.fromhex("e5" * 32))
     w2, _ = env.billing.repo.add_verified_wallet(sess["user_id"], "evm", second.public_key.to_checksum_address().lower())
-    env.billing.repo.set_wallet_sign_in(sess["user_id"], w2["wallet_id"], True)
     w1 = next(w for w in env.billing.repo.list_verified_wallets(sess["user_id"]) if w["address"] == EVM_ADDR.lower())
+    env.billing.repo.set_wallet_sign_in(sess["user_id"], w2["wallet_id"], True, approved_by=f"evm:{w1['address']}")
     env.billing.repo.set_wallet_sign_in(sess["user_id"], w1["wallet_id"], False)
     assert ok()[1] == {"ok": False}
     # Listed by sanctions screening: ended too.
-    env.billing.repo.set_wallet_sign_in(sess["user_id"], w1["wallet_id"], True)
+    env.billing.repo.set_wallet_sign_in(sess["user_id"], w1["wallet_id"], True, approved_by=f"evm:{w2['address']}")
     assert ok()[1] == {"ok": True}
     sanctions.store_list(env.sf, sanctions.OFAC, {("evm", EVM_ADDR.lower()): "Listed", ("evm", LISTED_EVM): "x"})
     assert ok()[1] == {"ok": False}
+
+
+# --- security review round 2: website session keys, approvals ---------------------------
+
+
+def _web_session(key=EVM_KEY):
+    ch = challenge(key.public_key.to_checksum_address())
+    status, out = call("POST", "/platform/auth/wallet/website-session",
+                       {"nonce": ch["nonce"], "signature": evm_sign(ch["message"], key)}, key=PROVISION)
+    assert status == 200, out
+    return out
+
+
+def _works(secret):
+    return call("GET", "/platform/billing/balance", key=secret)[0] == 200
+
+
+def test_each_website_session_has_its_own_key_that_an_agent_sign_in_leaves_alone(env):
+    web = _web_session()
+    status, sub = call("POST", "/platform/api-keys", {"name": "made on the website"}, key=web["api_key"])
+    assert status == 200
+    with session_scope(env.sf) as s:
+        assert s.get(APIKeyORM, sub["key_id"]).issued_by_wallet == f"evm:{EVM_ADDR.lower()}#web"
+    agent = sign_in_evm()
+    again = sign_in_evm()  # an agent replacing its key logs no person out
+    assert again["revoked_key_ids"] == [agent["key_id"]]
+    assert _works(web["api_key"]) and _works(sub["secret"])
+
+
+def test_a_revoke_keys_signature_ends_website_sessions_too(env):
+    web, agent = _web_session(), sign_in_evm()
+    ch = challenge(EVM_ADDR, action="revoke_keys")
+    status, out = verify(ch["nonce"], evm_sign(ch["message"]))
+    assert status == 200 and set(out["revoked_key_ids"]) == {web["key_id"], agent["key_id"]}
+    assert not _works(web["api_key"]) and not _works(agent["api_key"])
+
+
+def test_unlinking_or_turning_sign_in_off_ends_the_wallets_website_sessions(env):
+    uid = _email_account(env)
+    w = _link_for_sign_in(env, uid, EVM_ADDR.lower())
+    web = _web_session()
+    status, sub = call("POST", "/platform/api-keys", {"name": "planted"}, key=web["api_key"])
+    off = env.billing.repo.set_wallet_sign_in(uid, w["wallet_id"], False)
+    assert set(off["revoked_key_ids"]) == {web["key_id"], sub["key_id"]}
+    assert not _works(web["api_key"]) and not _works(sub["secret"])
+    env.billing.repo.set_wallet_sign_in(uid, w["wallet_id"], True)  # the only sign-in wallet: no approval
+    web = _web_session()
+    assert env.billing.repo.unlink_wallet(uid, w["wallet_id"])["revoked_key_ids"] == [web["key_id"]]
+    assert not _works(web["api_key"])
+
+
+def test_a_wallet_keeps_only_its_five_newest_website_sessions(env, monkeypatch):
+    sessions = [_web_session() for _ in range(6)]
+    status, sub = call("POST", "/platform/api-keys", {"name": "made in session 6"}, key=sessions[-1]["api_key"])
+    sessions.append(_web_session())
+    assert [_works(s["api_key"]) for s in sessions] == [False, False, True, True, True, True, True]
+    assert _works(sub["secret"])  # keys made with a session's key don't count
+
+
+def test_a_sanctions_hit_ends_the_website_session_and_its_key(env):
+    web = _web_session()
+    sanctions.store_list(env.sf, sanctions.OFAC, {("evm", EVM_ADDR.lower()): "Listed", ("evm", LISTED_EVM): "x"})
+    status, out = call("POST", "/platform/auth/wallet/website-session/check",
+                       {"user_id": web["user_id"], "chain": "evm", "address": EVM_ADDR}, key=PROVISION)
+    assert out == {"ok": False} and not _works(web["api_key"])
+
+
+def test_turning_on_another_wallet_needs_a_sign_in_wallets_signature(env):
+    out = sign_in_evm()  # a wallet account: EVM_KEY signs in to it
+    second = keys.PrivateKey(bytes.fromhex("d4" * 32))
+    w2, _ = env.billing.repo.add_verified_wallet(out["user_id"], "evm", second.public_key.to_checksum_address().lower())
+    path = f"/platform/billing/wallets/{w2['wallet_id']}"
+    status, body = call("PATCH", path, {"sign_in": True}, key=out["api_key"])
+    assert status == 403 and body["error"]["code"] == "approval_required"
+    assert body["detail"]["sign_with"] == [{"chain": "evm", "address": EVM_ADDR.lower()}]
+    assert body["detail"]["subject"] == f"evm:{w2['address']}"
+    # The message names the wallet it lets in, in words.
+    ch = challenge(EVM_ADDR, action="approve_sign_in", subject=f"evm:{w2['address'].upper().replace('0X', '0x')}")
+    assert f"Allow the Ethereum/Base wallet {second.public_key.to_checksum_address()} to sign in" in ch["message"]
+    assert ch["subject"] == f"evm:{w2['address']}"
+    # Signed by the wallet being let in itself: not one that signs in yet.
+    status, body = call("PATCH", path, _approve_sign_in(second, w2), key=out["api_key"])
+    assert status == 403 and body["error"]["code"] == "approval_required"
+    # Approval for a different wallet doesn't carry over.
+    third = keys.PrivateKey(bytes.fromhex("d5" * 32))
+    w3, _ = env.billing.repo.add_verified_wallet(out["user_id"], "evm", third.public_key.to_checksum_address().lower())
+    status, body = call("PATCH", path, _approve_sign_in(EVM_KEY, w3), key=out["api_key"])
+    assert status == 400 and body["error"]["code"] == "challenge_invalid"
+    # A limited key can't do it even with the signature.
+    status, limited = call("POST", "/platform/api-keys", {"name": "billing", "scopes": ["billing", "read"]},
+                           key=out["api_key"])
+    status, body = call("PATCH", path, _approve_sign_in(EVM_KEY, w2), key=limited["secret"])
+    assert status == 403 and body["error"]["code"] == "scope_required"
+    approval = _approve_sign_in(EVM_KEY, w2)
+    assert call("PATCH", path, approval, key=out["api_key"])[0] == 200
+    assert call("PATCH", f"/platform/billing/wallets/{w3['wallet_id']}", {**approval, "sign_in": True},
+                key=out["api_key"])[1]["error"]["code"] == "challenge_invalid"  # used once
+
+
+def test_another_accounts_wallet_cant_approve(env):
+    victim = sign_in_evm()
+    mallory = keys.PrivateKey(bytes.fromhex("d6" * 32))
+    sign_in_evm(mallory)  # signs in to its own account, not the victim's
+    planted = keys.PrivateKey(bytes.fromhex("d7" * 32))
+    w, _ = env.billing.repo.add_verified_wallet(victim["user_id"], "evm", planted.public_key.to_checksum_address().lower())
+    status, body = call("PATCH", f"/platform/billing/wallets/{w['wallet_id']}", _approve_sign_in(mallory, w),
+                        key=victim["api_key"])
+    assert status == 403 and "doesn't sign in to this account" in body["error"]["message"]
+
+
+def test_the_first_sign_in_wallet_of_an_email_account_needs_no_signature_and_the_owner_is_told(env):
+    uid = _email_account(env)
+    w, _ = env.billing.repo.add_verified_wallet(uid, "evm", EVM_ADDR.lower())
+    status, key = call("POST", "/platform/api-keys", {"name": "default", "user_id": uid}, key=PROVISION)
+    status, body = call("PATCH", f"/platform/billing/wallets/{w['wallet_id']}", {"sign_in": True}, key=key["secret"])
+    assert status == 200 and body["changed"] is True
+    assert [(e[1], e[2]["event"]) for e in env.emails] == [("wallet_sign_in", "sign_in_on")]
+
+
+def test_an_approval_can_never_sign_in(env):
+    out = sign_in_evm()
+    for action, subject in (("approve_sign_in", "evm:" + "0x" + "ee" * 20), ("add_email", "a@b.io")):
+        ch = challenge(EVM_ADDR, action=action, subject=subject)
+        status, body = verify(ch["nonce"], evm_sign(ch["message"]))
+        assert status == 400 and body["error"]["code"] == "challenge_invalid"
+        ch = challenge(EVM_ADDR, action=action, subject=subject)
+        status, body = call("POST", "/platform/auth/wallet/website-session",
+                            {"nonce": ch["nonce"], "signature": evm_sign(ch["message"])}, key=PROVISION)
+        assert status == 400 and body["error"]["code"] == "challenge_invalid"
+    assert call("POST", "/platform/auth/wallet/challenge", {"address": EVM_ADDR, "action": "approve_sign_in"})[0] == 400
+    assert call("POST", "/platform/auth/wallet/challenge",
+                {"address": EVM_ADDR, "action": "sign_in", "subject": "x"})[0] == 400
+    assert out
+
+
+def test_a_wallet_account_adding_an_email_needs_its_wallets_signature(env):
+    out = sign_in_evm()
+
+    def ask(body):
+        return call("POST", "/platform/account/email-approval", {"user_id": out["user_id"], **body}, key=PROVISION)
+
+    status, body = ask({"email": "me@example.com"})
+    assert status == 403 and body["error"]["code"] == "approval_required"
+    ch = challenge(EVM_ADDR, action="add_email", subject="Me@Example.com")
+    assert "Add the email address me@example.com to your Green Compute account" in ch["message"]
+    sig = evm_sign(ch["message"])
+    status, body = ask({"email": "other@example.com", "nonce": ch["nonce"], "signature": sig})
+    assert status == 400 and body["error"]["code"] == "challenge_invalid"  # signed for another email
+    ch = challenge(EVM_ADDR, action="add_email", subject="me@example.com")
+    approval = {"email": "me@example.com", "nonce": ch["nonce"], "signature": evm_sign(ch["message"])}
+    assert ask(approval) == (200, {"approved": True, "needed": True, "signed_by": f"evm:{EVM_ADDR.lower()}"})
+    assert ask(approval)[1]["error"]["code"] == "challenge_invalid"  # once
+    stranger = keys.PrivateKey(bytes.fromhex("d8" * 32))
+    ch = challenge(stranger.public_key.to_checksum_address(), action="add_email", subject="me@example.com")
+    status, body = ask({"email": "me@example.com", "nonce": ch["nonce"], "signature": evm_sign(ch["message"], stranger)})
+    assert status == 403
+    assert call("POST", "/platform/account/email-approval", {"user_id": out["user_id"], "email": "me@example.com"},
+                key=out["api_key"])[0] in (401, 403)
+    # An account made on the website needs no signature.
+    uid = _email_account(env)
+    status, body = call("POST", "/platform/account/email-approval", {"user_id": uid, "email": "x@example.com"},
+                        key=PROVISION)
+    assert body == {"approved": True, "needed": False}

@@ -433,6 +433,7 @@ def wallet_auth_challenge(
         return wallet_auth.issue_challenge(
             service.repository.session_factory, address=payload.address, chain=payload.chain,
             action=payload.action, chain_id=payload.chain_id, client_ip=_audit_client_ip(),
+            subject=payload.subject,
         )
     except wallet_auth.WalletAuthError as exc:
         raise _wallet_auth_error(exc) from exc
@@ -495,14 +496,14 @@ def wallet_auth_verify(
     return result
 
 
-def _email_wallet_sign_in(user_id: str, chain: str, address: str, key_name: str) -> None:
-    """Tell an account with an email that a wallet just got a key for it,
-    the way a new-device notice would: a wallet verified only for payments
-    may not be one its owner expects to sign in with."""
+def _email_wallet_sign_in(user_id: str, chain: str, address: str, key_name: str, *, event: str = "signed_in") -> None:
+    """Tell an account with an email that a wallet just got a key for it
+    (`event` "signed_in"), or may now sign in to it ("sign_in_on"), the way
+    a new-device notice would. notify_user skips accounts with no email."""
     from greencompute_gateway.infrastructure.notify_website import notify_user
 
     notify_user(service.repository.session_factory, user_id, "wallet_sign_in", {
-        "chain": chain, "address": address, "key_name": key_name,
+        "chain": chain, "address": address, "key_name": key_name or None, "event": event,
         "signed_in_at": datetime.now(UTC).isoformat(),
     })
 
@@ -514,9 +515,11 @@ def wallet_auth_website_session(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     """For the website's "Connect wallet" sign-in (provision secret only):
-    the same checks as verify, and the account back instead of a key. The
-    website keeps its own key per account, which wallet sign-ins never
-    revoke. Body: {"nonce", "signature"}."""
+    the same checks as verify, the account back, and a key for this website
+    session alone (`api_key`, tagged "<chain>:<address>#web": it ends when
+    the wallet is unlinked, its sign-in turned off or its keys revoked, and
+    an agent signing in again with the wallet doesn't touch it). Body:
+    {"nonce", "signature"}."""
     from greencompute_gateway.application import wallet_auth
 
     require_provision_or_admin(authorization, x_api_key)
@@ -555,6 +558,31 @@ def wallet_auth_website_session_check(
         chain=str(payload.get("chain") or ""),
         address=str(payload.get("address") or ""),
     )}
+
+
+@router.post("/platform/account/email-approval", include_in_schema=False)
+def approve_account_email(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """For the website (provision secret only), before it emails a link to
+    add an email to an account: a wallet account needs a signature from one
+    of its sign-in wallets over an `add_email` challenge naming the email
+    (claimed here, once). Body: {"user_id", "email", "nonce", "signature"}.
+    Accounts made on the website need none: {"approved": true, "needed": false}."""
+    from greencompute_gateway.application import wallet_auth
+
+    require_provision_or_admin(authorization, x_api_key)
+    if not is_provision_secret(authorization, x_api_key):
+        raise HTTPException(status_code=403, detail="only the website server may call this")
+    try:
+        return wallet_auth.approve_email(
+            service.repository.session_factory, user_id=str(payload.get("user_id") or ""),
+            email=str(payload.get("email") or ""), nonce=payload.get("nonce"), signature=payload.get("signature"),
+        )
+    except wallet_auth.WalletAuthError as exc:
+        raise _wallet_auth_error(exc) from exc
 
 
 @router.post("/platform/account/verified-email", include_in_schema=False)
@@ -3756,22 +3784,67 @@ def billing_update_wallet(
 ) -> dict:
     """Turn signing in with a verified wallet on or off: {"sign_in": true}.
     A wallet linked to receive payments can't sign in to the account until
-    this is on; turning it off revokes the API keys its sign-ins issued."""
-    user_id = _require_user(authorization, x_api_key)
-    if not isinstance(payload.get("sign_in"), bool):
-        raise coded(400, "invalid_request", 'send {"sign_in": true} or {"sign_in": false}')
-    from greencompute_gateway.infrastructure.billing_repository import WalletIsTheSignIn
+    this is on; turning it off revokes the API keys its sign-ins issued and
+    ends the website sessions it began.
 
+    Turning it on gives that wallet a full-access way in, so it needs a
+    full-access key, and when the account already has wallets that sign in,
+    a signature from one of them: ask for a challenge with `action`
+    `approve_sign_in` and `subject` `<chain>:<address>` of this wallet, and
+    send {"sign_in": true, "nonce", "signature"}. Without it: 403
+    approval_required, naming the wallets that can sign."""
+    api_key = _user_key(authorization, x_api_key)
+    user_id = api_key.user_id
+    enabling = payload.get("sign_in")
+    if not isinstance(enabling, bool):
+        raise coded(400, "invalid_request", 'send {"sign_in": true} or {"sign_in": false}')
+    from greencompute_gateway.application import wallet_auth
+    from greencompute_gateway.infrastructure.billing_repository import ApprovalNeeded, WalletIsTheSignIn
+    from greencompute_gateway.infrastructure.wallet_signatures import wallet_tag
+
+    repo = _get_billing().repo
+    wallets = repo.list_verified_wallets(user_id)
+    target = next((w for w in wallets if w["wallet_id"] == wallet_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="wallet not found")
+    approved_by = None
+    if enabling and not target["sign_in"]:
+        if api_key.scopes and not api_key.admin:
+            # A limited key (say billing only) must not mint itself a way to
+            # a full-access key by letting a wallet it controls sign in.
+            raise coded(403, "scope_required", {
+                "message": "turning on sign-in for a wallet needs a full-access key",
+                "required_scope": "full access", "key_scopes": list(api_key.scopes),
+            })
+        subject = wallet_tag(target["chain"], target["address"])
+        if any(w["sign_in"] for w in wallets if w["wallet_id"] != wallet_id):
+            try:
+                approved_by = wallet_auth.approve(
+                    service.repository.session_factory, user_id=user_id, action="approve_sign_in",
+                    subject=subject, nonce=str(payload.get("nonce") or ""),
+                    signature=str(payload.get("signature") or ""),
+                )
+            except wallet_auth.WalletAuthError as exc:
+                raise _wallet_auth_error(exc) from exc
     try:
-        result = _get_billing().repo.set_wallet_sign_in(user_id, wallet_id, payload["sign_in"])
+        result = repo.set_wallet_sign_in(user_id, wallet_id, enabling, approved_by=approved_by)
     except WalletIsTheSignIn as exc:
         raise coded(
             409, "conflict",
             "this wallet is how this account signs in, and the account has no email: add an email on the "
             "website (Settings) or turn on signing in with another wallet first",
         ) from exc
+    except ApprovalNeeded as exc:
+        # Another wallet was turned on in the meantime, and it didn't sign this.
+        raise _wallet_auth_error(wallet_auth.approval_required(
+            "approve_sign_in", wallet_tag(target["chain"], target["address"]),
+            wallet_auth.sign_in_wallets(service.repository.session_factory, user_id),
+        )) from exc
     if result is None:
         raise HTTPException(status_code=404, detail="wallet not found")
+    if enabling and result.get("changed"):
+        # A new way into the account: tell its owner, as for a sign-in.
+        _email_wallet_sign_in(user_id, target["chain"], target["address"], "", event="sign_in_on")
     return result
 
 

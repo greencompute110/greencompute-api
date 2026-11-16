@@ -45,6 +45,11 @@ class WalletUnderSanctions(Exception):
     """Screening named this wallet: unlinking it would lift its account's block."""
 
 
+class ApprovalNeeded(Exception):
+    """Turning on another wallet's sign-in needs a signature from a wallet
+    that already signs in to the account."""
+
+
 MAX_WALLETS_PER_USER = 10
 
 
@@ -1331,8 +1336,6 @@ class BillingRepository:
         account's. Raises WalletUnderSanctions for a wallet screening named
         (the account's block stays until staff lift it) and WalletIsTheSignIn
         for a wallet account's only wallet when it has no confirmed email."""
-        from greencompute_gateway.infrastructure.wallet_signatures import wallet_tag
-
         with session_scope(self.session_factory) as session:
             user = session.get(UserORM, user_id, with_for_update=True)
             wallets = session.scalars(select(VerifiedWalletORM).where(VerifiedWalletORM.user_id == user_id)).all()
@@ -1351,18 +1354,20 @@ class BillingRepository:
             no_email = user is not None and user.signup_method == "wallet" and user.email_verified_at is None
             if no_email and wallet.sign_in and not other_ways_in:
                 raise WalletIsTheSignIn(wallet_id)
-            tag = wallet_tag(wallet.chain, wallet.address)
-            revoked = list(session.scalars(select(APIKeyORM.key_id).where(
-                APIKeyORM.user_id == user_id, APIKeyORM.issued_by_wallet == tag)).all())
-            if revoked:
-                session.execute(delete(APIKeyORM).where(APIKeyORM.key_id.in_(revoked)))
+            revoked = self._revoke_wallet_keys(session, user_id, wallet.chain, wallet.address)
             session.delete(wallet)
             return {"deleted": True, "wallet_id": wallet_id, "revoked_key_ids": revoked}
 
-    def set_wallet_sign_in(self, user_id: str, wallet_id: str, enabled: bool) -> dict | None:
+    def set_wallet_sign_in(
+        self, user_id: str, wallet_id: str, enabled: bool, *, approved_by: str | None = None,
+    ) -> dict | None:
         """Turn signing in with this wallet on or off. Off revokes the keys its
-        sign-ins issued. None if it isn't this account's; WalletIsTheSignIn
-        for a wallet account's only way in."""
+        sign-ins issued, over the API and on the website. On, when the account
+        already has wallets that sign in, needs `approved_by`: the tag of one
+        of them, whose signature approved it (checked again here, under the
+        account's lock). None if it isn't this account's; WalletIsTheSignIn
+        for a wallet account's only way in; ApprovalNeeded without approval.
+        `changed` says whether it was turned on or off just now."""
         from greencompute_gateway.infrastructure.wallet_signatures import wallet_tag
 
         with session_scope(self.session_factory) as session:
@@ -1371,19 +1376,31 @@ class BillingRepository:
             wallet = next((w for w in wallets if w.wallet_id == wallet_id), None)
             if wallet is None:
                 return None
+            others = [w for w in wallets if w.wallet_id != wallet_id and w.sign_in]
             revoked: list[str] = []
+            changed = bool(wallet.sign_in) != enabled
+            if enabled and changed and others:
+                if approved_by not in {wallet_tag(w.chain, w.address) for w in others}:
+                    raise ApprovalNeeded(wallet_id)
             if not enabled and wallet.sign_in:
-                others = [w for w in wallets if w.wallet_id != wallet_id and w.sign_in]
                 no_email = user is not None and user.signup_method == "wallet" and user.email_verified_at is None
                 if no_email and not others:
                     raise WalletIsTheSignIn(wallet_id)
-                tag = wallet_tag(wallet.chain, wallet.address)
-                revoked = list(session.scalars(select(APIKeyORM.key_id).where(
-                    APIKeyORM.user_id == user_id, APIKeyORM.issued_by_wallet == tag)).all())
-                if revoked:
-                    session.execute(delete(APIKeyORM).where(APIKeyORM.key_id.in_(revoked)))
+                revoked = self._revoke_wallet_keys(session, user_id, wallet.chain, wallet.address)
             wallet.sign_in = enabled
-            return {**self._wallet_dict(wallet), "revoked_key_ids": revoked}
+            return {**self._wallet_dict(wallet), "revoked_key_ids": revoked, "changed": changed}
+
+    @staticmethod
+    def _revoke_wallet_keys(session, user_id: str, chain: str, address: str) -> list[str]:
+        """Delete the account's keys this wallet's sign-ins issued, over the
+        API and for website sessions, and keys made with them."""
+        from greencompute_gateway.infrastructure.wallet_signatures import wallet_tags
+
+        ids = list(session.scalars(select(APIKeyORM.key_id).where(
+            APIKeyORM.user_id == user_id, APIKeyORM.issued_by_wallet.in_(wallet_tags(chain, address)))).all())
+        if ids:
+            session.execute(delete(APIKeyORM).where(APIKeyORM.key_id.in_(ids)))
+        return ids
 
     def delete_verified_wallet(self, user_id: str, wallet_id: str) -> bool:
         with session_scope(self.session_factory) as session:

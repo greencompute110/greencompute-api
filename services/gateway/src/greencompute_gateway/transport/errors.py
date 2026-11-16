@@ -50,6 +50,7 @@ CODES: dict[str, tuple[int, str]] = {
     "key_limit": (403, "The key is at one of its limits (rentals at once, or spend per 24 hours)."),
     "new_account_limit": (403, "A wallet account's first 7 days: at most 2 rentals at once and $50 of spend per 24 hours."),
     "wallet_blocked": (403, "This wallet can't be used with Green Compute; contact support@green-compute.com."),
+    "approval_required": (403, "This change needs a signature from a wallet that already signs in to the account; `detail.sign_with` lists them."),
     "wallet_sign_in_off": (403, "This wallet is linked to an account to pay in, not to sign in; sign in another way and turn wallet sign-in on under Billing > Verified wallets."),
     "signature_invalid": (401, "The wallet signature doesn't match the sign-in message; request a new challenge and sign it unchanged."),
     "challenge_invalid": (400, "The sign-in message is unknown, already used or expired; request a new challenge."),

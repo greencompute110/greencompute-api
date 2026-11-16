@@ -14,9 +14,21 @@ to THAT account; a new wallet gets a new account with no email. Either way
 payments from the wallet are credited to the account automatically, since
 that row is what the deposit watcher matches senders against.
 
-Keys issued here carry api_keys.issued_by_wallet. Signing in again revokes
-those (a lost key is a new signature, not a support ticket), and only those:
-never the website's session key or keys made with POST /platform/api-keys.
+Keys issued here carry api_keys.issued_by_wallet = "<chain>:<address>", and
+keys made with them (POST /platform/api-keys) inherit it. Each website session
+the wallet begins gets a key of its own, tagged "<chain>:<address>#web".
+- Signing in again over the API without keep_existing_keys revokes the
+  "<chain>:<address>" keys: the earlier sign-ins' keys AND the keys an agent
+  made with them (a lost or leaked key is a new signature, not a support
+  ticket). Website sessions keep theirs.
+- A revoke_keys signature, unlinking the wallet and turning its sign-in off
+  revoke both kinds.
+- Nothing here touches the account's own keys: the website's key for email
+  sign-ins, or keys made with it.
+
+A wallet already signing in to an account approves, with its signature,
+anything that would add another way in: another wallet's sign-in
+(approve_sign_in) or, on a wallet account, an email (add_email).
 """
 from __future__ import annotations
 
@@ -45,14 +57,21 @@ from greencompute_gateway.infrastructure.wallet_signatures import (
     checksum_address,
     detect_chain,
     normalize_address_strict,
+    WEB_TAG_SUFFIX,
     signature_problem,
     verify_signature,
     wallet_tag,
+    wallet_tags,
 )
 
 log = logging.getLogger(__name__)
 
 DEFAULT_KEY_NAME = "wallet sign-in"
+# The key of one website session a wallet began, and how many of a wallet's
+# are kept (older sessions then end: their key is revoked).
+WEB_KEY_NAME = "website session (wallet)"
+WEB_KEYS_KEPT = 5
+_EMAIL = re.compile(r"^[!-~]+@[!-~]+\.[!-~]+$")
 # Expired challenges are kept this long (for support questions), then pruned.
 # Short, so the table stays small whatever rate challenges are asked for at.
 _KEEP_EXPIRED = timedelta(hours=1)
@@ -96,9 +115,11 @@ def issue_challenge(
     action: str = "sign_in",
     chain_id: int | None = None,
     client_ip: str | None = None,
+    subject: str | None = None,
 ) -> dict:
     """A one-time message for this wallet to sign. The same answer whether
-    or not the wallet has an account: nothing here looks one up."""
+    or not the wallet has an account: nothing here looks one up. Approvals
+    (approve_sign_in, add_email) name their `subject` in the message."""
     chain = (chain or detect_chain(address)).strip().lower()
     if chain not in CHAINS:
         raise WalletAuthError(400, "invalid_request", "chain must be `evm` (Ethereum or Base) or `bittensor`.")
@@ -109,6 +130,7 @@ def issue_challenge(
         canonical = normalize_address_strict(chain, address)
     except InvalidAddress as exc:
         raise WalletAuthError(400, "invalid_request", f"Not a valid {chain} address: {exc}.") from exc
+    subject = _canonical_subject(action, subject)
     if chain == "evm":
         chain_id = 1 if chain_id is None else chain_id
         if chain_id not in msg.EVM_CHAIN_IDS:
@@ -122,12 +144,12 @@ def issue_challenge(
     domain, uri = msg.auth_domain(), msg.auth_uri()
     text = msg.sign_in_message(
         chain=chain, display_address=display, action=action, nonce=nonce, issued_at=now, expires_at=expires,
-        chain_id=chain_id or 1, domain=domain, uri=uri,
+        chain_id=chain_id or 1, domain=domain, uri=uri, subject=subject,
     )
     with session_scope(session_factory) as session:
         session.execute(delete(WalletAuthChallengeORM).where(WalletAuthChallengeORM.expires_at < now - _KEEP_EXPIRED))
         session.add(WalletAuthChallengeORM(
-            nonce=nonce, chain=chain, address=canonical, action=action, message=text,
+            nonce=nonce, chain=chain, address=canonical, action=action, subject=subject, message=text,
             client_ip=(client_ip or None) and client_ip[:64], created_at=now, expires_at=expires,
         ))
     return {
@@ -136,6 +158,7 @@ def issue_challenge(
         "chain": chain,
         "address": display,
         "action": action,
+        "subject": subject,
         "domain": domain,
         "uri": uri,
         "chain_id": chain_id,
@@ -148,8 +171,41 @@ def issue_challenge(
             "the wallet's coldkey (sr25519) over `message`, exactly as given, e.g. "
             "`btcli wallet sign --no-use-hotkey --message '<message>'`"
         ),
-        "next": "POST /platform/auth/wallet/verify with {\"nonce\": ..., \"signature\": \"0x...\"}",
+        "next": _NEXT[action],
     }
+
+
+_NEXT = {
+    "sign_in": "POST /platform/auth/wallet/verify with {\"nonce\": ..., \"signature\": \"0x...\"}",
+    "revoke_keys": "POST /platform/auth/wallet/verify with {\"nonce\": ..., \"signature\": \"0x...\"}",
+    "approve_sign_in": "PATCH /platform/billing/wallets/{wallet_id} with {\"sign_in\": true, \"nonce\": ..., \"signature\": ...}",
+    "add_email": "Settings on the website sends this with the email to confirm",
+}
+
+
+def _canonical_subject(action: str, subject: str | None) -> str | None:
+    """What an approval is for, in the one form it is stored and compared in:
+    "<chain>:<canonical address>" for a wallet, the lowercased email for an
+    email. None for the actions that have no subject."""
+    raw = (subject or "").strip()
+    if action not in msg.SUBJECT_ACTIONS:
+        if raw:
+            raise WalletAuthError(400, "invalid_request", f"`subject` is only for {' and '.join(sorted(msg.SUBJECT_ACTIONS))}.")
+        return None
+    if action == "approve_sign_in":
+        chain, _, address = raw.partition(":")
+        if chain not in CHAINS:
+            raise WalletAuthError(
+                400, "invalid_request", "subject must be the wallet to allow, as `evm:0x…` or `bittensor:5…`.",
+            )
+        try:
+            return wallet_tag(chain, normalize_address_strict(chain, address))
+        except InvalidAddress as exc:
+            raise WalletAuthError(400, "invalid_request", f"subject isn't a valid {chain} address: {exc}.") from exc
+    email = raw.lower()
+    if len(email) > 254 or not _EMAIL.match(email):
+        raise WalletAuthError(400, "invalid_request", "subject must be the email address to add.")
+    return email
 
 
 # --- 2. claiming and checking it ----------------------------------------------------
@@ -364,15 +420,41 @@ def _issue_key(
         return row.secret, _key_out(row), revoked
 
 
-def revoke_wallet_keys(session_factory, user_id: str, chain: str, address: str) -> list[str]:
-    """Delete every key this wallet's sign-ins issued on this account."""
-    tag = wallet_tag(chain, address)
+def revoke_wallet_keys(session_factory, user_id: str, chain: str, address: str, *, web_only: bool = False) -> list[str]:
+    """Delete the keys this wallet's sign-ins issued on this account, over the
+    API and for website sessions, and keys made with them (`web_only`: only
+    the website sessions')."""
+    tags = wallet_tags(chain, address)[1:] if web_only else wallet_tags(chain, address)
     with session_scope(session_factory) as session:
         ids = list(session.scalars(select(APIKeyORM.key_id).where(
-            APIKeyORM.user_id == user_id, APIKeyORM.issued_by_wallet == tag)).all())
+            APIKeyORM.user_id == user_id, APIKeyORM.issued_by_wallet.in_(tags))).all())
         if ids:
             session.execute(delete(APIKeyORM).where(APIKeyORM.key_id.in_(ids)))
     return ids
+
+
+def _issue_web_key(session_factory, user_id: str, chain: str, address: str) -> tuple[str, str]:
+    """(secret, key id) for one website session this wallet begins. Only the
+    newest WEB_KEYS_KEPT sessions' keys are kept: an older session's key is
+    revoked (it signs in again). Keys made with them aren't counted."""
+    tag = wallet_tag(chain, address) + WEB_TAG_SUFFIX
+    now = _now()
+    with session_scope(session_factory) as session:
+        row = APIKeyORM(
+            key_id=str(uuid4()), user_id=user_id, name=WEB_KEY_NAME, admin=False, scopes=[],
+            secret=f"gk_{secrets.token_urlsafe(24)}", created_at=now, issued_by_wallet=tag,
+        )
+        session.add(row)
+        session.flush()
+        sessions = session.execute(
+            select(APIKeyORM.key_id).where(
+                APIKeyORM.user_id == user_id, APIKeyORM.issued_by_wallet == tag, APIKeyORM.name == WEB_KEY_NAME,
+            ).order_by(APIKeyORM.created_at.desc(), APIKeyORM.key_id)
+        ).scalars().all()
+        stale = [k for k in sessions if k != row.key_id][WEB_KEYS_KEPT - 1:]
+        if stale:
+            session.execute(delete(APIKeyORM).where(APIKeyORM.key_id.in_(stale)))
+        return row.secret, row.key_id
 
 
 # --- verify -----------------------------------------------------------------------
@@ -402,6 +484,8 @@ def verify(
     name = "".join(c for c in (key_name or "") if " " <= c <= "~").strip()[:64] or DEFAULT_KEY_NAME
 
     challenge = _claim(session_factory, (nonce or "").strip())
+    if challenge.action not in msg.SIGN_IN_ACTIONS:
+        raise _approval_not_sign_in()
     _check_signature(challenge, signature)
     chain, address = challenge.chain, challenge.address
     wallet = {"chain": chain, "address": address}
@@ -447,17 +531,26 @@ def website_session_ok(session_factory, *, user_id: str, chain: str, address: st
     with session_scope(session_factory) as session:
         row = session.scalar(select(VerifiedWalletORM).where(
             VerifiedWalletORM.chain == chain_n, VerifiedWalletORM.address == address_n))
-        ok = row is not None and row.user_id == user_id and bool(row.sign_in) and not row.sanctions_hit
-    return ok and not sanctions.listed(session_factory, chain_n, address_n)
+        ok = row is not None and row.user_id == user_id and bool(row.sign_in)
+        hit = bool(row is not None and row.sanctions_hit)
+    if ok and (hit or sanctions.listed(session_factory, chain_n, address_n)):
+        # Unlinking or turning sign-in off revoked the session keys already;
+        # a sanctions hit is the one way here that hasn't.
+        revoke_wallet_keys(session_factory, user_id, chain_n, address_n, web_only=True)
+        return False
+    return ok
 
 
 def verify_for_website(session_factory, *, nonce: str, signature: str) -> dict:
     """Step 3 for the website's sign-in: the same checks, the account id
-    back and no key issued or revoked (the website keeps its own key per
-    account, which a wallet's sign-ins never touch)."""
+    back, and a key for this website session alone (tagged
+    "<chain>:<address>#web"). Never the account's own website key: that one
+    outlives anything the owner does to shut a wallet out, and a phished
+    session's key must not."""
     challenge = _claim(session_factory, (nonce or "").strip())
     if challenge.action != "sign_in":
-        raise WalletAuthError(400, "invalid_request", "This message is for revoking keys, not signing in.")
+        raise _approval_not_sign_in() if challenge.action in msg.SUBJECT_ACTIONS else WalletAuthError(
+            400, "invalid_request", "This message is for revoking keys, not signing in.")
     _check_signature(challenge, signature)
     user_id, created = _account_for(session_factory, challenge.chain, challenge.address)
     user = _user_or_conflict(session_factory, user_id)
@@ -470,9 +563,12 @@ def verify_for_website(session_factory, *, nonce: str, signature: str) -> dict:
         raise WalletAuthError(
             403, "forbidden", "Admin accounts sign in with email or Google, not a wallet.",
         )
+    secret, key_id = _issue_web_key(session_factory, user_id, challenge.chain, challenge.address)
     return {
         "user_id": user_id,
         "account_created": created,
+        "api_key": secret,
+        "key_id": key_id,
         "chain": challenge.chain,
         "address": challenge.address,
         "username": user.username,
@@ -482,3 +578,83 @@ def verify_for_website(session_factory, *, nonce: str, signature: str) -> dict:
         # confirmed: only then may the email tie it to a website user.
         "email_confirmed": user.signup_method != "wallet" or user.email_verified_at is not None,
     }
+
+
+# --- approvals ----------------------------------------------------------------------
+
+
+def _approval_not_sign_in() -> WalletAuthError:
+    return WalletAuthError(
+        400, "challenge_invalid",
+        "This message approves a change; it doesn't sign in. Ask for a `sign_in` challenge to sign in.",
+    )
+
+
+def sign_in_wallets(session_factory, user_id: str) -> list[dict]:
+    """The account's wallets that sign in to it: who can approve."""
+    with session_scope(session_factory) as session:
+        rows = session.scalars(select(VerifiedWalletORM).where(
+            VerifiedWalletORM.user_id == user_id, VerifiedWalletORM.sign_in.is_(True))).all()
+        return [{"chain": r.chain, "address": r.address} for r in rows]
+
+
+def approval_required(action: str, subject: str, signers: list[dict]) -> WalletAuthError:
+    """403 approval_required: what to sign, with which wallets, and where to send it."""
+    what = "turning on sign-in for another wallet" if action == "approve_sign_in" else "adding an email"
+    return WalletAuthError(
+        403, "approval_required",
+        f"{what[0].upper()}{what[1:]} needs a signature from a wallet that already signs in to this account. "
+        "Ask for a challenge with one of `sign_with`, `action` and `subject` as given, sign it, and send "
+        "`nonce` and `signature` with this request.",
+        action=action, subject=subject, sign_with=signers,
+        hint="POST /platform/auth/wallet/challenge {\"address\": <one of sign_with>, \"action\": "
+             f"\"{action}\", \"subject\": \"{subject}\"}}",
+    )
+
+
+def approve(session_factory, *, user_id: str, action: str, subject: str, nonce: str, signature: str) -> str:
+    """Check a signed approval: the challenge is unused and unexpired (it is
+    claimed here, once), was issued for this `action` and `subject`, the
+    signature is good, and the signer is a wallet that signs in to THIS
+    account and isn't sanctioned. Returns the signer's wallet tag."""
+    if not (nonce or "").strip() or not (signature or "").strip():
+        raise approval_required(action, subject, sign_in_wallets(session_factory, user_id))
+    challenge = _claim(session_factory, nonce.strip())
+    if challenge.action != action or (challenge.subject or "") != subject:
+        raise WalletAuthError(
+            400, "challenge_invalid",
+            f"This message wasn't issued to approve this. Ask for a challenge with action `{action}` and "
+            f"subject `{subject}`, and sign that.",
+        )
+    _check_signature(challenge, signature)
+    with session_scope(session_factory) as session:
+        row = session.scalar(select(VerifiedWalletORM).where(
+            VerifiedWalletORM.chain == challenge.chain, VerifiedWalletORM.address == challenge.address))
+        signs_in = row is not None and row.user_id == user_id and bool(row.sign_in)
+    if not signs_in:
+        raise WalletAuthError(
+            403, "approval_required",
+            "That wallet doesn't sign in to this account, so it can't approve this. Sign with one that does.",
+            action=action, subject=subject, sign_with=sign_in_wallets(session_factory, user_id),
+        )
+    if sanctions.screen(session_factory, challenge.chain, challenge.address):
+        raise WalletAuthError(403, "wallet_blocked", sanctions.BLOCKED_MESSAGE)
+    return wallet_tag(challenge.chain, challenge.address)
+
+
+def approve_email(session_factory, *, user_id: str, email: str, nonce: str | None, signature: str | None) -> dict:
+    """For the website before it emails a confirmation link: a wallet
+    account adding an email needs one of its sign-in wallets to sign for it
+    (an email is another way in: password resets go there). Accounts made
+    on the website need nothing. Raises WalletAuthError."""
+    subject = _canonical_subject("add_email", email)
+    with session_scope(session_factory) as session:
+        user = session.get(UserORM, user_id)
+        if user is None:
+            raise WalletAuthError(404, "not_found", "No such account.")
+        wallet_account = user.signup_method == "wallet"
+    if not wallet_account:
+        return {"approved": True, "needed": False}
+    signer = approve(session_factory, user_id=user_id, action="add_email", subject=subject,
+                     nonce=nonce or "", signature=signature or "")
+    return {"approved": True, "needed": True, "signed_by": signer}

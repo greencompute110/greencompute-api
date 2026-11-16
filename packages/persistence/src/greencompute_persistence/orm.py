@@ -1051,8 +1051,12 @@ class WalletAuthChallengeORM(Base):
     chain: Mapped[str] = mapped_column(String(16))
     # Canonical form, as verified_wallets stores it.
     address: Mapped[str] = mapped_column(String(128))
-    # "sign_in" or "revoke_keys": what the signed statement says it is for.
+    # sign_in, revoke_keys, approve_sign_in or add_email: what the signed
+    # statement says it is for.
     action: Mapped[str] = mapped_column(String(16), default="sign_in")
+    # What an approval is for: the wallet to let sign in ("<chain>:<address>")
+    # or the email to add. NULL for sign_in and revoke_keys.
+    subject: Mapped[str | None] = mapped_column(String(255), nullable=True)
     message: Mapped[str] = mapped_column(Text)
     client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

@@ -1,7 +1,8 @@
 """wallet sign-in, sanctions screening
 
-- wallet_auth_challenges: one-time sign-in messages issued to a wallet; the
-  exact text is kept and each is claimed once by verify.
+- wallet_auth_challenges: one-time messages issued to a wallet (to sign in,
+  revoke its keys, or approve another wallet's sign-in or an email: then
+  `subject` says what); the exact text is kept and each is claimed once.
 - sanctioned_addresses: crypto addresses from the OFAC SDN list and the UK
   Sanctions List, replaced per source on each successful download.
 - users.signup_method ("wallet" for accounts a wallet signature created) and
@@ -33,6 +34,7 @@ def upgrade() -> None:
         sa.Column("chain", sa.String(length=16), nullable=False),
         sa.Column("address", sa.String(length=128), nullable=False),
         sa.Column("action", sa.String(length=16), nullable=False, server_default="sign_in"),
+        sa.Column("subject", sa.String(length=255), nullable=True),
         sa.Column("message", sa.Text(), nullable=False),
         sa.Column("client_ip", sa.String(length=64), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),

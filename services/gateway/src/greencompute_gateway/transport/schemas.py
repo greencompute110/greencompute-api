@@ -488,7 +488,12 @@ class WalletChallengeRequest(BaseModel):
         "It changes nothing about the account: one address, both networks."))
     action: str = Field(default="sign_in", description=(
         "`sign_in` (the default): verify issues an API key, creating the account the first time. "
-        "`revoke_keys`: verify revokes every key this wallet's sign-ins issued and issues none."))
+        "`revoke_keys`: verify revokes every key this wallet's sign-ins issued (and keys made with them) "
+        "and issues none. `approve_sign_in` / `add_email`: this wallet, one that already signs in to the "
+        "account, approves letting another wallet sign in or adding an email (see `subject`)."))
+    subject: str | None = Field(default=None, max_length=255, description=(
+        "Approvals only: the wallet to allow, as `evm:0x…` or `bittensor:5…` (approve_sign_in), or the "
+        "email to add (add_email). The message names it."))
 
 
 class WalletChallenge(BaseModel):
@@ -497,6 +502,7 @@ class WalletChallenge(BaseModel):
     chain: str
     address: str = Field(description="As the message shows it: EIP-55 checksummed for EVM, SS58 for Bittensor.")
     action: str
+    subject: str | None = Field(default=None, description="What an approval is for, as stored.")
     domain: str = Field(description="The domain the message is bound to; a signature for another domain fails.")
     uri: str
     chain_id: int | None

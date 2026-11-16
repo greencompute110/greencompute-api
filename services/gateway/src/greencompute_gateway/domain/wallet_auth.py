@@ -25,11 +25,38 @@ from datetime import datetime
 DEFAULT_DOMAIN = "www.green-compute.com"
 CHALLENGE_TTL_SECONDS = 300
 
-#: What a signature is for. The statement is part of the signed text.
+#: What a signature is for. The statement is part of the signed text, so a
+#: signature for one of these can never be used as another.
 ACTIONS: dict[str, str] = {
     "sign_in": "Sign in to Green Compute with this wallet and issue an API key. This moves no funds.",
     "revoke_keys": "Revoke every Green Compute API key this wallet signed in with. This moves no funds.",
+    # Approvals: a wallet that already signs in to an account agrees to a
+    # change that would add another way in. `{subject}` names what, in words.
+    "approve_sign_in": "Allow the {subject} to sign in to your Green Compute account as well. This moves no funds.",
+    "add_email": "Add the email address {subject} to your Green Compute account. This moves no funds.",
 }
+#: Actions whose message names a subject (and whose challenge must have one).
+SUBJECT_ACTIONS = frozenset({"approve_sign_in", "add_email"})
+#: Actions that end in an API key or a revocation, at verify. The others are
+#: approvals, checked only by the endpoint that asked for them.
+SIGN_IN_ACTIONS = frozenset({"sign_in", "revoke_keys"})
+
+_CHAIN_WORDS = {"evm": "Ethereum/Base wallet", "bittensor": "Bittensor wallet"}
+
+
+def subject_words(action: str, subject: str | None) -> str | None:
+    """How the message names `subject`: "Bittensor wallet 5F…", or the
+    email itself."""
+    if action not in SUBJECT_ACTIONS or not subject:
+        return None
+    if action == "approve_sign_in":
+        chain, _, address = subject.partition(":")
+        if chain == "evm":
+            from eth_utils import to_checksum_address
+
+            address = to_checksum_address(address)
+        return f"{_CHAIN_WORDS.get(chain, 'wallet')} {address}"
+    return subject
 
 #: EIP-155 chain ids a Sign-In with Ethereum message may name: Ethereum and
 #: Base, where we take payments. It says which network the wallet is on and
@@ -72,12 +99,15 @@ def sign_in_message(
     chain_id: int = 1,
     domain: str | None = None,
     uri: str | None = None,
+    subject: str | None = None,
 ) -> str:
     """The exact text to sign. `display_address` is EIP-55 checksummed for
-    EVM (the standard requires it) and SS58 for Bittensor."""
+    EVM (the standard requires it) and SS58 for Bittensor. `subject` is what
+    an approval is for (a wallet as "<chain>:<address>", or an email)."""
     domain = domain or auth_domain()
     uri = uri or auth_uri()
-    statement = ACTIONS[action]
+    words = subject_words(action, subject)
+    statement = ACTIONS[action].format(subject=words) if words else ACTIONS[action]
     issued, expires = _rfc3339(issued_at), _rfc3339(expires_at)
     if chain == "evm":
         return (
