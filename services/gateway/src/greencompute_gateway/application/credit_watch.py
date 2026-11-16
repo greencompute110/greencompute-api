@@ -324,7 +324,7 @@ def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=
     for an hour of the one deployment; this is automatic, so it is more
     careful, or a $0.40 top-up would bring back three pods that all stop again
     within the hour. Returns the deployment ids resumed."""
-    from greencompute_gateway.application.services import InsufficientBalanceForRentalError
+    from greencompute_gateway.application.services import InsufficientBalanceForRentalError, SanctionedAccountError
 
     now = now or datetime.now(UTC)
     svc = service or _service()
@@ -355,10 +355,10 @@ def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=
             svc.resume_deployment(dep.deployment_id, user_id=uid)
         except InsufficientBalanceForRentalError:
             continue
-        except (ValueError, KeyError, PermissionError) as exc:
-            # Its machine is full, its placement or workload is gone, or the
-            # owner no longer matches: nothing a top-up fixes. The customer sees
-            # it on My Rentals and resumes by hand.
+        except (ValueError, KeyError, PermissionError, SanctionedAccountError) as exc:
+            # Its machine is full, its placement or workload is gone, the
+            # owner no longer matches, or the account may not rent: nothing a
+            # top-up fixes. The customer sees it on My Rentals.
             log.info("auto-resume %s not possible now: %s", dep.deployment_id, exc)
             continue
         except Exception:  # noqa: BLE001 - one bad row must not stop the sweep

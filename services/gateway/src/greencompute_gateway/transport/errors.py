@@ -48,6 +48,10 @@ CODES: dict[str, tuple[int, str]] = {
     "forbidden": (403, "This key or account may not do this."),
     "scope_required": (403, "The key lacks a scope; `detail.required_scope` names it."),
     "key_limit": (403, "The key is at one of its limits (rentals at once, or spend per 24 hours)."),
+    "new_account_limit": (403, "A wallet account's first 7 days: at most 2 rentals at once and $50 of spend per 24 hours."),
+    "wallet_blocked": (403, "This wallet can't be used with Green Compute; contact support@green-compute.com."),
+    "signature_invalid": (401, "The wallet signature doesn't match the sign-in message; request a new challenge and sign it unchanged."),
+    "challenge_invalid": (400, "The sign-in message is unknown, already used or expired; request a new challenge."),
     "not_found": (404, "No such resource on this account."),
     "unknown_endpoint": (404, "No such endpoint; check the path against /openapi.json."),
     "method_not_allowed": (405, "That HTTP method isn't used on this path."),
@@ -64,6 +68,7 @@ CODES: dict[str, tuple[int, str]] = {
     "not_implemented": (501, "This endpoint is turned off."),
     "no_capacity": (503, "Every GPU that fits is in use; nothing was created. Retry after `retry_after_seconds`."),
     "unavailable": (503, "Temporarily unavailable."),
+    "screening_unavailable": (503, "New wallets can't be checked right now; request a new challenge and try again in a few minutes."),
     "exec_unknown": (504, "A command was sent but no answer came back in time: it may or may not have run."),
 }
 

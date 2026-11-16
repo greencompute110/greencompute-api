@@ -7,6 +7,7 @@ from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
+from greencompute_persistence.account_events import add_event, payment_event
 from greencompute_persistence.db import needs_bootstrap
 from greencompute_persistence.orm import (
     CryptoDepositORM,
@@ -78,6 +79,12 @@ class BillingRepository:
                 created_at=datetime.now(UTC),
             )
             session.add(entry)
+            if kind == "topup" and amount_cents > 0:
+                # Staff adding credit by hand (a payment matched by hand, a
+                # goodwill credit): the customer's code hears of it too.
+                add_event(session, payment_event(
+                    user_id, cents=amount_cents, balance_after=row.balance_credits, method="manual",
+                ))
             return self._to_ledger_entry(entry)
 
     def debit_user(
@@ -604,6 +611,10 @@ class BillingRepository:
                     "invoice_id": invoice_id,
                     "duplicate_deposit": True,
                 }
+            add_event(session, payment_event(
+                inv.user_id, cents=credited, balance_after=user.balance_credits, method="crypto",
+                currency=inv.currency, tx_hash=tx_hash, invoice_id=invoice_id, matched_by="invoice",
+            ))
             return {
                 "credited": True,
                 "invoice_id": invoice_id,
@@ -1087,6 +1098,30 @@ class BillingRepository:
             row.status, row.matched_by = "ignored", "admin_ignored"
             return self._deposit_dict(row)
 
+    def tx_blocked(self, tx_hash: str | None) -> bool:
+        """Was a transfer in this transaction blocked by sanctions screening?
+        Staff confirming an invoice against it would credit it anyway."""
+        tx = (tx_hash or "").strip().lower()
+        if not tx:
+            return False
+        with session_scope(self.session_factory) as session:
+            return session.scalar(
+                select(CryptoDepositORM.deposit_ref).where(
+                    func.lower(CryptoDepositORM.tx_hash) == tx, CryptoDepositORM.status == "blocked",
+                ).limit(1)
+            ) is not None
+
+    def block_deposit(self, deposit_ref: str, source: str) -> bool:
+        """Mark a logged, uncredited deposit as blocked by sanctions screening
+        (`source`: the list or oracle that named its sender). False when it
+        was credited meanwhile."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(CryptoDepositORM, deposit_ref, with_for_update=True)
+            if row is None or row.status == "credited":
+                return False
+            row.status, row.matched_by = "blocked", f"sanctions:{source}"[:32]
+            return True
+
     def tx_credited_to(self, user_id: str, tx_hash: str | None) -> bool:
         """Has a transfer in this transaction been credited to this user: by
         the watcher, a wallet link or an admin?"""
@@ -1136,13 +1171,16 @@ class BillingRepository:
         paid an invoice can never be credited again here.
 
         Returns None if the deposit isn't logged, {"already_credited": True}
-        if it was credited before, else {"credited": True, ...}."""
+        if it was credited before, {"blocked": True} if its sender is on a
+        sanctions list (never credited, by any path), else {"credited": True, ...}."""
         with session_scope(self.session_factory) as session:
             dep = session.get(CryptoDepositORM, deposit_ref, with_for_update=True)
             if dep is None:
                 return None
             if dep.status == "credited":
                 return {"already_credited": True, "deposit_ref": deposit_ref}
+            if dep.status == "blocked":
+                return {"blocked": True, "deposit_ref": deposit_ref}
             earlier = session.scalar(
                 select(LedgerEntryORM).where(LedgerEntryORM.deposit_ref == deposit_ref)
             ) or self._manual_credit_row(session, dep.currency, dep.tx_hash)
@@ -1178,6 +1216,10 @@ class BillingRepository:
             except IntegrityError:
                 session.rollback()
                 return {"already_credited": True, "deposit_ref": deposit_ref}
+            add_event(session, payment_event(
+                user_id, cents=amount_cents, balance_after=user.balance_credits, method="crypto",
+                currency=dep.currency, tx_hash=dep.tx_hash, sender=dep.sender, matched_by=matched_by,
+            ))
             return {
                 "credited": True,
                 "deposit_ref": deposit_ref,
@@ -1301,6 +1343,14 @@ class BillingRepository:
                 )
             ).all()
             return ids[0] if len(ids) == 1 else None
+
+    def signs_in_without_a_wallet(self, user_id: str) -> bool:
+        """Can this account sign in some other way than a wallet: it was made
+        on the website (email or Google), or the website has since confirmed
+        an email for it?"""
+        with session_scope(self.session_factory) as session:
+            row = session.get(UserORM, user_id)
+            return bool(row and (row.signup_method != "wallet" or row.email_verified_at is not None))
 
     def get_username(self, user_id: str) -> str | None:
         with session_scope(self.session_factory) as session:
@@ -1476,6 +1526,9 @@ class BillingRepository:
                     "session_id": ss.session_id,
                     "duplicate": True,
                 }
+            add_event(session, payment_event(
+                ss.user_id, cents=ss.amount_cents, balance_after=user.balance_credits, method="card",
+            ))
             return {
                 "credited": True,
                 "session_id": ss.session_id,

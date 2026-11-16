@@ -29,6 +29,7 @@ EVENT_TYPES: dict[str, str] = {
     "deployment.terminated": "It was stopped for good: deleted, or `max_runtime_minutes` reached.",
     "balance.low": "Your balance lasts under 24 hours at the current rate (sent again under 2 hours).",
     "capacity.available": "GPUs you asked to hear about (POST /platform/capacity-alerts) are free now.",
+    "payment.credited": "A payment was added to your balance: `amount_usd`, the new `balance_usd`, and how it was paid.",
 }
 _DEPLOYMENT_STATES = {"ready", "failed", "suspended", "terminated"}
 _ERROR_CHARS = 1000
@@ -58,6 +59,40 @@ def deployment_event(row: Any, previous_state: str | None) -> AccountEventORM | 
             "previous_state": previous_state,
             "error": error[:_ERROR_CHARS] if error else None,
             "suspended_reason": getattr(row, "suspended_reason", None) if state == "suspended" else None,
+        },
+        created_at=utcnow(),
+    )
+
+
+def payment_event(
+    user_id: str,
+    *,
+    cents: int,
+    balance_after: int | None,
+    method: str,
+    currency: str | None = None,
+    tx_hash: str | None = None,
+    invoice_id: str | None = None,
+    sender: str | None = None,
+    matched_by: str | None = None,
+) -> AccountEventORM:
+    """`payment.credited`, written in the transaction that adds the payment
+    to the balance, so the event exists exactly when the credit does. An
+    agent paying from its wallet waits for this instead of polling the
+    balance. `method` is crypto, card or manual (added by staff)."""
+    return AccountEventORM(
+        user_id=user_id,
+        type="payment.credited",
+        data={
+            "amount_cents": cents,
+            "amount_usd": round(cents / 100, 2),
+            "balance_usd": round(balance_after / 100, 2) if balance_after is not None else None,
+            "method": method,
+            "currency": currency,
+            "tx_hash": tx_hash or None,
+            "invoice_id": invoice_id,
+            "sender": sender,
+            "matched_by": matched_by,
         },
         created_at=utcnow(),
     )

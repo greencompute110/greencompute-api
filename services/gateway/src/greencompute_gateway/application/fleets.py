@@ -460,7 +460,9 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
     from greencompute_gateway.application.services import (
         InsufficientBalanceForRentalError,
         KeyLimitError,
+        NewAccountLimitError,
         NoCapacityError,
+        SanctionedAccountError,
         UnsupportedGPUError,
     )
 
@@ -577,6 +579,18 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
                 f"Waiting: the API key that created this fleet has spent its daily limit "
                 f"(${exc.daily_spend_limit_usd:.2f})."))
             break
+        except NewAccountLimitError as exc:
+            reasons.insert(0, (
+                f"Waiting: new wallet accounts can have {exc.numbers['max_active_rentals']} rentals running at "
+                "once for their first 7 days." if exc.reason == "active" else
+                f"Waiting: new wallet accounts can spend ${exc.numbers['daily_spend_limit_usd']:.2f} a day for "
+                "their first 7 days."))
+            break
+        except SanctionedAccountError:
+            from greencompute_gateway.application.sanctions import BLOCKED_MESSAGE
+
+            _set_status(service, fleet_id, state="paused", reason=f"Paused: {BLOCKED_MESSAGE}")
+            return
         except (KeyError, PermissionError):
             _set_status(service, fleet_id, state="paused",
                         reason="Paused: its workload was deleted or is no longer yours.")

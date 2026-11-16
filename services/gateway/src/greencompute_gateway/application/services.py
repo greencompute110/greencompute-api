@@ -208,6 +208,26 @@ class KeyLimitError(Exception):
         super().__init__(f"api key at its {reason} limit")
 
 
+class EmailTakenError(ValueError):
+    """The email belongs to another account."""
+
+
+class NewAccountLimitError(Exception):
+    """A wallet account in its first week is at the limits new wallet
+    accounts have (key_limits.new_account_limits): `reason` "active" (rentals
+    at once) or "spend" (spend in the last 24 hours), for every key together."""
+
+    def __init__(self, reason: str, numbers: dict) -> None:
+        self.reason = reason
+        self.numbers = numbers
+        super().__init__(f"new wallet account at its {reason} limit")
+
+
+class SanctionedAccountError(Exception):
+    """One of the account's verified wallets is on a sanctions list (or the
+    oracle named it): the account can't rent."""
+
+
 class InsufficientBalanceForRentalError(Exception):
     """Raised by GatewayService.create_deployment when the caller doesn't
     have enough credits to cover ≥ 1 hour of the requested workload at the
@@ -462,6 +482,34 @@ class GatewayService:
             if self.repository.get_user_by_username(candidate) is None:
                 return candidate
         return f"{seed}-{uuid4().hex[:8]}"
+
+    def set_verified_email(self, user_id: str, email: str) -> dict:
+        """Record an email the website confirmed for this account (it sent a
+        link to the address, and the link was opened). Only the website
+        server calls this: an email set through PATCH /platform/users is a
+        contact address and proves nothing. Ends a new wallet account's
+        limits. Raises KeyError, ValueError, or EmailTakenError when another
+        account already has the address."""
+        from sqlalchemy import func, select
+
+        from greencompute_persistence import session_scope
+        from greencompute_persistence.orm import UserORM
+
+        address = (email or "").strip().lower()
+        if "@" not in address or len(address) > 255 or any(c.isspace() for c in address):
+            raise ValueError("email must be an email address")
+        now = datetime.now(UTC)
+        with session_scope(self.repository.session_factory) as session:
+            user = session.get(UserORM, user_id, with_for_update=True)
+            if user is None:
+                raise KeyError(user_id)
+            taken = session.scalar(
+                select(UserORM.user_id).where(func.lower(UserORM.email) == address, UserORM.user_id != user_id).limit(1)
+            )
+            if taken:
+                raise EmailTakenError("another account already uses this email")
+            user.email, user.email_verified_at = address, now
+        return {"user_id": user_id, "email": address, "email_verified_at": now.isoformat()}
 
     def get_user(self, user_id: str) -> UserRecord | None:
         return self.repository.get_user(user_id)
@@ -828,6 +876,11 @@ class GatewayService:
             raise KeyError(f"workload not found: {payload.workload_id}")
         if not admin and not self._user_can_access_workload(workload, user_id):
             raise PermissionError(f"workload access denied: {payload.workload_id}")
+        if not admin and user_id is not None:
+            from greencompute_gateway.application.sanctions import account_blocked
+
+            if account_blocked(self.repository.session_factory, user_id):
+                raise SanctionedAccountError(user_id)
         if not admin and (workload.metadata or {}).get("managed_by") == "flux":
             # A shared catalog model: the platform runs its replicas. Customers
             # call it by name, or deploy their own copy from its HF id.
@@ -915,6 +968,15 @@ class GatewayService:
                     raise KeyLimitError(why, max_active_rentals=key.max_active_rentals,
                                         daily_spend_limit_usd=key.daily_spend_limit_usd, numbers=numbers)
 
+        # A wallet account's first week: the account's own limits, whichever
+        # key it uses.
+        if not admin and user_id is not None:
+            from greencompute_persistence.key_limits import new_account_room
+
+            why, numbers = new_account_room(self.repository.session_factory, user_id)
+            if why:
+                raise NewAccountLimitError(why, numbers)
+
         # Fail fast when the fleet is full, too (after the balance check, so a
         # caller who must top up hears that first and is ready to go when a GPU
         # frees up). Mirrors the scheduler's own ranking, net of reservations.
@@ -976,6 +1038,11 @@ class GatewayService:
                 f"deployment {deployment_id} is not suspended "
                 f"(current state: {old.state.value})"
             )
+        if not admin and user_id is not None:
+            from greencompute_gateway.application.sanctions import account_blocked
+
+            if account_blocked(self.repository.session_factory, user_id):
+                raise SanctionedAccountError(user_id)
 
         if not admin and user_id is not None:
             workload = self.control_plane.repository.get_workload(old.workload_id)

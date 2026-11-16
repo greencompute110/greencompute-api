@@ -156,7 +156,8 @@ def extract_api_key_secret(authorization: str | None, x_api_key: str | None) -> 
 # text ("missing api key" / "invalid api key") so nothing matching on it breaks.
 _AUTH_HELP = (
     ". Send `Authorization: Bearer <key>`. Create a key at "
-    "https://www.green-compute.com/settings ; docs: https://www.green-compute.com/docs"
+    "https://www.green-compute.com/settings , or get one by signing with a wallet "
+    "(POST /platform/auth/wallet/challenge, no email needed); docs: https://www.green-compute.com/docs"
 )
 _AUTH_HEADERS = {
     "WWW-Authenticate": 'Bearer realm="green-compute"',

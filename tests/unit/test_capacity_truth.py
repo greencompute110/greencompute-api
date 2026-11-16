@@ -19,6 +19,7 @@ from fastapi import HTTPException
 from greencompute_control_plane.application.services import ControlPlaneService
 from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
 from greencompute_gateway.application.services import GatewayService, NoCapacityError
+from greencompute_gateway.infrastructure.repository import GatewayRepository
 from greencompute_gateway.transport import routes
 from greencompute_protocol import (
     CapacityUpdate,
@@ -156,6 +157,8 @@ def _gateway(can_place, free, balance_cents=10_000):
         control_plane=cp,
         _user_can_access_workload=lambda w, u: True,
         billing_repo=SimpleNamespace(get_balance=lambda uid: balance_cents),
+        # The account checks (sanctions, new wallet accounts) read users.
+        repository=GatewayRepository(database_url="sqlite:///:memory:", bootstrap=True),
     )
     return svc, workload
 

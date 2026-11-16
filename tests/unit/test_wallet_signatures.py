@@ -75,3 +75,42 @@ def test_address_normalization():
     for chain, bad in [("evm", "0x123"), ("evm", "5F..."), ("bittensor", "0xabc"), ("solana", "x")]:
         with pytest.raises(InvalidAddress):
             normalize_address(chain, bad)
+
+
+# --- sign-in (strict) ---------------------------------------------------------------
+
+from greencompute_gateway.infrastructure.wallet_signatures import (  # noqa: E402
+    detect_chain,
+    normalize_address_strict,
+    signature_problem,
+)
+
+
+def test_strict_evm_refuses_the_high_s_twin_the_lenient_check_accepts():
+    pk = keys.PrivateKey(bytes.fromhex("11" * 32))
+    address = pk.public_key.to_checksum_address()
+    data = MESSAGE.encode()
+    sig = pk.sign_msg_hash(keccak(b"\x19Ethereum Signed Message:\n" + str(len(data)).encode() + data))
+    n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    twin = "0x" + sig.r.to_bytes(32, "big").hex() + (n - sig.s).to_bytes(32, "big").hex() + bytes([28 - sig.v]).hex()
+    low = "0x" + sig.r.to_bytes(32, "big").hex() + sig.s.to_bytes(32, "big").hex() + bytes([27 + sig.v]).hex()
+    assert verify_signature("evm", address, MESSAGE, twin)  # the same key's signature, other encoding
+    assert not verify_signature("evm", address, MESSAGE, twin, strict=True)
+    assert verify_signature("evm", address, MESSAGE, low, strict=True)
+
+
+def test_chain_detection_checksums_and_signature_shapes():
+    assert detect_chain("0xAbC") == "evm" and detect_chain("5Grw...") == "bittensor"
+    good = keys.PrivateKey(bytes.fromhex("11" * 32)).public_key.to_checksum_address()
+    assert normalize_address_strict("evm", good) == good.lower()
+    assert normalize_address_strict("evm", good.lower()) == good.lower()
+    assert normalize_address_strict("evm", "0x" + good[2:].upper()) == good.lower()
+    wrong = good[:-1] + (good[-1].lower() if good[-1].isupper() else good[-1].upper())
+    if wrong[-1].isalpha():
+        with pytest.raises(InvalidAddress):
+            normalize_address_strict("evm", wrong)
+    assert "smart-contract" in signature_problem("evm", "0x" + "00" * 200)
+    assert "65 bytes" in signature_problem("evm", "0x" + "00" * 64)
+    assert "64 bytes" in signature_problem("bittensor", "0x" + "00" * 65)
+    assert "hex" in signature_problem("evm", "not hex")
+    assert signature_problem("evm", "0x" + "00" * 65) is None

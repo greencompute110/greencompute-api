@@ -8,14 +8,18 @@ plane (stops running rentals once a key reaches its limit).
 """
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 
 from greencompute_persistence.db import session_scope
-from greencompute_persistence.orm import APIKeyORM, DeploymentORM, InvocationRecordORM, LedgerEntryORM
+from greencompute_persistence.orm import APIKeyORM, DeploymentORM, InvocationRecordORM, LedgerEntryORM, UserORM
 
 SPEND_WINDOW = timedelta(hours=24)
+
+# Ledger debits that aren't spending: staff clawing back a payment.
+_NOT_SPEND = ("refund", "chargeback")
 
 # Deployments in these states no longer count towards max_active_rentals.
 _FINISHED_STATES = ("terminated", "failed")
@@ -94,3 +98,89 @@ def key_rental_room(
         if spent >= round(daily_spend_limit_usd * 100):
             return 0, "spend", numbers
     return room, None, numbers
+
+
+# --- New wallet accounts ---------------------------------------------------------
+# An account a wallet signature created has no email and nobody has vouched
+# for it, which is what abuse looks like too. For its first week (unless the
+# website has since confirmed an email for it) the account as a whole, every
+# key together, may have only a few rentals running and spend only so much
+# a day. Env: GREENCOMPUTE_NEW_WALLET_MAX_RENTALS (2),
+# GREENCOMPUTE_NEW_WALLET_DAILY_SPEND_USD (50), GREENCOMPUTE_NEW_WALLET_DAYS (7).
+
+
+def _env_number(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+def new_account_limits(session_factory, user_id: str | None, now: datetime | None = None) -> dict | None:
+    """The limits a new wallet account is under now, or None when it isn't
+    one: {"max_active_rentals", "daily_spend_limit_usd", "until"}."""
+    if not user_id:
+        return None
+    with session_scope(session_factory) as session:
+        row = session.execute(
+            select(UserORM.signup_method, UserORM.email_verified_at, UserORM.created_at).where(UserORM.user_id == user_id)
+        ).first()
+    if row is None or row.signup_method != "wallet" or row.email_verified_at is not None or row.created_at is None:
+        return None
+    created = row.created_at if row.created_at.tzinfo else row.created_at.replace(tzinfo=UTC)
+    until = created + timedelta(days=_env_number("GREENCOMPUTE_NEW_WALLET_DAYS", 7))
+    if (now or datetime.now(UTC)) >= until:
+        return None
+    return {
+        "max_active_rentals": int(_env_number("GREENCOMPUTE_NEW_WALLET_MAX_RENTALS", 2)),
+        "daily_spend_limit_usd": _env_number("GREENCOMPUTE_NEW_WALLET_DAILY_SPEND_USD", 50),
+        "until": until,
+    }
+
+
+def account_spend_cents(session_factory, user_id: str, since: datetime | None = None) -> int:
+    """Cents the account spent since `since` (default: the last 24 hours):
+    every charge, by any key or none."""
+    since = since or datetime.now(UTC) - SPEND_WINDOW
+    with session_scope(session_factory) as session:
+        total = session.scalar(
+            select(func.coalesce(func.sum(LedgerEntryORM.amount_cents), 0)).where(
+                LedgerEntryORM.user_id == user_id,
+                LedgerEntryORM.amount_cents < 0,
+                LedgerEntryORM.kind.not_in(_NOT_SPEND),
+                LedgerEntryORM.created_at >= since,
+            )
+        ) or 0
+    return -int(total)
+
+
+def account_active_rentals(session_factory, user_id: str) -> int:
+    """The account's deployments that haven't finished, whoever started them."""
+    with session_scope(session_factory) as session:
+        return session.scalar(
+            select(func.count()).select_from(DeploymentORM).where(
+                DeploymentORM.owner_user_id == user_id,
+                DeploymentORM.state.not_in(_FINISHED_STATES),
+            )
+        ) or 0
+
+
+def new_account_room(
+    session_factory, user_id: str | None, *, starting_rental: bool = True,
+) -> tuple[str | None, dict]:
+    """(reason, numbers) when a new wallet account is at one of its limits:
+    "active" (rentals at once, checked only when `starting_rental`) or
+    "spend" (the last 24 hours); (None, {}) otherwise. The numbers include
+    the limits and when they end."""
+    limits = new_account_limits(session_factory, user_id)
+    if limits is None:
+        return None, {}
+    numbers = dict(limits)
+    if starting_rental:
+        numbers["active_rentals"] = account_active_rentals(session_factory, user_id)
+        if numbers["active_rentals"] >= limits["max_active_rentals"]:
+            return "active", numbers
+    numbers["spent_cents"] = account_spend_cents(session_factory, user_id)
+    if numbers["spent_cents"] >= round(limits["daily_spend_limit_usd"] * 100):
+        return "spend", numbers
+    return None, numbers

@@ -9,6 +9,10 @@ os.environ.setdefault("GREENCOMPUTE_BUILD_EXECUTION_MODE", "simulated")
 # test turns them on (tests/unit/test_payment_emails.py, with the POST mocked).
 os.environ["GREENCOMPUTE_PAYMENT_EMAILS_ENABLED"] = "false"
 os.environ["WEBSITE_NOTIFY_URL"] = "http://127.0.0.1:9/api/internal/notify"
+# Sanctions screening never reaches the network in tests: the Chainalysis
+# oracle is off unless a test turns it on with its RPC call mocked, and the
+# lists are loaded from fixtures (tests/unit/test_sanctions.py).
+os.environ["GREENCOMPUTE_SANCTIONS_ORACLE_ENABLED"] = "false"
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = ROOT.parent

@@ -14,6 +14,7 @@ from greencompute_gateway.domain.payment_decisions import DecisionError, check_r
 from greencompute_gateway.infrastructure.billing_repository import BillingRepository, InsufficientBalanceError
 from greencompute_gateway.infrastructure.wallet_signatures import (
     CURRENCY_CHAIN,
+    InvalidAddress,
     normalize_address,
     verify_signature,
 )
@@ -95,6 +96,15 @@ class TooManyOpenInvoices(Exception):
 
 class WalletProofError(ValueError):
     """The wallet-link request doesn't prove control of the wallet."""
+
+
+class WalletBlocked(PermissionError):
+    """Sanctions screening named the wallet: it can't be linked."""
+
+
+class BlockedPaymentError(ValueError):
+    """Staff tried to credit a transfer whose sender sanctions screening
+    named. Such a payment is never credited."""
 
 
 # Unmatched payments already alerted on in this process (by deposit_ref): a
@@ -563,6 +573,10 @@ class BillingService:
             )
             return "seen"
         amount = deposit["amount_raw"] / (10 ** deposit["decimals"])
+        # Before any rule can credit it: a payment from a sanctioned wallet
+        # is never credited, whoever's invoice it would pay.
+        if self._block_if_sanctioned(deposit, amount):
+            return "blocked"
         invoices = self.repo.pending_invoices(currency, deposit["deposit_address"])
 
         exact = [inv for inv in invoices if _exact_amount(inv, deposit)]
@@ -619,6 +633,39 @@ class BillingService:
             "Billing admin > Unmatched deposits, or wait for the payer to verify the wallet."
         )
         return "unmatched"
+
+    def _block_if_sanctioned(self, deposit: dict, amount: float) -> bool:
+        """Screen the sender; if a list or the oracle names it, mark the
+        deposit blocked (staff see it under status=blocked), flag the wallet
+        if an account verified it, and alert support. True when blocked."""
+        from greencompute_gateway.application import sanctions
+
+        chain = CURRENCY_CHAIN.get(deposit["currency"])
+        if not chain:
+            return False
+        try:
+            sender = normalize_address(chain, deposit["sender"])
+        except InvalidAddress:
+            return False
+        source = sanctions.screen(self.repo.session_factory, chain, sender)
+        if not source:
+            return False
+        if not self.repo.block_deposit(deposit["deposit_ref"], source):
+            return False  # credited meanwhile by another path
+        owner = self.repo.wallet_owner(chain, sender)
+        if owner:
+            sanctions.flag_wallet(self.repo.session_factory, chain, sender, source)
+        from greencompute_gateway.infrastructure.alerts import send_payment_alert
+
+        send_payment_alert(
+            f"Blocked payment: {amount:g} {deposit['currency'].upper()} from {deposit['sender']} "
+            f"(tx {deposit.get('tx_hash') or deposit['deposit_ref']}) was NOT credited: sanctions screening "
+            f"({source}) names the sender. "
+            + (f"The wallet is verified by account {owner}, which can no longer rent. " if owner else "")
+            + "It is listed under Billing admin > deposits with status blocked; decide what to do with the funds."
+        )
+        log.warning("deposit %s blocked: sender named by %s", deposit["deposit_ref"], source)
+        return True
 
     def _credit_one_customers_invoice(self, deposit: dict, amount: float, open_invoices: list[dict]) -> str | None:
         """Rule 4 of resolve_deposit: the transfer isn't any invoice's exact
@@ -747,6 +794,8 @@ class BillingService:
             dep, result = self._assign_deposit(deposit_ref or "", review["user_id"])
             if dep is None:
                 raise ReviewError("deposit not found")
+            if result and result.get("blocked"):
+                raise ReviewError("that deposit's sender is on a sanctions list: it can't be credited")
             if not result or not result.get("credited"):
                 raise ReviewError("that deposit was already credited")
             self.repo.set_review_status(invoice_id, "resolved", paid_tx=dep["tx_hash"] or "")
@@ -765,6 +814,8 @@ class BillingService:
 
         if action == "confirm_invoice":
             tx_hash = review["tx_hash"] or ""
+            if self.repo.tx_blocked(tx_hash):
+                raise ReviewError("that transaction's sender is on a sanctions list: it can't be credited")
             paid = self.repo.tx_credit_owner(tx_hash)
             if paid is not None:
                 raise ReviewError(
@@ -843,6 +894,17 @@ class BillingService:
         message = wallet_link_message(username, user_id, address, issued_at)
         if not verify_signature(chain, address, message, signature):
             raise WalletProofError("signature does not match this wallet and message")
+        from greencompute_gateway.application import sanctions
+
+        source = sanctions.screen(self.repo.session_factory, chain, address)
+        if source:
+            from greencompute_gateway.infrastructure.alerts import send_payment_alert
+
+            send_payment_alert(
+                f"Sanctions screening refused linking wallet {chain} {address} (named by {source}) "
+                f"to account {user_id}."
+            )
+            raise WalletBlocked(address)
         wallet, created = self.repo.add_verified_wallet(user_id, chain, address)
         return {**wallet, "newly_linked": created, "credited": self.claim_wallet_deposits(user_id, chain, address)}
 
@@ -908,6 +970,10 @@ class BillingService:
         invoice = self.repo.get_crypto_invoice(invoice_id)
         if invoice is None:
             return None
+        if self.repo.tx_blocked(tx_hash):
+            raise BlockedPaymentError(
+                f"transaction {tx_hash[:14]} came from a wallet on a sanctions list and can't be credited"
+            )
         # The watcher (or another confirm) may already have credited this
         # transaction under its own deposit_ref, which the "manual:" key below
         # can't see: confirming it again would pay twice.

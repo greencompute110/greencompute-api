@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import threading
+from datetime import UTC, datetime
 from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
@@ -312,6 +313,199 @@ def register_user(
     secret). register is idempotent-by-email so re-running is safe."""
     require_provision_or_admin(authorization, x_api_key)
     return service.register_user(payload).model_dump(mode="json")
+
+
+# --- Signing in with a wallet ---------------------------------------------------
+# No email, password or browser: challenge -> sign -> verify -> an API key.
+# application/wallet_auth.py has the rules; these routes add rate limits and
+# what an agent needs next (where to pay, the account's limits).
+
+WALLET_AUTH_PER_IP = 30  # challenges, and verifies, per minute per address
+WALLET_CHALLENGES_PER_WALLET = 20  # per 5 minutes
+
+
+def _wallet_auth_error(exc) -> HTTPException:
+    retry = exc.extra.get("retry_after_seconds")
+    return coded(exc.status, exc.code, exc.detail(), {"Retry-After": str(retry)} if retry else None)
+
+
+def _wallet_auth_rate_limit(subject: str, authorization: str | None, x_api_key: str | None) -> None:
+    """Per client IP. The website server's calls carry the provision secret
+    and are limited per visitor there instead: through it, every visitor
+    shares a few egress IPs."""
+    if is_provision_secret(authorization, x_api_key):
+        return
+    enforce_rate_limit(subject, _audit_client_ip() or "unknown", limit=WALLET_AUTH_PER_IP, window_seconds=60)
+
+
+def _wallet_deposit_addresses(chain: str) -> list[dict]:
+    from greencompute_gateway.application.billing_service import BONUS_RATES, _base_currency, _deposit_address_for
+    from greencompute_gateway.infrastructure.wallet_signatures import CURRENCY_CHAIN
+
+    return [
+        {"currency": c, "deposit_address": _deposit_address_for(c),
+         "bonus_pct": BONUS_RATES.get(_base_currency(c), 0.0)}
+        for c, ch in CURRENCY_CHAIN.items() if ch == chain and _deposit_address_for(c)
+    ]
+
+
+def _claim_wallet_payments(user_id: str, chain: str, address: str) -> list[dict]:
+    """Credit what this wallet sent before it had an account (or before
+    this account verified it), as linking a wallet does. Best effort: a
+    failure leaves them claimable, and must not fail the sign-in."""
+    try:
+        return _get_billing().claim_wallet_deposits(user_id, chain, address)
+    except Exception:  # noqa: BLE001
+        log.exception("wallet sign-in: claiming earlier payments for %s failed", user_id)
+        return []
+
+
+@router.post("/platform/auth/wallet/challenge", response_model=None,
+             responses=ok(schemas.WalletChallenge, "The message to sign, valid for 5 minutes"))
+def wallet_auth_challenge(
+    payload: schemas.WalletChallengeRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Sign in with a wallet, step 1 of 2 (no API key, email or browser
+    needed): a one-time message to sign with the wallet, bound to
+    green-compute.com and valid for 5 minutes. EVM wallets sign it with
+    `personal_sign` (it is a Sign-In with Ethereum message); Bittensor
+    wallets sign it with the coldkey (sr25519). Then send the signature to
+    POST /platform/auth/wallet/verify."""
+    from greencompute_gateway.application import wallet_auth
+
+    _wallet_auth_rate_limit("wallet_challenge", authorization, x_api_key)
+    enforce_rate_limit("wallet_challenge_wallet", payload.address.strip().lower(),
+                       limit=WALLET_CHALLENGES_PER_WALLET, window_seconds=300)
+    try:
+        return wallet_auth.issue_challenge(
+            service.repository.session_factory, address=payload.address, chain=payload.chain,
+            action=payload.action, chain_id=payload.chain_id, client_ip=_audit_client_ip(),
+        )
+    except wallet_auth.WalletAuthError as exc:
+        raise _wallet_auth_error(exc) from exc
+
+
+@router.post("/platform/auth/wallet/verify", response_model=None,
+             responses=ok(schemas.WalletSignIn, "Signed in: the new API key (shown only now)"))
+def wallet_auth_verify(
+    payload: schemas.WalletVerifyRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Sign in with a wallet, step 2 of 2: the signed challenge in, an API
+    key out. The first time, this creates the account: no email, no
+    password, the wallet is the account. A wallet already verified on an
+    account (Billing > Verified wallets) signs in to that account.
+
+    Each sign-in revokes the keys this wallet's earlier sign-ins issued
+    (`keep_existing_keys: true` keeps them), never other keys: lost a key?
+    Sign in again. `scopes`, `max_active_rentals` and `daily_spend_limit_usd`
+    limit the new key. Payments this wallet sends to `deposit_addresses` are
+    credited automatically. A `revoke_keys` challenge revokes and issues
+    nothing."""
+    from greencompute_gateway.application import wallet_auth
+    from greencompute_persistence.key_limits import new_account_limits
+
+    _wallet_auth_rate_limit("wallet_verify", authorization, x_api_key)
+    sf = service.repository.session_factory
+    try:
+        result = wallet_auth.verify(
+            sf, nonce=payload.nonce, signature=payload.signature, key_name=payload.key_name,
+            scopes=payload.scopes, max_active_rentals=payload.max_active_rentals,
+            daily_spend_limit_usd=payload.daily_spend_limit_usd, keep_existing_keys=payload.keep_existing_keys,
+        )
+    except wallet_auth.WalletAuthError as exc:
+        raise _wallet_auth_error(exc) from exc
+    if result["api_key"] is None:
+        return {**result, "next_steps": ["No key was issued. Sign a new `sign_in` challenge to get one."]}
+    chain, address, user_id = result["wallet"]["chain"], result["wallet"]["address"], result["user_id"]
+    limits = new_account_limits(sf, user_id)
+    if limits:
+        limits = {**limits, "until": limits["until"].isoformat()}
+    deposits = _wallet_deposit_addresses(chain)
+    pay = ("TAO or alpha (subnet 110)" if chain == "bittensor" else "USDC or USDT on Base or Ethereum")
+    result.update(
+        account_limits=limits,
+        deposit_addresses=deposits,
+        credited=_claim_wallet_payments(user_id, chain, address),
+        next_steps=[
+            "Send the key as `Authorization: Bearer <api_key>` on every request.",
+            f"Add credit: send {pay} from THIS wallet to the matching `deposit_addresses` entry. It is "
+            "credited within a few minutes, with no invoice (event `payment.credited`; check "
+            "GET /platform/billing/balance).",
+            "Rent: GET /platform/pricing, then POST /platform/workloads and POST /platform/deployments "
+            "(https://www.green-compute.com/docs/agents).",
+        ],
+    )
+    if result["has_email"]:
+        _email_wallet_sign_in(user_id, chain, address, result["key_name"])
+    return result
+
+
+def _email_wallet_sign_in(user_id: str, chain: str, address: str, key_name: str) -> None:
+    """Tell an account with an email that a wallet just got a key for it,
+    the way a new-device notice would: a wallet verified only for payments
+    may not be one its owner expects to sign in with."""
+    from greencompute_gateway.infrastructure.notify_website import notify_user
+
+    notify_user(service.repository.session_factory, user_id, "wallet_sign_in", {
+        "chain": chain, "address": address, "key_name": key_name,
+        "signed_in_at": datetime.now(UTC).isoformat(),
+    })
+
+
+@router.post("/platform/auth/wallet/website-session", include_in_schema=False)
+def wallet_auth_website_session(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """For the website's "Connect wallet" sign-in (provision secret only):
+    the same checks as verify, and the account back instead of a key. The
+    website keeps its own key per account, which wallet sign-ins never
+    revoke. Body: {"nonce", "signature"}."""
+    from greencompute_gateway.application import wallet_auth
+
+    require_provision_or_admin(authorization, x_api_key)
+    if not is_provision_secret(authorization, x_api_key):
+        raise HTTPException(status_code=403, detail="only the website server may call this")
+    try:
+        result = wallet_auth.verify_for_website(
+            service.repository.session_factory,
+            nonce=str(payload.get("nonce") or ""), signature=str(payload.get("signature") or ""),
+        )
+    except wallet_auth.WalletAuthError as exc:
+        raise _wallet_auth_error(exc) from exc
+    result["credited"] = _claim_wallet_payments(result["user_id"], result["chain"], result["address"])
+    if result["email"]:
+        _email_wallet_sign_in(result["user_id"], result["chain"], result["address"], "website sign-in")
+    return result
+
+
+@router.post("/platform/account/verified-email", include_in_schema=False)
+def set_verified_email(
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """For the website (provision secret only), after the person clicked
+    the link it emailed: record the account's confirmed email. A wallet
+    account's new-account limits end with it. Body: {"user_id", "email"}."""
+    require_provision_or_admin(authorization, x_api_key)
+    if not is_provision_secret(authorization, x_api_key):
+        raise HTTPException(status_code=403, detail="only the website server may call this")
+    from greencompute_gateway.application.services import EmailTakenError
+
+    try:
+        return service.set_verified_email(str(payload.get("user_id") or ""), str(payload.get("email") or ""))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="user not found") from exc
+    except EmailTakenError as exc:
+        raise coded(409, "conflict", str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/platform/users", include_in_schema=False)
@@ -723,10 +917,48 @@ def cancel_build(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+def _wallet_blocked() -> HTTPException:
+    """403 for an account whose wallet failed sanctions screening: the same
+    neutral sentence wherever it shows."""
+    from greencompute_gateway.application.sanctions import BLOCKED_MESSAGE
+
+    return coded(403, "wallet_blocked", {"code": "wallet_blocked", "message": BLOCKED_MESSAGE})
+
+
+def _new_account_limit(reason: str, numbers: dict) -> HTTPException:
+    """403 new_account_limit: a wallet account in its first week is at one
+    of the limits new wallet accounts have."""
+    until = numbers["until"].isoformat() if numbers.get("until") else None
+    if reason == "active":
+        message = (
+            f"New wallet accounts can have {numbers['max_active_rentals']} rentals running at once for their "
+            "first 7 days"
+        )
+        hint = "stop one with DELETE /platform/deployments/{id}, or wait until `until`"
+    else:
+        message = (
+            f"New wallet accounts can spend ${numbers['daily_spend_limit_usd']:.2f} in any 24 hours for their "
+            "first 7 days"
+        )
+        hint = "wait for earlier spending to fall out of the 24-hour window, or until `until`"
+    return coded(403, "new_account_limit", {
+        "code": "new_account_limit",
+        "message": message,
+        "limit": reason,
+        "max_active_rentals": numbers.get("max_active_rentals"),
+        "active_rentals": numbers.get("active_rentals"),
+        "daily_spend_limit_usd": numbers.get("daily_spend_limit_usd"),
+        "spent_last_24h_usd": round(numbers.get("spent_cents", 0) / 100, 2) if "spent_cents" in numbers else None,
+        "until": until,
+        "hint": hint + ". Adding an email address to the account on the website (Settings) lifts these limits.",
+    })
+
+
 def _enforce_key_limits(api_key, *, starting_rental: bool = False) -> None:
     """Refuse a request once its API key is at one of its limits: rentals
     running at once (when starting a rental) or spend in the last 24 hours
-    (rentals and inference). Keys without limits, and admin keys, pass."""
+    (rentals and inference). Keys without limits, and admin keys, pass.
+    (A new wallet account's own limits are checked by create_deployment.)"""
     max_active = getattr(api_key, "max_active_rentals", None)
     daily_limit = getattr(api_key, "daily_spend_limit_usd", None)
     if getattr(api_key, "admin", False) or (max_active is None and daily_limit is None):
@@ -1108,7 +1340,9 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
     from greencompute_gateway.application.services import (
         InsufficientBalanceForRentalError,
         KeyLimitError,
+        NewAccountLimitError,
         NoCapacityError,
+        SanctionedAccountError,
         UnsupportedGPUError,
     )
 
@@ -1120,6 +1354,10 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
             admin=api_key.admin,
             created_by_key_id=api_key.key_id,
         ), api_key.admin)
+    except SanctionedAccountError as exc:
+        raise _wallet_blocked() from exc
+    except NewAccountLimitError as exc:
+        raise _new_account_limit(exc.reason, exc.numbers) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1871,7 +2109,7 @@ def resume_deployment(
     READY). 402 if balance can't cover an hour, 409 if the original node is
     full / its placement is gone.
     """
-    from greencompute_gateway.application.services import InsufficientBalanceForRentalError
+    from greencompute_gateway.application.services import InsufficientBalanceForRentalError, SanctionedAccountError
 
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("resume_deployment", api_key.key_id, limit=30, window_seconds=60)
@@ -1881,6 +2119,8 @@ def resume_deployment(
             user_id=api_key.user_id,
             admin=api_key.admin,
         ), api_key.admin)
+    except SanctionedAccountError as exc:
+        raise _wallet_blocked() from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -3210,11 +3450,11 @@ def billing_confirm_crypto(
     tx_hash = payload.get("tx_hash", "")
     if not tx_hash:
         raise HTTPException(status_code=400, detail="tx_hash required")
-    from greencompute_gateway.application.billing_service import AlreadyCreditedError
+    from greencompute_gateway.application.billing_service import AlreadyCreditedError, BlockedPaymentError
 
     try:
         result = _get_billing().confirm_crypto_deposit(invoice_id, tx_hash)
-    except AlreadyCreditedError as exc:
+    except (AlreadyCreditedError, BlockedPaymentError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result is None:
         raise HTTPException(status_code=404, detail="invoice not found")
@@ -3382,7 +3622,7 @@ def billing_link_wallet(
     Body: {"chain", "address", "issued_at" (from the challenge), "signature"}.
     Also credits any unmatched payments the wallet sent in the last 30 days."""
     user_id = _require_user(authorization, x_api_key)
-    from greencompute_gateway.application.billing_service import WalletProofError
+    from greencompute_gateway.application.billing_service import WalletBlocked, WalletProofError
     from greencompute_gateway.infrastructure.billing_repository import (
         MAX_WALLETS_PER_USER,
         TooManyWallets,
@@ -3400,6 +3640,8 @@ def billing_link_wallet(
         )
     except (InvalidAddress, WalletProofError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except WalletBlocked as exc:
+        raise _wallet_blocked() from exc
     except WalletLinkedElsewhere as exc:
         raise HTTPException(
             status_code=409, detail="this wallet is already verified by another account"
@@ -3417,11 +3659,28 @@ def billing_unlink_wallet(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     """Unlink a verified wallet. Later payments from it are no longer
-    credited to this account automatically."""
+    credited to this account automatically, it can no longer sign in to the
+    account, and the API keys its sign-ins issued stop working. The only
+    wallet of an account with no email can't be unlinked: nothing else
+    signs in to it."""
     user_id = _require_user(authorization, x_api_key)
-    if not _get_billing().repo.delete_verified_wallet(user_id, wallet_id):
+    repo = _get_billing().repo
+    wallets = repo.list_verified_wallets(user_id)
+    wallet = next((w for w in wallets if w["wallet_id"] == wallet_id), None)
+    if wallet is None:
         raise HTTPException(status_code=404, detail="wallet not found")
-    return {"deleted": True, "wallet_id": wallet_id}
+    if len(wallets) == 1 and not repo.signs_in_without_a_wallet(user_id):
+        raise coded(
+            409, "conflict",
+            "this wallet is how this account signs in, and the account has no email: add an email on the "
+            "website (Settings) or verify another wallet first",
+        )
+    if not repo.delete_verified_wallet(user_id, wallet_id):
+        raise HTTPException(status_code=404, detail="wallet not found")
+    from greencompute_gateway.application.wallet_auth import revoke_wallet_keys
+
+    revoked = revoke_wallet_keys(repo.session_factory, user_id, wallet["chain"], wallet["address"])
+    return {"deleted": True, "wallet_id": wallet_id, "revoked_key_ids": revoked}
 
 
 @router.get("/platform/billing/admin/crypto/invoices", include_in_schema=False)
@@ -3465,6 +3724,62 @@ def billing_admin_list_deposits(
     payments nobody has been credited for yet."""
     require_api_key(authorization, x_api_key, admin_required=True)
     return _get_billing().repo.list_deposits_for_admin(status=status, limit=max(1, min(limit, 500)))
+
+
+@router.get("/platform/admin/sanctions", include_in_schema=False)
+def admin_sanctions_state(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — sanctions screening: each list's last download, how many
+    addresses it holds and its last error. Blocked payments are listed by
+    GET /platform/billing/admin/crypto/deposits?status=blocked."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    from greencompute_gateway.application import sanctions
+
+    return {
+        "enabled": sanctions.enabled(),
+        "oracle_enabled": sanctions.oracle_enabled(),
+        "lists": sanctions.list_state(service.repository.session_factory),
+    }
+
+
+@router.post("/platform/admin/sanctions/refresh", include_in_schema=False)
+def admin_sanctions_refresh(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — download the lists now (normally daily). A list that fails
+    keeps its last good copy."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    from greencompute_gateway.application import sanctions
+
+    return sanctions.refresh(service.repository.session_factory)
+
+
+@router.get("/platform/admin/sanctions/check", include_in_schema=False)
+def admin_sanctions_check(
+    address: str = Query(...),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Admin — what screening says about one address: the list naming it
+    (if any) and, for EVM, the oracle's answer (null if it can't be asked)."""
+    require_api_key(authorization, x_api_key, admin_required=True)
+    from greencompute_gateway.application import sanctions
+    from greencompute_gateway.infrastructure.wallet_signatures import InvalidAddress, detect_chain, normalize_address
+
+    chain = detect_chain(address)
+    try:
+        canonical = normalize_address(chain, address)
+    except InvalidAddress as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "chain": chain,
+        "address": canonical,
+        "listed": sanctions.listed(service.repository.session_factory, chain, canonical),
+        "oracle": sanctions.oracle_says(canonical) if chain == "evm" else None,
+    }
 
 
 @router.get("/platform/billing/admin/crypto/reasons", include_in_schema=False)
@@ -3547,6 +3862,8 @@ def billing_admin_assign_deposit(
         raise HTTPException(status_code=404, detail="deposit not found")
     if result.get("already_credited"):
         raise HTTPException(status_code=409, detail="deposit was already credited")
+    if result.get("blocked"):
+        raise HTTPException(status_code=409, detail="deposit's sender is on a sanctions list: it can't be credited")
     return result
 
 

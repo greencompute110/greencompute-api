@@ -39,6 +39,14 @@ class UserORM(Base):
     profile_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
     balance_credits: Mapped[int] = mapped_column(BigInteger, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # "wallet" for an account created by signing in with a wallet (no email,
+    # no password); NULL for every account made through the website's email
+    # or Google sign-up. New wallet accounts get lower limits for a week.
+    signup_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # When the website confirmed the account's email by a link sent to it.
+    # Only the website server sets it: an email typed into PATCH
+    # /platform/users/{id} is a contact address, not proof of anything.
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AdminAccountORM(Base):
@@ -68,6 +76,10 @@ class APIKeyORM(Base):
     # Optional limits: rentals running at once, and spend in any 24 hours.
     max_active_rentals: Mapped[int | None] = mapped_column(Integer, nullable=True)
     daily_spend_limit_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # "<chain>:<address>" when the key was issued by signing in with that
+    # wallet (POST /platform/auth/wallet/verify). Signing in again revokes
+    # exactly these, never the website's key or keys the user made.
+    issued_by_wallet: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
 
 
 class HeartbeatORM(Base):
@@ -984,9 +996,10 @@ class CryptoDepositORM(Base):
     block_number: Mapped[int] = mapped_column(BigInteger)
     # USD price of one token when the deposit was seen (1.0 for stablecoins).
     usd_price: Mapped[float | None] = mapped_column(Float, nullable=True)
-    # unmatched | credited | ignored (dust worth under a cent)
+    # unmatched | credited | ignored (dust worth under a cent) | blocked (the
+    # sender is on a sanctions list: never credited, for staff to handle)
     status: Mapped[str] = mapped_column(String(32), default="unmatched", index=True)
-    # invoice | invoice_overpay | wallet | wallet_link | admin
+    # invoice | invoice_overpay | wallet | wallet_link | admin | sanctions:<source>
     matched_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
     invoice_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
@@ -1012,6 +1025,51 @@ class VerifiedWalletORM(Base):
     # SS58 (prefix 42) for bittensor, lowercase 0x-hex for evm.
     address: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Set when a live check (the Chainalysis oracle) found the wallet
+    # sanctioned: the account can't rent while it is set. Hits on the lists
+    # are looked up in sanctioned_addresses each time instead, so a
+    # delisting there takes effect on the next refresh.
+    sanctions_hit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sanctions_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WalletAuthChallengeORM(Base):
+    """A one-time sign-in message issued to a wallet (POST
+    /platform/auth/wallet/challenge). The exact text is kept, so verify checks
+    the signature over what we issued, never over anything the client sends.
+    Single use: verify claims it (used_at) before looking at the signature."""
+
+    __tablename__ = "wallet_auth_challenges"
+
+    nonce: Mapped[str] = mapped_column(String(64), primary_key=True)
+    chain: Mapped[str] = mapped_column(String(16))
+    # Canonical form, as verified_wallets stores it.
+    address: Mapped[str] = mapped_column(String(128))
+    # "sign_in" or "revoke_keys": what the signed statement says it is for.
+    action: Mapped[str] = mapped_column(String(16), default="sign_in")
+    message: Mapped[str] = mapped_column(Text)
+    client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SanctionedAddressORM(Base):
+    """A crypto address on a sanctions list we screen against, as of the
+    list's last successful download. A refresh replaces one source's rows in
+    one transaction, so a failed download leaves the last good copy."""
+
+    __tablename__ = "sanctioned_addresses"
+    __table_args__ = (Index("ix_sanctioned_addresses_chain_address", "chain", "address"),)
+
+    # "ofac_sdn" or "uk_sanctions_list".
+    source: Mapped[str] = mapped_column(String(32), primary_key=True)
+    # "evm" or "bittensor", in verified_wallets' canonical form.
+    chain: Mapped[str] = mapped_column(String(16), primary_key=True)
+    address: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # Who the list names, for staff; never shown to customers.
+    label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    loaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class StripeSessionORM(Base):

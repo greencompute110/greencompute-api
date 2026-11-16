@@ -469,3 +469,96 @@ class ExecResult(BaseModel):
     output: str = Field(description="The last 64 KiB of its output (stdout and stderr).")
     output_truncated: bool
     timed_out: bool = Field(description="True: we stopped waiting; the command may still be running in the pod.")
+
+
+# --- wallet sign-in -------------------------------------------------------------
+
+
+class WalletChallengeRequest(BaseModel):
+    address: str = Field(min_length=1, max_length=128, description=(
+        "The wallet's address: `0x...` (Ethereum or Base) or an SS58 coldkey `5...` (Bittensor). "
+        "Sign in with the wallet you will pay from: its payments are credited to the account automatically."))
+    chain: str | None = Field(default=None, description="`evm` or `bittensor`; worked out from the address when left out.")
+    chain_id: int | None = Field(default=None, description=(
+        "EVM only: 1 (Ethereum, the default) or 8453 (Base), the network your wallet is on. "
+        "It changes nothing about the account: one address, both networks."))
+    action: str = Field(default="sign_in", description=(
+        "`sign_in` (the default): verify issues an API key, creating the account the first time. "
+        "`revoke_keys`: verify revokes every key this wallet's sign-ins issued and issues none."))
+
+
+class WalletChallenge(BaseModel):
+    nonce: str = Field(description="Send it back to verify. Works once.")
+    message: str = Field(description="The exact text to sign, unchanged (EIP-4361 for EVM wallets).")
+    chain: str
+    address: str = Field(description="As the message shows it: EIP-55 checksummed for EVM, SS58 for Bittensor.")
+    action: str
+    domain: str = Field(description="The domain the message is bound to; a signature for another domain fails.")
+    uri: str
+    chain_id: int | None
+    issued_at: str
+    expires_at: str = Field(description="Verify before this (5 minutes after issue).")
+    expires_in_seconds: int
+    sign_with: str = Field(description="How to sign it.")
+    next: str
+
+
+class WalletVerifyRequest(BaseModel):
+    nonce: str = Field(min_length=1, max_length=64, description="From the challenge.")
+    signature: str = Field(min_length=1, max_length=4096, description="The wallet's signature over `message`, hex (0x...).")
+    key_name: str | None = Field(default=None, max_length=64, description="A name for the new key (default `wallet sign-in`).")
+    scopes: list[str] | None = Field(default=None, description=(
+        "Limit what the new key may do: any of `read`, `rentals`, `inference`, `billing`, `keys`. "
+        "Left out: full access."))
+    max_active_rentals: int | None = Field(default=None, ge=0, le=100, description="Rentals the key may have running at once.")
+    daily_spend_limit_usd: float | None = Field(default=None, gt=0, le=100000, description="What the key may spend in any 24 hours.")
+    keep_existing_keys: bool = Field(default=False, description=(
+        "false (the default): the keys this wallet's earlier sign-ins issued are revoked, so signing in again "
+        "is how you replace a lost key. true: keep them and add this one."))
+
+
+class WalletAddress(BaseModel):
+    chain: str
+    address: str = Field(description="Canonical form: lowercase 0x-hex, or SS58 with prefix 42.")
+
+
+class WalletDepositAddress(BaseModel):
+    currency: str = Field(description="e.g. `usdc-base`, `tao`.")
+    deposit_address: str
+    bonus_pct: float
+
+
+class NewAccountLimits(BaseModel):
+    """A new wallet account's limits for its first 7 days, for every key together."""
+    max_active_rentals: int
+    daily_spend_limit_usd: float
+    until: str = Field(description="When they end. Adding an email on the website ends them sooner.")
+
+
+class CreditedDeposit(BaseModel):
+    deposit_ref: str
+    currency: str
+    amount: float
+    tx_hash: str | None
+    credited_cents: int
+
+
+class WalletSignIn(BaseModel):
+    api_key: str | None = Field(description="Shown only now: store it. Null for a `revoke_keys` challenge.")
+    key_id: str | None = None
+    key_name: str | None = None
+    scopes: list[str] = Field(default_factory=list, description="Empty: full access.")
+    max_active_rentals: int | None = None
+    daily_spend_limit_usd: float | None = None
+    user_id: str | None = Field(description="The account. Null when revoking for a wallet with no account.")
+    account_created: bool = Field(default=False, description="True the first time this wallet signs in.")
+    has_email: bool = False
+    wallet: WalletAddress
+    revoked_key_ids: list[str] = Field(description="Keys this wallet's earlier sign-ins issued, now revoked.")
+    account_limits: NewAccountLimits | None = None
+    deposit_addresses: list[WalletDepositAddress] = Field(default_factory=list, description=(
+        "Where to send funds from this wallet: each payment is added to the balance automatically, "
+        "no invoice needed (event `payment.credited`)."))
+    credited: list[CreditedDeposit] = Field(default_factory=list, description=(
+        "Payments this wallet sent in the last 30 days that no account had been credited for, added now."))
+    next_steps: list[str] = Field(default_factory=list)

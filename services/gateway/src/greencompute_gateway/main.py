@@ -36,14 +36,15 @@ def _client_ip_from_request(request) -> str | None:
 async def lifespan(app: FastAPI):
     """Spawn long-running background tasks at startup; cancel them on
     shutdown: the on-chain crypto deposit watcher, the billing monitor,
-    the credit watch (auto-resume after top-up, low-credit emails), fleets
-    and webhook delivery."""
+    the credit watch (auto-resume after top-up, low-credit emails), fleets,
+    webhook delivery and the daily sanctions-list refresh."""
     from greencompute_gateway.application.billing_monitor import billing_monitor_loop
     from greencompute_gateway.application.credit_watch import credit_watch_loop
     from greencompute_gateway.application.fleets import fleet_loop
     from greencompute_gateway.application.webhooks import webhook_loop
     from greencompute_gateway.application.capacity_alerts import capacity_alert_loop
     from greencompute_gateway.application.stopped_alerts import stopped_alert_loop
+    from greencompute_gateway.application.sanctions import sanctions_refresh_loop
     from greencompute_gateway.infrastructure.deposit_watcher import (
         deposit_watcher_loop,
     )
@@ -56,6 +57,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(webhook_loop(), name="webhooks"),
         asyncio.create_task(capacity_alert_loop(), name="capacity-alerts"),
         asyncio.create_task(stopped_alert_loop(), name="stopped-emails"),
+        asyncio.create_task(sanctions_refresh_loop(), name="sanctions-lists"),
     ]
     try:
         yield
@@ -137,6 +139,8 @@ def api_index() -> dict:
         "gpu_models": "https://api.green-compute.com/platform/nodes/supported",
         "inference_base_url": "https://api.green-compute.com/v1",
         "auth": "Authorization: Bearer <api key> -- create one at https://www.green-compute.com/settings",
+        "wallet_sign_in": "No account yet? POST /platform/auth/wallet/challenge, sign the message with your "
+                          "wallet, POST /platform/auth/wallet/verify: an API key, no email needed",
     }
 
 

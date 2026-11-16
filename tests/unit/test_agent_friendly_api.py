@@ -13,6 +13,7 @@ from greencompute_control_plane.application.services import ControlPlaneService
 from greencompute_control_plane.domain.scheduler import PlacementPolicy, normalize_gpu_model
 from greencompute_gateway.application.services import GatewayService
 from greencompute_gateway.domain.gpu_catalog import matches_public_gpu, public_gpu_models
+from greencompute_gateway.infrastructure.repository import GatewayRepository
 from greencompute_gateway.transport.routes import DEPLOYMENT_SECRET_FIELDS, public_pricing
 from greencompute_protocol import (
     BuildRecord,
@@ -254,7 +255,9 @@ def _gateway_stub(online, supported):
         placement_preview=lambda w: (True, {}),
         create_deployment=lambda body: pytest.fail("must be rejected before reaching the control-plane"),
     )
-    return SimpleNamespace(control_plane=cp, _user_can_access_workload=lambda w, u: True), workload
+    # The account checks (sanctions, new wallet accounts) read users.
+    repo = GatewayRepository(database_url="sqlite:///:memory:", bootstrap=True)
+    return SimpleNamespace(control_plane=cp, _user_can_access_workload=lambda w, u: True, repository=repo), workload
 
 
 def test_an_offline_gpu_is_rejected_up_front_with_what_is_available(monkeypatch):
