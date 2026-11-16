@@ -4086,6 +4086,10 @@ def billing_admin_assign_deposit(
         raise HTTPException(status_code=409, detail="deposit was already credited")
     if result.get("blocked"):
         raise HTTPException(status_code=409, detail="deposit's sender is on a sanctions list: it can't be credited")
+    if result.get("stray"):
+        raise HTTPException(
+            status_code=409, detail="deposit is alpha of another subnet (or its amount couldn't be read): it can't be credited",
+        )
     return result
 
 

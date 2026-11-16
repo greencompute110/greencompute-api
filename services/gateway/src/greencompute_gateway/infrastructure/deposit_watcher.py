@@ -593,6 +593,54 @@ def _extract_alpha_transfer(
     return dest, origin
 
 
+def _parse_alpha_transfer(ev_obj: object, dest_addrs: set[str]) -> tuple[str, str, int] | None:
+    """A StakeTransferred event to one of our addresses, on any subnet, as
+    (destination_coldkey, origin_coldkey, destination_netuid)."""
+    if not _is_event(ev_obj, "subtensormodule", "staketransferred"):
+        return None
+    vals = _event_values(ev_obj)
+    if not vals or len(vals) < 6:
+        return None
+    try:
+        origin, dest, dest_netuid = str(vals[0]), str(vals[1]), int(vals[4])
+    except (TypeError, ValueError):
+        return None
+    return (dest, origin, dest_netuid) if dest in dest_addrs else None
+
+
+def _stray_alpha(
+    events: list, dest_addrs: set[str], want_netuid: int
+) -> list[tuple[int, str, int, str, object, str]]:
+    """Alpha moved to our deposit addresses that _alpha_deposits won't credit,
+    as (event_idx, our_address, alpha_rao (0 if unknown), sender,
+    extrinsic_idx, why): "wrong_subnet:<netuid>" (alpha of another subnet,
+    which our price doesn't value) or "unvalued" (no StakeAdded to read the
+    amount from). Until 2026-11 these were dropped with at most a log line:
+    the sender's money arrived and nobody, staff or customer, could find it."""
+    added: dict[object, list[tuple[str, int, int]]] = {}
+    moved: list[tuple[int, object, str, str, int]] = []
+    for idx, ev in enumerate(events):
+        ev_obj = getattr(ev, "value", ev)
+        if not isinstance(ev_obj, dict):
+            continue
+        xidx = ev_obj.get("extrinsic_idx")
+        stake = _extract_stake_added(ev_obj)
+        if stake is not None:
+            added.setdefault(xidx, []).append(stake)
+            continue
+        transfer = _parse_alpha_transfer(ev_obj, dest_addrs)
+        if transfer is not None:
+            moved.append((idx, xidx, *transfer))
+    stray = []
+    for idx, xidx, dest, origin, netuid in moved:
+        alpha = next((a for coldkey, n, a in added.get(xidx, []) if coldkey == dest and n == netuid), None)
+        if want_netuid >= 0 and netuid != want_netuid:
+            stray.append((idx, dest, alpha or 0, origin, xidx, f"wrong_subnet:{netuid}"))
+        elif alpha is None:
+            stray.append((idx, dest, 0, origin, xidx, "unvalued"))
+    return stray
+
+
 def _extract_stake_added(ev_obj: object) -> tuple[str, int, int] | None:
     """Decode SubtensorModule.StakeAdded(coldkey, hotkey, tao_amount,
     alpha_amount, netuid, fee) into (coldkey, netuid, alpha_rao). Alpha has 9
@@ -747,6 +795,25 @@ def scan_bittensor(repo: BillingRepository) -> int:
 
             found = [("tao", *t) for t in _tao_transfers(events, watched["tao"])]
             found += [("alpha", *a) for a in _alpha_deposits(events, watched["alpha"], want_netuid)]
+            stray = _stray_alpha(events, watched["alpha"], want_netuid)
+            if stray:
+                hashes = _extrinsic_hashes(substrate, block_hash)
+                try:
+                    for idx, dest, amount, sender, xidx, why in stray:
+                        service.record_stray_deposit({
+                            "deposit_ref": f"alpha:{block_num}:{idx}",
+                            "currency": f"alpha-sn{why.split(':')[1]}" if why.startswith("wrong_subnet") else "alpha",
+                            "tx_hash": hashes.get(xidx),
+                            "sender": sender,
+                            "deposit_address": dest,
+                            "amount_raw": amount,
+                            "decimals": 9,
+                            "block_number": block_num,
+                            "usd_price": None,
+                        }, why)
+                except Exception:
+                    log.exception("watcher bittensor: logging stray alpha in block %d failed — will retry", block_num)
+                    return scanned_through, False
             if found:
                 hashes = _extrinsic_hashes(substrate, block_hash)
                 try:

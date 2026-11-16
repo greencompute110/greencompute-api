@@ -786,6 +786,29 @@ class BillingService:
         self.repo.mark_deposit(deposit["deposit_ref"], status="credited")
         return "seen"
 
+    def record_stray_deposit(self, deposit: dict, why: str) -> None:
+        """Log alpha that reached our address but can't be credited at our
+        price (another subnet's, or with no amount to read), so staff and the
+        sender's payment check can find it, and tell support once. Never
+        credited by any path: status "stray"."""
+        ref = deposit["deposit_ref"]
+        self.repo.record_deposit(deposit)
+        self.repo.mark_deposit(ref, status="stray", matched_by=why[:32])
+        if ref in _ALERTED_UNMATCHED:
+            return
+        _ALERTED_UNMATCHED.add(ref)
+        from greencompute_gateway.infrastructure.alerts import send_payment_alert
+
+        what = (
+            f"alpha of subnet {why.split(':')[1]} (not 110), {deposit['amount_raw'] / 1e9:g} of it"
+            if why.startswith("wrong_subnet") else "an alpha transfer whose amount couldn't be read"
+        )
+        send_payment_alert(
+            f"Stray payment: {what}, from {deposit['sender']} (tx {deposit.get('tx_hash') or ref}). "
+            "Not credited: our price can't value it. If the sender asks, answer their payment review with the "
+            '"Alpha of another subnet" reason, and sort out returning it by hand.'
+        )
+
     # --- Payment reviews ---
 
     def resolve_review(
@@ -830,6 +853,11 @@ class BillingService:
                 raise ReviewError("deposit not found")
             if result and result.get("blocked"):
                 raise ReviewError("that deposit's sender is on a sanctions list: it can't be credited")
+            if result and result.get("stray"):
+                raise ReviewError(
+                    "that deposit is alpha of another subnet (or its amount couldn't be read): it can't be "
+                    "credited; dismiss the review with the 'Alpha of another subnet' reason"
+                )
             if not result or not result.get("credited"):
                 raise ReviewError("that deposit was already credited")
             self.repo.set_review_status(invoice_id, "resolved", paid_tx=dep["tx_hash"] or "")
@@ -986,6 +1014,8 @@ class BillingService:
         dep = self.repo.get_deposit(deposit_ref)
         if dep is None:
             return None, None
+        if dep["status"] == "stray":  # another subnet's alpha: our price can't value it
+            return dep, {"stray": True, "deposit_ref": deposit_ref}
         # Logged before its sender was listed (or before screening existed):
         # screen it now, as the watcher would, before staff can credit it.
         source = self._sanctioned_sender(dep) if dep["status"] == "unmatched" or dep["status"] == "ignored" else None

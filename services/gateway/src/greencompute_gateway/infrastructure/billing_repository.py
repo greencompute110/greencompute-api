@@ -1203,6 +1203,8 @@ class BillingRepository:
                 return {"already_credited": True, "deposit_ref": deposit_ref}
             if dep.status == "blocked":
                 return {"blocked": True, "deposit_ref": deposit_ref}
+            if dep.status == "stray":  # another subnet's alpha: our price can't value it
+                return {"stray": True, "deposit_ref": deposit_ref}
             earlier = session.scalar(
                 select(LedgerEntryORM).where(LedgerEntryORM.deposit_ref == deposit_ref)
             ) or self._manual_credit_row(session, dep.currency, dep.tx_hash)
