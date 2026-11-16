@@ -5,14 +5,18 @@ import json
 import logging
 import math
 import os
+import re
 import threading
-from datetime import UTC, datetime
+import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from greencompute_protocol.ssh_host_keys import known_hosts_line, ssh_key_fingerprint
 from greencompute_protocol import (
@@ -2014,6 +2018,22 @@ def _lookup_miner_base_url(hotkey: str, *, timeout: float = 3.0) -> str | None:
         return None
 
 
+def _node_base_url(deployment) -> str | None:
+    """The node agent's address for the box `deployment` runs on, by node:
+    several boxes share a hotkey and the miner record holds one address. The
+    hotkey's address is the fallback for nodes that don't report their own
+    yet."""
+    if not deployment.hotkey:
+        return None
+    miner_base = None
+    if getattr(deployment, "node_id", None):
+        try:
+            miner_base = service.control_plane.repository.node_api_base_url(deployment.node_id)
+        except Exception:  # noqa: BLE001
+            miner_base = None
+    return miner_base or _lookup_miner_base_url(deployment.hotkey)
+
+
 def _node_request(deployment, path: str, *, timeout: float, max_bytes: int,
                   body: dict | None = None) -> tuple[str, int | None, Any]:
     """Call the node agent running `deployment` (gateway → control plane for
@@ -2024,18 +2044,7 @@ def _node_request(deployment, path: str, *, timeout: float, max_bytes: int,
     - ("unreachable", None, None): no address, or no connection was made;
     - ("unknown", None, None): sent, but no answer in time (or a broken one),
       so a POST may or may not have taken effect."""
-    if not deployment.hotkey:
-        return "unreachable", None, None
-    # The box the deployment runs on, by node: several boxes share a hotkey
-    # and the miner record holds one address. The hotkey's address is the
-    # fallback for nodes that don't report their own yet.
-    miner_base = None
-    if getattr(deployment, "node_id", None):
-        try:
-            miner_base = service.control_plane.repository.node_api_base_url(deployment.node_id)
-        except Exception:  # noqa: BLE001
-            miner_base = None
-    miner_base = miner_base or _lookup_miner_base_url(deployment.hotkey)
+    miner_base = _node_base_url(deployment)
     if not miner_base:
         return "unreachable", None, None
     data = json.dumps(body).encode() if body is not None else None
@@ -2197,6 +2206,230 @@ def run_in_deployment(
                                          "Check before running it again (e.g. its log, or a quick read-only command)")
     raise coded(503, "unavailable", "the machine running this rental didn't answer; nothing was run. Try again shortly",
                 headers={"Retry-After": "10"})
+
+
+# --- the browser terminal (request #34) ------------------------------------------
+
+_HOST_HEADER = re.compile(r"[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?")
+
+
+def _terminal_ws_base(request: Request) -> str:
+    """ws(s)://host the caller reached us at: GREENCOMPUTE_PUBLIC_API_URL, else
+    from the request (behind nginx, its X-Forwarded-Proto, when trusted)."""
+    from greencompute_gateway import main
+
+    base = (os.environ.get("GREENCOMPUTE_PUBLIC_API_URL") or "").strip().rstrip("/")
+    if not base:
+        proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip() if main._TRUST_PROXY else ""
+        host = request.headers.get("host") or ""
+        if not _HOST_HEADER.fullmatch(host):
+            host = request.url.netloc
+        base = f"{'https' if (proto or request.url.scheme) == 'https' else 'http'}://{host}"
+    if base.startswith("https://"):
+        return "wss://" + base[len("https://"):]
+    if base.startswith("http://"):
+        return "ws://" + base[len("http://"):]
+    return base
+
+
+def _rental_terminal_problem(deployment) -> HTTPException | None:
+    if deployment.state != DeploymentState.READY:
+        return coded(409, "conflict", f"the rental is {deployment.state.value}; a terminal opens while it is ready")
+    if not str(deployment.endpoint or "").startswith("ssh://"):
+        return coded(409, "conflict", "terminals open only in rentals (pods), not in models")
+    return None
+
+
+@router.post("/platform/deployments/{deployment_id}/terminal", response_model=None,
+             responses=ok(schemas.TerminalTicket, "A one-time ticket for the terminal's WebSocket"))
+def open_deployment_terminal(
+    deployment_id: str,
+    request: Request,
+    payload: schemas.TerminalTicketRequest | None = None,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """A terminal in your running rental, without SSH keys: a root login
+    shell in the pod, from /workspace, as SSH gives you. This returns a
+    ticket; open `websocket_url` with it within 60 seconds (it works once).
+    Needs the `rentals` scope, and only in your own rentals. At most 3 open
+    at once per account; each closes after 15 minutes with no input or
+    output, or 4 hours in all. Closing it ends the shell, as closing SSH
+    does."""
+    api_key = require_api_key(authorization, x_api_key)
+    from greencompute_gateway.application import sanctions, terminal
+
+    if not terminal.enabled():
+        raise coded(501, "not_implemented", "the browser terminal is turned off")
+    enforce_rate_limit("deployment_terminal", api_key.key_id, limit=30, window_seconds=60)
+    deployment = service.get_deployment(deployment_id, user_id=api_key.user_id, admin=False)
+    # Root in a customer's pod is theirs alone, as for exec and SSH.
+    if deployment is None or api_key.user_id is None or deployment.owner_user_id != api_key.user_id:
+        raise HTTPException(status_code=404, detail="deployment not found")
+    if sanctions.account_blocked(service.repository.session_factory, api_key.user_id):
+        raise _wallet_blocked()
+    problem = _rental_terminal_problem(deployment)
+    if problem is not None:
+        raise problem
+    if terminal.open_count(api_key.user_id) >= terminal.PER_USER:
+        raise coded(429, "terminal_limit", f"at most {terminal.PER_USER} terminals can be open at once on an "
+                                           "account; close one first", headers={"Retry-After": "5"})
+    ticket, expires = terminal.issue_ticket(
+        service.repository.session_factory, user_id=api_key.user_id, key_id=api_key.key_id,
+        deployment_id=deployment.deployment_id, shell=(payload.shell if payload else "auto"))
+    log.info("secret_access event=deployment_terminal_ticket deployment_id=%s key_id=%s user_id=%s ip=%s",
+             deployment.deployment_id, api_key.key_id, api_key.user_id, _audit_client_ip())
+    path = f"/platform/deployments/{urllib_parse.quote(deployment.deployment_id, safe='')}/terminal"
+    return {
+        "ticket": ticket,
+        "expires_in_seconds": terminal.TICKET_TTL_SECONDS,
+        "expires_at": expires.isoformat(),
+        "websocket_url": f"{_terminal_ws_base(request)}{path}?ticket={ticket}",
+        "idle_timeout_seconds": terminal.IDLE_SECONDS,
+        "max_session_seconds": terminal.MAX_SESSION_SECONDS,
+    }
+
+
+def _terminal_still_allowed(ticket, deployment_id: str) -> tuple[int, str, str] | None:
+    """While a terminal is open: its key, the account and the rental, as at
+    the start. None to carry on (also when the database can't be asked: the
+    check at the start was made, and a blip shouldn't cut everyone off)."""
+    from greencompute_gateway.application import sanctions, terminal
+    from greencompute_gateway.transport import security
+
+    try:
+        if not terminal.key_still_allows(security.credential_store.session_factory, ticket.key_id, ticket.user_id):
+            return 4403, "forbidden", "the API key this terminal was opened with was deleted"
+        if sanctions.account_blocked(service.repository.session_factory, ticket.user_id):
+            return 4403, "wallet_blocked", sanctions.BLOCKED_MESSAGE
+        deployment = service.get_deployment(deployment_id, user_id=ticket.user_id, admin=False)
+    except Exception:  # noqa: BLE001
+        log.warning("terminal: couldn't re-check %s; keeping it open", deployment_id, exc_info=True)
+        return None
+    if deployment is None or deployment.owner_user_id != ticket.user_id:
+        return 4404, "not_found", "deployment not found"
+    problem = _rental_terminal_problem(deployment)
+    return (4409, "conflict", str(problem.detail)) if problem is not None else None
+
+
+def _terminal_admission(ticket_value: str, deployment_id: str, presented_secret: str | None):
+    """Everything a terminal needs checked before it opens, in one trip to
+    the thread pool: the ticket (taken, so it can't be used again), its key,
+    the account, the rental. Returns (ticket, deployment, None) or (ticket or
+    None, None, (close code, error code, message))."""
+    from greencompute_gateway.application import sanctions, terminal
+    from greencompute_gateway.transport import security
+
+    invalid = (4401, "terminal_ticket_invalid",
+               "this terminal ticket is unknown, already used, expired or for another rental; request a new one")
+    ticket = terminal.consume_ticket(service.repository.session_factory, ticket_value)
+    if ticket is None or ticket.deployment_id != deployment_id:
+        return ticket, None, invalid
+    # A client that can send a key (an agent) must send the one the ticket
+    # was made with: someone else's ticket is no good with your key.
+    if presented_secret is not None:
+        presented = security.credential_store.get_api_key_by_secret(presented_secret)
+        if presented is None or presented.key_id != ticket.key_id:
+            return ticket, None, invalid
+    if not terminal.key_still_allows(security.credential_store.session_factory, ticket.key_id, ticket.user_id):
+        return ticket, None, (4403, "forbidden", "the API key this ticket was made with was deleted or can't "
+                                                  "open terminals any more")
+    if sanctions.account_blocked(service.repository.session_factory, ticket.user_id):
+        from greencompute_gateway.application.sanctions import BLOCKED_MESSAGE
+
+        return ticket, None, (4403, "wallet_blocked", BLOCKED_MESSAGE)
+    deployment = service.get_deployment(deployment_id, user_id=ticket.user_id, admin=False)
+    if deployment is None or deployment.owner_user_id != ticket.user_id:
+        return ticket, None, (4404, "not_found", "deployment not found")
+    problem = _rental_terminal_problem(deployment)
+    if problem is not None:
+        return ticket, None, (4409, "conflict", str(problem.detail))
+    return ticket, deployment, None
+
+
+@router.websocket("/platform/deployments/{deployment_id}/terminal")
+async def deployment_terminal(websocket: WebSocket, deployment_id: str) -> None:
+    """The terminal's WebSocket: ?ticket=<from the POST>&cols=<n>&rows=<n>.
+    Relayed to the node agent running the pod. Never blocks the event loop:
+    the checks run in the thread pool, the relay is async I/O."""
+    from greencompute_gateway import main
+    from greencompute_gateway.application import terminal
+    from greencompute_gateway.transport.security import extract_api_key_secret
+
+    origin = websocket.headers.get("origin")
+    if not terminal.origin_allowed(origin):
+        log.warning("terminal refused: origin %r deployment_id=%s", (origin or "")[:200], deployment_id)
+        await websocket.close(code=1008)  # before accepting: the handshake is refused (HTTP 403)
+        return
+    await websocket.accept()
+    ip = main._client_ip_from_request(websocket)
+    if not terminal.enabled():
+        await terminal.refuse(websocket, 4501, "not_implemented", "the browser terminal is turned off")
+        return
+    presented = extract_api_key_secret(websocket.headers.get("authorization"), websocket.headers.get("x-api-key"))
+    ticket, deployment, problem = await run_in_threadpool(
+        _terminal_admission, websocket.query_params.get("ticket") or "", deployment_id, presented)
+    if problem is not None:
+        log.info("secret_access event=deployment_terminal_refused deployment_id=%s user_id=%s ip=%s code=%s",
+                 deployment_id, ticket.user_id if ticket else None, ip, problem[1])
+        await terminal.refuse(websocket, *problem)
+        return
+    refused = terminal.take_slot(ticket.user_id)
+    if refused:
+        await terminal.refuse(websocket, 4429, "terminal_limit", refused)
+        return
+    session = terminal.Session()
+    node = None
+    try:
+        cols, rows = terminal.clamp_size(websocket.query_params.get("cols"), websocket.query_params.get("rows"))
+        base = await run_in_threadpool(_node_base_url, deployment)
+        if not base:
+            session.end_reason = "no_node_address"
+            await terminal.refuse(websocket, 4503, "unavailable", "the machine running this rental didn't answer; "
+                                                                   "try again shortly")
+            return
+        try:
+            node = await terminal.open_node_link(
+                terminal.node_terminal_url(base, deployment.deployment_id, cols=cols, rows=rows, shell=ticket.shell),
+                os.environ.get("GREENCOMPUTE_INFERENCE_AUTH_SECRET"))
+        except terminal.NodeUnavailableError as exc:
+            log.warning("terminal %s: %s (deployment_id=%s node_id=%s)", session.session_id, exc,
+                        deployment.deployment_id, getattr(deployment, "node_id", None))
+            session.end_reason = "node_unavailable"
+            await terminal.refuse(websocket, 4503, "unavailable", "the machine running this rental didn't answer; "
+                                                                   "try again shortly")
+            return
+        not_ready = await terminal.wait_ready(node)
+        if not_ready is not None:
+            session.end_reason = f"node_refused_{not_ready[1]}"
+            await terminal.refuse(websocket, *not_ready)
+            return
+        session.touch()
+        log.info("secret_access event=deployment_terminal_start session=%s deployment_id=%s key_id=%s user_id=%s "
+                 "ip=%s", session.session_id, deployment.deployment_id, ticket.key_id, ticket.user_id, ip)
+        await websocket.send_text(json.dumps({
+            "type": "ready", "idle_timeout_seconds": terminal.IDLE_SECONDS,
+            "max_session_seconds": terminal.MAX_SESSION_SECONDS,
+            "session_ends_at": (datetime.now(UTC) + timedelta(seconds=terminal.MAX_SESSION_SECONDS)).isoformat()}))
+
+        async def recheck():
+            return await run_in_threadpool(_terminal_still_allowed, ticket, deployment.deployment_id)
+        ending = await terminal.relay(websocket, node, session, recheck=recheck)
+        if ending is not None:
+            close_code, code, message = ending
+            if close_code == 1000:
+                with contextlib.suppress(Exception):
+                    await websocket.close(code=1000)
+            else:
+                await terminal.refuse(websocket, close_code, code, message)
+    finally:
+        if node is not None:
+            await node.close()
+        terminal.release_slot(ticket.user_id)
+        log.info("secret_access event=deployment_terminal_end session=%s deployment_id=%s key_id=%s user_id=%s "
+                 "ip=%s reason=%s duration_s=%d bytes_in=%d bytes_out=%d", session.session_id,
+                 deployment.deployment_id, ticket.key_id, ticket.user_id, ip, session.end_reason,
+                 int(time.monotonic() - session.started), session.bytes_in, session.bytes_out)
 
 
 @router.patch("/platform/deployments/{deployment_id}")

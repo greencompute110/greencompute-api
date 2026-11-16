@@ -37,9 +37,13 @@ SUPPORT = "support@green-compute.com"
 #: Codes whose request may succeed if sent again later, unchanged.
 RETRYABLE = frozenset({
     "no_capacity", "rate_limited", "idempotency_in_progress", "model_not_ready", "unavailable", "server_error",
+    "terminal_limit",
 })
 
 #: Every code, its usual status, and what it means: the table in the docs.
+#: On the terminal's WebSocket an error arrives as an `error` message and then
+#: close code 4000 + status (terminal_idle and terminal_session_limit only
+#: ever arrive that way).
 CODES: dict[str, tuple[int, str]] = {
     "invalid_request": (400, "The request can't be done as sent; `message` says why."),
     "gpu_unavailable": (400, "None of the GPU models asked for is offered; `detail.available` lists those that are."),
@@ -54,6 +58,8 @@ CODES: dict[str, tuple[int, str]] = {
     "wallet_sign_in_off": (403, "This wallet is linked to an account to pay in, not to sign in; sign in another way and turn wallet sign-in on under Billing > Verified wallets."),
     "signature_invalid": (401, "The wallet signature doesn't match the sign-in message; request a new challenge and sign it unchanged."),
     "challenge_invalid": (400, "The sign-in message is unknown, already used or expired; request a new challenge."),
+    "terminal_ticket_invalid": (401, "The terminal ticket is unknown, already used, expired (60 s) or for another "
+                                     "rental or key; request a new one."),
     "not_found": (404, "No such resource on this account."),
     "unknown_endpoint": (404, "No such endpoint; check the path against /openapi.json."),
     "method_not_allowed": (405, "That HTTP method isn't used on this path."),
@@ -61,11 +67,15 @@ CODES: dict[str, tuple[int, str]] = {
     "active_deployments": (409, "Stop the running rentals and models first."),
     "idempotency_in_progress": (409, "A request with this Idempotency-Key is still running."),
     "model_not_ready": (409, "The model has no replica ready yet (starting or moving); retry shortly."),
+    "terminal_idle": (408, "The terminal closed after 15 minutes with no input or output; open a new one."),
+    "terminal_session_limit": (410, "The terminal reached its 4-hour limit; open a new one."),
     "validation_error": (422, "Fields are missing or invalid; `detail` lists each one."),
     "idempotency_key_reused": (422, "This Idempotency-Key was used with a different body."),
     "rate_limited": (429, "Too many requests; wait `retry_after_seconds`."),
     "too_many_invoices": (429, "Too many unpaid crypto invoices are open."),
     "auth_throttled": (429, "Too many failed API-key checks from this address; fix the key, then wait."),
+    "terminal_limit": (429, "Too many terminals are open: at most 3 per account at once, and a few per machine; "
+                            "close one first."),
     "server_error": (500, "Something failed on our side."),
     "not_implemented": (501, "This endpoint is turned off."),
     "no_capacity": (503, "No GPU that fits is free; nothing was created. Join the waitlist (capacity alerts), "

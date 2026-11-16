@@ -475,6 +475,24 @@ class ExecResult(BaseModel):
     timed_out: bool = Field(description="True: we stopped waiting; the command may still be running in the pod.")
 
 
+class TerminalTicketRequest(BaseModel):
+    shell: Literal["auto", "bash", "sh"] = Field(
+        default="auto", description="`auto`: bash if the image has it, else sh. A login shell, as root, in /workspace.")
+
+
+class TerminalTicket(BaseModel):
+    """Open `websocket_url` (adding `&cols=<n>&rows=<n>` for the terminal's
+    size) within `expires_in_seconds`; the ticket works once. Binary frames
+    are terminal bytes both ways; text frames are JSON control messages. See
+    https://www.green-compute.com/docs/gpu-rental#open-a-terminal-over-the-api"""
+    ticket: str
+    expires_in_seconds: int
+    expires_at: str
+    websocket_url: str = Field(description="wss://.../platform/deployments/{id}/terminal?ticket=...")
+    idle_timeout_seconds: int = Field(description="It closes after this long with no input and no output.")
+    max_session_seconds: int = Field(description="It closes after this long in all.")
+
+
 # --- wallet sign-in -------------------------------------------------------------
 
 
