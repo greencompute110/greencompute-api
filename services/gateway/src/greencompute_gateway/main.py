@@ -139,7 +139,11 @@ app.add_middleware(
     allow_credentials=not _wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
+    # "*" exposes every header only to requests without credentials; with
+    # credentials browsers read it as a header named "*". So the ones clients
+    # read are also named: paging (X-Next-Cursor, Link), Retry-After and
+    # Idempotent-Replayed.
+    expose_headers=["*", "X-Next-Cursor", "Link", "Retry-After", "Idempotent-Replayed"],
 )
 
 @app.middleware("http")

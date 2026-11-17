@@ -1169,6 +1169,23 @@ class GatewayService:
             if _owned_by(deployment.owner_user_id, user_id)
         ]
 
+    def list_deployments_page(
+        self,
+        user_id: str | None = None,
+        *,
+        admin: bool = False,
+        states: set[str] | None = None,
+        limit: int = 100,
+        after: tuple[datetime, str] | None = None,
+    ) -> list[DeploymentRecord]:
+        """One page of list_deployments, newest first, filtered and limited in
+        the database (control-plane repository list_deployments_page)."""
+        if not admin and user_id is None:
+            return []  # a key bound to no account owns nothing (see _owned_by)
+        return self.control_plane.repository.list_deployments_page(
+            owner_user_id=None if admin else user_id, states=states, limit=limit, after=after,
+        )
+
     def get_deployment(self, deployment_id: str, user_id: str | None = None, *, admin: bool = False) -> DeploymentRecord | None:
         deployment = self.control_plane.repository.get_deployment(deployment_id)
         if deployment is None:

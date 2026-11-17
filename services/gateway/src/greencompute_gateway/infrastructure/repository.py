@@ -132,6 +132,15 @@ class GatewayRepository:
             ).first()
             return self._to_user(row) if row else None
 
+    def get_users(self, user_ids: set[str] | list[str]) -> dict[str, UserRecord]:
+        """Several users by id in one query; ids not found are left out."""
+        ids = {i for i in user_ids if i}
+        if not ids:
+            return {}
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(select(UserORM).where(UserORM.user_id.in_(ids))).all()
+            return {row.user_id: self._to_user(row) for row in rows}
+
     def list_users(self) -> list[UserRecord]:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(select(UserORM)).all()

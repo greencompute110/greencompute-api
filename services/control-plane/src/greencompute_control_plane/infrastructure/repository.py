@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -663,6 +663,35 @@ class ControlPlaneRepository:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(select(DeploymentORM)).all()
             return [self._to_deployment(row) for row in rows]
+
+    def list_deployments_page(
+        self,
+        *,
+        owner_user_id: str | None,
+        states: set[str] | None = None,
+        limit: int = 100,
+        after: tuple[datetime, str] | None = None,
+    ) -> list[DeploymentRecord]:
+        """At most `limit` deployments, newest first (created_at, then
+        deployment_id, both descending), in `states` when given, owned by
+        `owner_user_id` (None: everyone's, for admins), strictly after the
+        (created_at, deployment_id) of the last row of the previous page. Keyset
+        paging: rows created meanwhile sort before the cursor, so a walk
+        through the pages sees every older row exactly once."""
+        stmt = select(DeploymentORM)
+        if owner_user_id is not None:
+            stmt = stmt.where(DeploymentORM.owner_user_id == owner_user_id)
+        if states:
+            stmt = stmt.where(DeploymentORM.state.in_(sorted(states)))
+        if after is not None:
+            created, deployment_id = after
+            stmt = stmt.where(or_(
+                DeploymentORM.created_at < created,
+                and_(DeploymentORM.created_at == created, DeploymentORM.deployment_id < deployment_id),
+            ))
+        stmt = stmt.order_by(DeploymentORM.created_at.desc(), DeploymentORM.deployment_id.desc()).limit(limit)
+        with session_scope(self.session_factory) as session:
+            return [self._to_deployment(row) for row in session.scalars(stmt).all()]
 
     def list_ready_deployments(self, workload_id: str) -> list[DeploymentRecord]:
         with session_scope(self.session_factory) as session:

@@ -47,6 +47,8 @@ RETRYABLE = frozenset({
 #: ever arrive that way).
 CODES: dict[str, tuple[int, str]] = {
     "invalid_request": (400, "The request can't be done as sent; `message` says why."),
+    "invalid_cursor": (400, "The paging `cursor` isn't one the API gave out, or was changed; send the previous "
+                            "page's X-Next-Cursor unchanged, or start again without one."),
     "gpu_unavailable": (400, "None of the GPU models asked for is offered; `detail.available` lists those that are."),
     "unauthenticated": (401, "The API key is missing or not valid."),
     "api_key_expired": (401, "The API key is past its expiry (`expires_at`); create a new key. Rentals it "

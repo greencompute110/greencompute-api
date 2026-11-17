@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import hashlib
 import http.client
@@ -9,7 +10,7 @@ import re
 import threading
 import time
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
@@ -2031,6 +2032,64 @@ def stop_fleet(
     return fleets.view(service, fleet)
 
 
+#: Rows per page of GET /platform/deployments when a cursor comes without a limit.
+DEPLOYMENTS_PAGE_DEFAULT = 100
+DEPLOYMENTS_PAGE_MAX = 500
+
+
+def _encode_deployments_cursor(deployment) -> str:
+    """Opaque to clients: where the next page starts (the last row's
+    created_at and id), urlsafe base64."""
+    raw = f"1|{deployment.created_at.isoformat()}|{deployment.deployment_id}"
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def _decode_deployments_cursor(cursor: str) -> tuple[datetime, str]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode()
+        version, created, deployment_id = raw.split("|", 2)
+        if version != "1" or not deployment_id or len(deployment_id) > 64:
+            raise ValueError(raw)
+        return datetime.fromisoformat(created), deployment_id
+    except (ValueError, UnicodeDecodeError, TypeError) as exc:
+        raise coded(400, "invalid_cursor", {
+            "message": "this cursor isn't one this API gave out, or it was changed",
+            "cursor": cursor[:200],
+            "hint": "send the X-Next-Cursor header (or the Link rel=\"next\" URL) of the previous page "
+                    "unchanged, or start again without a cursor",
+        }) from exc
+
+
+def _list_deployments_page(api_key, wanted: set[str], state: str | None, limit: int, cursor: str | None,
+                           response: Response | None) -> list[dict]:
+    """GET /platform/deployments with `limit`/`cursor`: newest first, the state
+    filter and the limit applied in the database. When there are more, the
+    X-Next-Cursor and Link rel="next" headers say where the next page starts."""
+    if not 1 <= limit <= DEPLOYMENTS_PAGE_MAX:
+        raise coded(400, "invalid_request", f"limit must be from 1 to {DEPLOYMENTS_PAGE_MAX}")
+    after = _decode_deployments_cursor(cursor) if cursor else None
+    page = service.list_deployments_page(
+        user_id=api_key.user_id, admin=api_key.admin, states=wanted or None, limit=limit + 1, after=after,
+    )
+    more, page = len(page) > limit, page[:limit]
+    workloads: dict = {}
+    rows = [_deployment_out(deployment, api_key.admin, workloads, brief=True) for deployment in page]
+    if api_key.admin:
+        # Only the owners on this page, not every user.
+        _attach_owner_info(rows, service.repository.get_users({row.get("owner_user_id") for row in rows}))
+    _attach_workload_info(rows, service.control_plane.repository.get_workloads({row["workload_id"] for row in rows}))
+    if more and response is not None:
+        next_cursor = _encode_deployments_cursor(page[-1])
+        query = {"state": state.strip()} if state and state.strip() else {}
+        query.update(limit=limit, cursor=next_cursor)
+        response.headers["X-Next-Cursor"] = next_cursor
+        # Relative, so it is right whatever host and scheme the client used.
+        response.headers["Link"] = (
+            f'</platform/deployments?{urllib_parse.urlencode(query, safe=",")}>; rel="next"'
+        )
+    return rows
+
+
 @router.get("/platform/deployments", response_model=None, responses=ok(list[schemas.Deployment], "Your deployments, including stopped ones"))
 def list_deployments(
     state: str | None = Query(
@@ -2039,7 +2098,21 @@ def list_deployments(
     ),
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    limit: Annotated[int | None, Query(
+        ge=1, le=DEPLOYMENTS_PAGE_MAX,
+        description=("Page through them: at most this many, newest first. When there are more, the "
+                     "`X-Next-Cursor` header holds the next page's `cursor` and `Link` its URL (rel=\"next\"). "
+                     "Without `limit` or `cursor`, every deployment comes back at once, as before."),
+    )] = None,
+    cursor: Annotated[str | None, Query(
+        max_length=512,
+        description="The previous page's `X-Next-Cursor`, unchanged (with `state` and `limit` as before).",
+    )] = None,
+    response: Response = None,  # type: ignore[assignment]  # injected by FastAPI; None in-process
 ) -> list[dict]:
+    """Your deployments, including stopped ones. By default all of them, in
+    no particular order; with `limit` (and then `cursor`), a page at a time,
+    newest first."""
     api_key = require_api_key(authorization, x_api_key)
     wanted = {s.strip().lower() for s in (state or "").split(",") if s.strip()}
     known = {s.value for s in DeploymentState}
@@ -2048,6 +2121,8 @@ def list_deployments(
             status_code=400,
             detail=f"unknown state {sorted(wanted - known)}; use any of {sorted(known)}",
         )
+    if limit is not None or cursor is not None:
+        return _list_deployments_page(api_key, wanted, state, limit or DEPLOYMENTS_PAGE_DEFAULT, cursor, response)
     workloads: dict = {}
     rows = [
         _deployment_out(deployment, api_key.admin, workloads, brief=True)

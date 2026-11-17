@@ -116,9 +116,18 @@ def t_get_balance(auth: tuple, args: dict) -> dict:
 def t_list_rentals(auth: tuple, args: dict) -> dict:
     r = _routes()
     state = _str(args, "state") or ACTIVE_STATES
-    deps = _as("GET", "/platform/deployments",
-               lambda: r.list_deployments(state=state, authorization=auth[0], x_api_key=auth[1]))
-    return {"rentals": [_brief(d) for d in deps], "states": state}
+    if args.get("limit") is None and args.get("cursor") is None:
+        deps = _as("GET", "/platform/deployments",
+                   lambda: r.list_deployments(state=state, authorization=auth[0], x_api_key=auth[1]))
+        return {"rentals": [_brief(d) for d in deps], "states": state}
+    # A page at a time, newest first, as GET /platform/deployments?limit=&cursor= does.
+    limit = _int(args, "limit", 50, 1, 500)
+    cursor = _str(args, "cursor")
+    response = Response()
+    deps = _as("GET", "/platform/deployments", lambda: r.list_deployments(
+        state=state, limit=limit, cursor=cursor, response=response, authorization=auth[0], x_api_key=auth[1]))
+    return {"rentals": [_brief(d) for d in deps], "states": state,
+            "next_cursor": response.headers.get("X-Next-Cursor")}
 
 
 def t_get_rental(auth: tuple, args: dict) -> dict:
@@ -293,9 +302,13 @@ TOOLS: list[dict[str, Any]] = [
      "description": "Your balance, what everything running costs per hour, and how many hours the balance lasts.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "list_rentals", "title": "List rentals", "handler": t_list_rentals, "readOnly": True,
-     "description": "Your rentals and private models. By default the ones running, starting or paused.",
-     "inputSchema": {"type": "object", "properties": {"state": {
-         "type": "string", "description": "Comma-separated states, e.g. `ready` or `terminated,failed`."}}}},
+     "description": ("Your rentals and private models. By default the ones running, starting or paused, all at "
+                     "once; with `limit`, newest first, a page at a time (pass the returned next_cursor as `cursor` "
+                     "for the next page; null means there are no more)."),
+     "inputSchema": {"type": "object", "properties": {
+         "state": {"type": "string", "description": "Comma-separated states, e.g. `ready` or `terminated,failed`."},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "At most this many per page."},
+         "cursor": {"type": "string", "description": "next_cursor from the previous page, unchanged."}}}},
     {"name": "get_rental", "title": "Get a rental", "handler": t_get_rental, "readOnly": True,
      "description": "One rental's state and, once it is ready, how to SSH in (command and host keys).",
      "inputSchema": {"type": "object", "properties": _ID, "required": ["deployment_id"]}},
