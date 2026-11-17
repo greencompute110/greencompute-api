@@ -15,6 +15,12 @@ each call runs as that REST request. Errors come back as tool results with
 
 A platform-made SSH private key is never put in a tool result: it would land
 in the assistant's context. Pass your own public key to rent_gpu instead.
+
+rent_gpu, get_rental and stop_rental return the rental as GET
+/platform/deployments/{id} does (flat), plus the same summary under `rental`
+as before. rent_gpu makes a workload for the rental, marked
+`metadata.created_by_tool: "mcp.rent_gpu"`; stop_rental deletes that
+workload with it (and only one so marked, with no other live rental).
 """
 from __future__ import annotations
 
@@ -44,6 +50,10 @@ INSTRUCTIONS = (
     "https://www.green-compute.com/docs"
 )
 ACTIVE_STATES = "pending,scheduled,pulling,starting,ready,suspended"
+#: metadata.created_by_tool on the workload rent_gpu makes, so stop_rental
+#: removes it with the rental instead of leaving it behind.
+RENT_GPU_MARK = "mcp.rent_gpu"
+_FINISHED_STATES = ("terminated", "failed")
 
 # --- tools -----------------------------------------------------------------------
 
@@ -141,7 +151,7 @@ def t_get_rental(auth: tuple, args: dict) -> dict:
     dep_id = _str(args, "deployment_id", required=True)
     dep = _as("GET", f"/platform/deployments/{dep_id}",
               lambda: r.get_deployment(dep_id, authorization=auth[0], x_api_key=auth[1]))
-    out: dict[str, Any] = {"rental": _brief(dep)}
+    out: dict[str, Any] = {**dep, "rental": _brief(dep)}
     endpoint = str(dep.get("endpoint") or "")
     if dep.get("state") == "ready" and endpoint.startswith("ssh://"):
         user_host = endpoint[len("ssh://"):]
@@ -184,7 +194,8 @@ def t_rent_gpu(auth: tuple, args: dict) -> dict:
         raise ToolInputError(
             "`ssh_public_keys` needs at least one SSH public key, e.g. [\"ssh-ed25519 AAAA… me@laptop\"] "
             "(the contents of ~/.ssh/id_ed25519.pub); without one you couldn't log in")
-    metadata: dict[str, Any] = {"ssh_public_keys": keys, "volume_size_gb": _int(args, "disk_gb", 50, 10, 500)}
+    metadata: dict[str, Any] = {"ssh_public_keys": keys, "volume_size_gb": _int(args, "disk_gb", 50, 10, 500),
+                                "created_by_tool": RENT_GPU_MARK}
     for key in ("command", "restart_policy", "env", "secret_env"):
         if args.get(key) is not None:
             metadata[key] = args[key]
@@ -229,7 +240,36 @@ def t_rent_gpu(auth: tuple, args: dict) -> dict:
             except Exception:  # noqa: BLE001
                 log.warning("mcp rent_gpu: could not remove workload %s after a failed rent", wl["workload_id"])
         raise
-    return {"rental": _brief(dep), "next": "Starting. Call get_rental in 30 seconds; it is usually ready in 1-3 minutes."}
+    return {**dep, "rental": _brief(dep),
+            "next": "Starting. Call get_rental in 30 seconds; it is usually ready in 1-3 minutes."}
+
+
+def _remove_rent_gpu_workload(auth: tuple, dep: dict) -> str | None:
+    """Delete the workload rent_gpu made for this rental, now it has stopped:
+    only one marked as rent_gpu's, and only when no other rental of it is
+    live. Returns its id when deleted. Best effort: the rental is stopped
+    either way."""
+    r = _routes()
+    workload_id = dep.get("workload_id")
+    if not isinstance(workload_id, str) or not workload_id:
+        return None
+    try:
+        workload = _as("GET", f"/platform/workloads/{workload_id}",
+                       lambda: r.get_workload(workload_id, authorization=auth[0], x_api_key=auth[1]))
+        if (workload.get("metadata") or {}).get("created_by_tool") != RENT_GPU_MARK:
+            return None
+        others = [
+            d for d in r.service.control_plane.repository.list_deployments_for_workload(workload_id)
+            if d.deployment_id != dep.get("deployment_id") and getattr(d.state, "value", d.state) not in _FINISHED_STATES
+        ]
+        if others:
+            return None
+        _as("DELETE", f"/platform/workloads/{workload_id}",
+            lambda: r.delete_workload(workload_id, authorization=auth[0], x_api_key=auth[1]))
+        return workload_id
+    except Exception:  # noqa: BLE001 - the rental is stopped; the workload costs nothing
+        log.warning("mcp stop_rental: could not remove workload %s", workload_id, exc_info=True)
+        return None
 
 
 def t_stop_rental(auth: tuple, args: dict) -> dict:
@@ -237,7 +277,12 @@ def t_stop_rental(auth: tuple, args: dict) -> dict:
     dep_id = _str(args, "deployment_id", required=True)
     dep = _as("DELETE", f"/platform/deployments/{dep_id}",
               lambda: r.terminate_deployment(dep_id, authorization=auth[0], x_api_key=auth[1]))
-    return {"rental": _brief(dep), "note": "Stopped: billing has stopped and its disk is deleted."}
+    out = {**dep, "rental": _brief(dep), "note": "Stopped: billing has stopped and its disk is deleted."}
+    removed = _remove_rent_gpu_workload(auth, dep)
+    if removed:
+        out["workload_deleted"] = removed
+        out["note"] += " The workload rent_gpu made for it was deleted too."
+    return out
 
 
 def t_rental_logs(auth: tuple, args: dict) -> dict:
@@ -310,7 +355,8 @@ TOOLS: list[dict[str, Any]] = [
          "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "At most this many per page."},
          "cursor": {"type": "string", "description": "next_cursor from the previous page, unchanged."}}}},
     {"name": "get_rental", "title": "Get a rental", "handler": t_get_rental, "readOnly": True,
-     "description": "One rental's state and, once it is ready, how to SSH in (command and host keys).",
+     "description": ("One rental, as GET /platform/deployments/{id} returns it, and once it is ready, how to SSH "
+                     "in (command and host keys)."),
      "inputSchema": {"type": "object", "properties": _ID, "required": ["deployment_id"]}},
     {"name": "rent_gpu", "title": "Rent a GPU", "handler": t_rent_gpu, "readOnly": False,
      "description": ("Start a GPU rental (a pod with SSH, billed by the minute once ready). Returns its deployment_id; "
@@ -333,7 +379,8 @@ TOOLS: list[dict[str, Any]] = [
          "idempotency_key": {"type": "string", "description": "Send the same key when retrying, so a retry never rents twice."},
      }, "required": ["ssh_public_keys"]}},
     {"name": "stop_rental", "title": "Stop a rental", "handler": t_stop_rental, "readOnly": False, "destructive": True,
-     "description": "Stop a rental for good: billing stops and its disk (/workspace) is deleted.",
+     "description": ("Stop a rental for good: billing stops and its disk (/workspace) is deleted. The workload "
+                     "rent_gpu made for it is deleted too."),
      "inputSchema": {"type": "object", "properties": _ID, "required": ["deployment_id"]}},
     {"name": "rental_logs", "title": "Rental output", "handler": t_rental_logs, "readOnly": True,
      "description": "The last lines of a running rental's start command log and container output.",

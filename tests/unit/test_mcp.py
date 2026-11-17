@@ -264,3 +264,83 @@ def test_list_gpus_reads_the_real_price_list(client):
     # An assistant sees what a person sees: a state, never a count.
     for g in gpus:
         assert not {"available_gpus", "max_gpus_per_deployment", "total_gpus"} & set(g)
+
+
+def test_rental_tools_return_the_flat_rest_object_and_the_old_summary(client):
+    """REST returns the deployment flat; MCP nested it under `rental`. Both now
+    (the nested key stays for clients that read it)."""
+    c, _, mp = client
+    rest = {"deployment_id": "d9", "workload_id": "w9", "state": "pending", "name": "rig-1",
+            "hourly_rate_cents": 40, "requested_instances": 1}
+    mp.setattr(routes, "create_workload", lambda payload, response, **k: {"workload_id": "w9"})
+    mp.setattr(routes, "create_deployment", lambda *a, **k: dict(rest))
+    mp.setattr(routes, "get_deployment", lambda dep_id, **k: dict(rest))
+    mp.setattr(routes, "terminate_deployment", lambda dep_id, **k: {**rest, "state": "terminated"})
+    mp.setattr(routes, "get_workload", lambda workload_id, **k: {"workload_id": workload_id, "metadata": {}})
+    for name, args in (("rent_gpu", {"ssh_public_keys": ["ssh-ed25519 AAAA me"]}),
+                       ("get_rental", {"deployment_id": "d9"}), ("stop_rental", {"deployment_id": "d9"})):
+        out = call(c, name, args)["structuredContent"]
+        assert {k: out[k] for k in rest if k != "state"} == {k: v for k, v in rest.items() if k != "state"}, name
+        assert out["rental"]["deployment_id"] == "d9" and out["rental"]["hourly_rate_cents_per_gpu"] == 40, name
+
+
+class _Deps:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def list_deployments_for_workload(self, workload_id):
+        return self.rows
+
+
+def _stop_setup(mp, metadata, other_states=()):
+    deleted = []
+    mp.setattr(routes, "terminate_deployment", lambda dep_id, **k: {
+        "deployment_id": dep_id, "workload_id": "w9", "state": "terminated"})
+    mp.setattr(routes, "get_workload", lambda workload_id, **k: {"workload_id": workload_id, "metadata": metadata})
+    mp.setattr(routes, "delete_workload", lambda workload_id, **k: deleted.append(
+        (workload_id, current_request_route.get())))
+    rows = [SimpleNamespace(deployment_id="d9", state="terminated")]
+    rows += [SimpleNamespace(deployment_id=f"o{i}", state=s) for i, s in enumerate(other_states)]
+    mp.setattr(routes, "service", SimpleNamespace(control_plane=SimpleNamespace(repository=_Deps(rows))))
+    return deleted
+
+
+def test_rent_gpu_marks_its_workload_and_stop_rental_deletes_it(client):
+    c, _, mp = client
+    seen = {}
+    mp.setattr(routes, "create_workload", lambda payload, response, **k: seen.update(payload) or {"workload_id": "w9"})
+    mp.setattr(routes, "create_deployment", lambda *a, **k: {"deployment_id": "d9", "workload_id": "w9"})
+    call(c, "rent_gpu", {"ssh_public_keys": ["ssh-ed25519 AAAA me"]})
+    assert seen["metadata"]["created_by_tool"] == mcp_module.RENT_GPU_MARK
+
+    deleted = _stop_setup(mp, {"created_by_tool": mcp_module.RENT_GPU_MARK})
+    out = call(c, "stop_rental", {"deployment_id": "d9"})["structuredContent"]
+    assert deleted == [("w9", ("DELETE", "/platform/workloads/w9"))]  # as its REST call, with its scope
+    assert out["workload_deleted"] == "w9" and "deleted too" in out["note"]
+
+
+def test_stop_rental_leaves_other_workloads_alone(client):
+    c, _, mp = client
+    # A workload rent_gpu didn't make (the agent's own, used by REST too).
+    deleted = _stop_setup(mp, {})
+    out = call(c, "stop_rental", {"deployment_id": "d9"})["structuredContent"]
+    assert deleted == [] and "workload_deleted" not in out
+    # rent_gpu's, but another rental of it is still running.
+    deleted = _stop_setup(mp, {"created_by_tool": mcp_module.RENT_GPU_MARK}, other_states=("ready",))
+    call(c, "stop_rental", {"deployment_id": "d9"})
+    assert deleted == []
+    # Only finished ones besides: deleted.
+    deleted = _stop_setup(mp, {"created_by_tool": mcp_module.RENT_GPU_MARK}, other_states=("failed",))
+    call(c, "stop_rental", {"deployment_id": "d9"})
+    assert [w for w, _ in deleted] == ["w9"]
+
+
+def test_a_failed_cleanup_still_reports_the_rental_stopped(client):
+    c, _, mp = client
+    _stop_setup(mp, {"created_by_tool": mcp_module.RENT_GPU_MARK})
+
+    def refuse(workload_id, **k):
+        raise HTTPException(status_code=403, detail="nope")
+    mp.setattr(routes, "delete_workload", refuse)
+    result = call(c, "stop_rental", {"deployment_id": "d9"})
+    assert result["isError"] is False and result["structuredContent"]["state"] == "terminated"
