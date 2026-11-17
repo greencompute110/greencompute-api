@@ -123,7 +123,10 @@ curl -s https://api.green-compute.com/platform/deployments/dep_... \
   -H "X-API-Key: $GC_KEY"
 # state goes: scheduled → pulling/starting → ready
 ```
-List everything: `GET /platform/deployments`.
+List everything: `GET /platform/deployments`. A page at a time, newest first:
+`GET /platform/deployments?limit=100`, then follow the `Link: <…>; rel="next"`
+header (or send `cursor=<X-Next-Cursor>` with the same `state`/`limit`) until it
+is absent.
 
 ### 4d. Call the model (OpenAI-compatible)
 

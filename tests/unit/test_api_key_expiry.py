@@ -254,3 +254,21 @@ def test_migration_0079_adds_and_removes_the_column_on_sqlite(tmp_path):
     assert "expires_at" not in {c["name"] for c in sa.inspect(engine).get_columns("api_keys")}
     with engine.connect() as conn:
         assert conn.execute(sa.text("SELECT secret FROM api_keys")).scalar() == "s1"
+
+
+def test_rentals_a_key_started_keep_running_after_it_expires(tmp_path):
+    """They belong to the account: expiry ends the key, not what it started."""
+    from greencompute_control_plane.application.services import ControlPlaneService
+    from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
+    from greencompute_persistence.orm import DeploymentORM
+    from greencompute_protocol import DeploymentState
+
+    cp = ControlPlaneRepository(database_url=f"sqlite:///{tmp_path / 'cp.sqlite'}", bootstrap=True)
+    with session_scope(cp.session_factory) as s:
+        s.add(APIKeyORM(key_id="k-old", user_id="u1", name="old", admin=False, scopes=[], secret="old",
+                        created_at=PAST - timedelta(days=1), expires_at=PAST))
+        s.add(DeploymentORM(deployment_id="d1", workload_id="w", owner_user_id="u1", state="ready",
+                            requested_instances=1, created_by_key_id="k-old"))
+    svc = ControlPlaneService(repository=cp)
+    assert svc.stop_rentals_over_key_limits() == [] and svc.stop_rentals_over_account_limits() == []
+    assert cp.get_deployment("d1").state == DeploymentState.READY
