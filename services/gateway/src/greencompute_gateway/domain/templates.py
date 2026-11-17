@@ -12,13 +12,20 @@ from greencompute_protocol.enums import WorkloadKind, SecurityTier
 
 
 def _metadata_with_hf_token(kwargs: dict[str, object]) -> dict[str, object]:
-    """Pull `hf_token` out of the request and stash it under workload.metadata
-    so the miner can pick it up during artifact dispatch. Empty/missing token
-    → empty dict (miner falls back to its own env)."""
+    """Pull `hf_token` (or `hf_token_secret`, a secret's name) out of the
+    request and stash it under workload.metadata so the miner can pick it up
+    during artifact dispatch. Empty/missing token → empty dict (miner falls
+    back to its own env)."""
+    out: dict[str, object] = {}
     token = kwargs.get("hf_token")
     if isinstance(token, str) and token.strip():
-        return {"hf_token": token.strip()}
-    return {}
+        out["hf_token"] = token.strip()
+    # Or the name of one of the account's secrets (POST /platform/secrets):
+    # filled in only for the machine that serves the model.
+    secret = kwargs.get("hf_token_secret")
+    if secret is not None:
+        out["hf_token_secret"] = secret.strip() if isinstance(secret, str) else secret
+    return out
 
 
 def build_vllm_workload(

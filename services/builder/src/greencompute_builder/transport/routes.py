@@ -1,4 +1,6 @@
-from fastapi import APIRouter
+from typing import Annotated
+
+from fastapi import APIRouter, Query
 
 from greencompute_protocol import BuildContextUploadRequest, BuildRequest
 from greencompute_builder.application.services import service
@@ -43,7 +45,7 @@ def image_history(image: str) -> list[dict]:
 
 
 @router.post("/builder/v1/events/process")
-def process_events(limit: int = 10) -> list[dict]:
+def process_events(limit: Annotated[int, Query(ge=1)] = 10) -> list[dict]:
     return [build.model_dump(mode="json") for build in service.process_pending_events(limit=limit)]
 
 

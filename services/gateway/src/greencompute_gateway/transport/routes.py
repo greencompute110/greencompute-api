@@ -204,7 +204,14 @@ def _created_key_out(created) -> dict:
     return {**created.model_dump(mode="json"), "expires_at": _api_key_out(created)["expires_at"], "expired": False}
 
 
-@router.post("/platform/api-keys", include_in_schema=False)
+@router.post("/platform/api-keys", response_model=None,
+             responses=ok(schemas.APIKeyCreated, "The new key, with its secret (shown only now)"),
+             openapi_extra={"requestBody": {"required": True, "content": {"application/json": {
+                 "schema": {"$ref": "#/components/schemas/APIKeyCreatePublic"}}}}},
+             description=("Create another API key for your account: optionally with narrower `scopes` (never "
+                          "broader than the key making it), its own limits, and an expiry (never later than the "
+                          "key making it). Needs a full-access key or one with the `keys` scope. The secret is "
+                          "in this answer only."))
 def create_api_key(
     payload: schemas.APIKeyCreate,
     authorization: str | None = Header(default=None),
@@ -1445,11 +1452,28 @@ def _create_workload(payload_data: dict, api_key) -> dict:
         # Template builders raise ValueError (e.g. "model must be org/model
         # format"); without this it would surface as a 500.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    from greencompute_gateway.application.services import SecretReferenceError, TooManyGpusError
+
     try:
+        if not api_key.admin:
+            service.check_gpu_count(request)
         workload = service.create_workload(request, api_key.user_id)
+    except TooManyGpusError as exc:
+        raise _too_many_gpus(exc, ["body", "requirements", "gpu_count"]) from exc
+    except SecretReferenceError as exc:
+        raise coded(422, "validation_error", exc.errors) from exc
     except ValueError as exc:  # e.g. an ingress_host outside the model zone
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _redact_workload(workload.model_dump(mode="json"))
+
+
+def _too_many_gpus(exc, loc: list) -> HTTPException:
+    """422 for more GPUs than one machine has, in a 422's usual `detail` shape
+    with the limit in `ctx.le`."""
+    return coded(422, "validation_error", [{
+        "loc": loc, "msg": str(exc), "type": "less_than_equal",
+        "ctx": {"le": exc.limit, "max_gpus_per_machine": exc.limit}, "input": exc.requested,
+    }])
 
 
 def _is_secret_meta_key(key: str) -> bool:
@@ -1463,10 +1487,13 @@ def _redact_workload(d: dict) -> dict:
     any client, owner or not. Public keys / ports / other config stay intact.
     (A workload is visible cross-user when public, so an un-redacted hf_token
     would otherwise leak to every authenticated user.)"""
+    from greencompute_persistence.user_secrets import REFERENCE_KEYS
+
     meta = d.get("metadata")
     if isinstance(meta, dict):
+        # secret_env / hf_token_secret name secrets and hold no values: shown as given.
         d["metadata"] = {
-            k: ("***redacted***" if _is_secret_meta_key(k) else v)
+            k: ("***redacted***" if _is_secret_meta_key(k) and k not in REFERENCE_KEYS else v)
             for k, v in meta.items()
         }
         # A pod's environment usually carries tokens: return the names only.
@@ -1513,12 +1540,12 @@ def update_workload(
 ) -> dict:
     api_key = require_api_key(authorization, x_api_key)
     try:
-        return service.update_workload(
+        return _redact_workload(service.update_workload(
             workload_id,
             payload,
             actor_user_id=api_key.user_id,
             admin=api_key.admin,
-        ).model_dump(mode="json")
+        ).model_dump(mode="json"))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1556,11 +1583,11 @@ def delete_workload(
 ) -> dict:
     api_key = require_api_key(authorization, x_api_key)
     try:
-        return service.delete_workload(
+        return _redact_workload(service.delete_workload(
             workload_id,
             actor_user_id=api_key.user_id,
             admin=api_key.admin,
-        ).model_dump(mode="json")
+        ).model_dump(mode="json"))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1580,13 +1607,7 @@ def get_workload_utilization(
     return service.workload_utilization(workload_id)
 
 
-@router.get("/platform/workloads/{workload_id}/warmup")
-def workload_warmup(
-    workload_id: str,
-    authorization: str | None = Header(default=None),
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-) -> StreamingResponse:
-    api_key = require_api_key(authorization, x_api_key)
+def _warmup(workload_id: str, api_key, headers: dict | None = None) -> StreamingResponse:
     workload = service.get_workload(workload_id, user_id=api_key.user_id, admin=api_key.admin)
     if workload is None:
         raise HTTPException(status_code=404, detail="workload not found")
@@ -1598,8 +1619,33 @@ def workload_warmup(
     return StreamingResponse(
         _warmup_stream(),
         media_type="text/event-stream",
-        headers={"cache-control": "no-cache"},
+        headers={"cache-control": "no-cache", **(headers or {})},
     )
+
+
+@router.post("/platform/workloads/{workload_id}/warmup")
+def workload_warmup(
+    workload_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> StreamingResponse:
+    """Warm a workload up: a server-sent event stream, `warmup_started` then
+    `warmup_complete`. Needs the `rentals` scope."""
+    return _warmup(workload_id, require_api_key(authorization, x_api_key))
+
+
+@router.get("/platform/workloads/{workload_id}/warmup", include_in_schema=False, deprecated=True)
+def workload_warmup_deprecated(
+    workload_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> StreamingResponse:
+    """Deprecated: a GET that starts something. Still answers as before, with
+    a `Deprecation` header and a Link to POST, its successor."""
+    return _warmup(workload_id, require_api_key(authorization, x_api_key), headers={
+        "Deprecation": "true",
+        "Link": f'</platform/workloads/{workload_id}/warmup>; rel="successor-version"',
+    })
 
 
 @router.get("/platform/workloads/{workload_id}/shares")
@@ -1694,6 +1740,8 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         NewAccountLimitError,
         NoCapacityError,
         SanctionedAccountError,
+        SecretReferenceError,
+        TooManyGpusError,
         UnsupportedGPUError,
     )
 
@@ -1707,6 +1755,12 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         ), api_key.admin)
     except SanctionedAccountError as exc:
         raise _wallet_blocked() from exc
+    except SecretReferenceError as exc:
+        # A secret the workload names was deleted since: nothing was created.
+        raise coded(422, "validation_error", exc.errors) from exc
+    except TooManyGpusError as exc:
+        # A workload made before gpu_count was checked at create.
+        raise _too_many_gpus(exc, ["body", "workload_id"]) from exc
     except NewAccountLimitError as exc:
         raise _new_account_limit(exc.reason, exc.numbers) from exc
     except AccountLimitError as exc:
@@ -1858,8 +1912,8 @@ def _webhook_call(fn):
 
 @router.get("/platform/events", response_model=None, responses=ok(schemas.EventPage, "Events after `after`"))
 def list_account_events(
-    after: int = 0,
-    limit: int = 100,
+    after: Annotated[int, Query(ge=0, description="The `next_after` of the previous page; 0 for the oldest.")] = 0,
+    limit: Annotated[int, Query(ge=1, description="At most this many (up to 500).")] = 100,
     types: str | None = None,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -2040,7 +2094,7 @@ def list_fleets(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
-    """Your fleets: all but those stopped more than a week ago."""
+    """Your fleets, but deleted ones."""
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
@@ -2083,14 +2137,18 @@ def update_fleet(
     return fleets.view(service, fleet)
 
 
-@router.delete("/platform/fleets/{fleet_id}", response_model=None, responses=ok(schemas.Fleet, "The stopped fleet"))
+@router.delete("/platform/fleets/{fleet_id}", response_model=None,
+               responses=ok(schemas.Fleet, "The fleet as it was stopped and deleted"))
 def stop_fleet(
     fleet_id: str,
     keep_running: bool = Query(default=False, description="true: stop the fleet but leave its rentals running."),
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    """Stop the fleet and its rentals (or only the fleet, with `keep_running=true`)."""
+    """Stop the fleet and its rentals (or only the fleet, with
+    `keep_running=true`: they carry on as ordinary rentals), and delete it:
+    it is no longer listed, and GET, PATCH or DELETE of it answer 404. To
+    stop it starting or replacing members but keep it, PATCH `paused: true`."""
     api_key = require_api_key(authorization, x_api_key)
     from greencompute_gateway.application import fleets
 
@@ -2393,7 +2451,7 @@ def get_deployment_stats(
             responses=ok(schemas.PodLogs, "The last lines of the rental's output"))
 def get_deployment_logs(
     deployment_id: str,
-    lines: int = 200,
+    lines: Annotated[int, Query(ge=1, description="Lines of each log, from the end (up to 2000).")] = 200,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
@@ -2837,19 +2895,64 @@ def resume_deployment(
         }) from exc
 
 
-@router.post("/platform/secrets")
+def _secret_out(secret) -> dict:
+    """A secret as every route returns it: its name and dates, never its
+    value (the value is only ever handed to the machine running a rental that
+    names it). An `ssh-key:` entry's SSH public key, which isn't secret, comes
+    back as `public_key`."""
+    from greencompute_persistence.user_secrets import SSH_KEY_PREFIX, public_key_of
+
+    public_key = public_key_of(secret.name, secret.value)
+    out = schemas.Secret(
+        secret_id=secret.secret_id,
+        user_id=secret.user_id,
+        name=secret.name,
+        public_key=public_key,
+        # The website's saved SSH keys only: their public key again, as
+        # `value`, which website tabs from before `public_key` still read.
+        value=(public_key or "") if secret.name.startswith(SSH_KEY_PREFIX) else None,
+        created_at=secret.created_at,
+        updated_at=secret.updated_at,
+    ).model_dump(mode="json")
+    if out["value"] is None:
+        del out["value"]  # every other secret: no `value` at all
+    return out
+
+
+def _secret_field_error(field: str, exc: ValueError) -> HTTPException:
+    detail = [{"loc": ["body", field], "msg": str(exc), "type": "value_error"}]
+    return coded(422, "validation_error", detail)
+
+
+@router.post("/platform/secrets", response_model=None, responses=ok(schemas.Secret, "The secret's name, not its value"))
 def create_secret(
     payload: UserSecretCreateRequest,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
+    """Store a value under a name, for rentals to use as environment variables
+    (`metadata.secret_env`) or for a model's Hugging Face token
+    (`metadata.hf_token_secret`). The value is never returned by any request;
+    names are unique (409 if taken: replace the value with PUT)."""
+    from greencompute_gateway.application.services import SecretNameTakenError
+
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
-    return service.create_secret(api_key.user_id, payload).model_dump(mode="json")
+    try:
+        return _secret_out(service.create_secret(api_key.user_id, payload))
+    except SecretNameTakenError as exc:
+        raise coded(409, "conflict", {
+            "message": f"you already have a secret named {exc.existing.name!r}",
+            "secret_id": exc.existing.secret_id,
+            "hint": f"replace its value with PUT /platform/secrets/{exc.existing.secret_id}, "
+                    "or delete it first",
+        }) from exc
+    except ValueError as exc:
+        raise _secret_field_error("value" if "public key" in str(exc) else "name", exc) from exc
 
 
-@router.get("/platform/secrets")
+@router.get("/platform/secrets", response_model=None, responses=ok(list[schemas.Secret], "Names and dates, never values"))
 def list_secrets(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -2857,22 +2960,41 @@ def list_secrets(
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
-    return [secret.model_dump(mode="json") for secret in service.list_secrets(api_key.user_id)]
+    return [_secret_out(secret) for secret in service.list_secrets(api_key.user_id)]
 
 
-@router.delete("/platform/secrets/{secret_id}")
+@router.put("/platform/secrets/{secret_id}", response_model=None, responses=ok(schemas.Secret, "The secret, value replaced"))
+def replace_secret(
+    secret_id: str,
+    payload: schemas.SecretUpdate,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Replace a secret's value; its name, and every workload using it, stay.
+    Rentals started from now on get the new value; running ones keep theirs."""
+    api_key = require_api_key(authorization, x_api_key)
+    try:
+        return _secret_out(service.update_secret(secret_id, payload.value, user_id=api_key.user_id,
+                                                 admin=api_key.admin))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="secret not found") from exc
+    except ValueError as exc:
+        raise _secret_field_error("value", exc) from exc
+
+
+@router.delete("/platform/secrets/{secret_id}", response_model=None, responses=ok(schemas.Secret, "The deleted secret"))
 def delete_secret(
     secret_id: str,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
+    """Delete a secret. Running rentals keep the value they started with; a
+    new deployment of a workload that names it is refused (422)."""
     api_key = require_api_key(authorization, x_api_key)
     try:
-        return service.delete_secret(secret_id, user_id=api_key.user_id, admin=api_key.admin).model_dump(mode="json")
+        return _secret_out(service.delete_secret(secret_id, user_id=api_key.user_id, admin=api_key.admin))
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail="secret not found") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -2918,7 +3040,7 @@ def create_commercial_inquiry(
 def list_commercial_inquiries(
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    offset: Annotated[int, Query(ge=0)] = 0,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -2993,7 +3115,7 @@ def create_bare_metal_inquiry(
 def list_bare_metal_inquiries(
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    offset: Annotated[int, Query(ge=0)] = 0,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -3461,11 +3583,11 @@ def public_pricing() -> dict:
     }
 
 
-def _public_inference_model_names() -> list[str]:
-    """Names of the public inference workloads -- the same filter /v1/models
-    uses -- less customers' own models, which are paid for by the hour by
-    their owner rather than per token."""
-    names = []
+def _public_inference_workloads() -> list:
+    """The public inference workloads -- the same filter /v1/models uses --
+    less customers' own models, which are paid for by the hour by their owner
+    rather than per token. Only named ones: the name is what callers use."""
+    out = []
     for workload in service.control_plane.list_workloads():
         kind = getattr(workload, "kind", None)
         if kind is not None and str(kind).lower().rsplit(".", 1)[-1] != "inference":
@@ -3476,10 +3598,65 @@ def _public_inference_model_names() -> list[str]:
             workload.workload_id, getattr(workload, "metadata", None)
         ):
             continue
-        name = (workload.name or "").strip()
-        if name:
-            names.append(name)
-    return list(dict.fromkeys(names))
+        if (workload.name or "").strip():
+            out.append(workload)
+    return out
+
+
+def _public_inference_model_names() -> list[str]:
+    """Names of the shared models, each once, in workload order."""
+    return list(dict.fromkeys(w.name.strip() for w in _public_inference_workloads()))
+
+
+#: Deployment states on the way to ready: a model with one is "starting".
+_COMING_UP = frozenset({
+    DeploymentState.PENDING, DeploymentState.SCHEDULED, DeploymentState.PULLING, DeploymentState.STARTING,
+})
+
+#: One answer serves every status-page poll for this long (the page asks every
+#: minute; during an incident many people do at once).
+_STATUS_TTL_SECONDS = 10.0
+_status_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _shared_model_state(workloads: list) -> str:
+    """available / starting / unavailable, by what inference routing would do:
+    a ready deployment on a live, healthy node with an endpoint takes requests."""
+    cp = service.control_plane
+    for workload in workloads:
+        if any(d.endpoint for d in cp.list_ready_deployments(workload.workload_id)):
+            return "available"
+    for workload in workloads:
+        if any(d.state in _COMING_UP for d in cp.repository.list_deployments_for_workload(workload.workload_id)):
+            return "starting"
+    return "unavailable"
+
+
+@router.get("/platform/status", response_model=None, responses=ok(schemas.PlatformStatus))
+def public_status() -> dict:
+    """Public -- whether each shared model can take requests right now, for
+    the website's status page. No API key required.
+
+    Coarse states only, the owner's rule for anything public: never a count
+    (replicas, GPUs, miners, requests), a deployment id or a host. Liveness of
+    the API itself is /healthz and /readyz.
+    """
+    cached = _status_cache.get("status")
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _STATUS_TTL_SECONDS:
+        return cached[1]
+    by_name: dict[str, list] = {}
+    for workload in _public_inference_workloads():
+        by_name.setdefault(workload.name.strip(), []).append(workload)
+    body = {
+        "models": [
+            {"model": name, "state": _shared_model_state(workloads)}
+            for name, workloads in sorted(by_name.items())
+        ],
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
+    _status_cache["status"] = (now, body)
+    return body
 
 
 @router.get("/platform/v1/debug/route/{model}", include_in_schema=False)
@@ -3508,7 +3685,7 @@ def debug_route(
 
 @router.get("/platform/v1/debug/routing-decisions", include_in_schema=False)
 def debug_routing_decisions(
-    limit: int = 50,
+    limit: Annotated[int, Query(ge=1)] = 50,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -3536,7 +3713,7 @@ def payment_summary(
 
 @router.get("/platform/v1/invocations", include_in_schema=False)
 def list_invocations(
-    limit: int = 100,
+    limit: Annotated[int, Query(ge=1)] = 100,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -3546,7 +3723,7 @@ def list_invocations(
 
 @router.get("/platform/v1/invocations/exports/recent", include_in_schema=False)
 def export_recent_invocations(
-    limit: int = 50,
+    limit: Annotated[int, Query(ge=1)] = 50,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
@@ -3637,7 +3814,7 @@ def get_invocation(
 
 @router.get("/platform/v1/debug/invocation-failures", include_in_schema=False)
 def debug_invocation_failures(
-    limit: int = 100,
+    limit: Annotated[int, Query(ge=1)] = 100,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -3645,31 +3822,26 @@ def debug_invocation_failures(
     return service.control_plane.invocation_failure_report(limit=limit)
 
 
-@router.get("/registry/auth")
+@router.get("/registry/auth", include_in_schema=False)
 def registry_auth(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    api_key = require_api_key(authorization, x_api_key)
-    # The registry password is a shared infra credential. Scope-tighten: only
-    # hand it to a user-bound key or an admin — never to an anonymous/system
-    # key (user_id None and not admin).
-    if api_key.user_id is None and not api_key.admin:
-        raise HTTPException(status_code=403, detail="registry auth requires a user-bound api key")
-    # Audit: a shared infra credential is being handed out.
-    metrics.increment("secret_access.registry_auth")
-    log.info(
-        "secret_access event=registry_auth key_id=%s user_id=%s ip=%s",
-        api_key.key_id,
-        api_key.user_id,
-        _audit_client_ip(),
-    )
-    import base64
-    from greencompute_persistence.runtime import load_runtime_settings
-    settings = load_runtime_settings("greencompute-gateway")
-    registry_password = getattr(settings, "registry_password", "greencompute-registry")
-    auth_string = base64.b64encode(f":{registry_password}".encode()).decode()
-    return {"authenticated": True, "auth_header": f"Basic {auth_string}"}
+    """Turned off (501). It handed every account the same static Basic
+    credential (":" + GREENCOMPUTE_REGISTRY_PASSWORD, by default
+    "greencompute-registry") for the builder's OCI registry. Production runs
+    no such registry and nothing pulls from one (rentals and models use
+    public images; the builder pushes without credentials), so it unlocked
+    nothing; but one password for every tenant would give anyone push and pull
+    on every account's u-<id>/ namespace the day a registry came up. A
+    registry for private images needs per-account credentials first."""
+    require_api_key(authorization, x_api_key)
+    raise coded(501, "not_implemented", {
+        "status": "disabled",
+        "feature": "registry_auth",
+        "reason": "there is no customer image registry: rentals and models pull public images "
+                  "(Docker Hub, GHCR, …) by name",
+    })
 
 
 @router.get("/guess/vllm_config")
@@ -3687,7 +3859,7 @@ def guess_vllm_config(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/logos")
+@router.post("/logos", include_in_schema=False)
 def upload_logo(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -3696,7 +3868,7 @@ def upload_logo(
     _feature_disabled("logos")
 
 
-@router.get("/logos/{logo_id}.{ext}")
+@router.get("/logos/{logo_id}.{ext}", include_in_schema=False)
 def get_logo(
     logo_id: str,
     ext: str,
@@ -3707,7 +3879,7 @@ def get_logo(
     _feature_disabled("logos")
 
 
-@router.get("/bounties")
+@router.get("/bounties", include_in_schema=False)
 def list_bounties(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -3745,7 +3917,7 @@ def audit_download(
     _feature_disabled("audit")
 
 
-@router.get("/misc/proxy")
+@router.get("/misc/proxy", include_in_schema=False)
 def misc_proxy(
     url: str = Query(""),
     authorization: str | None = Header(default=None),
@@ -3755,7 +3927,7 @@ def misc_proxy(
     _feature_disabled("misc_proxy")
 
 
-@router.get("/misc/hf_repo_info")
+@router.get("/misc/hf_repo_info", include_in_schema=False)
 def misc_hf_repo_info(
     repo: str = Query(""),
     path: str = Query(""),
@@ -3766,7 +3938,7 @@ def misc_hf_repo_info(
     _feature_disabled("misc_hf_repo_info")
 
 
-@router.get("/e2e/instances/{workload_id}")
+@router.get("/e2e/instances/{workload_id}", include_in_schema=False)
 def e2e_instances(
     workload_id: str,
     authorization: str | None = Header(default=None),
@@ -3776,12 +3948,12 @@ def e2e_instances(
     _feature_disabled("e2e_instances")
 
 
-@router.get("/idp/scopes")
+@router.get("/idp/scopes", include_in_schema=False)
 def idp_scopes() -> list[str]:
     _feature_disabled("idp")
 
 
-@router.get("/idp/authorize")
+@router.get("/idp/authorize", include_in_schema=False)
 def idp_authorize(
     client_id: str = Query(""),
     redirect_uri: str = Query(""),
@@ -3791,12 +3963,12 @@ def idp_authorize(
     _feature_disabled("idp")
 
 
-@router.post("/idp/token")
+@router.post("/idp/token", include_in_schema=False)
 def idp_token(payload: dict) -> dict:
     _feature_disabled("idp")
 
 
-@router.post("/e2e/invoke")
+@router.post("/e2e/invoke", include_in_schema=False)
 def e2e_invoke(
     payload: dict,
     authorization: str | None = Header(default=None),
@@ -3923,17 +4095,21 @@ def billing_statement(
     return statement
 
 
+#: The most ledger rows one page returns (one row per metered minute adds up).
+LEDGER_PAGE_MAX = 1000
+
+
 @router.get("/platform/billing/ledger", response_model=None, responses=ok(list[schemas.LedgerItem], "Top-ups and charges, newest first"))
 def billing_ledger(
-    limit: int = 50,
-    offset: int = 0,
+    limit: Annotated[int, Query(ge=1, description="At most this many; a limit above 1000 returns 1000 (page on with offset).")] = 50,
+    offset: Annotated[int, Query(ge=0, description="Skip this many of the newest first.")] = 0,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
-    entries = _get_billing().list_ledger(api_key.user_id, limit=limit, offset=offset)
+    entries = _get_billing().list_ledger(api_key.user_id, limit=min(limit, LEDGER_PAGE_MAX), offset=offset)
     return [e.model_dump(mode="json") for e in entries]
 
 
@@ -4296,7 +4472,7 @@ def billing_crypto_addresses(
 
 @router.get("/platform/billing/crypto/deposits")
 def billing_crypto_deposits(
-    limit: int = 50,
+    limit: Annotated[int, Query(ge=1)] = 50,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -4489,7 +4665,7 @@ def billing_unlink_wallet(
 @router.get("/platform/billing/admin/crypto/invoices", include_in_schema=False)
 def billing_admin_list_crypto_invoices(
     status: str | None = None,
-    limit: int = 100,
+    limit: Annotated[int, Query(ge=1)] = 100,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -4519,7 +4695,7 @@ def billing_admin_monitor(
 @router.get("/platform/billing/admin/crypto/deposits", include_in_schema=False)
 def billing_admin_list_deposits(
     status: str | None = None,
-    limit: int = 200,
+    limit: Annotated[int, Query(ge=1)] = 200,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -4693,7 +4869,7 @@ def billing_admin_ignore_deposit(
 
 @router.get("/platform/billing/admin/miner-revenue", include_in_schema=False)
 def billing_admin_miner_revenue(
-    window_hours: int = 168,
+    window_hours: Annotated[int, Query(ge=1)] = 168,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
@@ -4790,7 +4966,7 @@ def analytics_active_rentals(
 
 @router.get("/platform/admin/analytics/gpu-usage", include_in_schema=False)
 def analytics_gpu_usage(
-    days: int = 7,
+    days: Annotated[int, Query(ge=1)] = 7,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:

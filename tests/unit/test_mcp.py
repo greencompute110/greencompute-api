@@ -264,3 +264,89 @@ def test_list_gpus_reads_the_real_price_list(client):
     # An assistant sees what a person sees: a state, never a count.
     for g in gpus:
         assert not {"available_gpus", "max_gpus_per_deployment", "total_gpus"} & set(g)
+
+
+def test_rental_tools_return_the_flat_rest_object_and_the_old_summary(client):
+    """REST returns the deployment flat; MCP nested it under `rental`. Both now
+    (the nested key stays for clients that read it)."""
+    c, _, mp = client
+    rest = {"deployment_id": "d9", "workload_id": "w9", "state": "pending", "name": "rig-1",
+            "hourly_rate_cents": 40, "requested_instances": 1}
+    mp.setattr(routes, "create_workload", lambda payload, response, **k: {"workload_id": "w9"})
+    mp.setattr(routes, "create_deployment", lambda *a, **k: dict(rest))
+    mp.setattr(routes, "get_deployment", lambda dep_id, **k: dict(rest))
+    mp.setattr(routes, "terminate_deployment", lambda dep_id, **k: {**rest, "state": "terminated"})
+    mp.setattr(routes, "get_workload", lambda workload_id, **k: {"workload_id": workload_id, "metadata": {}})
+    for name, args in (("rent_gpu", {"ssh_public_keys": ["ssh-ed25519 AAAA me"]}),
+                       ("get_rental", {"deployment_id": "d9"}), ("stop_rental", {"deployment_id": "d9"})):
+        out = call(c, name, args)["structuredContent"]
+        assert {k: out[k] for k in rest if k != "state"} == {k: v for k, v in rest.items() if k != "state"}, name
+        assert out["rental"]["deployment_id"] == "d9" and out["rental"]["hourly_rate_cents_per_gpu"] == 40, name
+
+
+def _real_world(tmp_path, mp, user="u1"):
+    from greencompute_control_plane.application.services import ControlPlaneService
+    from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
+    from greencompute_gateway.application.services import GatewayService
+    from greencompute_gateway.infrastructure.repository import GatewayRepository
+
+    url = f"sqlite:///{tmp_path / 'm.sqlite'}"
+    cp = ControlPlaneService(repository=ControlPlaneRepository(database_url=url, bootstrap=True))
+    gw = GatewayService(repository=GatewayRepository(database_url=url, bootstrap=True), control_plane=cp)
+    mp.setattr(routes, "service", gw)
+    key = SimpleNamespace(key_id="k1", user_id=user, admin=False, scopes=[], max_active_rentals=None,
+                          daily_spend_limit_usd=None)
+    mp.setattr(routes, "require_api_key", lambda *a, **k: key)
+    started = []
+    mp.setattr(routes, "create_deployment", lambda payload, *a, **k: started.append(payload.workload_id) or {
+        "deployment_id": f"d{len(started)}", "workload_id": payload.workload_id, "state": "pending"})
+    return gw, key, started
+
+
+def _rent(c, **args):
+    return call(c, "rent_gpu", {"ssh_public_keys": ["ssh-ed25519 AAAA me"], **args})["structuredContent"]
+
+
+def test_renting_the_same_machine_again_reuses_its_workload(client, tmp_path):
+    """rent_gpu used to make a new workload every time and leave it behind;
+    deleting it at stop_rental would delete the rental's history. So the
+    same settings reuse the workload made the first time."""
+    c, _, mp = client
+    gw, key, started = _real_world(tmp_path, mp)
+    first = _rent(c, command="./mine.sh", env={"POOL": "eu"}, gpu_count=2)
+    again = _rent(c, command="./mine.sh", env={"POOL": "eu"}, gpu_count=2)
+    assert started[0] == started[1] and (first["workload_reused"], again["workload_reused"]) == (False, True)
+    wl = gw.control_plane.repository.get_workload(started[0])
+    assert wl.metadata["created_by_tool"] == mcp_module.RENT_GPU_MARK and wl.owner_user_id == "u1"
+    # Anything different is a different workload.
+    for change in ({"env": {"POOL": "us"}}, {"gpu_count": 1}, {"image": "ubuntu:24.04"}, {"disk_gb": 80},
+                   {"name": "rig-2"}, {"command": "./other.sh"}):
+        out = _rent(c, **{"command": "./mine.sh", "env": {"POOL": "eu"}, "gpu_count": 2, **change})
+        assert out["workload_reused"] is False, change
+    assert len(set(started)) == 7
+
+
+def test_another_accounts_workload_and_ones_made_by_hand_are_not_reused(client, tmp_path):
+    c, _, mp = client
+    gw, key, started = _real_world(tmp_path, mp)
+    _rent(c)
+    key.user_id = "u2"
+    assert _rent(c)["workload_reused"] is False  # u1's isn't u2's
+    # The very same settings without rent_gpu's mark (made over REST): not used.
+    repo = gw.control_plane.repository
+    own = repo.get_workload(started[-1])
+    repo.upsert_workload(own.model_copy(update={"metadata": {
+        k: v for k, v in own.metadata.items() if k != "created_by_tool"}}))
+    assert _rent(c)["workload_reused"] is False
+
+
+def test_stop_rental_keeps_the_workload_and_so_the_rentals_history(client):
+    c, _, mp = client
+    mp.setattr(routes, "terminate_deployment", lambda dep_id, **k: {
+        "deployment_id": dep_id, "workload_id": "w9", "state": "terminated"})
+
+    def must_not(*a, **k):
+        raise AssertionError("deleting the workload deletes its rentals' history")
+    mp.setattr(routes, "delete_workload", must_not)
+    out = call(c, "stop_rental", {"deployment_id": "d9"})["structuredContent"]
+    assert out["state"] == "terminated" and "workload_deleted" not in out

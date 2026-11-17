@@ -34,6 +34,16 @@ import pytest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def _fresh_key_rate_limits():
+    """Each test starts with every API key's request allowance full (the
+    per-key rate limit is per process; tests reuse key ids)."""
+    from greencompute_gateway.transport import security
+
+    security.key_rate_limiter.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _fresh_unmatched_alerts():
     """The gateway remembers, per process, which unmatched payments it already
     alerted on; tests reuse deposit refs, so each starts with none."""

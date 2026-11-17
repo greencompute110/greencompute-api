@@ -520,13 +520,15 @@ class ControlPlaneRepository:
             row = session.scalar(select(WorkloadORM).where(WorkloadORM.name == name))
             return self._to_workload(row) if row else None
 
-    def list_workloads_by_name(self, name: str) -> list[WorkloadSpec]:
-        """Every workload with this name, oldest first: names aren't unique
-        (models deployed from the dashboard are named after their HF id)."""
+    def list_workloads_by_name(self, name: str, owner_user_id: str | None = None) -> list[WorkloadSpec]:
+        """Every workload with this name (of one owner, when given), oldest
+        first: names aren't unique (models deployed from the dashboard are
+        named after their HF id)."""
         with session_scope(self.session_factory) as session:
-            rows = session.scalars(
-                select(WorkloadORM).where(WorkloadORM.name == name).order_by(WorkloadORM.created_at)
-            ).all()
+            stmt = select(WorkloadORM).where(WorkloadORM.name == name)
+            if owner_user_id is not None:
+                stmt = stmt.where(WorkloadORM.owner_user_id == owner_user_id)
+            rows = session.scalars(stmt.order_by(WorkloadORM.created_at)).all()
             return [self._to_workload(row) for row in rows]
 
     def find_workload_by_alias(self, alias: str) -> WorkloadSpec | None:

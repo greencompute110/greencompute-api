@@ -16,7 +16,7 @@ import re
 
 SCOPES = {
     "read": "See deployments, workloads, balance, invoices and other account data",
-    "rentals": "Create, change and delete workloads and deployments, and get SSH access",
+    "rentals": "Create, change and delete workloads, deployments and secrets, and get SSH access",
     "inference": "Call models through /v1 (chat, completions, embeddings, model list)",
     "billing": "Add credit: crypto invoices, verified wallets, payment reviews",
     "keys": "Create, list and delete API keys (never broader than its own)",
@@ -25,7 +25,7 @@ SCOPES = {
 _SSH = re.compile(r"^/platform/deployments/[^/]+/ssh/?$")
 _RENTAL_PREFIXES = (
     "/platform/workloads", "/platform/deployments", "/platform/fleets", "/platform/builds", "/platform/images",
-    "/platform/capacity-alerts",
+    "/platform/capacity-alerts", "/platform/secrets",
 )
 
 

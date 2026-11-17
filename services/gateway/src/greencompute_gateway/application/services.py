@@ -361,6 +361,144 @@ def normalize_pod_start(metadata: dict) -> dict:
     return metadata
 
 
+class SecretReferenceError(ValueError):
+    """A workload names secrets wrongly, or ones the account doesn't have
+    (shown as 422). `errors` is a list in the shape of a 422's `detail`."""
+
+    def __init__(self, errors: list[dict]) -> None:
+        self.errors = errors
+        super().__init__("; ".join(f"{'.'.join(str(p) for p in e['loc'][1:])}: {e['msg']}" for e in errors))
+
+
+#: The most GPUs on one machine when no machine is registered to say (the
+#: fleet's are 8-GPU boxes). GREENCOMPUTE_MAX_GPUS_PER_MACHINE overrides it.
+DEFAULT_MAX_GPUS_PER_MACHINE = 8
+
+
+class TooManyGpusError(ValueError):
+    """More GPUs than any one machine has: a rental or model runs on one
+    machine, so it could never be placed (shown as 422 with the limit)."""
+
+    def __init__(self, requested: int, limit: int) -> None:
+        self.requested = requested
+        self.limit = limit
+        super().__init__(
+            f"at most {limit} GPUs: a rental or model runs on one machine, and the largest has {limit} "
+            f"(asked for {requested}). For more, start several, or write to support@green-compute.com"
+        )
+
+
+def max_gpus_per_machine(control_plane, gpu_models: list[str] | None = None) -> int:
+    """The most GPUs one rental (or model replica) can have: the largest
+    registered machine of those GPU models (any public one, if none of those
+    is registered), else GREENCOMPUTE_MAX_GPUS_PER_MACHINE (8)."""
+    found = control_plane.max_gpus_per_machine(gpu_models)
+    if found:
+        return int(found)
+    try:
+        return max(1, int(os.environ.get("GREENCOMPUTE_MAX_GPUS_PER_MACHINE") or DEFAULT_MAX_GPUS_PER_MACHINE))
+    except ValueError:
+        return DEFAULT_MAX_GPUS_PER_MACHINE
+
+
+def check_gpu_count(control_plane, workload) -> None:
+    """TooManyGpusError when the workload asks for more GPUs than one machine has."""
+    requested = int(workload.requirements.gpu_count or 1)
+    if requested <= 1:
+        return
+    limit = max_gpus_per_machine(control_plane, list(workload.requirements.supported_gpu_models or []))
+    if requested > limit:
+        raise TooManyGpusError(requested, limit)
+
+
+class SecretNameTakenError(Exception):
+    """The account already has a secret with this name (shown as 409)."""
+
+    def __init__(self, existing: UserSecretRecord) -> None:
+        self.existing = existing
+        super().__init__(f"a secret named {existing.name!r} already exists")
+
+
+def _secret_error(where: list, msg: str) -> dict:
+    return {"loc": ["body", "metadata", *where], "msg": msg, "type": "value_error"}
+
+
+def check_secret_references(workload: WorkloadSpec, have: set[str]) -> None:
+    """Validate the secrets a workload names (metadata.secret_env on a pod,
+    metadata.hf_token_secret on a model) against the names the account has.
+    Raises SecretReferenceError listing every problem."""
+    from greencompute_persistence.user_secrets import HF_TOKEN_SECRET_KEY, SECRET_ENV_KEY
+
+    meta = workload.metadata or {}
+    errors: list[dict] = []
+    wanted: list[tuple[list, str]] = []
+    env_refs = meta.get(SECRET_ENV_KEY)
+    if env_refs is not None:
+        if workload.kind != WorkloadKind.POD:
+            errors.append(_secret_error([SECRET_ENV_KEY], "secret_env is for GPU rentals (pods); a model takes "
+                                                          "metadata.hf_token_secret"))
+        elif not isinstance(env_refs, dict) or not env_refs:
+            errors.append(_secret_error([SECRET_ENV_KEY], 'must be an object of VARIABLE: secret name, such as '
+                                                          '{"HF_TOKEN": "hf-read"}'))
+        else:
+            plain = meta.get("env") if isinstance(meta.get("env"), dict) else {}
+            if len(env_refs) + len(plain) > _MAX_ENV_VARS:
+                errors.append(_secret_error([SECRET_ENV_KEY], f"env and secret_env together can set at most "
+                                                              f"{_MAX_ENV_VARS} variables"))
+            for var, name in env_refs.items():
+                where = [SECRET_ENV_KEY, var]
+                if not isinstance(var, str) or not _ENV_NAME.match(var):
+                    errors.append(_secret_error(where, f"{var!r} is not a valid variable name"))
+                elif var.upper() in _RESERVED_ENV:
+                    errors.append(_secret_error(where, f"{var} is set by the platform and can't be changed"))
+                elif var in plain:
+                    errors.append(_secret_error(where, f"{var} is also in metadata.env; set it in one of them"))
+                elif not isinstance(name, str) or not name.strip():
+                    errors.append(_secret_error(where, "must be the name of one of your secrets"))
+                else:
+                    wanted.append((where, name.strip()))
+    hf_ref = meta.get(HF_TOKEN_SECRET_KEY)
+    if hf_ref is not None:
+        where = [HF_TOKEN_SECRET_KEY]
+        if workload.kind != WorkloadKind.INFERENCE:
+            errors.append(_secret_error(where, 'hf_token_secret is for models; a rental takes metadata.secret_env, '
+                                               'e.g. {"HF_TOKEN": "<secret name>"}'))
+        elif not isinstance(hf_ref, str) or not hf_ref.strip():
+            errors.append(_secret_error(where, "must be the name of one of your secrets"))
+        elif isinstance(meta.get("hf_token"), str) and meta["hf_token"].strip():
+            errors.append(_secret_error(where, "give hf_token or hf_token_secret, not both"))
+        else:
+            wanted.append((where, hf_ref.strip()))
+    for where, name in wanted:
+        if name not in have:
+            errors.append(_secret_error(where, f"you have no secret named {name!r}; create it with POST "
+                                               "/platform/secrets (GET /platform/secrets lists the names)"))
+    if errors:
+        raise SecretReferenceError(errors)
+
+
+def _tidy_secret_references(metadata: dict) -> dict:
+    """Names trimmed, as they are matched."""
+    from greencompute_persistence.user_secrets import HF_TOKEN_SECRET_KEY, SECRET_ENV_KEY
+
+    if isinstance(metadata.get(SECRET_ENV_KEY), dict):
+        metadata[SECRET_ENV_KEY] = {var: name.strip() if isinstance(name, str) else name
+                                    for var, name in metadata[SECRET_ENV_KEY].items()}
+    if isinstance(metadata.get(HF_TOKEN_SECRET_KEY), str):
+        metadata[HF_TOKEN_SECRET_KEY] = metadata[HF_TOKEN_SECRET_KEY].strip()
+    return metadata
+
+
+_SECRET_NAME_MAX = 128
+
+
+def normalize_secret_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name or len(name) > _SECRET_NAME_MAX or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise ValueError(f"name must be 1 to {_SECRET_NAME_MAX} characters, without control characters")
+    return name
+
+
 def model_ingress_zone() -> str:
     zone = os.environ.get("GREENCOMPUTE_MODEL_INGRESS_DOMAIN") or "inference.green-compute.com"
     return zone.strip().lower().strip(".")
@@ -884,11 +1022,31 @@ class GatewayService:
         workload = WorkloadSpec(**request.model_dump(), owner_user_id=owner_user_id)
         if workload.kind == WorkloadKind.POD:
             workload.metadata = normalize_pod_start(dict(workload.metadata or {}))
+        self._check_workload_secrets(workload)
         if workload.ingress_host is not None:
             workload.ingress_host = self._claim_ingress_host(workload.ingress_host, workload.workload_id)
         elif workload.kind == WorkloadKind.INFERENCE:
             workload.ingress_host = self._assign_ingress_host(workload)
         return self.control_plane.upsert_workload(workload)
+
+    def max_gpus_per_machine(self, gpu_models: list[str] | None = None) -> int:
+        return max_gpus_per_machine(self.control_plane, gpu_models)
+
+    def check_gpu_count(self, workload: WorkloadCreateRequest | WorkloadSpec) -> None:
+        check_gpu_count(self.control_plane, workload)
+
+    def _check_workload_secrets(self, workload: WorkloadSpec) -> None:
+        """The secrets a workload names must be the owner's (422 otherwise).
+        Only names are stored; values are filled in for the machine."""
+        from greencompute_persistence.user_secrets import secret_names, secret_references
+
+        meta = workload.metadata or {}
+        if not any(k in meta for k in ("secret_env", "hf_token_secret")):
+            return
+        workload.metadata = _tidy_secret_references(dict(meta))
+        have = secret_names(self.repository.session_factory, workload.owner_user_id) if secret_references(
+            workload.metadata) else set()
+        check_secret_references(workload, have)
 
     def get_workload(self, workload_id: str, user_id: str | None = None, *, admin: bool = False) -> WorkloadSpec | None:
         workload = self.control_plane.repository.get_workload(workload_id)
@@ -971,6 +1129,16 @@ class GatewayService:
 
             if account_blocked(self.repository.session_factory, user_id):
                 raise SanctionedAccountError(user_id)
+        if not admin:
+            check_gpu_count(self.control_plane, workload)  # one made before the check at create
+        if workload.owner_user_id and any(k in (workload.metadata or {}) for k in ("secret_env", "hf_token_secret")):
+            # Its secrets are its owner's: anyone else it is shared with (or
+            # public to) would get them in a pod they can SSH into.
+            if not admin and user_id != workload.owner_user_id:
+                raise PermissionError(
+                    f"workload {payload.workload_id} uses its owner's secrets, so only its owner can start it")
+            # A secret it names may have been deleted since the workload was made.
+            self._check_workload_secrets(workload.model_copy(deep=True))
         if not admin and (workload.metadata or {}).get("managed_by") == "flux":
             # A shared catalog model: the platform runs its replicas. Customers
             # call it by name, or deploy their own copy from its HF id.
@@ -1578,8 +1746,35 @@ class GatewayService:
         return deleted
 
     def create_secret(self, user_id: str, request: UserSecretCreateRequest) -> UserSecretRecord:
-        secret = UserSecretRecord(user_id=user_id, name=request.name, value=request.value)
-        return self.repository.save_secret(secret)
+        """Store a new secret. Names are unique per account (SecretNameTakenError
+        when taken; replace a value with update_secret). An `ssh-key:` name
+        holds an SSH public key for the website's rental form."""
+        from greencompute_persistence.user_secrets import SSH_KEY_PREFIX, is_ssh_public_key
+
+        name = normalize_secret_name(request.name)
+        if name.startswith(SSH_KEY_PREFIX) and not is_ssh_public_key(request.value):
+            raise ValueError(f"a {SSH_KEY_PREFIX} secret holds an SSH public key, such as the contents of "
+                             "~/.ssh/id_ed25519.pub (never a private key)")
+        secret = UserSecretRecord(user_id=user_id, name=name, value=request.value)
+        saved = self.repository.create_secret_unique(secret)
+        if saved is None:
+            raise SecretNameTakenError(self.repository.find_secret_by_name(user_id, name) or secret)
+        return saved
+
+    def update_secret(self, secret_id: str, value: str, *, user_id: str | None, admin: bool = False) -> UserSecretRecord:
+        """Replace a secret's value (its name, and so every workload naming
+        it, stays). Rentals already running keep the value they started with."""
+        from greencompute_persistence.user_secrets import SSH_KEY_PREFIX, is_ssh_public_key
+
+        secret = self.repository.get_secret(secret_id)
+        if secret is None or (not admin and secret.user_id != user_id):
+            raise KeyError(f"secret not found: {secret_id}")
+        if secret.name.startswith(SSH_KEY_PREFIX) and not is_ssh_public_key(value):
+            raise ValueError(f"a {SSH_KEY_PREFIX} secret holds an SSH public key (never a private key)")
+        updated = self.repository.update_secret_value(secret_id, value, datetime.now(UTC))
+        if updated is None:
+            raise KeyError(f"secret not found: {secret_id}")
+        return updated
 
     def list_secrets(self, user_id: str) -> list[UserSecretRecord]:
         return self.repository.list_secrets(user_id)
@@ -1589,7 +1784,7 @@ class GatewayService:
         if secret is None:
             raise KeyError(f"secret not found: {secret_id}")
         if not admin and secret.user_id != user_id:
-            raise PermissionError(f"secret access denied: {secret_id}")
+            raise KeyError(f"secret not found: {secret_id}")  # another account's: as if it didn't exist
         deleted = self.repository.delete_secret(secret_id)
         if deleted is None:
             raise KeyError(f"secret not found: {secret_id}")

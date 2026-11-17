@@ -244,7 +244,8 @@ class Fleet(BaseModel):
     name_prefix: str
     target: int
     replace: bool
-    state: str = Field(description="`active`, `paused`, `completed` (replace=false, all have run) or `stopped`.")
+    state: str = Field(description=("`active`, `paused`, `completed` (replace=false, all have run), or `stopped` "
+                                    "(only in DELETE's answer: a deleted fleet is no longer listed)."))
     status: str = Field(description="What the fleet is doing or waiting for, in plain English.")
     running: int
     starting: int
@@ -256,6 +257,8 @@ class Fleet(BaseModel):
     members: list[FleetMember] = Field(description="Live members, and those that ended in the last day; newest first.")
     created_at: str | None
     updated_at: str | None
+    deleted_at: str | None = Field(default=None, description=(
+        "When DELETE stopped and removed it; after that it is not listed and GET by id is 404."))
 
 
 class LedgerItem(LedgerEntry):
@@ -327,6 +330,22 @@ class Pricing(BaseModel):
         description="Your own deployed model: the GPU rental rate × its GPU count, per started minute while it runs.",
     )
     docs: str
+
+
+class ModelStatus(BaseModel):
+    model: str = Field(description="The shared model's name, as used for `model` in /v1/chat/completions.")
+    state: Literal["available", "starting", "unavailable"] = Field(
+        description="`available`: it is taking requests now. `starting`: it isn't yet, but is being brought up. "
+                    "`unavailable`: it isn't running; requests to it fail until it is.",
+    )
+
+
+class PlatformStatus(BaseModel):
+    """What the status page shows: coarse states only, never counts, ids or hosts."""
+    models: list[ModelStatus] = Field(
+        description="Every shared model in /platform/pricing, by name. Your own private models aren't listed.",
+    )
+    checked_at: str = Field(description="When these states were worked out (UTC, ISO 8601).")
 
 
 class CryptoInvoiceCreated(BaseModel):
@@ -656,11 +675,29 @@ class APIKeyCreate(KeyExpiry, APIKeyCreateRequest):
     """POST /platform/api-keys: the protocol's fields plus an expiry."""
 
 
+class APIKeyCreatePublic(KeyExpiry):
+    """POST /platform/api-keys, as a customer sends it (the spec shows this;
+    the fields for staff tools, `user_id` and `admin`, are ignored for anyone
+    else)."""
+    name: str = Field(min_length=1, max_length=64)
+    scopes: list[str] = Field(default_factory=list, description=(
+        "Empty: full access. Otherwise any of read, rentals, inference, billing, keys; never broader than the "
+        "key creating it."))
+    max_active_rentals: int | None = Field(default=None, ge=0, le=100, description="Rentals it may have running at once.")
+    daily_spend_limit_usd: float | None = Field(default=None, gt=0, le=100000, description=(
+        "What it may spend (rentals and inference) in any 24 hours."))
+
+
 class APIKeyOut(APIKeySummary):
     """An API key without its secret (list and get)."""
     expires_at: datetime | None = Field(default=None, description="When it stops working; null: never.")
     expired: bool = Field(default=False, description="True once `expires_at` has passed: requests with it get 401 "
                                                      "`api_key_expired`. Delete it and create a new one.")
+
+
+class APIKeyCreated(APIKeyOut):
+    """The new key: as listed, plus its secret, which is shown only here."""
+    secret: str = Field(description="Send it as `Authorization: Bearer <secret>`. Store it: it isn't shown again.")
 
 
 # --- Account-wide limits -----------------------------------------------------------
@@ -704,3 +741,30 @@ class AccountLimits(BaseModel):
     new_account_limits: NewAccountLimits | None = Field(
         default=None, description="A new wallet account's first-week limits, while they last.")
     in_force: AccountLimitsInForce
+
+
+# --- Secrets -------------------------------------------------------------------------
+
+
+class Secret(BaseModel):
+    """A stored secret: its name and dates. The value is never returned."""
+    secret_id: str
+    user_id: str
+    name: str = Field(description=(
+        "Unique on the account. Use it in a pod's `metadata.secret_env` ({\"VAR\": \"<name>\"}) or as a model's "
+        "`metadata.hf_token_secret`."))
+    public_key: str | None = Field(default=None, description=(
+        "Only for an `ssh-key:<label>` entry (the website's saved SSH keys): the SSH public key it holds, which "
+        "isn't secret. null for every other secret."))
+    value: str | None = Field(default=None, description=(
+        "Only on an `ssh-key:` entry: the same public key (\"\" if it doesn't hold one), for older clients. "
+        "Absent on every other secret: a secret's value is never returned."))
+    created_at: datetime
+    updated_at: datetime
+
+
+class SecretUpdate(BaseModel):
+    """PUT /platform/secrets/{secret_id}: the new value."""
+    model_config = {"extra": "forbid"}
+
+    value: str = Field(min_length=1, max_length=4096)
