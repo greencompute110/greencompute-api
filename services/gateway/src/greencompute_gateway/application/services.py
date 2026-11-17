@@ -622,6 +622,7 @@ class GatewayService:
         allow_admin_grant: bool = False,
         caller_scopes: list[str] | None = None,
         caller_limits: APIKeyRecord | None = None,
+        expires_no_later_than: datetime | None = None,
     ) -> APIKeyRecord:
         """Mint an api key, deriving privilege from the authenticated caller
         rather than trusting the wire.
@@ -695,9 +696,13 @@ class GatewayService:
         # When it stops working (schemas.KeyExpiry; a plain protocol request
         # has none). A key never outlives the key that made it, so a leaked
         # short-lived key can't mint itself a lasting one.
+        # `expires_no_later_than`: the expiry of the key making this one, on
+        # paths that don't pass it as caller_limits (an admin key from the DB).
         requested = getattr(request, "requested_expiry", None)
         expires_at = requested() if callable(requested) else None
-        parent_expiry = getattr(caller_limits, "expires_at", None) if caller_limits is not None else None
+        parent_expiry = expires_no_later_than
+        if parent_expiry is None and caller_limits is not None:
+            parent_expiry = getattr(caller_limits, "expires_at", None)
         if parent_expiry is not None:
             expires_at = parent_expiry if expires_at is None else min(expires_at, parent_expiry)
         api_key = StoredAPIKey(

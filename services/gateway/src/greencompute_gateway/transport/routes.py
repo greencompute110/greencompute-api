@@ -250,11 +250,14 @@ def create_api_key(
     # Privileged caller. Both the env master admin AND the provision secret may
     # bind the key to an explicit user_id (the UI provisions a key for the
     # newly-registered user). Only the master admin may grant admin=true.
+    # An admin key from the database may expire: what it makes expires no
+    # later (the env master record and the provision secret have no expiry).
     return _created_key_out(service.create_api_key(
         payload,
         caller_user_id=caller.user_id,
         allow_user_id_override=True,
         allow_admin_grant=is_master_admin,
+        expires_no_later_than=getattr(caller, "expires_at", None),
     ))
 
 

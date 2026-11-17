@@ -272,3 +272,22 @@ def test_rentals_a_key_started_keep_running_after_it_expires(tmp_path):
     svc = ControlPlaneService(repository=cp)
     assert svc.stop_rentals_over_key_limits() == [] and svc.stop_rentals_over_account_limits() == []
     assert cp.get_deployment("d1").state == DeploymentState.READY
+
+
+def test_a_key_made_by_an_expiring_admin_key_never_outlives_it(db):
+    """The privileged branch (admin keys from the database) caps the new key's
+    expiry the same way the self-service branch does."""
+    parent_expiry = datetime.now(UTC) + timedelta(days=7)
+    _key(db, "admin7", expires_at=parent_expiry, admin=True)
+
+    def mint(**kw):
+        made = routes.create_api_key(schemas.APIKeyCreate(name="minted", user_id="u2", **kw), "Bearer admin7", None)
+        assert made["user_id"] == "u2"  # still the privileged path: it may bind another account's key
+        return made["expires_at"]
+
+    assert abs(datetime.fromisoformat(mint()) - parent_expiry) < timedelta(seconds=1)  # not permanent
+    assert abs(datetime.fromisoformat(mint(expires_in_days=90)) - parent_expiry) < timedelta(seconds=1)
+    assert datetime.fromisoformat(mint(expires_in_days=1)) < parent_expiry
+    _key(db, "admin-forever", admin=True)
+    made = routes.create_api_key(schemas.APIKeyCreate(name="m", user_id="u2"), "Bearer admin-forever", None)
+    assert made["expires_at"] is None
