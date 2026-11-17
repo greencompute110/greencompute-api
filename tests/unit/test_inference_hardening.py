@@ -327,3 +327,219 @@ def test_several_completions_are_billed_as_several(gw):
                                     max_tokens=100, n=3)
     assert gw._completion_token_bound(request) == 300
     assert gw._clamp_reported_usage(request, 10, 300)[1] == 300
+
+
+# --- items 4 and 5: a failure counts against a model only if its probe fails too --------
+
+
+def test_a_timeout_on_a_healthy_model_is_a_504_and_never_counts(api, cp, node):
+    """One long completion (a huge max_tokens, not streamed) ran past the
+    gateway's timeout. The model is fine: the probe right after says so."""
+    _, dep = catalog_model(cp, node)
+    node.chat = "hang"
+    for _ in range(4):
+        res = chat(api)
+        assert res.status_code == 504
+        err = res.json()["error"]
+        assert (err["code"], err["retryable"]) == ("upstream_timeout", False)
+        assert "stream it" in err["message"]
+    assert failures(cp, dep) == 0 and state(cp, dep) == DeploymentState.READY
+    assert charges(cp) == []
+
+
+def test_a_5xx_on_a_healthy_model_is_a_502_with_its_reason_and_never_counts(api, cp, node):
+    _, dep = catalog_model(cp, node)
+    node.chat = (502, {"object": "error", "message": "CUDA error on this input"}, {"X-Upstream-Status": "500"})
+    for _ in range(4):
+        res = chat(api)
+        assert res.status_code == 502
+        err = res.json()["error"]
+        assert (err["code"], err["retryable"]) == ("upstream_error", False)
+        assert "CUDA error on this input" in err["message"]
+    assert failures(cp, dep) == 0 and state(cp, dep) == DeploymentState.READY
+
+
+def test_a_model_that_fails_its_probe_too_is_503_and_counts_to_failed(api, cp, node):
+    _, dep = catalog_model(cp, node)
+    chat(api)  # healthy, served
+    node.chat = (502, {"object": "error", "message": "engine dead"}, None)
+    node.health = 503  # ...and the probe right after fails
+    res = chat(api)
+    # The pre-request probe fails first now: no replica is answering.
+    assert res.status_code == 503
+    err = res.json()["error"]
+    assert (err["code"], err["retryable"], err["retry_after_seconds"]) == ("model_unavailable", True, 30)
+    assert res.headers["retry-after"] == "30"
+    for _ in range(2):
+        chat(api)
+    assert state(cp, dep) == DeploymentState.FAILED  # 3 failed probes: replaced
+
+
+def test_a_failure_whose_probe_fails_after_a_healthy_preflight_is_503(api, cp, node, monkeypatch):
+    _, dep = catalog_model(cp, node)
+    node.chat = (502, {"object": "error", "message": "engine dead"}, None)
+    probes = iter([True, False])  # healthy before the request, down right after it
+    monkeypatch.setattr(routes.service.inference_client, "check_deployment_health", lambda d: next(probes))
+    res = chat(api)
+    assert res.status_code == 503 and res.json()["error"]["code"] == "model_unavailable"
+    assert failures(cp, dep) == 1
+
+
+def test_a_node_that_cant_reach_its_model_counts_without_a_probe(api, cp, node):
+    _, dep = catalog_model(cp, node)
+    node.chat = (502, {"detail": "couldn't reach the model server", "reason": "model_unreachable"},
+                 {"X-GC-Node-Error": "model_unreachable"})
+    res = chat(api)
+    assert res.status_code == 503 and res.json()["error"]["code"] == "model_unavailable"
+    assert failures(cp, dep) == 1
+
+
+def test_an_old_node_that_cant_reach_its_model_counts_too(api, cp, node):
+    """Before the node update: 502 {"detail": "upstream error: <urlopen error
+    [Errno 111] Connection refused>"} while its healthz still says ok."""
+    _, dep = catalog_model(cp, node)
+    node.chat = (502, {"detail": "upstream error: <urlopen error [Errno 111] Connection refused>"}, None)
+    res = chat(api)
+    assert res.status_code == 503 and failures(cp, dep) == 1
+
+
+def test_a_success_still_resets_the_count(api, cp, node):
+    _, dep = catalog_model(cp, node)
+    cp.repository.update_deployment(dep.model_copy(update={"health_check_failures": 2}))
+    assert chat(api).status_code == 200
+    assert failures(cp, dep) == 0
+
+
+def test_a_healthy_timeout_isnt_sent_on_to_another_replica(api, cp, node):
+    workload, _ = catalog_model(cp, node)
+    ready_deployment(cp, workload, node)
+    node.chat = "hang"
+    assert chat(api).status_code == 504
+    assert len(node.requests) == 1  # not a second full wait on the other replica
+
+
+def test_a_down_replica_is_skipped_for_the_next(api, cp, node, monkeypatch):
+    workload, first = catalog_model(cp, node)
+    second = ready_deployment(cp, workload, node)
+    calls = []
+
+    def invoke(deployment, request, *, request_id):
+        calls.append(deployment.deployment_id)
+        if len(calls) == 1:
+            from greencompute_gateway.infrastructure.inference_client import InferenceConnectionError
+            raise InferenceConnectionError("down", model_unreachable=True)
+        return original(deployment, request, request_id=request_id)
+
+    original = routes.service.inference_client.invoke_chat_completion
+    monkeypatch.setattr(routes.service.inference_client, "invoke_chat_completion", invoke)
+    assert chat(api).status_code == 200
+    assert len(calls) == 2 and {calls[0], calls[1]} == {first.deployment_id, second.deployment_id}
+
+
+# --- item 7: what an unknown, loading, paused or missing model answers -------------------
+
+
+def test_an_unknown_model_is_404_model_not_found(api, cp, node):
+    res = chat(api, model="no-such-model")
+    assert res.status_code == 404
+    err = res.json()["error"]
+    assert (err["code"], err["retryable"]) == ("model_not_found", False)
+    assert "/v1/models" in err["message"]
+
+
+def test_someone_elses_private_model_is_404_like_an_unknown_one(api, cp, node):
+    workload = cp.repository.upsert_workload(WorkloadSpec(
+        name="their-llama", image="vllm", kind=WorkloadKind.INFERENCE, owner_user_id="u2", requirements={"gpu_count": 1}))
+    ready_deployment(cp, workload, node, owner="u2")
+    assert chat(api, model=workload.workload_id).json()["error"]["code"] == "model_not_found"
+    assert chat(api, model="their-llama").json()["error"]["code"] == "model_not_found"
+
+
+def test_a_model_that_is_starting_is_409_model_not_ready(api, cp, node):
+    workload, _ = catalog_model(cp, None)
+    cp.repository.create_deployment(DeploymentRecord(workload_id=workload.workload_id, state=DeploymentState.STARTING))
+    res = chat(api)
+    assert res.status_code == 409 and res.headers["retry-after"] == "30"
+    err = res.json()["error"]
+    assert (err["code"], err["retryable"], err["retry_after_seconds"]) == ("model_not_ready", True, 30)
+
+
+def test_a_shared_model_with_no_replica_up_is_503(api, cp, node):
+    workload, _ = catalog_model(cp, None)
+    cp.repository.create_deployment(DeploymentRecord(workload_id=workload.workload_id, state=DeploymentState.FAILED))
+    res = chat(api)
+    assert res.status_code == 503 and res.json()["error"]["code"] == "model_unavailable"
+
+
+def test_a_ready_model_on_a_silent_machine_is_503(api, cp, node):
+    _, dep = catalog_model(cp, node)
+    cp.repository.upsert_heartbeat(Heartbeat(hotkey="hk", healthy=False))
+    res = chat(api)
+    assert res.status_code == 503 and res.json()["error"]["code"] == "model_unavailable"
+
+
+def _private(cp, owner="u1", name="meta-llama-Llama-3.1-8B-Instruct"):
+    return cp.repository.upsert_workload(WorkloadSpec(
+        name=name, image="vllm", kind=WorkloadKind.INFERENCE, owner_user_id=owner, requirements={"gpu_count": 1},
+        runtime={"model_identifier": "meta-llama/Llama-3.1-8B-Instruct"}))
+
+
+def test_your_paused_model_says_how_to_resume_it(api, cp, node):
+    workload = _private(cp)
+    paused = cp.repository.create_deployment(DeploymentRecord(
+        workload_id=workload.workload_id, owner_user_id="u1", state=DeploymentState.SUSPENDED,
+        last_error="idle — no invocations in 30 min"))
+    res = chat(api, model=workload.workload_id)
+    assert res.status_code == 409
+    body = res.json()
+    assert (body["error"]["code"], body["error"]["retryable"]) == ("model_not_running", False)
+    assert body["detail"]["deployment_id"] == paused.deployment_id and body["detail"]["paused"] is True
+    assert f"/platform/deployments/{paused.deployment_id}/resume" in body["error"]["message"]
+
+
+def test_your_model_whose_deployment_ended_says_to_deploy_it_again(api, cp, node):
+    workload = _private(cp)
+    cp.repository.create_deployment(DeploymentRecord(
+        workload_id=workload.workload_id, owner_user_id="u1", state=DeploymentState.FAILED,
+        last_error="container exited prematurely"))
+    res = chat(api, model=workload.workload_id)
+    assert res.status_code == 409 and res.json()["error"]["code"] == "model_not_running"
+    assert "deploy it again" in res.json()["error"]["message"]
+
+
+def _listed(api):
+    res = api.get("/v1/models")
+    assert res.status_code == 200
+    return [m["id"] for m in res.json()["data"]]
+
+
+def test_models_are_listed_only_while_a_backend_can_serve_them(api, cp, node):
+    catalog_model(cp, node, name="qwen2.5-7b-instruct")
+    loading, _ = catalog_model(cp, None, name="qwen2-vl-7b-instruct")
+    cp.repository.create_deployment(DeploymentRecord(workload_id=loading.workload_id, state=DeploymentState.STARTING))
+    assert _listed(api) == ["qwen2.5-7b-instruct"]
+    cp.repository.upsert_heartbeat(Heartbeat(hotkey="hk", healthy=False))  # its machine stops answering
+    assert _listed(api) == []
+
+
+def test_your_own_private_model_is_listed_for_you_and_reachable_by_that_id(api, cp, node):
+    mine = _private(cp)
+    ready_deployment(cp, mine, node, owner="u1")
+    theirs = _private(cp, owner="u2")
+    ready_deployment(cp, theirs, node, owner="u2")
+    catalog_model(cp, node)
+    listed = _listed(api)
+    assert listed == sorted(["qwen2.5-7b-instruct", "meta-llama-Llama-3.1-8B-Instruct"])
+    assert chat(api, model="meta-llama-Llama-3.1-8B-Instruct").status_code == 200  # reaches u1's own
+    api.caller.user_id = "u3"  # nobody's: sees the shared model only
+    assert _listed(api) == ["qwen2.5-7b-instruct"]
+
+
+def test_a_private_model_named_like_a_shared_one_is_listed_by_its_id(api, cp, node):
+    catalog_model(cp, node, name="qwen2.5-7b-instruct")
+    mine = _private(cp, name="qwen2.5-7b-instruct")
+    ready_deployment(cp, mine, node, owner="u1")
+    listed = _listed(api)
+    assert sorted(listed) == sorted(["qwen2.5-7b-instruct", mine.workload_id])
+    # Each id reaches what it says.
+    assert chat(api, model=mine.workload_id).status_code == 200

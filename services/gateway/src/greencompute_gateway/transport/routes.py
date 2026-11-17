@@ -48,7 +48,12 @@ from greencompute_gateway.application.services import (
     service,
 )
 from greencompute_gateway.domain.inference_requests import InvalidInferenceRequestError
-from greencompute_gateway.domain.routing import NoReadyDeploymentError
+from greencompute_gateway.domain.routing import (
+    ModelNotFoundError,
+    ModelNotRunningError,
+    ModelUnavailableError,
+    NoReadyDeploymentError,
+)
 from greencompute_gateway.infrastructure.inference_client import (
     InferenceBadResponseError,
     InferenceConnectionError,
@@ -3176,24 +3181,32 @@ def list_models(
     perfectly -- the failure looked like "your API is down", not "discovery is
     unimplemented".
 
-    Lists inference workloads the gateway can actually route to, so a client that
-    picks an id from here can use it verbatim as `model`.
+    Lists the inference models this key can call right now, so a client that
+    picks an id from here can use it verbatim as `model`: public ones, and
+    the caller's own (or shared with it) private ones, each only while a
+    replica can serve it (a ready deployment on a machine that reports). A
+    model that is starting, paused or down isn't offered; calling it says
+    why (model_not_ready, model_not_running, model_unavailable).
     """
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("list_models", api_key.key_id, limit=60, window_seconds=60)
 
+    servable = _servable_workload_ids()
     seen: dict[str, int] = {}
     for workload in service.control_plane.list_workloads():
         if getattr(workload, "kind", None) is not None and str(workload.kind).lower().rsplit(".", 1)[-1] != "inference":
+            continue
+        if workload.workload_id not in servable:
             continue
         # `public` is the same visibility flag the model catalog uses. Without it
         # this endpoint published every inference workload ever created -- 21 of
         # 25 were internal test artifacts (ssrf-poc-workload, sqli-test2,
         # file-env-leak...), which would have appeared in every customer's model
-        # picker in Cursor.
-        if not getattr(workload, "public", False):
+        # picker in Cursor. A private model is listed only for the accounts
+        # that may call it (its owner, and those it is shared with).
+        if not getattr(workload, "public", False) and not service._user_can_access_workload(workload, api_key.user_id):
             continue
-        name = (workload.name or "").strip()
+        name = _callable_model_id(workload, api_key)
         if not name or name in seen:
             continue
         created = getattr(workload, "created_at", None)
@@ -3213,6 +3226,30 @@ def list_models(
             for name in sorted(seen)
         ],
     }
+
+
+def _servable_workload_ids() -> set[str]:
+    """Workloads with a replica that can take a request now: a READY
+    deployment on a machine that is reporting (the same filter routing uses)."""
+    ready = {d.workload_id for d in service.control_plane.repository.list_deployments_by_state(DeploymentState.READY)}
+    return {wid for wid in ready if service.control_plane.list_ready_deployments(wid)}
+
+
+def _callable_model_id(workload, api_key) -> str | None:
+    """The id to list a model under: its name, which is what callers send,
+    when the name reaches this very model for this caller; else its workload
+    id. Names repeat across accounts (everyone's Llama 3.1 8B), and a name a
+    shared model also answers to reaches that one first."""
+    name = (workload.name or "").strip()
+    if not name:
+        return None
+    if getattr(workload, "public", False) and not workload.owner_user_id:
+        return name
+    try:
+        resolved, _ = service.resolve_workload_reference(name, user_id=api_key.user_id, admin=api_key.admin)
+    except NoReadyDeploymentError:
+        return workload.workload_id
+    return name if resolved.workload_id == workload.workload_id else workload.workload_id
 
 
 @router.post("/v1/chat/completions")
@@ -3298,6 +3335,10 @@ def _complete(
         raise _inference_failure(exc) from exc
 
 
+#: Retry-After on a model that is starting or being brought back.
+MODEL_UNAVAILABLE_RETRY_SECONDS = 30
+
+
 def _sse_chain(first: str | None, rest):
     """The stream the caller reads: the line already received, then the
     rest. Closing it (the caller hung up) closes the inner stream, which
@@ -3321,9 +3362,20 @@ def _inference_failure(exc: Exception) -> HTTPException:
         # doesn't support, a 400.
         metrics.increment("invoke.failure.invalid_request")
         return coded(exc.status, "validation_error" if exc.status == 422 else "invalid_request", exc.detail())
+    if isinstance(exc, ModelNotFoundError):
+        metrics.increment("invoke.failure.model_not_found")
+        return coded(404, "model_not_found", str(exc))
+    if isinstance(exc, ModelNotRunningError):
+        metrics.increment("invoke.failure.model_not_running")
+        return coded(409, "model_not_running", {
+            "message": str(exc), "deployment_id": exc.deployment_id, "paused": exc.paused,
+        })
+    if isinstance(exc, ModelUnavailableError):
+        metrics.increment("invoke.failure.model_unavailable")
+        return coded(503, "model_unavailable", str(exc), {"Retry-After": str(MODEL_UNAVAILABLE_RETRY_SECONDS)})
     if isinstance(exc, NoReadyDeploymentError):
         metrics.increment("invoke.failure.no_ready_deployment")
-        return coded(409, "model_not_ready", str(exc), {"Retry-After": "10"})
+        return coded(409, "model_not_ready", str(exc), {"Retry-After": str(MODEL_UNAVAILABLE_RETRY_SECONDS)})
     if isinstance(exc, InferenceRequestRejectedError):
         # The model refused the request itself: hand the caller its reason.
         # 413 and 422 mean something to clients; any other refusal is a 400.
@@ -3334,16 +3386,34 @@ def _inference_failure(exc: Exception) -> HTTPException:
             "message": f"The model rejected the request: {reason}",
             "upstream_status": exc.status_code,
         })
+    # The model failed on it. `model_healthy` is the gateway's health probe
+    # right after (services._handle_upstream_failure).
+    metrics.increment(
+        "invoke.failure.timeout" if isinstance(exc, InferenceTimeoutError)
+        else "invoke.failure.connection" if isinstance(exc, InferenceConnectionError)
+        else "invoke.failure.bad_response" if isinstance(exc, InferenceBadResponseError)
+        else "invoke.failure.upstream"
+    )
+    if getattr(exc, "model_healthy", None) is False:
+        return coded(503, "model_unavailable", {
+            "message": "The model isn't answering its health check right now, so it is being restarted. "
+                       "Send the request again after `retry_after_seconds`.",
+        }, {"Retry-After": str(MODEL_UNAVAILABLE_RETRY_SECONDS)})
     if isinstance(exc, InferenceTimeoutError):
-        metrics.increment("invoke.failure.timeout")
-        return HTTPException(status_code=504, detail=str(exc))
+        return coded(504, "upstream_timeout", {
+            "message": "The model is up but didn't finish this request in time. Sent unchanged it will most "
+                       "likely time out again: stream it (`stream: true`) or ask for fewer tokens (`max_tokens`).",
+        })
     if isinstance(exc, InferenceConnectionError):
-        metrics.increment("invoke.failure.connection")
-    elif isinstance(exc, InferenceBadResponseError):
-        metrics.increment("invoke.failure.bad_response")
-    else:
-        metrics.increment("invoke.failure.upstream")
-    return HTTPException(status_code=502, detail=str(exc))
+        return coded(503, "model_unavailable", {
+            "message": "The connection to the model dropped, but the model is up: send the request again.",
+        }, {"Retry-After": "5"})
+    reason = getattr(exc, "upstream_message", None) or "it gave no reason"
+    return coded(502, "upstream_error", {
+        "message": f"The model is up but failed on this request ({reason}). Sent unchanged it will most likely "
+                   f"fail again; a shorter request or fewer tokens may work. If it keeps happening, write to {SUPPORT}.",
+        "upstream_status": getattr(exc, "status_code", None),
+    })
 
 
 @router.post("/v1/completions")

@@ -70,7 +70,12 @@ from greencompute_gateway.domain.inference_requests import (
     model_auto_tool_choice,
     model_context_limit,
 )
-from greencompute_gateway.domain.routing import NoReadyDeploymentError
+from greencompute_gateway.domain.routing import (
+    ModelNotFoundError,
+    ModelNotRunningError,
+    ModelUnavailableError,
+    NoReadyDeploymentError,
+)
 from greencompute_gateway.infrastructure.inference_client import (
     HttpInferenceClient,
     InferenceBadResponseError,
@@ -2072,7 +2077,7 @@ class GatewayService:
         named = self._pick_named_workload(model, user_id=user_id, admin=admin)
         if named is not None:
             return named, {"matched_by": "name", "host": normalized_host, "model": model}
-        raise NoReadyDeploymentError(f"unknown model={model}")
+        raise ModelNotFoundError(f"unknown model={model}")
 
     def _pick_named_workload(self, name: str, *, user_id: str | None, admin: bool) -> WorkloadSpec | None:
         """The workload a name means for this caller. Names repeat (everyone
@@ -2143,7 +2148,7 @@ class GatewayService:
         # with them, or a public one. Otherwise report it as an unknown model so
         # a private workload's existence is not enumerable via its id/alias/name.
         if not admin and not self._user_can_access_workload(workload, user_id):
-            raise NoReadyDeploymentError(f"unknown model={request.model}")
+            raise ModelNotFoundError(f"unknown model={request.model}")
         # Before anything reaches (or probes) a backend: a request no model
         # here can serve is answered at once, with the reason.
         check_chat_request(
@@ -2167,7 +2172,7 @@ class GatewayService:
                     "created_at": datetime.now(UTC).isoformat(),
                 }
             )
-            raise NoReadyDeploymentError(f"no ready deployment for model={request.model}")
+            raise self._why_no_replica(workload, request.model)
 
         healthy: list[DeploymentRecord] = []
         for deployment in candidates:
@@ -2209,7 +2214,7 @@ class GatewayService:
                     "created_at": datetime.now(UTC).isoformat(),
                 }
             )
-            raise NoReadyDeploymentError(f"no healthy deployment available for model={request.model}")
+            raise ModelUnavailableError(f"no replica of model={request.model} is answering its health check right now")
 
         # Latency-aware: sort healthy deployments by EMA latency ascending
         # (faster miners first). Deployments without a latency sample keep
@@ -2232,6 +2237,46 @@ class GatewayService:
             "candidate_count": len(ordered),
         }
         return ordered, routing_out
+
+    _STARTING = frozenset({DeploymentState.PENDING, DeploymentState.SCHEDULED, DeploymentState.PULLING,
+                           DeploymentState.STARTING})
+
+    def _why_no_replica(self, workload: WorkloadSpec, model: str) -> NoReadyDeploymentError:
+        """Why a known model has nothing to route to, as the error the caller
+        acts on: starting (retry shortly), its machine silent or a shared
+        model with no replica up (the platform brings one back: retry later),
+        or a customer's own model that isn't running (paused or ended:
+        retrying won't help until it is resumed or redeployed)."""
+        deployments = self.control_plane.repository.list_deployments_for_workload(workload.workload_id)
+        states = {d.state for d in deployments}
+        if states & self._STARTING:
+            return NoReadyDeploymentError(f"model={model} is starting; it answers once a replica is ready")
+        if states & {DeploymentState.READY, DeploymentState.DRAINING}:
+            return ModelUnavailableError(f"the machine serving model={model} isn't reporting right now")
+        platform_run = (workload.metadata or {}).get("managed_by") == "flux" or not workload.owner_user_id
+        if platform_run:
+            return ModelUnavailableError(f"no replica of model={model} is running right now")
+        def when(d: DeploymentRecord) -> float:
+            at = d.updated_at or d.created_at
+            if at is None:
+                return 0.0
+            return (at if at.tzinfo else at.replace(tzinfo=UTC)).timestamp()
+
+        latest = sorted(deployments, key=when, reverse=True)
+        paused = next((d for d in latest if d.state == DeploymentState.SUSPENDED), None)
+        if paused is not None:
+            why = paused.last_error or "no requests for a while"
+            return ModelNotRunningError(
+                f"model={model} is paused ({why}); resume it with POST /platform/deployments/"
+                f"{paused.deployment_id}/resume, or from its page in the dashboard",
+                deployment_id=paused.deployment_id, paused=True,
+            )
+        last = latest[0] if latest else None
+        why = f"its last deployment ended: {last.last_error}" if last is not None and last.last_error else "it has no deployment"
+        return ModelNotRunningError(
+            f"model={model} isn't running ({why}); deploy it again",
+            deployment_id=last.deployment_id if last is not None else None,
+        )
 
     def _select_deployment_for_request(
         self,
@@ -2317,10 +2362,28 @@ class GatewayService:
             # from one caller mark a shared model FAILED for everyone.
             decision = "rejected"
             self.metrics.increment("inference.request_rejected")
-        elif not self._is_external(deployment):
-            self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
-        else:
+        elif self._is_external(deployment):
             log.warning("external upstream failed model=%s: %s", routing.get("model"), exc)
+            if isinstance(exc, InferenceUpstreamError) and exc.model_healthy is None:
+                # Nothing to probe: unreachable means down; any other failure
+                # was this request's.
+                exc.model_healthy = not isinstance(exc, InferenceConnectionError)
+        else:
+            # A timeout, a dropped connection or a 5xx counts against the
+            # model only if it fails a health probe right now too. A healthy
+            # probe means this request failed (one huge completion timing
+            # out, say), not the model: counting those let a few long
+            # requests mark a shared model FAILED for everyone.
+            healthy = not getattr(exc, "model_unreachable", False) and self.inference_client.check_deployment_health(
+                deployment
+            )
+            if isinstance(exc, InferenceUpstreamError):
+                exc.model_healthy = healthy
+            if healthy:
+                decision = "failed_model_healthy"
+                self.metrics.increment("inference.failure.model_healthy")
+            else:
+                self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
         self.repository.record_routing_decision(
             {
                 **routing,
@@ -2334,8 +2397,15 @@ class GatewayService:
     @staticmethod
     def _worth_another_replica(exc: RuntimeError) -> bool:
         """Whether a failed request should be sent to the next replica. Not
-        when the request itself was refused: every replica would refuse it."""
-        return not isinstance(exc, InferenceRequestRejectedError)
+        when the request itself was refused (every replica would refuse it),
+        nor when a healthy model timed out or failed on it (another would
+        most likely do the same, after another full wait). Yes when the
+        model is down or the connection to it dropped."""
+        if isinstance(exc, InferenceRequestRejectedError):
+            return False
+        if getattr(exc, "model_healthy", None) is True and not isinstance(exc, InferenceConnectionError):
+            return False
+        return True
 
     @staticmethod
     def _classify_inference_error(exc: RuntimeError) -> str:

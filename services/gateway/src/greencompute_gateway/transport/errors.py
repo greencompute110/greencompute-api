@@ -37,8 +37,8 @@ SUPPORT = "support@green-compute.com"
 
 #: Codes whose request may succeed if sent again later, unchanged.
 RETRYABLE = frozenset({
-    "no_capacity", "rate_limited", "idempotency_in_progress", "model_not_ready", "unavailable", "server_error",
-    "terminal_limit", "account_busy",
+    "no_capacity", "rate_limited", "idempotency_in_progress", "model_not_ready", "model_unavailable", "unavailable",
+    "server_error", "terminal_limit", "account_busy",
 })
 
 #: Every code, its usual status, and what it means: the table in the docs.
@@ -46,7 +46,9 @@ RETRYABLE = frozenset({
 #: close code 4000 + status (terminal_idle and terminal_session_limit only
 #: ever arrive that way).
 CODES: dict[str, tuple[int, str]] = {
-    "invalid_request": (400, "The request can't be done as sent; `message` says why."),
+    "invalid_request": (400, "The request can't be done as sent; `message` says why. From /v1, also when the "
+                             "model itself refused it (then `detail.upstream_status` is its status, kept when "
+                             "it is 413 or 422)."),
     "invalid_cursor": (400, "The paging `cursor` isn't one the API gave out, or was changed; send the previous "
                             "page's X-Next-Cursor unchanged, or start again without one."),
     "gpu_unavailable": (400, "None of the GPU models asked for is offered; `detail.available` lists those that are."),
@@ -73,6 +75,8 @@ CODES: dict[str, tuple[int, str]] = {
     "terminal_ticket_invalid": (401, "The terminal ticket is unknown, already used, expired (60 s) or for another "
                                      "rental or key; request a new one."),
     "not_found": (404, "No such resource on this account."),
+    "model_not_found": (404, "No model by that name, id or address that this key may use; GET /v1/models lists "
+                             "the ones it can call."),
     "unknown_endpoint": (404, "No such endpoint; check the path against /openapi.json."),
     "method_not_allowed": (405, "That HTTP method isn't used on this path."),
     "conflict": (409, "The resource's current state doesn't allow this."),
@@ -80,7 +84,10 @@ CODES: dict[str, tuple[int, str]] = {
     "account_busy": (409, "Another rental is being started for this account right now (it has a limit on rentals "
                           "at once, so they start one at a time); send it again after `retry_after_seconds`."),
     "idempotency_in_progress": (409, "A request with this Idempotency-Key is still running."),
-    "model_not_ready": (409, "The model has no replica ready yet (starting or moving); retry shortly."),
+    "model_not_ready": (409, "The model has a replica starting and none ready yet; retry after "
+                             "`retry_after_seconds`."),
+    "model_not_running": (409, "Your model isn't running: it paused after sitting idle (resume it), or its last "
+                               "deployment ended (deploy it again). `detail.deployment_id` names it."),
     "terminal_idle": (408, "The terminal closed after 15 minutes with no input or output; open a new one."),
     "terminal_session_limit": (410, "The terminal reached its 4-hour limit; open a new one."),
     "validation_error": (422, "Fields are missing or invalid; `detail` lists each one."),
@@ -95,8 +102,14 @@ CODES: dict[str, tuple[int, str]] = {
     "no_capacity": (503, "No GPU that fits is free; nothing was created. Join the waitlist (capacity alerts), "
                          "retry after `retry_after_seconds`, or ask the team for more."),
     "unavailable": (503, "Temporarily unavailable."),
+    "model_unavailable": (503, "The model exists but no replica can answer right now (its health check fails, or "
+                               "one is being started); it comes back by itself. Retry after `retry_after_seconds`."),
     "screening_unavailable": (503, "New wallets can't be checked right now; request a new challenge and try again in a few minutes."),
+    "upstream_error": (502, "The model is up but failed on this request; `message` has its reason. Sent "
+                            "unchanged it will most likely fail again."),
     "exec_unknown": (504, "A command was sent but no answer came back in time: it may or may not have run."),
+    "upstream_timeout": (504, "The model is up but didn't finish this request in time. Stream it or ask for "
+                              "fewer tokens; sent unchanged it will most likely time out again."),
 }
 
 
@@ -228,6 +241,8 @@ def _message(code: str, detail: Any, text: str, retry_after: int | None) -> str:
         return f"Something went wrong on our side. Try again in a minute; if it keeps happening, write to {SUPPORT}."
     if code == "not_found":
         return _sentence(text or "Not found") + " Check the id; it may belong to another account."
+    if code == "model_not_found":
+        return _sentence(text or "Unknown model") + " GET /v1/models lists the models this key can call."
     if code == "unavailable" and not text:
         return "The service is busy. Try again in a minute."
     return _sentence(text) or _sentence(CODES.get(code, (0, "The request failed."))[1])
