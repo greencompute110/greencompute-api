@@ -421,6 +421,8 @@ def test_a_rental_paused_at_the_cap_is_kept_like_one_whose_credit_ran_out(db, mo
     paused_at = paused_at if paused_at.tzinfo else paused_at.replace(tzinfo=UTC)
     assert svc.suspension_terms(db.cp.get_deployment(saved))[0] > 0  # storage charge while kept
     assert svc.reap_exhausted_pods(now=paused_at + timedelta(minutes=settings.pod_unsaved_grace_minutes, seconds=5)) == [unsaved]
+    assert db.cp.get_deployment(unsaved).last_error == (
+        f"unsaved pod removed {settings.pod_unsaved_grace_minutes}min after a spend limit paused it")
     assert db.cp.get_deployment(saved).state == DeploymentState.SUSPENDED
 
 

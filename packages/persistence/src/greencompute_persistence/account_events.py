@@ -25,7 +25,7 @@ from greencompute_persistence.orm import AccountEventORM
 EVENT_TYPES: dict[str, str] = {
     "deployment.ready": "A rental or private model is running (also after a resume: see `previous_state`).",
     "deployment.failed": "It could not start, or stopped with an error; `error` says why. Nothing is billed for a start that failed.",
-    "deployment.suspended": "It was paused: `suspended_reason` is `balance` (credit ran out) or `idle` (a private model nobody called).",
+    "deployment.suspended": "It was paused: `suspended_reason` is `balance` (credit ran out), `spend_limit` (the account or the API key that started it reached its spend limit) or `idle` (a private model nobody called).",
     "deployment.terminated": "It was stopped for good: deleted, or `max_runtime_minutes` reached.",
     "balance.low": "Your balance lasts under 24 hours at the current rate (sent again under 2 hours).",
     "capacity.available": "GPUs you asked to hear about (POST /platform/capacity-alerts) are free now.",

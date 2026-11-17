@@ -2259,10 +2259,16 @@ class ControlPlaneService:
             deadline = retention_seconds if deployment.save_on_exhaustion else grace_seconds
             if age < deadline:
                 continue
+            # Why it was paused: an empty balance, or a spend limit.
+            paused_by = (
+                "a spend limit paused it"
+                if deployment.suspended_reason == self.SUSPENDED_FOR_SPEND_LIMIT
+                else "credits ran out"
+            )
             reason = (
                 f"saved-pod retention expired ({settings.pod_saved_retention_days}d)"
                 if deployment.save_on_exhaustion
-                else f"unsaved pod removed {settings.pod_unsaved_grace_minutes}min after credits ran out"
+                else f"unsaved pod removed {settings.pod_unsaved_grace_minutes}min after {paused_by}"
             )
             try:
                 self.update_deployment_status(
