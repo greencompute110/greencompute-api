@@ -190,6 +190,7 @@ def api_index() -> dict:
         "interactive_docs": "https://api.green-compute.com/docs",
         "pricing": "https://api.green-compute.com/platform/pricing",
         "gpu_models": "https://api.green-compute.com/platform/nodes/supported",
+        "status": "https://api.green-compute.com/platform/status",
         "inference_base_url": "https://api.green-compute.com/v1",
         "auth": "Authorization: Bearer <api key> -- create one at https://www.green-compute.com/settings",
         "wallet_sign_in": "No account yet? POST /platform/auth/wallet/challenge, sign the message with your "

@@ -3564,11 +3564,11 @@ def public_pricing() -> dict:
     }
 
 
-def _public_inference_model_names() -> list[str]:
-    """Names of the public inference workloads -- the same filter /v1/models
-    uses -- less customers' own models, which are paid for by the hour by
-    their owner rather than per token."""
-    names = []
+def _public_inference_workloads() -> list:
+    """The public inference workloads -- the same filter /v1/models uses --
+    less customers' own models, which are paid for by the hour by their owner
+    rather than per token. Only named ones: the name is what callers use."""
+    out = []
     for workload in service.control_plane.list_workloads():
         kind = getattr(workload, "kind", None)
         if kind is not None and str(kind).lower().rsplit(".", 1)[-1] != "inference":
@@ -3579,10 +3579,65 @@ def _public_inference_model_names() -> list[str]:
             workload.workload_id, getattr(workload, "metadata", None)
         ):
             continue
-        name = (workload.name or "").strip()
-        if name:
-            names.append(name)
-    return list(dict.fromkeys(names))
+        if (workload.name or "").strip():
+            out.append(workload)
+    return out
+
+
+def _public_inference_model_names() -> list[str]:
+    """Names of the shared models, each once, in workload order."""
+    return list(dict.fromkeys(w.name.strip() for w in _public_inference_workloads()))
+
+
+#: Deployment states on the way to ready: a model with one is "starting".
+_COMING_UP = frozenset({
+    DeploymentState.PENDING, DeploymentState.SCHEDULED, DeploymentState.PULLING, DeploymentState.STARTING,
+})
+
+#: One answer serves every status-page poll for this long (the page asks every
+#: minute; during an incident many people do at once).
+_STATUS_TTL_SECONDS = 10.0
+_status_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _shared_model_state(workloads: list) -> str:
+    """available / starting / unavailable, by what inference routing would do:
+    a ready deployment on a live, healthy node with an endpoint takes requests."""
+    cp = service.control_plane
+    for workload in workloads:
+        if any(d.endpoint for d in cp.list_ready_deployments(workload.workload_id)):
+            return "available"
+    for workload in workloads:
+        if any(d.state in _COMING_UP for d in cp.repository.list_deployments_for_workload(workload.workload_id)):
+            return "starting"
+    return "unavailable"
+
+
+@router.get("/platform/status", response_model=None, responses=ok(schemas.PlatformStatus))
+def public_status() -> dict:
+    """Public -- whether each shared model can take requests right now, for
+    the website's status page. No API key required.
+
+    Coarse states only, the owner's rule for anything public: never a count
+    (replicas, GPUs, miners, requests), a deployment id or a host. Liveness of
+    the API itself is /healthz and /readyz.
+    """
+    cached = _status_cache.get("status")
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _STATUS_TTL_SECONDS:
+        return cached[1]
+    by_name: dict[str, list] = {}
+    for workload in _public_inference_workloads():
+        by_name.setdefault(workload.name.strip(), []).append(workload)
+    body = {
+        "models": [
+            {"model": name, "state": _shared_model_state(workloads)}
+            for name, workloads in sorted(by_name.items())
+        ],
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
+    _status_cache["status"] = (now, body)
+    return body
 
 
 @router.get("/platform/v1/debug/route/{model}", include_in_schema=False)

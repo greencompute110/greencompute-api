@@ -322,6 +322,22 @@ class Pricing(BaseModel):
     docs: str
 
 
+class ModelStatus(BaseModel):
+    model: str = Field(description="The shared model's name, as used for `model` in /v1/chat/completions.")
+    state: Literal["available", "starting", "unavailable"] = Field(
+        description="`available`: it is taking requests now. `starting`: it isn't yet, but is being brought up. "
+                    "`unavailable`: it isn't running; requests to it fail until it is.",
+    )
+
+
+class PlatformStatus(BaseModel):
+    """What the status page shows: coarse states only, never counts, ids or hosts."""
+    models: list[ModelStatus] = Field(
+        description="Every shared model in /platform/pricing, by name. Your own private models aren't listed.",
+    )
+    checked_at: str = Field(description="When these states were worked out (UTC, ISO 8601).")
+
+
 class CryptoInvoiceCreated(BaseModel):
     invoice_id: str
     currency: str
