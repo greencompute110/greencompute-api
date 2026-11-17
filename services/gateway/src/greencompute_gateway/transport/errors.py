@@ -92,7 +92,8 @@ CODES: dict[str, tuple[int, str]] = {
     "terminal_session_limit": (410, "The terminal reached its 4-hour limit; open a new one."),
     "validation_error": (422, "Fields are missing or invalid; `detail` lists each one."),
     "idempotency_key_reused": (422, "This Idempotency-Key was used with a different body."),
-    "rate_limited": (429, "Too many requests; wait `retry_after_seconds`."),
+    "rate_limited": (429, "Too many requests (or, on /v1, as many inference requests in progress for the account "
+                          "as it may have at once); wait `retry_after_seconds`."),
     "too_many_invoices": (429, "Too many unpaid crypto invoices are open."),
     "auth_throttled": (429, "Too many failed API-key checks from this address; fix the key, then wait."),
     "terminal_limit": (429, "Too many terminals are open: at most 3 per account at once, and a few per machine; "
@@ -102,8 +103,9 @@ CODES: dict[str, tuple[int, str]] = {
     "no_capacity": (503, "No GPU that fits is free; nothing was created. Join the waitlist (capacity alerts), "
                          "retry after `retry_after_seconds`, or ask the team for more."),
     "unavailable": (503, "Temporarily unavailable."),
-    "model_unavailable": (503, "The model exists but no replica can answer right now (its health check fails, or "
-                               "one is being started); it comes back by itself. Retry after `retry_after_seconds`."),
+    "model_unavailable": (503, "The model exists but no replica can answer right now (its health check fails, "
+                               "one is being started, or every one is at capacity); it comes back by itself. "
+                               "Retry after `retry_after_seconds`."),
     "screening_unavailable": (503, "New wallets can't be checked right now; request a new challenge and try again in a few minutes."),
     "upstream_error": (502, "The model is up but failed on this request; `message` has its reason. Sent "
                             "unchanged it will most likely fail again."),
