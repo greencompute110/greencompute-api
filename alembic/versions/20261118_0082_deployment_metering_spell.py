@@ -19,15 +19,15 @@ rewrite, safe on the live database, with a 5 s lock_timeout so it can't
 queue behind a long transaction. Rows already READY get a spell on their
 first meter tick after the deploy.
 
-Revision ID: 20261117_0081
-Revises: 20261117_0080
+Revision ID: 20261118_0082
+Revises: 20261118_0081
 Create Date: 2026-11-17
 """
 import sqlalchemy as sa
 from alembic import op
 
-revision = "20261117_0081"
-down_revision = "20261117_0080"
+revision = "20261118_0082"
+down_revision = "20261118_0081"
 branch_labels = None
 depends_on = None
 

@@ -405,7 +405,7 @@ def test_migration_0081_adds_and_removes_the_columns_on_sqlite(tmp_path):
     spec = importlib.util.spec_from_file_location("m0081", path)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
-    assert (m.revision, m.down_revision) == ("20261117_0081", "20261117_0080")
+    assert (m.revision, m.down_revision) == ("20261118_0082", "20261118_0081")
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'm.db'}")
     with engine.begin() as conn:
         conn.execute(sa.text("CREATE TABLE deployments (deployment_id VARCHAR(64) PRIMARY KEY, state VARCHAR(32))"))
