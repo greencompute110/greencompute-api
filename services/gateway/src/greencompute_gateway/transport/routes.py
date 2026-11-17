@@ -2881,16 +2881,23 @@ def _secret_out(secret) -> dict:
     value (the value is only ever handed to the machine running a rental that
     names it). An `ssh-key:` entry's SSH public key, which isn't secret, comes
     back as `public_key`."""
-    from greencompute_persistence.user_secrets import public_key_of
+    from greencompute_persistence.user_secrets import SSH_KEY_PREFIX, public_key_of
 
-    return schemas.Secret(
+    public_key = public_key_of(secret.name, secret.value)
+    out = schemas.Secret(
         secret_id=secret.secret_id,
         user_id=secret.user_id,
         name=secret.name,
-        public_key=public_key_of(secret.name, secret.value),
+        public_key=public_key,
+        # The website's saved SSH keys only: their public key again, as
+        # `value`, which website tabs from before `public_key` still read.
+        value=(public_key or "") if secret.name.startswith(SSH_KEY_PREFIX) else None,
         created_at=secret.created_at,
         updated_at=secret.updated_at,
     ).model_dump(mode="json")
+    if out["value"] is None:
+        del out["value"]  # every other secret: no `value` at all
+    return out
 
 
 def _secret_field_error(field: str, exc: ValueError) -> HTTPException:

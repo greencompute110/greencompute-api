@@ -723,6 +723,9 @@ class Secret(BaseModel):
     public_key: str | None = Field(default=None, description=(
         "Only for an `ssh-key:<label>` entry (the website's saved SSH keys): the SSH public key it holds, which "
         "isn't secret. null for every other secret."))
+    value: str | None = Field(default=None, description=(
+        "Only on an `ssh-key:` entry: the same public key (\"\" if it doesn't hold one), for older clients. "
+        "Absent on every other secret: a secret's value is never returned."))
     created_at: datetime
     updated_at: datetime
 

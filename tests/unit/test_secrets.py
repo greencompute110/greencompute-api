@@ -142,7 +142,9 @@ def test_names_are_checked(world):
 def test_an_ssh_key_entry_returns_its_public_key_and_must_be_one(world):
     saved = _secret(world, "ssh-key:laptop", PUBKEY)
     assert saved.status_code == 200 and saved.json()["public_key"] == PUBKEY
-    assert world.client.get("/platform/secrets", headers=AUTH).json()[0]["public_key"] == PUBKEY
+    listed = world.client.get("/platform/secrets", headers=AUTH).json()[0]
+    # `value` too, for website tabs from before `public_key` (k.value.slice(0, 60)).
+    assert listed["public_key"] == listed["value"] == PUBKEY
     refused = _secret(world, "ssh-key:oops", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk=\n")
     assert refused.status_code == 422 and refused.json()["detail"][0]["loc"] == ["body", "value"]
 
@@ -167,7 +169,7 @@ def test_an_old_ssh_key_entry_holding_a_secret_is_not_returned(world):
     with session_scope(world.gw.repository.session_factory) as s:
         s.add(UserSecretORM(secret_id="s1", user_id="ann", name="ssh-key:weird", value=VALUE))
     listed = world.client.get("/platform/secrets", headers=AUTH).json()
-    assert listed[0]["public_key"] is None
+    assert listed[0]["public_key"] is None and listed[0]["value"] == ""
     _no_values(listed)
 
 
