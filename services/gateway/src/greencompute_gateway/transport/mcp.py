@@ -482,7 +482,9 @@ async def mcp(request: Request) -> Response:
     try:
         api_key = await run_in_threadpool(require_api_key, authorization, x_api_key)
     except HTTPException as exc:
-        body = {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": describe_error(
+        # -32002: over the key's request rate (429); -32001: the key itself.
+        body = {"jsonrpc": "2.0", "id": None, "error": {"code": -32002 if exc.status_code == 429 else -32001,
+                                                        "message": describe_error(
             exc.status_code, exc.detail, exc.headers, getattr(exc, "error_code", None))["message"]}}
         return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
     try:

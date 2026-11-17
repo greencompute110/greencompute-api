@@ -8,7 +8,7 @@ from fastapi.responses import PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 
 from greencompute_persistence import database_ready, load_runtime_settings, render_prometheus_text
-from greencompute_gateway.transport.security import current_client_ip, current_request_route
+from greencompute_gateway.transport.security import current_client_ip, current_rate_limit, current_request_route
 from greencompute_gateway.transport.security import metrics as gateway_metrics
 from greencompute_gateway.transport.mcp import router as mcp_router
 from greencompute_gateway.transport.routes import router
@@ -141,21 +141,31 @@ app.add_middleware(
     allow_headers=["*"],
     # "*" exposes every header only to requests without credentials; with
     # credentials browsers read it as a header named "*". So the ones clients
-    # read are also named: paging (X-Next-Cursor, Link), Retry-After and
-    # Idempotent-Replayed.
-    expose_headers=["*", "X-Next-Cursor", "Link", "Retry-After", "Idempotent-Replayed"],
+    # read are also named: paging (X-Next-Cursor, Link), Retry-After,
+    # Idempotent-Replayed, the per-key rate limit and Deprecation.
+    expose_headers=[
+        "*", "X-Next-Cursor", "Link", "Retry-After", "Idempotent-Replayed",
+        "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "Deprecation",
+    ],
 )
 
 @app.middleware("http")
 async def _stash_client_ip(request, call_next):
     """Record the per-request client IP in a ContextVar so the auth helpers can
     apply a per-IP auth-failure rate limit without threading `request` through
-    every handler."""
+    every handler; likewise the route (for scopes) and a slot for the key's
+    rate limit, whose X-RateLimit-* headers are added to the response here."""
     token = current_client_ip.set(_client_ip_from_request(request))
     route_token = current_request_route.set((request.method, request.url.path))
+    rate_state = {"path": request.url.path, "counted": False, "headers": None}
+    rate_token = current_rate_limit.set(rate_state)
     try:
-        return await call_next(request)
+        response = await call_next(request)
+        for name, value in (rate_state.get("headers") or {}).items():
+            response.headers[name] = value
+        return response
     finally:
+        current_rate_limit.reset(rate_token)
         current_request_route.reset(route_token)
         current_client_ip.reset(token)
 
