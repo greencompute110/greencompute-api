@@ -155,14 +155,31 @@ def get_workload(
     workload = service.repository.get_workload(workload_id)
     if workload is None:
         raise HTTPException(status_code=404, detail="workload not found")
-    # The secrets it names (metadata.secret_env / hf_token_secret) are filled
-    # in here and only here, for the miner holding one of its leases: the
-    # machine that starts it. Any other miner gets the names alone.
-    if any(lease.workload_id == workload_id for lease in service.list_leases(hotkey)):
+    if _may_have_secrets(workload, hotkey):
         from greencompute_persistence.user_secrets import resolve_workload_secrets
 
         workload = resolve_workload_secrets(workload, service.repository.session_factory)
     return workload.model_dump(mode="json")
+
+
+def _may_have_secrets(workload, hotkey: str) -> bool:
+    """The secrets a workload names (metadata.secret_env / hf_token_secret)
+    are filled in here and only here: for the miner holding its leases (the
+    machine that starts it), and only when every one of those is a deployment
+    of the workload's owner, whose secrets they are. Anyone else gets the
+    names alone."""
+    from greencompute_persistence.user_secrets import secret_references
+
+    if not workload.owner_user_id or not secret_references(workload.metadata):
+        return False
+    leases = [lease for lease in service.list_leases(hotkey) if lease.workload_id == workload.workload_id]
+    if not leases:
+        return False
+    for lease in leases:
+        deployment = service.repository.get_deployment(lease.deployment_id)
+        if deployment is None or deployment.owner_user_id != workload.owner_user_id:
+            return False
+    return True
 
 
 @router.get("/miner/v1/leases/{hotkey}")

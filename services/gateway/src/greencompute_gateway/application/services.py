@@ -1132,6 +1132,11 @@ class GatewayService:
         if not admin:
             check_gpu_count(self.control_plane, workload)  # one made before the check at create
         if workload.owner_user_id and any(k in (workload.metadata or {}) for k in ("secret_env", "hf_token_secret")):
+            # Its secrets are its owner's: anyone else it is shared with (or
+            # public to) would get them in a pod they can SSH into.
+            if not admin and user_id != workload.owner_user_id:
+                raise PermissionError(
+                    f"workload {payload.workload_id} uses its owner's secrets, so only its owner can start it")
             # A secret it names may have been deleted since the workload was made.
             self._check_workload_secrets(workload.model_copy(deep=True))
         if not admin and (workload.metadata or {}).get("managed_by") == "flux":

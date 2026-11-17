@@ -255,9 +255,11 @@ def test_bad_references_are_refused_with_the_reason(world, metadata, says):
 def test_the_lease_holder_gets_the_values_and_no_other_miner_does(world, monkeypatch):
     _secret(world, "hf-read", VALUE)
     wid = _pod(world, {"env": {"SEED": "7"}, "secret_env": {"HF_TOKEN": "hf-read"}}).json()["workload_id"]
+    dep = world.cp.create_deployment(DeploymentCreateRequest(workload_id=wid).model_dump() | {"owner_user_id": "ann"})
     monkeypatch.setattr(cp_routes, "service", world.cp)
     monkeypatch.setattr(cp_routes, "require_miner_request", lambda *a, **k: None)
-    leases = {"hk-runs-it": [SimpleNamespace(workload_id=wid)], "hk-other": [SimpleNamespace(workload_id="w-else")]}
+    leases = {"hk-runs-it": [SimpleNamespace(workload_id=wid, deployment_id=dep.deployment_id)],
+              "hk-other": [SimpleNamespace(workload_id="w-else", deployment_id="d-else")]}
     monkeypatch.setattr(world.cp, "list_leases", lambda hotkey: leases.get(hotkey, []))
     app = FastAPI()
     app.include_router(cp_routes.router)
@@ -270,6 +272,26 @@ def test_the_lease_holder_gets_the_values_and_no_other_miner_does(world, monkeyp
     _no_values(other)
     # Handing it to the machine changed nothing stored.
     _no_values(world.cp.repository.get_workload(wid).model_dump(mode="json"))
+
+
+def test_only_the_owner_can_start_a_workload_that_uses_secrets(world, monkeypatch):
+    """A shared or public workload naming secrets would put its owner's values
+    in a pod someone else can SSH into."""
+    _secret(world, "hf-read", VALUE)
+    wid = _pod(world, {"secret_env": {"HF_TOKEN": "hf-read"}}).json()["workload_id"]
+    monkeypatch.setattr(world.gw, "_user_can_access_workload", lambda w, u: True)  # as if shared with bob
+    with pytest.raises(PermissionError, match="owner's secrets"):
+        world.gw.create_deployment({"workload_id": wid}, user_id="bob")
+    # And should one exist anyway, its machine gets the names alone.
+    bobs = world.cp.create_deployment(DeploymentCreateRequest(workload_id=wid).model_dump() | {"owner_user_id": "bob"})
+    monkeypatch.setattr(cp_routes, "service", world.cp)
+    monkeypatch.setattr(cp_routes, "require_miner_request", lambda *a, **k: None)
+    monkeypatch.setattr(world.cp, "list_leases", lambda hotkey: [
+        SimpleNamespace(workload_id=wid, deployment_id=bobs.deployment_id)])
+    app = FastAPI()
+    app.include_router(cp_routes.router)
+    got = TestClient(app).get(f"/miner/v1/workloads/{wid}", headers={"X-Miner-Hotkey": "hk"}).json()
+    _no_values(got)
 
 
 def test_a_model_names_its_hf_token_secret(world):
