@@ -23,7 +23,7 @@ from greencompute_gateway.transport.errors import install_error_handlers
 from greencompute_persistence import session_scope
 from greencompute_persistence.orm import UserORM, UserSecretORM
 from greencompute_persistence.user_secrets import is_ssh_public_key, resolve_workload_secrets
-from greencompute_protocol import DeploymentCreateRequest, WorkloadCreateRequest
+from greencompute_protocol import DeploymentCreateRequest, WorkloadCreateRequest, WorkloadSpec
 
 VALUE = "hf_live_TOPSECRET_9f8e7d"
 POOL = "pool-pass-0xDEADBEEF"
@@ -270,7 +270,7 @@ def test_the_lease_holder_gets_the_values_and_no_other_miner_does(world, monkeyp
     mine = client.get(f"/miner/v1/workloads/{wid}", headers={"X-Miner-Hotkey": "hk-runs-it"}).json()
     assert mine["metadata"]["env"] == {"SEED": "7", "HF_TOKEN": VALUE}
     other = client.get(f"/miner/v1/workloads/{wid}", headers={"X-Miner-Hotkey": "hk-other"}).json()
-    assert other["metadata"]["env"] == {"SEED": "7"} and other["metadata"]["secret_env"] == {"HF_TOKEN": "hf-read"}
+    assert "env" not in other["metadata"] and other["metadata"]["secret_env"] == {"HF_TOKEN": "hf-read"}
     _no_values(other)
     # Handing it to the machine changed nothing stored.
     _no_values(world.cp.repository.get_workload(wid).model_dump(mode="json"))
@@ -388,3 +388,36 @@ def test_masking_keeps_short_values_and_masks_shell_style_flags():
     text = "failed at step 7: docker run -e HF_TOKEN=abc123 --env=POOL=xyz img"
     assert mask_values(text, []) == "failed at step 7: docker run -e HF_TOKEN=*** --env=POOL=*** img"
     assert mask_values(None) is None
+
+
+def test_a_miner_without_a_lease_gets_no_renter_data_and_lists_only_its_own(world, monkeypatch):
+    """Any signed-in miner could read any workload's env, start command, SSH
+    keys and HF token, and list every workload id. The node agent asks for a
+    workload only for a lease it holds (start, or resuming a model)."""
+    wid = world.cp.repository.upsert_workload(WorkloadSpec(
+        name="job", image="pytorch", kind="pod", owner_user_id="ann",
+        metadata={"env": {"POOL_PASS": POOL}, "command": "./mine.sh --pass x", "hf_token": VALUE,
+                  "ssh_public_keys": [PUBKEY], "volume_size_gb": 80, "wallet_private_key": "k"})).workload_id
+    other_wid = world.cp.repository.upsert_workload(WorkloadSpec(
+        name="bobs", image="pytorch", kind="pod", owner_user_id="bob")).workload_id
+    catalog_wid = world.cp.repository.upsert_workload(WorkloadSpec(name="catalog-llama", image="vllm")).workload_id
+    dep = world.cp.create_deployment(DeploymentCreateRequest(workload_id=wid).model_dump() | {"owner_user_id": "ann"})
+    monkeypatch.setattr(cp_routes, "service", world.cp)
+    monkeypatch.setattr(cp_routes, "require_miner_request", lambda *a, **k: None)
+    monkeypatch.setattr(world.cp, "list_leases", lambda hotkey: [
+        SimpleNamespace(workload_id=wid, deployment_id=dep.deployment_id)] if hotkey == "hk-runs-it" else [])
+    app = FastAPI()
+    app.include_router(cp_routes.router)
+    client = TestClient(app)
+
+    stranger = client.get(f"/miner/v1/workloads/{wid}", headers={"X-Miner-Hotkey": "hk-other"}).json()
+    assert stranger["metadata"] == {"volume_size_gb": 80}
+    mine = client.get(f"/miner/v1/workloads/{wid}", headers={"X-Miner-Hotkey": "hk-runs-it"}).json()
+    assert mine["metadata"]["env"] == {"POOL_PASS": POOL} and mine["metadata"]["ssh_public_keys"] == [PUBKEY]
+
+    def listed(hotkey):
+        body = client.get("/miner/v1/workloads", headers={"X-Miner-Hotkey": hotkey}).text
+        return {json.loads(line[6:])["workload_id"] for line in body.splitlines()
+                if line.startswith("data: {")}
+    assert listed("hk-runs-it") == {wid, catalog_wid}
+    assert listed("hk-other") == {catalog_wid} and other_wid not in listed("hk-runs-it")

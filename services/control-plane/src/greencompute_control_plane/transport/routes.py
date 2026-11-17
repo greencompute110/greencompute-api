@@ -155,31 +155,40 @@ def get_workload(
     workload = service.repository.get_workload(workload_id)
     if workload is None:
         raise HTTPException(status_code=404, detail="workload not found")
-    if _may_have_secrets(workload, hotkey):
-        from greencompute_persistence.user_secrets import resolve_workload_secrets
-
-        workload = resolve_workload_secrets(workload, service.repository.session_factory)
-    return workload.model_dump(mode="json")
+    return _for_miner(workload, hotkey).model_dump(mode="json")
 
 
-def _may_have_secrets(workload, hotkey: str) -> bool:
-    """The secrets a workload names (metadata.secret_env / hf_token_secret)
-    are filled in here and only here: for the miner holding its leases (the
-    machine that starts it), and only when every one of those is a deployment
-    of the workload's owner, whose secrets they are. Anyone else gets the
-    names alone."""
-    from greencompute_persistence.user_secrets import secret_references
+#: Workload metadata only the machine running it gets: the renter's env,
+#: start command, SSH keys and HF token (and anything else named like a
+#: credential).
+_TENANT_META_KEYS = ("env", "command", "ssh_public_keys", "hf_token")
+_CREDENTIAL_MARKERS = ("token", "secret", "password", "apikey", "privatekey")
 
-    if not workload.owner_user_id or not secret_references(workload.metadata):
-        return False
+
+def _for_miner(workload, hotkey: str):
+    """The workload as this miner may see it. The node agent asks for a
+    workload only for a lease it holds (starting it, or bringing back a
+    suspended model); a miner without one gets it without the renter's data.
+    The secrets it names (metadata.secret_env / hf_token_secret) are filled in
+    only when every lease of it on this miner is a deployment of the
+    workload's owner, whose secrets they are."""
+    from greencompute_persistence.user_secrets import REFERENCE_KEYS, resolve_workload_secrets, secret_references
+
     leases = [lease for lease in service.list_leases(hotkey) if lease.workload_id == workload.workload_id]
     if not leases:
-        return False
+        meta = {
+            k: v for k, v in (workload.metadata or {}).items()
+            if k in REFERENCE_KEYS or (k not in _TENANT_META_KEYS
+                                       and not any(m in k.lower().replace("_", "") for m in _CREDENTIAL_MARKERS))
+        }
+        return workload.model_copy(update={"metadata": meta})
+    if not workload.owner_user_id or not secret_references(workload.metadata):
+        return workload
     for lease in leases:
         deployment = service.repository.get_deployment(lease.deployment_id)
         if deployment is None or deployment.owner_user_id != workload.owner_user_id:
-            return False
-    return True
+            return workload
+    return resolve_workload_secrets(workload, service.repository.session_factory)
 
 
 @router.get("/miner/v1/leases/{hotkey}")
@@ -255,7 +264,10 @@ def miner_stream_workloads(
 ) -> StreamingResponse:
     hotkey = x_miner_hotkey or ""
     require_miner_request(hotkey, b"", x_miner_hotkey, x_miner_signature, x_miner_nonce, x_miner_timestamp, x_miner_auth_mode=x_miner_auth_mode)
-    workloads = service.list_workloads()
+    # What this miner runs (its leases) and the platform's own catalog
+    # workloads (no owner), not every customer's workload id.
+    held = {lease.workload_id for lease in service.list_leases(hotkey)}
+    workloads = [w for w in service.list_workloads() if w.owner_user_id is None or w.workload_id in held]
     items = [{"workload_id": w.workload_id, "name": w.name, "image": w.image, "kind": w.kind.value} for w in workloads]
     return StreamingResponse(
         _sse_stream(items),
