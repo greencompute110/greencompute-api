@@ -2032,7 +2032,7 @@ def list_fleets(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
-    """Your fleets: all but those stopped more than a week ago."""
+    """Your fleets, but deleted ones."""
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
@@ -2075,14 +2075,18 @@ def update_fleet(
     return fleets.view(service, fleet)
 
 
-@router.delete("/platform/fleets/{fleet_id}", response_model=None, responses=ok(schemas.Fleet, "The stopped fleet"))
+@router.delete("/platform/fleets/{fleet_id}", response_model=None,
+               responses=ok(schemas.Fleet, "The fleet as it was stopped and deleted"))
 def stop_fleet(
     fleet_id: str,
     keep_running: bool = Query(default=False, description="true: stop the fleet but leave its rentals running."),
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    """Stop the fleet and its rentals (or only the fleet, with `keep_running=true`)."""
+    """Stop the fleet and its rentals (or only the fleet, with
+    `keep_running=true`: they carry on as ordinary rentals), and delete it:
+    it is no longer listed, and GET, PATCH or DELETE of it answer 404. To
+    stop it starting or replacing members but keep it, PATCH `paused: true`."""
     api_key = require_api_key(authorization, x_api_key)
     from greencompute_gateway.application import fleets
 

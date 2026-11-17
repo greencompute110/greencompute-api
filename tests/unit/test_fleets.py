@@ -200,7 +200,53 @@ def test_stopping_a_fleet_stops_its_rentals_unless_asked_not_to(world):
     v = fleets.view(world.gw, fleets.stop_fleet(world.gw, g.fleet_id, user_id="ann", admin=False, keep_running=True))
     assert v["state"] == "stopped" and v["members"][0]["state"] == "pending"
     fleets.fleet_once(world.gw)  # stopped fleets are left alone
-    assert len(_view(world, g.fleet_id)["members"]) == 1
+    kept = v["members"][0]["deployment_id"]
+    assert world.cp.repository.get_deployment(kept).state == DeploymentState.PENDING
+    assert [d.deployment_id for d in world.cp.repository.list_deployments_for_workload(world.wl.workload_id)
+            if d.state not in (DeploymentState.TERMINATED, DeploymentState.FAILED)] == [kept]
+
+
+def test_a_deleted_fleet_is_gone_from_lists_and_by_id(world):
+    """DELETE used to stop a fleet but leave it listed for a week, and a
+    second DELETE answered 200 (external review, Nov 2026)."""
+    f = _create(world, target=1)
+    other = _create(world, target=1, name_prefix="other")
+    v = fleets.view(world.gw, fleets.stop_fleet(world.gw, f.fleet_id, user_id="ann", admin=False, keep_running=False))
+    assert v["state"] == "stopped" and v["deleted_at"] is not None
+    assert [x.fleet_id for x in fleets.list_fleets(world.gw, "ann")] == [other.fleet_id]
+    for again in (
+        lambda: fleets.get_fleet(world.gw, f.fleet_id, "ann"),
+        lambda: fleets.update_fleet(world.gw, f.fleet_id, user_id="ann", admin=False, body={"target": 2}),
+        lambda: fleets.stop_fleet(world.gw, f.fleet_id, user_id="ann", admin=False, keep_running=True),
+    ):
+        with pytest.raises(KeyError):
+            again()
+    # Its name prefix is free again.
+    assert _create(world, target=1).name_prefix == "miner"
+
+
+def test_delete_over_http_answers_404_the_second_time(world, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from greencompute_gateway.transport import routes
+    from greencompute_gateway.transport.errors import install_error_handlers
+
+    monkeypatch.setattr(routes, "service", world.gw)
+    monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: SimpleNamespace(
+        key_id="k1", user_id="ann", admin=False, scopes=[]))
+    monkeypatch.setattr(world.cp, "online_gpu_models", lambda: ["rtx4090"])
+    app = FastAPI()
+    app.include_router(routes.router)
+    install_error_handlers(app)
+    c = TestClient(app)
+    f = _create(world, target=1)
+    first = c.delete(f"/platform/fleets/{f.fleet_id}?keep_running=true")
+    assert first.status_code == 200 and first.json()["state"] == "stopped" and first.json()["deleted_at"]
+    assert c.get("/platform/fleets").json() == []
+    assert c.get(f"/platform/fleets/{f.fleet_id}").status_code == 404
+    second = c.delete(f"/platform/fleets/{f.fleet_id}")
+    assert second.status_code == 404 and second.json()["error"]["code"] == "not_found"
 
 
 @pytest.mark.parametrize("body, says", [

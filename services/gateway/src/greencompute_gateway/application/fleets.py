@@ -374,23 +374,32 @@ def view(service, fleet: FleetORM, members: list | None = None, online: list[str
         ],
         "created_at": _utc(fleet.created_at).isoformat() if fleet.created_at else None,
         "updated_at": _utc(fleet.updated_at).isoformat() if fleet.updated_at else None,
+        "deleted_at": _utc(fleet.deleted_at).isoformat() if getattr(fleet, "deleted_at", None) else None,
     }
 
 
-def get_fleet(service, fleet_id: str, user_id: str | None, *, admin: bool = False) -> FleetORM:
+def get_fleet(service, fleet_id: str, user_id: str | None, *, admin: bool = False,
+              include_deleted: bool = False) -> FleetORM:
+    """The fleet, if it is the caller's and not deleted (KeyError otherwise:
+    a deleted fleet is gone, 404, also for a repeated DELETE)."""
     with session_scope(service.repository.session_factory) as session:
         fleet = session.get(FleetORM, fleet_id)
         if fleet is None or (not admin and fleet.owner_user_id != user_id):
             raise KeyError(f"fleet not found: {fleet_id}")
+        if fleet.deleted_at is not None and not include_deleted:
+            raise KeyError(f"fleet not found: {fleet_id} (it was deleted)")
         session.expunge(fleet)
         return fleet
 
 
 def list_fleets(service, user_id: str) -> list[FleetORM]:
-    """The account's fleets: everything not stopped, plus fleets stopped in the last week."""
+    """The account's fleets, but deleted ones (and, as before, any stopped
+    more than a week ago)."""
     with session_scope(service.repository.session_factory) as session:
         rows = session.scalars(
-            select(FleetORM).where(FleetORM.owner_user_id == user_id).order_by(FleetORM.created_at.desc())
+            select(FleetORM)
+            .where(FleetORM.owner_user_id == user_id, FleetORM.deleted_at.is_(None))
+            .order_by(FleetORM.created_at.desc())
         ).all()
         cutoff = _now() - timedelta(days=7)
         out = [f for f in rows if f.state != "stopped" or (_utc(f.updated_at) or cutoff) > cutoff]
@@ -485,17 +494,23 @@ def update_fleet(service, fleet_id: str, *, user_id: str | None, admin: bool, bo
 
 
 def stop_fleet(service, fleet_id: str, *, user_id: str | None, admin: bool, keep_running: bool) -> FleetORM:
-    """Stop the fleet: it starts and replaces nothing more (marked stopped
-    first, under the lock, so no pass can start another). Its members are
-    stopped too unless `keep_running`."""
+    """Stop and delete the fleet (DELETE /platform/fleets/{id}): it starts
+    and replaces nothing more (marked stopped first, under the lock, so no
+    pass can start another), and is no longer listed or found by id. Its
+    members are stopped too unless `keep_running` (then they carry on as
+    ordinary rentals). To stop starting members but keep the fleet, PATCH it
+    with paused: true instead."""
     fleet = get_fleet(service, fleet_id, user_id, admin=admin)
     with _fleet_lock(service, fleet_id):
         with session_scope(service.repository.session_factory) as session:
             row = session.get(FleetORM, fleet_id)
+            if row.deleted_at is not None:  # deleted meanwhile by a request sent at the same time
+                raise KeyError(f"fleet not found: {fleet_id} (it was deleted)")
             row.state = "stopped"
-            row.status_reason = ("Stopped. Its rentals keep running as ordinary rentals." if keep_running
-                                 else "Stopped, with its rentals.")
+            row.status_reason = ("Stopped and deleted. Its rentals keep running as ordinary rentals." if keep_running
+                                 else "Stopped and deleted, with its rentals.")
             row.updated_at = _now()
+            row.deleted_at = row.updated_at
         if not keep_running:
             for m, dep in _member_rows(service, fleet_id):
                 if _live(dep):
@@ -505,7 +520,7 @@ def stop_fleet(service, fleet_id: str, *, user_id: str | None, admin: bool, keep
                         log.exception("fleet %s: could not stop %s", fleet_id, m["deployment_id"])
     with _thread_locks_guard:
         _thread_locks.pop(fleet_id, None)  # a stopped fleet is never locked again
-    return get_fleet(service, fleet_id, user_id, admin=admin)
+    return get_fleet(service, fleet_id, user_id, admin=admin, include_deleted=True)
 
 
 # --- the loop -------------------------------------------------------------------

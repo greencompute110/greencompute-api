@@ -234,7 +234,8 @@ class Fleet(BaseModel):
     name_prefix: str
     target: int
     replace: bool
-    state: str = Field(description="`active`, `paused`, `completed` (replace=false, all have run) or `stopped`.")
+    state: str = Field(description=("`active`, `paused`, `completed` (replace=false, all have run), or `stopped` "
+                                    "(only in DELETE's answer: a deleted fleet is no longer listed)."))
     status: str = Field(description="What the fleet is doing or waiting for, in plain English.")
     running: int
     starting: int
@@ -246,6 +247,8 @@ class Fleet(BaseModel):
     members: list[FleetMember] = Field(description="Live members, and those that ended in the last day; newest first.")
     created_at: str | None
     updated_at: str | None
+    deleted_at: str | None = Field(default=None, description=(
+        "When DELETE stopped and removed it; after that it is not listed and GET by id is 404."))
 
 
 class LedgerItem(LedgerEntry):
