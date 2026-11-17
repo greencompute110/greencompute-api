@@ -655,8 +655,8 @@ class AccountLimitsUpdate(BaseModel):
     model_config = {"extra": "forbid"}  # a misspelt field must not clear a limit by being left out
 
     daily_spend_limit_usd: float | None = Field(default=None, ge=1, le=100000, description=(
-        "What the whole account, every key together, may spend in any 24 hours (rentals, storage and "
-        "inference), at least $1. At it: new rentals and paid model requests are refused and running "
+        "What the whole account, every key together, may spend in any 24 hours (rentals, private models and "
+        "inference; saved-pod storage isn't counted), at least $1. At it: new rentals and paid model requests are refused and running "
         "rentals are paused (suspended, kept as when credit runs out) until spending is back under it."))
     max_active_rentals: int | None = Field(default=None, ge=1, le=1000, description=(
         "Rentals (and private models) the account may have running at once. Lowering it below what runs "
@@ -677,7 +677,10 @@ class AccountLimits(BaseModel):
     """The account's own limits, every key together, and where it stands."""
     daily_spend_limit_usd: float | None = Field(description="Set by you; null: no limit.")
     max_active_rentals: int | None = Field(description="Set by you; null: no limit.")
-    spent_last_24h_usd: float = Field(description="Everything charged in the last 24 hours, by any key or none.")
+    spent_last_24h_usd: float = Field(description=(
+        "What counts against the spend limit: charged in the last 24 hours, by any key or none, for rentals, "
+        "private models and model requests. Saved-pod storage isn't counted, so paused pods never keep you at "
+        "a limit."))
     active_rentals: int = Field(description="Deployments not yet ended (starting, running or paused), any key's.")
     running_rentals: int = Field(default=0, description=(
         "Of those, the ones running (`ready`): what reaching the spend limit would pause."))

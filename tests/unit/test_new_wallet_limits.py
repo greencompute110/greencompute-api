@@ -80,7 +80,9 @@ def test_spend_is_the_account_s_last_24_hours_without_staff_clawbacks(sf):
     _charge(sf, uid, 9000, when=datetime.now(UTC) - timedelta(hours=25))
     assert account_spend_cents(sf, uid) == 4000
     assert new_account_room(sf, uid)[0] is None
-    _charge(sf, uid, 1000, kind="storage")
+    _charge(sf, uid, 1000, kind="storage")  # saved-pod storage never holds anyone at a limit
+    assert new_account_room(sf, uid)[0] is None
+    _charge(sf, uid, 1000, kind="usage")
     why, numbers = new_account_room(sf, uid)
     assert (why, numbers["spent_cents"]) == ("spend", 5000)
 

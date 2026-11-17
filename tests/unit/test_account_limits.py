@@ -527,3 +527,33 @@ def test_on_postgres_both_migrations_set_a_short_lock_timeout_first():
             sql = buf.getvalue()
             assert "SET LOCAL lock_timeout = '5s'" in sql, (number, step.__name__)
             assert sql.index("SET LOCAL lock_timeout") < sql.index("ALTER TABLE"), (number, step.__name__)
+
+
+# --- saved-pod storage never holds anyone at a limit --------------------------------------------
+
+
+def test_paused_pods_storage_does_not_keep_the_account_at_its_cap(db):
+    """The reviewer's case: a $2 cap, two saved pods paused at it, and only
+    their storage charges left in the window: there is room again."""
+    _account(db.sf, spend_cents=200)
+    pods = [_rental(db.sf, state="suspended"), _rental(db.sf, state="suspended")]
+    for dep_id in pods:
+        _charge(db.sf, "u1", 100, kind="storage", ref=dep_id)  # $1/day each, still charged
+    _charge(db.sf, "u1", 150)  # some real spend, under the cap
+    assert account_room(db.sf, "u1", starting_rental=False) == (None, None, {"spent_cents": 150})
+
+
+def test_storage_alone_never_blocks_resuming_under_a_key_s_limit(db):
+    """The reviewer's case: a key with a $1 limit whose paused pod has only
+    storage charges in the window: the owner can resume it."""
+    from greencompute_gateway.application.services import GatewayService
+
+    _account(db.sf)
+    with session_scope(db.sf) as s:
+        s.add(APIKeyORM(key_id="k1", user_id="u1", name="agent", admin=False, scopes=[], secret="s1",
+                        daily_spend_limit_cents=100))
+    dep_id = _rental(db.sf, state="suspended", key_id="k1")
+    _charge(db.sf, "u1", 300, kind="storage", ref=dep_id)
+    gw = GatewayService(repository=GatewayRepository(database_url=db.url),
+                        control_plane=ControlPlaneService(repository=db.cp))
+    gw._refuse_resume_at_spend_limits(db.cp.get_deployment(dep_id), "u1")  # no KeyLimitError

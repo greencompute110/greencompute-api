@@ -1,8 +1,9 @@
 """Per-API-key and per-account spending, for their optional limits.
 
-A key's spend is every charge on rentals it started (GPU time and saved-pod
-storage, matched through deployments.created_by_key_id) plus every inference
-request it made (matched through invocation_records.api_key_id). Shared by the
+A key's spend is every charge on rentals it started (GPU time, matched
+through deployments.created_by_key_id) plus every inference request it made
+(matched through invocation_records.api_key_id). Saved-pod storage is never
+counted against a limit (see _NOT_COUNTED). Shared by the
 gateway (checks before starting a rental or serving a request) and the control
 plane (stops running rentals once a key reaches its limit). The account's
 own limits and a new wallet account's first-week limits are at the end.
@@ -24,6 +25,13 @@ SPEND_WINDOW = timedelta(hours=24)
 # closed). The same as billing_monitor.MANUAL_DEBITS (a test keeps them equal).
 _NOT_SPEND = ("adjustment", "refund", "chargeback", "account_closed")
 
+# Ledger kinds no spend limit counts: those, and saved-pod storage. A pod a
+# limit paused keeps being charged $1/day for its disk; counting that would
+# hold the account (or key) at its limit for good (10 saved pods against a
+# $10 cap) and block resuming them. Storage is still charged, only not
+# counted here.
+_NOT_COUNTED = _NOT_SPEND + ("storage",)
+
 # Deployments in these states no longer count towards max_active_rentals.
 _FINISHED_STATES = ("terminated", "failed")
 
@@ -39,7 +47,7 @@ def key_spend_cents(session_factory, key_id: str, since: datetime | None = None)
             .where(
                 DeploymentORM.created_by_key_id == key_id,
                 LedgerEntryORM.amount_cents < 0,
-                LedgerEntryORM.kind.not_in(_NOT_SPEND),
+                LedgerEntryORM.kind.not_in(_NOT_COUNTED),
                 LedgerEntryORM.created_at >= since,
             )
         ) or 0
@@ -144,14 +152,14 @@ def new_account_limits(session_factory, user_id: str | None, now: datetime | Non
 
 def account_spend_cents(session_factory, user_id: str, since: datetime | None = None) -> int:
     """Cents the account spent since `since` (default: the last 24 hours):
-    every charge, by any key or none."""
+    every charge, by any key or none, but saved-pod storage (_NOT_COUNTED)."""
     since = since or datetime.now(UTC) - SPEND_WINDOW
     with session_scope(session_factory) as session:
         total = session.scalar(
             select(func.coalesce(func.sum(LedgerEntryORM.amount_cents), 0)).where(
                 LedgerEntryORM.user_id == user_id,
                 LedgerEntryORM.amount_cents < 0,
-                LedgerEntryORM.kind.not_in(_NOT_SPEND),
+                LedgerEntryORM.kind.not_in(_NOT_COUNTED),
                 LedgerEntryORM.created_at >= since,
             )
         ) or 0
