@@ -18,9 +18,12 @@ in the assistant's context. Pass your own public key to rent_gpu instead.
 
 rent_gpu, get_rental and stop_rental return the rental as GET
 /platform/deployments/{id} does (flat), plus the same summary under `rental`
-as before. rent_gpu makes a workload for the rental, marked
-`metadata.created_by_tool: "mcp.rent_gpu"`; stop_rental deletes that
-workload with it (and only one so marked, with no other live rental).
+as before. rent_gpu needs a workload for the rental: it reuses one it made
+before for the account with exactly the same settings (marked
+`metadata.created_by_tool: "mcp.rent_gpu"`), so renting the same machine
+again and again doesn't pile up workloads, and makes one otherwise.
+stop_rental leaves the workload: deleting a workload deletes its rentals'
+history (get_rental, list_rentals, statements).
 """
 from __future__ import annotations
 
@@ -50,10 +53,9 @@ INSTRUCTIONS = (
     "https://www.green-compute.com/docs"
 )
 ACTIVE_STATES = "pending,scheduled,pulling,starting,ready,suspended"
-#: metadata.created_by_tool on the workload rent_gpu makes, so stop_rental
-#: removes it with the rental instead of leaving it behind.
+#: metadata.created_by_tool on the workload rent_gpu makes, so a later
+#: rent_gpu with the same settings reuses it rather than making another.
 RENT_GPU_MARK = "mcp.rent_gpu"
-_FINISHED_STATES = ("terminated", "failed")
 
 # --- tools -----------------------------------------------------------------------
 
@@ -222,54 +224,56 @@ def t_rent_gpu(auth: tuple, args: dict) -> dict:
         "metadata": metadata,
     }
     idem = _str(args, "idempotency_key")
-    wl = _as("POST", "/platform/workloads", lambda: r.create_workload(
-        workload, Response(), authorization=auth[0], x_api_key=auth[1],
-        idempotency_key=f"{idem}:workload" if idem else None))
+    reused = _reusable_workload(auth, workload)
+    if reused:
+        wl = {"workload_id": reused}
+    else:
+        wl = _as("POST", "/platform/workloads", lambda: r.create_workload(
+            workload, Response(), authorization=auth[0], x_api_key=auth[1],
+            idempotency_key=f"{idem}:workload" if idem else None))
     body["workload_id"] = wl["workload_id"]
     try:
         dep = _as("POST", "/platform/deployments", lambda: r.create_deployment(
             GatewayDeploymentCreateRequest(**body), Response(), authorization=auth[0], x_api_key=auth[1],
             idempotency_key=idem))
     except Exception:
-        # Nothing was rented: don't leave the workload behind. (With an
-        # idempotency key a retry must find the same workload, so it stays.)
-        if not idem:
+        # Nothing was rented: don't leave a workload made for it behind. (With
+        # an idempotency key a retry must find the same workload, so it
+        # stays; one reused from before stays too.)
+        if not idem and not reused:
             try:
                 _as("DELETE", f"/platform/workloads/{wl['workload_id']}",
                     lambda: r.delete_workload(wl["workload_id"], authorization=auth[0], x_api_key=auth[1]))
             except Exception:  # noqa: BLE001
                 log.warning("mcp rent_gpu: could not remove workload %s after a failed rent", wl["workload_id"])
         raise
-    return {**dep, "rental": _brief(dep),
+    return {**dep, "rental": _brief(dep), "workload_reused": bool(reused),
             "next": "Starting. Call get_rental in 30 seconds; it is usually ready in 1-3 minutes."}
 
 
-def _remove_rent_gpu_workload(auth: tuple, dep: dict) -> str | None:
-    """Delete the workload rent_gpu made for this rental, now it has stopped:
-    only one marked as rent_gpu's, and only when no other rental of it is
-    live. Returns its id when deleted. Best effort: the rental is stopped
-    either way."""
+def _reusable_workload(auth: tuple, workload: dict) -> str | None:
+    """The id of a workload rent_gpu made before for this account with
+    exactly these settings (image, GPUs, SSH keys, disk, command, env,
+    secret_env, name), else None. Looked up as the POST /platform/workloads
+    it stands in for, so a key that couldn't create one can't reuse one."""
+    from greencompute_gateway.application.services import _tidy_secret_references, normalize_pod_start
+    from greencompute_protocol import WorkloadCreateRequest
+
     r = _routes()
-    workload_id = dep.get("workload_id")
-    if not isinstance(workload_id, str) or not workload_id:
-        return None
     try:
-        workload = _as("GET", f"/platform/workloads/{workload_id}",
-                       lambda: r.get_workload(workload_id, authorization=auth[0], x_api_key=auth[1]))
-        if (workload.get("metadata") or {}).get("created_by_tool") != RENT_GPU_MARK:
-            return None
-        others = [
-            d for d in r.service.control_plane.repository.list_deployments_for_workload(workload_id)
-            if d.deployment_id != dep.get("deployment_id") and getattr(d.state, "value", d.state) not in _FINISHED_STATES
-        ]
-        if others:
-            return None
-        _as("DELETE", f"/platform/workloads/{workload_id}",
-            lambda: r.delete_workload(workload_id, authorization=auth[0], x_api_key=auth[1]))
-        return workload_id
-    except Exception:  # noqa: BLE001 - the rental is stopped; the workload costs nothing
-        log.warning("mcp stop_rental: could not remove workload %s", workload_id, exc_info=True)
+        api_key = _as("POST", "/platform/workloads", lambda: r.require_api_key(auth[0], auth[1]))
+        wanted = WorkloadCreateRequest(**workload)
+        metadata = _tidy_secret_references(normalize_pod_start(dict(wanted.metadata)))
+    except Exception:  # noqa: BLE001 - no reuse: the create reports the problem
         return None
+    if getattr(api_key, "user_id", None) is None:
+        return None
+    for existing in r.service.control_plane.repository.list_workloads_by_name(wanted.name, api_key.user_id):
+        if ((existing.metadata or {}).get("created_by_tool") == RENT_GPU_MARK
+                and existing.kind == wanted.kind and existing.image == wanted.image
+                and existing.requirements == wanted.requirements and (existing.metadata or {}) == metadata):
+            return existing.workload_id
+    return None
 
 
 def t_stop_rental(auth: tuple, args: dict) -> dict:
@@ -277,12 +281,7 @@ def t_stop_rental(auth: tuple, args: dict) -> dict:
     dep_id = _str(args, "deployment_id", required=True)
     dep = _as("DELETE", f"/platform/deployments/{dep_id}",
               lambda: r.terminate_deployment(dep_id, authorization=auth[0], x_api_key=auth[1]))
-    out = {**dep, "rental": _brief(dep), "note": "Stopped: billing has stopped and its disk is deleted."}
-    removed = _remove_rent_gpu_workload(auth, dep)
-    if removed:
-        out["workload_deleted"] = removed
-        out["note"] += " The workload rent_gpu made for it was deleted too."
-    return out
+    return {**dep, "rental": _brief(dep), "note": "Stopped: billing has stopped and its disk is deleted."}
 
 
 def t_rental_logs(auth: tuple, args: dict) -> dict:
@@ -379,8 +378,7 @@ TOOLS: list[dict[str, Any]] = [
          "idempotency_key": {"type": "string", "description": "Send the same key when retrying, so a retry never rents twice."},
      }, "required": ["ssh_public_keys"]}},
     {"name": "stop_rental", "title": "Stop a rental", "handler": t_stop_rental, "readOnly": False, "destructive": True,
-     "description": ("Stop a rental for good: billing stops and its disk (/workspace) is deleted. The workload "
-                     "rent_gpu made for it is deleted too."),
+     "description": "Stop a rental for good: billing stops and its disk (/workspace) is deleted.",
      "inputSchema": {"type": "object", "properties": _ID, "required": ["deployment_id"]}},
     {"name": "rental_logs", "title": "Rental output", "handler": t_rental_logs, "readOnly": True,
      "description": "The last lines of a running rental's start command log and container output.",
