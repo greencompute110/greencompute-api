@@ -2256,6 +2256,7 @@ class GatewayService:
         platform_run = (workload.metadata or {}).get("managed_by") == "flux" or not workload.owner_user_id
         if platform_run:
             return ModelUnavailableError(f"no replica of model={model} is running right now")
+
         def when(d: DeploymentRecord) -> float:
             at = d.updated_at or d.created_at
             if at is None:
