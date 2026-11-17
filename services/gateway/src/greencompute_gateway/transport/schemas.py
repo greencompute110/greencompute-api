@@ -53,7 +53,7 @@ Deployment = create_model(
             description=(
                 "Cents per GPU per hour, quoted when the deployment is created and locked to the GPU it "
                 "is placed on (never above the quote). Your deployments, GPU rentals and private models "
-                "alike, are charged this × the GPU count, by the minute, while `ready`; requests to a "
+                "alike, are charged this × the GPU count for every started minute they are `ready`; requests to a "
                 "private model are not charged per token. (Shared catalog models aren't deployments of "
                 "yours: they are charged per token.)"
             ),
@@ -324,7 +324,7 @@ class Pricing(BaseModel):
     gpu_rental: GpuRentalPricing
     inference: InferencePricing
     private_model: PrivateModelPricing = Field(
-        description="Your own deployed model: the GPU rental rate × its GPU count, by the minute while it runs.",
+        description="Your own deployed model: the GPU rental rate × its GPU count, per started minute while it runs.",
     )
     docs: str
 

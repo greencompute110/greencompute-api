@@ -3441,7 +3441,7 @@ def public_pricing() -> dict:
         "currency": "USD",
         "payment_bonuses": {k: v for k, v in BONUS_RATES.items() if v > 0},
         "gpu_rental": {
-            "billing": "per minute while running, per GPU",
+            "billing": "per started minute while running, per GPU; starting up is free",
             "deployment_fee_usd": 0,
             "gpus": gpus,
         },
@@ -3452,7 +3452,7 @@ def public_pricing() -> dict:
         },
         "private_model": {
             "billing": (
-                "per minute while running, at the gpu_rental rate per GPU; requests to it are not "
+                "per started minute while running, at the gpu_rental rate per GPU; requests to it are not "
                 "charged per token. Starting or resuming one needs one hour of that rate in credit"
             ),
             "idle_pause_minutes": control_plane_settings.idle_private_endpoint_timeout_seconds // 60,
