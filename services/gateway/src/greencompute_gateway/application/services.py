@@ -100,6 +100,26 @@ SILENT_FAILURE_ESCALATION = int(os.getenv("GREENCOMPUTE_SILENT_FAILURE_ESCALATIO
 SILENT_FAILURE_MIN_ACCOUNTS = int(os.getenv("GREENCOMPUTE_SILENT_FAILURE_MIN_ACCOUNTS", "2"))
 
 
+def _short(text: str | None, limit: int = 300) -> str | None:
+    """A deployment's last_error for a message (it can hold a container's
+    log tail): one line, at most `limit` characters."""
+    if not text:
+        return None
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _without_null_tool_choice(request: ChatCompletionRequest) -> ChatCompletionRequest:
+    """`tool_choice: null` means the default (as if left out); vLLM refuses
+    the explicit null, so it isn't sent on."""
+    extra = request.model_extra or {}
+    if "tool_choice" not in extra or extra["tool_choice"] is not None:
+        return request
+    copied = request.model_copy()
+    copied.__pydantic_extra__ = {k: v for k, v in extra.items() if k != "tool_choice"}
+    return copied
+
+
 def _external_model_upstreams() -> dict[str, str]:
     """model_id -> base URL for models served OUTSIDE the miner fleet.
 
@@ -2485,14 +2505,15 @@ class GatewayService:
                 paused=paused is not None,
             )
         if paused is not None:
-            why = paused.last_error or "no requests for a while"
+            why = _short(paused.last_error) or "no requests for a while"
             return ModelNotRunningError(
                 f"model={model} is paused ({why}); resume it with POST /platform/deployments/"
                 f"{paused.deployment_id}/resume, or from its page in the dashboard",
                 deployment_id=paused.deployment_id, paused=True,
             )
         last = latest[0] if latest else None
-        why = f"its last deployment ended: {last.last_error}" if last is not None and last.last_error else "it has no deployment"
+        why = (f"its last deployment ended: {_short(last.last_error)}" if last is not None and last.last_error
+               else "it has no deployment")
         return ModelNotRunningError(
             f"model={model} isn't running ({why}); deploy it again",
             deployment_id=last.deployment_id if last is not None else None,
@@ -2519,7 +2540,7 @@ class GatewayService:
         here raised NoReadyDeploymentError("unknown model=...") on every call.
         """
         if deployment is not None and self._is_external(deployment):
-            return request
+            return _without_null_tool_choice(request)
         # The deployment was already chosen (by model address or by name), so
         # its workload is the model. Resolving `model` again would ignore the
         # address and fail on a name the caller didn't need to send.
@@ -2528,6 +2549,7 @@ class GatewayService:
         )
         if workload is None:
             workload, _ = self.resolve_workload_reference(request.model)
+        request = _without_null_tool_choice(request)
         if workload.runtime and workload.runtime.model_identifier:
             return request.model_copy(update={"model": workload.runtime.model_identifier})
         return request

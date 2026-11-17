@@ -756,6 +756,21 @@ class ControlPlaneService:
             routable.append(deployment)
         return sorted(routable, key=lambda item: item.updated_at, reverse=True)
 
+    def servable_workload_ids(self) -> set[str]:
+        """Workloads with a deployment list_ready_deployments would route to
+        (READY, on a node that reports, whose miner isn't unhealthy): the
+        same filter, with three queries for all of them, not two per
+        deployment."""
+        nodes = {node.node_id: node for node in self.repository.list_nodes()}
+        unhealthy = {hb.hotkey for hb in self.repository.list_heartbeats() if not hb.healthy}
+        servable: set[str] = set()
+        for deployment in self.repository.list_deployments_by_state(DeploymentState.READY):
+            node = nodes.get(deployment.node_id) if deployment.node_id else None
+            if node is None or self._is_node_stale(node) or (deployment.hotkey or "") in unhealthy:
+                continue
+            servable.add(deployment.workload_id)
+        return servable
+
     def resolve_ready_deployment(self, workload_id: str) -> DeploymentRecord | None:
         ready = self.list_ready_deployments(workload_id)
         return ready[0] if ready else None

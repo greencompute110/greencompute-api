@@ -543,6 +543,7 @@ def test_your_model_whose_deployment_ended_says_to_deploy_it_again(api, cp, node
 
 
 def _listed(api):
+    routes._servable_cache["at"] = -1e9  # each look is a fresh one
     res = api.get("/v1/models")
     assert res.status_code == 200
     return [m["id"] for m in res.json()["data"]]
@@ -920,3 +921,51 @@ def test_a_full_replica_is_busy_not_failing(api, cp, node):
         assert res.status_code == 503 and res.headers["retry-after"] == "2"
         assert res.json()["error"]["code"] == "model_unavailable"
     assert failures(cp, dep) == 0  # neither counted nor escalated
+
+
+# --- review lows ------------------------------------------------------------------------
+
+
+def test_the_non_retryable_502_and_504_tell_sdks_not_to_retry(api, cp, node):
+    _, dep = catalog_model(cp, node)
+    node.chat = (502, {"object": "error", "message": "engine error"}, None)
+    res = chat(api)
+    assert res.status_code == 502 and res.headers["x-should-retry"] == "false"
+    node.chat = "hang"
+    res = chat(api)
+    assert res.status_code == 504 and res.headers["x-should-retry"] == "false"
+
+
+def test_a_null_tool_choice_means_the_default(api, cp, node):
+    catalog_model(cp, node, extra_engine_args=["--enable-auto-tool-choice", "--tool-call-parser", "hermes"])
+    assert chat(api, tools=TOOLS, tool_choice=None).status_code == 200
+    assert "tool_choice" not in node.requests[-1]  # vLLM refuses an explicit null
+    assert node.requests[-1]["tools"] == TOOLS
+
+
+def test_a_null_tool_choice_on_a_model_without_auto_tools_says_so(api, cp, node):
+    catalog_model(cp, node)
+    res = chat(api, tools=TOOLS, tool_choice=None)
+    assert res.status_code == 400 and "tool_choice" in res.json()["error"]["message"]
+
+
+def test_model_listing_is_cached_and_doesnt_query_per_workload(api, cp, node, monkeypatch):
+    catalog_model(cp, node)
+    calls = []
+    real = cp.servable_workload_ids
+    monkeypatch.setattr(cp, "servable_workload_ids", lambda: calls.append(1) or real())
+    monkeypatch.setattr(cp, "list_ready_deployments", lambda *a, **k: pytest.fail("per-workload query"))
+    monkeypatch.setattr(routes, "_servable_cache", {"at": -1e9, "ids": set(), "service": None})
+    for _ in range(3):
+        res = api.get("/v1/models")
+        assert [m["id"] for m in res.json()["data"]] == ["qwen2.5-7b-instruct"]
+    assert len(calls) == 1
+
+
+def test_an_owner_facing_last_error_is_short(api, cp, node):
+    workload = _private(cp)
+    cp.repository.create_deployment(DeploymentRecord(
+        workload_id=workload.workload_id, owner_user_id="u1", state=DeploymentState.FAILED,
+        last_error="container exited prematurely\n" + "log line\n" * 500))
+    message = chat(api, model=workload.workload_id).json()["error"]["message"]
+    assert len(message) < 500 and "\n" not in message

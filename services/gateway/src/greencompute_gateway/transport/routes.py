@@ -3352,11 +3352,23 @@ def list_models(
     }
 
 
+#: /v1/models' list of servable workloads, kept this many seconds: clients
+#: (Cursor, aider) call it often, and it reads every READY deployment.
+_SERVABLE_TTL_SECONDS = 5.0
+_servable_cache: dict[str, Any] = {"at": -1e9, "ids": set(), "service": None}
+
+
 def _servable_workload_ids() -> set[str]:
     """Workloads with a replica that can take a request now: a READY
-    deployment on a machine that is reporting (the same filter routing uses)."""
-    ready = {d.workload_id for d in service.control_plane.repository.list_deployments_by_state(DeploymentState.READY)}
-    return {wid for wid in ready if service.control_plane.list_ready_deployments(wid)}
+    deployment on a machine that is reporting (the same filter routing
+    uses), computed at most every few seconds."""
+    now = time.monotonic()
+    cached = _servable_cache
+    if cached["service"] is service and now - cached["at"] < _SERVABLE_TTL_SECONDS:
+        return cached["ids"]
+    ids = service.control_plane.servable_workload_ids()
+    _servable_cache.update(at=now, ids=ids, service=service)
+    return ids
 
 
 def _callable_model_id(workload, api_key) -> str | None:
@@ -3499,6 +3511,9 @@ def _complete_in_slot(payload: ChatCompletionRequest, *, api_key, host: str | No
 
 #: Retry-After on a model that is starting or being brought back.
 MODEL_UNAVAILABLE_RETRY_SECONDS = 30
+#: OpenAI's SDKs retry a 502/504 by themselves unless told not to; these two
+#: would fail the same way again.
+_NO_RETRY = {"x-should-retry": "false"}
 
 
 def _sse_chain(first: str | None, rest):
@@ -3571,7 +3586,7 @@ def _inference_failure(exc: Exception) -> HTTPException:
         return coded(504, "upstream_timeout", {
             "message": "The model is up but didn't finish this request in time. Sent unchanged it will most "
                        "likely time out again: stream it (`stream: true`) or ask for fewer tokens (`max_tokens`).",
-        })
+        }, _NO_RETRY)
     if isinstance(exc, InferenceConnectionError):
         return coded(503, "model_unavailable", {
             "message": "The connection to the model dropped, but the model is up: send the request again.",
@@ -3581,7 +3596,7 @@ def _inference_failure(exc: Exception) -> HTTPException:
         "message": f"The model is up but failed on this request ({reason}). Sent unchanged it will most likely "
                    f"fail again; a shorter request or fewer tokens may work. If it keeps happening, write to {SUPPORT}.",
         "upstream_status": getattr(exc, "status_code", None),
-    })
+    }, _NO_RETRY)
 
 
 #: Sampling fields a legacy completion passes on to the model unchanged.
