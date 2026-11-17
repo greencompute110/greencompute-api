@@ -1850,8 +1850,8 @@ def _webhook_call(fn):
 
 @router.get("/platform/events", response_model=None, responses=ok(schemas.EventPage, "Events after `after`"))
 def list_account_events(
-    after: int = 0,
-    limit: int = 100,
+    after: Annotated[int, Query(ge=0, description="The `next_after` of the previous page; 0 for the oldest.")] = 0,
+    limit: Annotated[int, Query(ge=1, description="At most this many (up to 500).")] = 100,
     types: str | None = None,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -2389,7 +2389,7 @@ def get_deployment_stats(
             responses=ok(schemas.PodLogs, "The last lines of the rental's output"))
 def get_deployment_logs(
     deployment_id: str,
-    lines: int = 200,
+    lines: Annotated[int, Query(ge=1, description="Lines of each log, from the end (up to 2000).")] = 200,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
@@ -2971,7 +2971,7 @@ def create_commercial_inquiry(
 def list_commercial_inquiries(
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    offset: Annotated[int, Query(ge=0)] = 0,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -3046,7 +3046,7 @@ def create_bare_metal_inquiry(
 def list_bare_metal_inquiries(
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    offset: Annotated[int, Query(ge=0)] = 0,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -3561,7 +3561,7 @@ def debug_route(
 
 @router.get("/platform/v1/debug/routing-decisions", include_in_schema=False)
 def debug_routing_decisions(
-    limit: int = 50,
+    limit: Annotated[int, Query(ge=1)] = 50,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -3589,7 +3589,7 @@ def payment_summary(
 
 @router.get("/platform/v1/invocations", include_in_schema=False)
 def list_invocations(
-    limit: int = 100,
+    limit: Annotated[int, Query(ge=1)] = 100,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -3599,7 +3599,7 @@ def list_invocations(
 
 @router.get("/platform/v1/invocations/exports/recent", include_in_schema=False)
 def export_recent_invocations(
-    limit: int = 50,
+    limit: Annotated[int, Query(ge=1)] = 50,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
@@ -3690,7 +3690,7 @@ def get_invocation(
 
 @router.get("/platform/v1/debug/invocation-failures", include_in_schema=False)
 def debug_invocation_failures(
-    limit: int = 100,
+    limit: Annotated[int, Query(ge=1)] = 100,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -3953,17 +3953,21 @@ def billing_statement(
     return statement
 
 
+#: The most ledger rows one page returns (one row per metered minute adds up).
+LEDGER_PAGE_MAX = 1000
+
+
 @router.get("/platform/billing/ledger", response_model=None, responses=ok(list[schemas.LedgerItem], "Top-ups and charges, newest first"))
 def billing_ledger(
-    limit: int = 50,
-    offset: int = 0,
+    limit: Annotated[int, Query(ge=1, description="At most this many (up to 1000).")] = 50,
+    offset: Annotated[int, Query(ge=0, description="Skip this many of the newest first.")] = 0,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
-    entries = _get_billing().list_ledger(api_key.user_id, limit=limit, offset=offset)
+    entries = _get_billing().list_ledger(api_key.user_id, limit=min(limit, LEDGER_PAGE_MAX), offset=offset)
     return [e.model_dump(mode="json") for e in entries]
 
 
@@ -4326,7 +4330,7 @@ def billing_crypto_addresses(
 
 @router.get("/platform/billing/crypto/deposits")
 def billing_crypto_deposits(
-    limit: int = 50,
+    limit: Annotated[int, Query(ge=1)] = 50,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -4519,7 +4523,7 @@ def billing_unlink_wallet(
 @router.get("/platform/billing/admin/crypto/invoices", include_in_schema=False)
 def billing_admin_list_crypto_invoices(
     status: str | None = None,
-    limit: int = 100,
+    limit: Annotated[int, Query(ge=1)] = 100,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -4549,7 +4553,7 @@ def billing_admin_monitor(
 @router.get("/platform/billing/admin/crypto/deposits", include_in_schema=False)
 def billing_admin_list_deposits(
     status: str | None = None,
-    limit: int = 200,
+    limit: Annotated[int, Query(ge=1)] = 200,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -4723,7 +4727,7 @@ def billing_admin_ignore_deposit(
 
 @router.get("/platform/billing/admin/miner-revenue", include_in_schema=False)
 def billing_admin_miner_revenue(
-    window_hours: int = 168,
+    window_hours: Annotated[int, Query(ge=1)] = 168,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
@@ -4820,7 +4824,7 @@ def analytics_active_rentals(
 
 @router.get("/platform/admin/analytics/gpu-usage", include_in_schema=False)
 def analytics_gpu_usage(
-    days: int = 7,
+    days: Annotated[int, Query(ge=1)] = 7,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:

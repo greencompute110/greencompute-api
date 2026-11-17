@@ -1,5 +1,7 @@
 import json
-from fastapi import APIRouter, Header, HTTPException
+from typing import Annotated
+
+from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from greencompute_persistence import get_metrics_store
@@ -408,7 +410,7 @@ def usage_summary(
 
 @router.post("/platform/v1/events/process")
 def process_events(
-    limit: int = 10,
+    limit: Annotated[int, Query(ge=1)] = 10,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict[str, list]:
@@ -519,7 +521,7 @@ def debug_nodes(
 
 @router.get("/platform/v1/debug/capacity-history")
 def debug_capacity_history(
-    limit: int = 100,
+    limit: Annotated[int, Query(ge=1)] = 100,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -529,7 +531,7 @@ def debug_capacity_history(
 
 @router.get("/platform/v1/debug/placements")
 def debug_placements(
-    limit: int = 100,
+    limit: Annotated[int, Query(ge=1)] = 100,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:
@@ -539,7 +541,7 @@ def debug_placements(
 
 @router.get("/platform/v1/debug/lease-history")
 def debug_lease_history(
-    limit: int = 100,
+    limit: Annotated[int, Query(ge=1)] = 100,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> list[dict]:

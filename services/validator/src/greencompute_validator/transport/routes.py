@@ -4,8 +4,9 @@ import os
 from time import monotonic
 from urllib import request as urlrequest
 from datetime import UTC, datetime
+from typing import Annotated
 
-from fastapi import APIRouter, Header, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Header, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import Response
 
 from greencompute_persistence import get_metrics_store
@@ -215,7 +216,7 @@ def flux_demand(
 
 @router.get("/validator/v1/flux/events")
 def flux_events(
-    limit: int = 50,
+    limit: Annotated[int, Query(ge=1)] = 50,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
@@ -853,7 +854,7 @@ def list_catalog(visibility: str | None = None) -> list[dict]:
 # ====================================================================
 
 @router.get("/validator/v1/audit/reports")
-def list_audit_reports(limit: int = 100, offset: int = 0) -> dict:
+def list_audit_reports(limit: Annotated[int, Query(ge=1)] = 100, offset: Annotated[int, Query(ge=0)] = 0) -> dict:
     """Public — paginated index of audit reports published by this validator.
     Each entry includes the SHA256 anchored on-chain + its commitment tx."""
     limit = max(1, min(limit, 500))
