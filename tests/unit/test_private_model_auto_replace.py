@@ -6,12 +6,27 @@ import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from greencompute_control_plane.application import services as cp_services
 from greencompute_control_plane.application.services import ControlPlaneService
 from greencompute_control_plane.config import settings
 from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
 from greencompute_persistence import session_scope
 from greencompute_persistence.orm import UserORM
 from greencompute_protocol import DeploymentRecord, DeploymentState, WorkloadKind, WorkloadSpec
+
+
+CLOCK = [1000.0]
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch):
+    """Failures only count spread over a window (30 s): each `fail` moves
+    this clock on, the way real failures are spread out in time."""
+    monkeypatch.setattr(cp_services, "_monotonic", lambda: CLOCK[0])
+
+    def advance(seconds):
+        CLOCK[0] += seconds
+    return advance
 
 
 @pytest.fixture
@@ -43,6 +58,7 @@ def serving(cp, workload, owner="u1", **fields):
 
 def fail(cp, deployment):
     for _ in range(settings.deployment_health_failure_threshold):
+        CLOCK[0] += 20
         out = cp.record_deployment_health_failure(deployment.deployment_id, "upstream timed out for deployment=x")
     return out
 
@@ -69,7 +85,9 @@ def test_two_requests_failing_at_once_replace_it_once(cp):
     workload = private_model(cp)
     dep = serving(cp, workload)
     for _ in range(settings.deployment_health_failure_threshold - 1):
+        CLOCK[0] += 20
         cp.record_deployment_health_failure(dep.deployment_id, "x")
+    CLOCK[0] += 20
     start = threading.Barrier(4)
 
     def hit():
@@ -156,3 +174,43 @@ def test_it_can_be_turned_off(cp, monkeypatch):
     dep = serving(cp, workload)
     fail(cp, dep)
     assert others(cp, workload, dep) == []
+
+
+# --- review H1: failures must be spread over a window ------------------------------------
+
+
+def test_failures_at_the_same_moment_count_once(cp, clock):
+    workload = private_model(cp)
+    dep = serving(cp, workload)
+    for _ in range(10):  # ten requests failing together (one brief stall)
+        cp.record_deployment_health_failure(dep.deployment_id, "x")
+    got = cp.repository.get_deployment(dep.deployment_id)
+    assert got.state == DeploymentState.READY and got.health_check_failures == 1
+
+
+def test_a_15_second_node_restart_with_traffic_fails_nothing(cp, clock):
+    """Connection refused for 15 s while a request arrives every second."""
+    workload = private_model(cp)
+    dep = serving(cp, workload)
+    for _ in range(16):
+        cp.record_deployment_health_failure(dep.deployment_id, "upstream connection failed")
+        clock(1)
+    got = cp.repository.get_deployment(dep.deployment_id)
+    assert got.state == DeploymentState.READY and got.health_check_failures == 2
+    cp.clear_deployment_health_failures(dep.deployment_id)  # back: a request succeeds
+    clock(5)
+    cp.record_deployment_health_failure(dep.deployment_id, "x")
+    assert cp.repository.get_deployment(dep.deployment_id).health_check_failures == 1  # a new streak
+
+
+def test_failing_for_the_whole_window_fails_it(cp, clock):
+    workload = private_model(cp)
+    dep = serving(cp, workload)
+    started = CLOCK[0]
+    for _ in range(40):
+        cp.record_deployment_health_failure(dep.deployment_id, "x")
+        if cp.repository.get_deployment(dep.deployment_id).state == DeploymentState.FAILED:
+            break
+        clock(1)
+    assert cp.repository.get_deployment(dep.deployment_id).state == DeploymentState.FAILED
+    assert CLOCK[0] - started >= settings.deployment_health_failure_window_seconds

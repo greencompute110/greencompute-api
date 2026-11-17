@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from greencompute_control_plane.application import services as cp_services
 from greencompute_control_plane.application.services import ControlPlaneService
 from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
 from greencompute_gateway.application.services import GatewayService
@@ -62,6 +64,10 @@ class FakeNode(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.health_probes += 1
+        if self.server.health == "slow":  # answers after the gateway's probe gave up
+            time.sleep(1.5)
+            self._send(200, {"status": "ok"})
+            return
         self._send(self.server.health, {"status": "ok" if self.server.health == 200 else "down"})
 
     def do_POST(self):
@@ -106,6 +112,18 @@ def node():
     server.release.set()
     server.shutdown()
     server.server_close()
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """The control plane's clock for counting health failures (they count
+    only spread over 30 s); advance(seconds) moves it on."""
+    now = [5000.0]
+    monkeypatch.setattr(cp_services, "_monotonic", lambda: now[0])
+
+    def advance(seconds):
+        now[0] += seconds
+    return advance
 
 
 @pytest.fixture
@@ -362,7 +380,7 @@ def test_a_5xx_on_a_healthy_model_is_a_502_with_its_reason_and_never_counts(api,
     assert failures(cp, dep) == 0 and state(cp, dep) == DeploymentState.READY
 
 
-def test_a_model_that_fails_its_probe_too_is_503_and_counts_to_failed(api, cp, node):
+def test_a_model_that_fails_its_probe_too_is_503_and_counts_to_failed(api, cp, node, clock):
     _, dep = catalog_model(cp, node)
     chat(api)  # healthy, served
     node.chat = (502, {"object": "error", "message": "engine dead"}, None)
@@ -374,8 +392,9 @@ def test_a_model_that_fails_its_probe_too_is_503_and_counts_to_failed(api, cp, n
     assert (err["code"], err["retryable"], err["retry_after_seconds"]) == ("model_unavailable", True, 30)
     assert res.headers["retry-after"] == "30"
     for _ in range(2):
+        clock(16)  # failures count only spread over 30 s
         chat(api)
-    assert state(cp, dep) == DeploymentState.FAILED  # 3 failed probes: replaced
+    assert state(cp, dep) == DeploymentState.FAILED  # 3 failed probes over 32 s: replaced
 
 
 def test_a_failure_whose_probe_fails_after_a_healthy_preflight_is_503(api, cp, node, monkeypatch):
@@ -551,13 +570,14 @@ def test_a_private_model_named_like_a_shared_one_is_listed_by_its_id(api, cp, no
 # --- item 6: a private model that crashes is brought back --------------------------------
 
 
-def test_a_crashed_private_model_is_replaced_and_says_so(api, cp, node):
+def test_a_crashed_private_model_is_replaced_and_says_so(api, cp, node, clock):
     mine = _private(cp)
     dep = ready_deployment(cp, mine, node, owner="u1")
     cp.repository.update_deployment(cp.repository.get_deployment(dep.deployment_id).model_copy(
         update={"ready_at": datetime.now(UTC)}))
     node.health = 503  # vLLM died: every probe fails
     for _ in range(3):
+        clock(16)
         res = chat(api, model=mine.workload_id)
         assert res.status_code == 503 and res.json()["error"]["code"] == "model_unavailable"
     assert state(cp, dep) == DeploymentState.FAILED
@@ -668,3 +688,38 @@ def test_someone_its_shared_with_isnt_told_the_owners_details(api, cp, node):
     api.caller.user_id = "u1"  # its owner is told which, and why
     body = chat(api, model=workload.workload_id).json()
     assert body["detail"]["deployment_id"] and "balance" in body["error"]["message"]
+
+
+# --- review H1: a moment's trouble never fails a model -----------------------------------
+
+
+def test_three_requests_during_a_health_stall_dont_fail_the_shared_model(api, cp, node, clock):
+    """The reviewer's case: a 1.7 s stall of the model's health check while
+    three requests arrived took the shared model to FAILED. Each request's
+    probe times out, but failures at one moment count once."""
+    _, dep = catalog_model(cp, node)
+    assert chat(api).status_code == 200
+    node.health = "slow"  # the probe (1 s timeout here) gives up on it
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(chat(api).status_code)) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results == [503, 503, 503]
+    assert state(cp, dep) == DeploymentState.READY and failures(cp, dep) == 1
+    node.health = 200
+    assert chat(api).status_code == 200 and failures(cp, dep) == 0
+
+
+def test_a_15_second_node_restart_under_traffic_fails_nothing(api, cp, node, clock):
+    _, dep = catalog_model(cp, node)
+    node.health = 503  # the node agent is restarting: nothing answers
+    node.chat = (502, {"detail": "x", "reason": "model_unreachable"}, {"X-GC-Node-Error": "model_unreachable"})
+    for _ in range(15):  # a request a second
+        assert chat(api).status_code == 503
+        clock(1)
+    assert state(cp, dep) == DeploymentState.READY and failures(cp, dep) <= 2
+    node.health = 200
+    node.chat = (200, {"model": "m", "choices": [{"message": {"role": "assistant", "content": "back"}}]}, None)
+    assert chat(api).status_code == 200 and failures(cp, dep) == 0

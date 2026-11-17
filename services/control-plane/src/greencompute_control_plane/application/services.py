@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from typing import Any
 from collections import Counter
 from datetime import UTC, datetime, timedelta
@@ -44,6 +45,10 @@ _HEALTH_FAILURE_LOCKS_GUARD = threading.Lock()
 def _health_failure_lock(workload_id: str) -> threading.Lock:
     with _HEALTH_FAILURE_LOCKS_GUARD:
         return _HEALTH_FAILURE_LOCKS.setdefault(workload_id, threading.Lock())
+
+
+def _monotonic() -> float:
+    return time.monotonic()
 
 
 class CannotResumeInPlace(ValueError):
@@ -114,6 +119,10 @@ class ControlPlaneService:
         self._placement_lock = threading.Lock()
         self.usage_aggregator = UsageAggregator()
         self.metrics = get_metrics_store("greencompute-control-plane")
+        # deployment id -> when its last health failure was counted (monotonic),
+        # for the spread-over-a-window rule (record_deployment_health_failure).
+        # In memory: the gateway, one process, is the only one counting.
+        self._health_counted_at: dict[str, float] = {}
         self._recovery_state: dict[str, object | None] = {
             "last_recovery_at": None,
             "last_recovery_error": None,
@@ -759,6 +768,11 @@ class ControlPlaneService:
             if deployment is None:
                 raise KeyError(f"deployment not found: {deployment_id}")
             was_ready = deployment.state == DeploymentState.READY
+            if not self._counts_now(deployment):
+                # Within the window of the failure counted last: the same
+                # moment's trouble, however many requests saw it.
+                self.metrics.increment("deployment.health.failed_within_window")
+                return deployment
             deployment.health_check_failures += 1
             deployment.last_error = error
             deployment.failure_class = "health_check_failure"
@@ -773,6 +787,7 @@ class ControlPlaneService:
                         observed_at=deployment.updated_at,
                     )
                 )
+                self._health_counted_at.pop(deployment_id, None)
                 if was_ready and failed.state == DeploymentState.FAILED:
                     # It failed its health checks, whatever the error's words
                     # (update_deployment_status classifies by text).
@@ -782,6 +797,27 @@ class ControlPlaneService:
                 return failed
             self.metrics.increment("deployment.health.failed")
             return self.repository.update_deployment(deployment)
+
+    def _counts_now(self, deployment: DeploymentRecord) -> bool:
+        """Whether a health failure now counts toward FAILED, and if so
+        stamp it. At most one counts per window / (threshold - 1) seconds,
+        so the threshold's failures span the whole window."""
+        counted_at = getattr(self, "_health_counted_at", None)
+        if counted_at is None:
+            counted_at = self._health_counted_at = {}
+        threshold = settings.deployment_health_failure_threshold
+        window = settings.deployment_health_failure_window_seconds
+        interval = window / (threshold - 1) if threshold > 1 else 0.0
+        now = _monotonic()
+        last = counted_at.get(deployment.deployment_id)
+        if last is None and deployment.health_check_failures > 0 and interval:
+            # Counted before this process started: when isn't known, so the
+            # streak starts over from here.
+            deployment.health_check_failures = 0
+        elif last is not None and deployment.health_check_failures > 0 and now - last < interval:
+            return False
+        counted_at[deployment.deployment_id] = now
+        return True
 
     _LIVE_STATES = frozenset({
         DeploymentState.PENDING, DeploymentState.SCHEDULED, DeploymentState.PULLING, DeploymentState.STARTING,
@@ -875,6 +911,7 @@ class ControlPlaneService:
         deployment = self.repository.get_deployment(deployment_id)
         if deployment is None:
             raise KeyError(f"deployment not found: {deployment_id}")
+        getattr(self, "_health_counted_at", {}).pop(deployment_id, None)  # a success ends the streak
         if deployment.health_check_failures == 0 and deployment.last_error is None:
             return deployment
         deployment.health_check_failures = 0
