@@ -3694,31 +3694,26 @@ def debug_invocation_failures(
     return service.control_plane.invocation_failure_report(limit=limit)
 
 
-@router.get("/registry/auth")
+@router.get("/registry/auth", include_in_schema=False)
 def registry_auth(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
-    api_key = require_api_key(authorization, x_api_key)
-    # The registry password is a shared infra credential. Scope-tighten: only
-    # hand it to a user-bound key or an admin — never to an anonymous/system
-    # key (user_id None and not admin).
-    if api_key.user_id is None and not api_key.admin:
-        raise HTTPException(status_code=403, detail="registry auth requires a user-bound api key")
-    # Audit: a shared infra credential is being handed out.
-    metrics.increment("secret_access.registry_auth")
-    log.info(
-        "secret_access event=registry_auth key_id=%s user_id=%s ip=%s",
-        api_key.key_id,
-        api_key.user_id,
-        _audit_client_ip(),
-    )
-    import base64
-    from greencompute_persistence.runtime import load_runtime_settings
-    settings = load_runtime_settings("greencompute-gateway")
-    registry_password = getattr(settings, "registry_password", "greencompute-registry")
-    auth_string = base64.b64encode(f":{registry_password}".encode()).decode()
-    return {"authenticated": True, "auth_header": f"Basic {auth_string}"}
+    """Turned off (501). It handed every account the same static Basic
+    credential (":" + GREENCOMPUTE_REGISTRY_PASSWORD, by default
+    "greencompute-registry") for the builder's OCI registry. Production runs
+    no such registry and nothing pulls from one (rentals and models use
+    public images; the builder pushes without credentials), so it unlocked
+    nothing; but one password for every tenant would give anyone push and pull
+    on every account's u-<id>/ namespace the day a registry came up. A
+    registry for private images needs per-account credentials first."""
+    require_api_key(authorization, x_api_key)
+    raise coded(501, "not_implemented", {
+        "status": "disabled",
+        "feature": "registry_auth",
+        "reason": "there is no customer image registry: rentals and models pull public images "
+                  "(Docker Hub, GHCR, …) by name",
+    })
 
 
 @router.get("/guess/vllm_config")
