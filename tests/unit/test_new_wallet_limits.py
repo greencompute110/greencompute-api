@@ -1,6 +1,7 @@
 """A wallet account in its first week: at most 2 rentals at once and $50 of
-spend a day for the whole account, until it is 7 days old or the website has
-confirmed an email for it. Email and Google accounts are never limited."""
+spend a day for the whole account, until it is 7 days old, the website has
+confirmed an email for it, or it has paid in $20 in crypto
+(test_new_wallet_deposit_lift). Email and Google accounts are never limited."""
 import types
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -55,9 +56,11 @@ def test_the_limits_come_from_the_environment(sf, monkeypatch):
     monkeypatch.setenv("GREENCOMPUTE_NEW_WALLET_MAX_RENTALS", "5")
     monkeypatch.setenv("GREENCOMPUTE_NEW_WALLET_DAILY_SPEND_USD", "12.5")
     monkeypatch.setenv("GREENCOMPUTE_NEW_WALLET_DAYS", "1")
+    monkeypatch.setenv("GREENCOMPUTE_NEW_WALLET_LIFT_DEPOSIT_USD", "25")
     uid = _account(sf, age=timedelta(hours=1))
     assert {k: v for k, v in new_account_limits(sf, uid).items() if k != "until"} == {
-        "max_active_rentals": 5, "daily_spend_limit_usd": 12.5}
+        "max_active_rentals": 5, "daily_spend_limit_usd": 12.5, "lifts_after_deposit_usd": 25.0,
+        "deposited_usd": 0.0}
     assert new_account_limits(sf, _account(sf, "older", age=timedelta(hours=25))) is None
 
 

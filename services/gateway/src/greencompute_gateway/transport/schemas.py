@@ -609,10 +609,17 @@ class WalletDepositAddress(BaseModel):
 
 
 class NewAccountLimits(BaseModel):
-    """A new wallet account's limits for its first 7 days, for every key together."""
+    """A new wallet account's limits for its first 7 days, for every key
+    together. They end sooner once the account has paid in
+    `lifts_after_deposit_usd` in crypto (TAO, alpha, USDC or USDT), or adds an
+    email on the website."""
     max_active_rentals: int
     daily_spend_limit_usd: float
-    until: str = Field(description="When they end. Adding an email on the website ends them sooner.")
+    until: str = Field(description="When they end at the latest.")
+    lifts_after_deposit_usd: float | None = Field(
+        default=None, description="Crypto paid in (credited deposits) that ends them at once.")
+    deposited_usd: float | None = Field(
+        default=None, description="Crypto paid in so far; card payments and staff credits don't count.")
 
 
 class CreditedDeposit(BaseModel):

@@ -493,23 +493,32 @@ def wallet_auth_verify(
     if result["api_key"] is None:
         return {**result, "next_steps": ["No key was issued. Sign a new `sign_in` challenge to get one."]}
     chain, address, user_id = result["wallet"]["chain"], result["wallet"]["address"], result["user_id"]
-    limits = new_account_limits(sf, user_id)
-    if limits:
-        limits = {**limits, "until": limits["until"].isoformat()}
     deposits = _wallet_deposit_addresses(chain)
     pay = ("TAO or alpha (subnet 110)" if chain == "bittensor" else "USDC or USDT on Base or Ethereum")
+    credited = _claim_wallet_payments(user_id, chain, address)
+    # After claiming: payments just credited count toward lifting them.
+    limits = new_account_limits(sf, user_id)
+    next_steps = [
+        "Send the key as `Authorization: Bearer <api_key>` on every request.",
+        f"Add credit: send {pay} from THIS wallet to the matching `deposit_addresses` entry. It is "
+        "credited within a few minutes, with no invoice (event `payment.credited`; check "
+        "GET /platform/billing/balance).",
+        "Rent: GET /platform/pricing, then POST /platform/workloads and POST /platform/deployments "
+        "(https://www.green-compute.com/docs/agents).",
+    ]
+    if limits:
+        from greencompute_persistence.key_limits import new_account_lift_text
+
+        next_steps.insert(2, (
+            f"For its first 7 days this account may run {limits['max_active_rentals']} rentals at once and "
+            f"spend ${limits['daily_spend_limit_usd']:.2f} in any 24 hours (`account_limits`). To lift that "
+            f"now, {new_account_lift_text(limits)}."))
+        limits = {**limits, "until": limits["until"].isoformat()}
     result.update(
         account_limits=limits,
         deposit_addresses=deposits,
-        credited=_claim_wallet_payments(user_id, chain, address),
-        next_steps=[
-            "Send the key as `Authorization: Bearer <api_key>` on every request.",
-            f"Add credit: send {pay} from THIS wallet to the matching `deposit_addresses` entry. It is "
-            "credited within a few minutes, with no invoice (event `payment.credited`; check "
-            "GET /platform/billing/balance).",
-            "Rent: GET /platform/pricing, then POST /platform/workloads and POST /platform/deployments "
-            "(https://www.green-compute.com/docs/agents).",
-        ],
+        credited=credited,
+        next_steps=next_steps,
     )
     if result["has_email"]:
         _email_wallet_sign_in(user_id, chain, address, result["key_name"])
@@ -1258,20 +1267,27 @@ def _wallet_blocked() -> HTTPException:
 
 def _new_account_limit(reason: str, numbers: dict) -> HTTPException:
     """403 new_account_limit: a wallet account in its first week is at one
-    of the limits new wallet accounts have."""
+    of the limits new wallet accounts have, until it pays in enough in
+    crypto, adds an email, or the week ends."""
+    from greencompute_persistence.key_limits import new_account_lift_text
+
     until = numbers["until"].isoformat() if numbers.get("until") else None
+    lift = new_account_lift_text(numbers) if numbers.get("until") and "lifts_after_deposit_usd" in numbers else None
     if reason == "active":
         message = (
             f"New wallet accounts can have {numbers['max_active_rentals']} rentals running at once for their "
             "first 7 days"
         )
-        hint = "stop one with DELETE /platform/deployments/{id}, or wait until `until`"
+        hint = "stop one with DELETE /platform/deployments/{id}"
     else:
         message = (
             f"New wallet accounts can spend ${numbers['daily_spend_limit_usd']:.2f} in any 24 hours for their "
             "first 7 days"
         )
-        hint = "wait for earlier spending to fall out of the 24-hour window, or until `until`"
+        hint = "wait for earlier spending to fall out of the 24-hour window"
+    if lift:
+        message += f" until they have paid in ${numbers['lifts_after_deposit_usd']:.2f} in crypto"
+    deposited = numbers.get("deposited_usd")
     return coded(403, "new_account_limit", {
         "code": "new_account_limit",
         "message": message,
@@ -1281,7 +1297,9 @@ def _new_account_limit(reason: str, numbers: dict) -> HTTPException:
         "daily_spend_limit_usd": numbers.get("daily_spend_limit_usd"),
         "spent_last_24h_usd": round(numbers.get("spent_cents", 0) / 100, 2) if "spent_cents" in numbers else None,
         "until": until,
-        "hint": hint + ". Adding an email address to the account on the website (Settings) lifts these limits.",
+        "lifts_after_deposit_usd": numbers.get("lifts_after_deposit_usd"),
+        "deposited_usd": deposited,
+        "hint": f"{hint}. To lift these limits now, {lift}." if lift else f"{hint}, or wait until `until`.",
     })
 
 

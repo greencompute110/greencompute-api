@@ -330,7 +330,7 @@ def test_migration_0081_adds_and_removes_the_columns_on_sqlite(tmp_path):
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
 
-    path = next(pathlib.Path("alembic/versions").glob("*_0081_*.py"))
+    path = next(pathlib.Path("alembic/versions").glob("*_deployment_metering_spell.py"))
     spec = importlib.util.spec_from_file_location("m0081", path)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)

@@ -2545,6 +2545,7 @@ class ControlPlaneService:
             NEW_ACCOUNT,
             account_spend_cents,
             accounts_with_spend_limits,
+            new_account_lift_text,
             new_account_limits,
             stricter,
         )
@@ -2553,13 +2554,14 @@ class ControlPlaneService:
         own_limits = accounts_with_spend_limits(sf)
         # user -> (limit in cents, its source) when over it, else None
         verdict: dict[str, tuple[int, str] | None] = {}
+        new_by_user: dict[str, dict | None] = {}
         paused: list[str] = []
         for deployment in self.repository.list_deployments_by_state(DeploymentState.READY):
             user_id = deployment.owner_user_id
             if not user_id:
                 continue
             if user_id not in verdict:
-                new = new_account_limits(sf, user_id)
+                new = new_by_user[user_id] = new_account_limits(sf, user_id)
                 limit, source = stricter(
                     own_limits.get(user_id), round(new["daily_spend_limit_usd"] * 100) if new else None)
                 over = limit is not None and account_spend_cents(sf, user_id) >= limit
@@ -2570,7 +2572,7 @@ class ControlPlaneService:
             if source == NEW_ACCOUNT:
                 reason = (
                     f"paused: a new wallet account can spend ${limit / 100:.2f} in 24 hours in its first "
-                    "week, and this one has; add an email to the account (Settings) to lift the limit"
+                    f"week, and this one has; to lift the limit, {new_account_lift_text(new_by_user[user_id])}"
                 )
                 metric = "deployment.suspended.new_account_limit"
             else:

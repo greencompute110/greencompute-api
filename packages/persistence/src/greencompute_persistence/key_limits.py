@@ -16,7 +16,14 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select
 
 from greencompute_persistence.db import session_scope
-from greencompute_persistence.orm import APIKeyORM, DeploymentORM, InvocationRecordORM, LedgerEntryORM, UserORM
+from greencompute_persistence.orm import (
+    APIKeyORM,
+    CryptoDepositORM,
+    DeploymentORM,
+    InvocationRecordORM,
+    LedgerEntryORM,
+    UserORM,
+)
 
 SPEND_WINDOW = timedelta(hours=24)
 
@@ -114,11 +121,14 @@ def key_rental_room(
 
 # --- New wallet accounts ---------------------------------------------------------
 # An account a wallet signature created has no email and nobody has vouched
-# for it, which is what abuse looks like too. For its first week (unless the
-# website has since confirmed an email for it) the account as a whole, every
-# key together, may have only a few rentals running and spend only so much
-# a day. Env: GREENCOMPUTE_NEW_WALLET_MAX_RENTALS (2),
-# GREENCOMPUTE_NEW_WALLET_DAILY_SPEND_USD (50), GREENCOMPUTE_NEW_WALLET_DAYS (7).
+# for it, which is what abuse looks like too. For its first week the account
+# as a whole, every key together, may have only a few rentals running and
+# spend only so much a day, unless the website has since confirmed an email
+# for it or it has paid in enough in crypto (owner decision 2026-11-17:
+# money in is the vouching a wallet account can give). Env:
+# GREENCOMPUTE_NEW_WALLET_MAX_RENTALS (2), GREENCOMPUTE_NEW_WALLET_DAILY_SPEND_USD
+# (50), GREENCOMPUTE_NEW_WALLET_DAYS (7), GREENCOMPUTE_NEW_WALLET_LIFT_DEPOSIT_USD
+# (20).
 
 
 def _env_number(name: str, default: float) -> float:
@@ -128,14 +138,33 @@ def _env_number(name: str, default: float) -> float:
         return default
 
 
+#: What lifts the first-week limits, in the words customers read.
+CRYPTO_NAMES = "TAO, alpha, USDC or USDT"
+
+
 def new_account_limits(session_factory, user_id: str | None, now: datetime | None = None) -> dict | None:
     """The limits a new wallet account is under now, or None when it isn't
-    one: {"max_active_rentals", "daily_spend_limit_usd", "until"}."""
+    one: {"max_active_rentals", "daily_spend_limit_usd", "until",
+    "lifts_after_deposit_usd", "deposited_usd"}. They end at `until` (a week
+    after sign-up), when the website confirms an email for the account, or
+    as soon as it has paid in `lifts_after_deposit_usd` in crypto: deposits
+    the watchers or staff credited from the chain (crypto_deposits
+    "credited"), never a staff credit or a card payment.
+
+    One query (the account, with its credited deposits summed by the
+    indexed crypto_deposits.user_id): it runs on every rental start, paid
+    request and control-plane pass."""
     if not user_id:
         return None
+    deposited = (
+        select(func.coalesce(func.sum(CryptoDepositORM.credited_cents), 0))
+        .where(CryptoDepositORM.user_id == UserORM.user_id, CryptoDepositORM.status == "credited")
+        .scalar_subquery()
+    )
     with session_scope(session_factory) as session:
         row = session.execute(
-            select(UserORM.signup_method, UserORM.email_verified_at, UserORM.created_at).where(UserORM.user_id == user_id)
+            select(UserORM.signup_method, UserORM.email_verified_at, UserORM.created_at, deposited.label("deposited"))
+            .where(UserORM.user_id == user_id)
         ).first()
     if row is None or row.signup_method != "wallet" or row.email_verified_at is not None or row.created_at is None:
         return None
@@ -143,11 +172,27 @@ def new_account_limits(session_factory, user_id: str | None, now: datetime | Non
     until = created + timedelta(days=_env_number("GREENCOMPUTE_NEW_WALLET_DAYS", 7))
     if (now or datetime.now(UTC)) >= until:
         return None
+    lift_cents = round(_env_number("GREENCOMPUTE_NEW_WALLET_LIFT_DEPOSIT_USD", 20) * 100)
+    deposited_cents = int(row.deposited or 0)
+    if deposited_cents >= lift_cents:
+        return None
     return {
         "max_active_rentals": int(_env_number("GREENCOMPUTE_NEW_WALLET_MAX_RENTALS", 2)),
         "daily_spend_limit_usd": _env_number("GREENCOMPUTE_NEW_WALLET_DAILY_SPEND_USD", 50),
         "until": until,
+        "lifts_after_deposit_usd": lift_cents / 100,
+        "deposited_usd": deposited_cents / 100,
     }
+
+
+def new_account_lift_text(limits: dict) -> str:
+    """How a new wallet account gets out of its limits early, e.g. "deposit
+    $15.00 more in crypto (TAO, alpha, USDC or USDT) or add an email address
+    on the website (Settings), or wait until 2026-11-24 10:00 UTC"."""
+    more = max(0.0, limits["lifts_after_deposit_usd"] - limits["deposited_usd"])
+    until = limits["until"].strftime("%Y-%m-%d %H:%M UTC")
+    return (f"deposit ${more:.2f} more in crypto ({CRYPTO_NAMES}) or add an email address on the website "
+            f"(Settings), or wait until {until}")
 
 
 def account_spend_cents(session_factory, user_id: str, since: datetime | None = None) -> int:
