@@ -60,9 +60,25 @@ class Slot:
                     _slots.pop(self.account, None)
 
 
+class _NoSlot(Slot):
+    """For a request that isn't limited (the caller's own private model)."""
+
+    def __init__(self) -> None:
+        self.account = ""
+        self.slot_id = ""
+
+    def release(self) -> None:
+        pass
+
+
+NO_SLOT = _NoSlot()
+
+
 def claim_slot(api_key: Any) -> Slot:
     """Count one more /v1 request in progress for the key's account, or raise
-    429 `rate_limited` when it already has V1_MAX_IN_FLIGHT_PER_ACCOUNT."""
+    429 `rate_limited` when it already has V1_MAX_IN_FLIGHT_PER_ACCOUNT.
+    Only requests to shared models count; a caller's own private model
+    isn't limited (routes._complete doesn't claim one for it)."""
     account = getattr(api_key, "user_id", None) or f"key:{getattr(api_key, 'key_id', None)}"
     now = time.monotonic()
     with _slots_lock:
@@ -72,8 +88,9 @@ def claim_slot(api_key: Any) -> Slot:
                 held.pop(slot_id, None)
         if len(held) >= V1_MAX_IN_FLIGHT_PER_ACCOUNT:
             raise coded(429, "rate_limited", {
-                "message": f"this account already has {len(held)} inference requests in progress, the most at "
-                           f"once; send more as those finish (stream long answers to get them sooner)",
+                "message": f"this account already has {len(held)} requests in progress to shared models, the most "
+                           f"at once; send more as those finish (stream long answers to get them sooner). Your own "
+                           f"private models aren't limited this way",
                 "limit": V1_MAX_IN_FLIGHT_PER_ACCOUNT,
                 "in_flight": len(held),
                 "retry_after_seconds": 2,

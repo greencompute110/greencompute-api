@@ -3454,7 +3454,10 @@ def _complete(
     _enforce_key_limits(api_key)
     _enforce_account_spend_limit(api_key)
     _refuse_blocked_account(api_key)
-    slot = v1_capacity.claim_slot(api_key)  # at most a few in progress per account
+    # At most a few in progress per account on the shared models; a caller's
+    # own private model (their GPU, paid by the hour) isn't limited.
+    own_model = service.is_callers_own_model(payload, routed_host=host, user_id=api_key.user_id)
+    slot = v1_capacity.NO_SLOT if own_model else v1_capacity.claim_slot(api_key)
     try:
         result = _complete_in_slot(payload, api_key=api_key, host=host, text_completion=text_completion)
     except BaseException:

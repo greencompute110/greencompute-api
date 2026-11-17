@@ -2872,6 +2872,25 @@ class GatewayService:
         ready = self.control_plane.repository.list_ready_deployments(workload.workload_id)
         return not ready or not self._is_private_model(ready[0])
 
+    def is_callers_own_model(
+        self, request: ChatCompletionRequest, routed_host: str | None = None, *, user_id: str | None = None,
+    ) -> bool:
+        """Whether the request is for a private model the caller owns (their
+        own GPU, paid by the hour): the per-account limit on /v1 requests in
+        progress is for the shared models only."""
+        if not user_id or _external_model_upstreams().get((request.model or "").strip().lower()):
+            return False
+        try:
+            workload, _routing = self.resolve_workload_reference(request.model, routed_host=routed_host,
+                                                                 user_id=user_id)
+        except NoReadyDeploymentError:
+            return False
+        return (
+            workload.owner_user_id == user_id
+            and workload.kind == WorkloadKind.INFERENCE
+            and metering.is_private_model(user_id, workload.kind, workload.workload_id, workload.metadata)
+        )
+
     def _reserve_inference_budget(
         self, user_id: str, reference_id: str, request: ChatCompletionRequest
     ) -> None:

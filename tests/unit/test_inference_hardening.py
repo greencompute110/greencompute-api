@@ -873,10 +873,10 @@ def test_a_passed_on_reason_is_capped(api, cp, node):
 # --- review H3: one account can't pin the gateway's threads ------------------------------
 
 
-def _hold(api, results, user, **body):
+def _hold(api, results, user, model="qwen2.5-7b-instruct", **body):
     def run():
         res = api.post("/v1/chat/completions", headers={"X-API-Key": user}, json={
-            "model": "qwen2.5-7b-instruct", "messages": [{"role": "user", "content": "hold"}], **body})
+            "model": model, "messages": [{"role": "user", "content": "hold"}], **body})
         results.append(res.status_code)
     t = threading.Thread(target=run)
     t.start()
@@ -1019,3 +1019,30 @@ def test_an_owner_facing_last_error_is_short(api, cp, node):
     message = chat(api, model=workload.workload_id).json()["error"]["message"]
     assert len(message) < 500 and "\n" not in message
 
+
+# --- review round 2, M3: the in-flight cap is for shared models ---------------------------
+
+
+def test_your_own_private_model_isnt_capped(api, cp, node, gw, monkeypatch):
+    """It's the caller's own GPU, paid by the hour: only requests to shared
+    models count toward the account's requests in progress."""
+    from greencompute_gateway.transport import v1_capacity
+
+    monkeypatch.setattr(v1_capacity, "V1_MAX_IN_FLIGHT_PER_ACCOUNT", 1)
+    gw.inference_client.upstream_timeout_seconds = 15
+    mine = _private(cp)
+    ready_deployment(cp, mine, node, owner="u1")
+    catalog_model(cp, node)
+    results = []
+    threads = [_hold(api, results, "u1", model=mine.workload_id) for _ in range(3)]
+    _wait_for(lambda: len(node.requests) == 3)  # three at once to its own model
+    assert v1_capacity.in_flight("u1") == 0
+    held = _hold(api, results, "u1")  # one to the shared model: the cap is 1
+    _wait_for(lambda: len(node.requests) == 4)
+    res = api.post("/v1/chat/completions", headers={"X-API-Key": "u1"},
+                   json={"model": "qwen2.5-7b-instruct", "messages": [{"role": "user", "content": "hi"}]})
+    assert res.status_code == 429 and "shared models" in res.json()["error"]["message"]
+    node.release.set()
+    for t in [*threads, held]:
+        t.join()
+    assert results == [200, 200, 200, 200]
