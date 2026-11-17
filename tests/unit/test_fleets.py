@@ -541,31 +541,118 @@ def test_a_fleet_skips_a_member_the_auto_resume_sweep_already_brought_back(world
     assert ids[0] not in capped  # being resumed already: not resumed twice
 
 
-def test_a_member_its_machine_cannot_take_back_is_replaced(world, capped, monkeypatch):
-    """The reviewer's case: the limit has room, but resuming in place fails
-    (machine full or gone): the member is stopped and a replacement started."""
-    from greencompute_control_plane.application.services import CannotResumeInPlace
+@pytest.fixture(autouse=True)
+def _fresh_full_counts():
+    fleets._FULL_SEEN.clear()
+    yield
+    fleets._FULL_SEEN.clear()
 
-    f, ids = _two_paused(world)
-    _age_out_spending(world)
-    full = ids[0]
+
+def _resume_raising(world, monkeypatch, failing: dict):
+    """cp.resume_deployment raising failing[deployment_id] (an exception) for
+    those, and resuming the rest as the `capped` fixture does."""
     real = world.cp.resume_deployment
 
     def resume(deployment_id):
-        if deployment_id == full:
-            raise CannotResumeInPlace(f"insufficient capacity to resume deployment {deployment_id}")
+        if deployment_id in failing:
+            raise failing[deployment_id]
         return real(deployment_id)
 
     monkeypatch.setattr(world.cp, "resume_deployment", resume)
+
+
+def _save(world, deployment_id, keep=True):
+    dep = world.cp.repository.get_deployment(deployment_id)
+    dep.save_on_exhaustion = keep
+    world.cp.repository.update_deployment(dep)
+
+
+def test_a_saved_member_is_never_deleted_for_a_full_machine(world, capped, monkeypatch):
+    """The reviewer's probe: a saved member, its machine's report still says
+    no room (stale): it is kept, pass after pass, and resumed once the
+    machine has room."""
+    from greencompute_control_plane.application.services import MachineFull
+
+    f, ids = _two_paused(world)
+    _save(world, ids[0])
+    _age_out_spending(world)
+    failing = {ids[0]: MachineFull(f"insufficient capacity to resume deployment {ids[0]}")}
+    _resume_raising(world, monkeypatch, failing)
+    monkeypatch.setattr(fleets, "FULL_SECONDS_BEFORE_REPLACING", 0)
+    for _ in range(fleets.FULL_PASSES_BEFORE_REPLACING + 2):
+        fleets.reconcile(world.gw, f.fleet_id)
+    assert world.cp.repository.get_deployment(ids[0]).state == DeploymentState.SUSPENDED  # disk kept
+    v = _view(world, f.fleet_id)
+    assert len(v["members"]) == 2  # no replacement started
+    from greencompute_persistence.orm import FleetORM
+
+    with session_scope(world.gw.repository.session_factory) as s:
+        status = s.get(FleetORM, f.fleet_id).status_reason
+    assert "1 paused at a spend limit waiting for room on its machine (saved disks are kept" in status
+    failing.clear()  # the machine reports room now
     fleets.reconcile(world.gw, f.fleet_id)
-    assert world.cp.repository.get_deployment(full).state == DeploymentState.TERMINATED
+    assert ids[0] in capped and world.cp.repository.get_deployment(ids[0]).state == DeploymentState.READY
+
+
+def test_an_unsaved_member_is_replaced_only_after_its_machine_stays_full(world, capped, monkeypatch):
+    from greencompute_control_plane.application.services import MachineFull
+
+    f, ids = _two_paused(world)
+    _age_out_spending(world)
+    _resume_raising(world, monkeypatch, {ids[0]: MachineFull("insufficient capacity")})
+    clock = {"t": 1000.0}
+    monkeypatch.setattr("time.monotonic", lambda: clock["t"])
+    for _ in range(fleets.FULL_PASSES_BEFORE_REPLACING):
+        fleets.reconcile(world.gw, f.fleet_id)  # 3 passes, but within a few seconds
+        clock["t"] += 5
+    assert world.cp.repository.get_deployment(ids[0]).state == DeploymentState.SUSPENDED
+    clock["t"] += fleets.FULL_SECONDS_BEFORE_REPLACING
+    fleets.reconcile(world.gw, f.fleet_id)  # full for 3+ passes and 2+ minutes: replaced
+    gone = world.cp.repository.get_deployment(ids[0])
+    assert gone.state == DeploymentState.TERMINATED and gone.last_error == fleets.REPLACED_REASON
+    live = [m for m in _view(world, f.fleet_id)["members"] if m["state"] not in ("terminated", "failed")]
+    assert len(live) == 2 and ids[0] not in {m["deployment_id"] for m in live}
+
+
+def test_a_member_whose_machine_is_gone_is_replaced_saved_or_not(world, capped, monkeypatch):
+    """The limit has room, the machine is gone for good: even a saved member
+    is replaced (its disk went with the machine), under the same name, with
+    the reason in last_error rather than "user terminated"."""
+    from greencompute_control_plane.application.services import MachineGone
+
+    f, ids = _two_paused(world)
+    _save(world, ids[0])
+    _age_out_spending(world)
+    _resume_raising(world, monkeypatch, {ids[0]: MachineGone(f"node n1 for deployment {ids[0]} is no longer registered")})
+    fleets.reconcile(world.gw, f.fleet_id)
+    gone = world.cp.repository.get_deployment(ids[0])
+    assert gone.state == DeploymentState.TERMINATED and gone.last_error == fleets.REPLACED_REASON
     v = _view(world, f.fleet_id)
     live = [m for m in v["members"] if m["state"] not in ("terminated", "failed")]
-    assert len(live) == 2 and full not in {m["deployment_id"] for m in live}  # a replacement took its place
-    assert ids[1] in capped  # the other one came back in place
+    assert len(live) == 2 and ids[1] in capped
     replacement = next(m for m in live if m["deployment_id"] not in ids)
-    gone = next(m for m in v["members"] if m["deployment_id"] == full)
-    assert replacement["name"] == gone["name"]  # same slot, same name
+    assert replacement["name"] == next(m for m in v["members"] if m["deployment_id"] == ids[0])["name"]
+
+
+def test_a_member_resumed_by_hand_meanwhile_is_not_deleted(world, capped, monkeypatch):
+    """Right before deleting, the member and its lease are read again: a
+    Resume pressed meanwhile (lease live) wins."""
+    from greencompute_control_plane.application.services import MachineGone
+    from greencompute_protocol import LeaseAssignment
+
+    f, ids = _two_paused(world)
+    _age_out_spending(world)
+    world.cp.repository.save_assignment(LeaseAssignment(
+        deployment_id=ids[0], workload_id=world.wl.workload_id, hotkey="hk", node_id="n1", status="suspended"))
+
+    def racing(deployment_id):
+        world.cp.repository.update_assignment_status(deployment_id, "active", reason="resume requested")  # by hand
+        raise MachineGone("no longer registered")
+
+    real = world.cp.resume_deployment
+    monkeypatch.setattr(world.cp, "resume_deployment", lambda d: racing(d) if d == ids[0] else real(d))
+    fleets.reconcile(world.gw, f.fleet_id)
+    assert world.cp.repository.get_deployment(ids[0]).state == DeploymentState.SUSPENDED  # not deleted
 
 
 def test_a_member_already_being_resumed_is_not_stopped(world, capped, monkeypatch):

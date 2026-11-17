@@ -199,10 +199,14 @@ def _paused_at_spend_limit(dep) -> bool:
             and getattr(dep, "suspended_reason", None) == "spend_limit")
 
 
-def _spend_limit_note(fleet, waiting: int, replaced: int = 0) -> str:
+def _spend_limit_note(fleet, waiting: int, replaced: int = 0, machine_full: int = 0) -> str:
     if replaced:
         note = (f" Replacing {replaced} paused at a spend limit that couldn't restart on {'its' if replaced == 1 else 'their'} "
                 "machine.")
+        return note + _spend_limit_note(fleet, waiting, 0, machine_full)
+    if machine_full:
+        note = (f" {machine_full} paused at a spend limit waiting for room on {'its' if machine_full == 1 else 'their'} "
+                "machine (saved disks are kept; delete one on My Rentals to get a replacement elsewhere).")
         return note + _spend_limit_note(fleet, waiting)
     if not waiting:
         return ""
@@ -212,16 +216,54 @@ def _spend_limit_note(fleet, waiting: int, replaced: int = 0) -> str:
     return f" {waiting} paused at a spend limit: resume them on My Rentals once you're under it."
 
 
-def _resume_paused_at_cap(service, fleet: FleetORM, paused: list, run: "_Pass") -> tuple[int, list[str]]:
+#: A member whose machine said "full" when the fleet tried to resume it:
+#: deployment_id -> (when first seen, passes seen). In memory, per gateway
+#: process: with several processes taking turns at the fleet loop each counts
+#: only its own passes, so replacing takes longer, never sooner.
+_FULL_SEEN: dict[str, tuple[float, int]] = {}
+#: An unsaved member is replaced only after its machine said "full" this many
+#: passes in a row, over at least this long: one reading is often stale (the
+#: paused pod's own GPUs are counted until the machine stops it). A saved
+#: member is never deleted for it: its disk is the customer's.
+FULL_PASSES_BEFORE_REPLACING = 3
+FULL_SECONDS_BEFORE_REPLACING = 120
+REPLACED_REASON = "replaced by its fleet: its machine couldn't take it back"
+
+
+def _drop_for_replacement(service, fleet: FleetORM, dep) -> bool:
+    """Delete a paused member so the fleet starts a replacement, but only if
+    it is still paused and nobody is resuming it (its lease still suspended,
+    or gone with its placement): a Resume pressed meanwhile wins."""
+    fresh = service.control_plane.repository.get_deployment(dep.deployment_id)
+    if fresh is None or fresh.state != DeploymentState.SUSPENDED:
+        return False
+    if service.lease_status(dep.deployment_id) not in ("suspended", None):
+        return False
+    try:
+        service.terminate_deployment(dep.deployment_id, actor_user_id=fleet.owner_user_id, admin=True,
+                                     reason=REPLACED_REASON)
+    except Exception:  # noqa: BLE001 - try again next pass
+        log.exception("fleet %s: could not stop %s", fleet.fleet_id, dep.deployment_id)
+        return False
+    _FULL_SEEN.pop(dep.deployment_id, None)
+    return True
+
+
+def _resume_paused_at_cap(service, fleet: FleetORM, paused: list, run: "_Pass") -> tuple[int, list[str], int]:
     """A keep-N-running fleet brings back its own members paused at a spend
     limit (not replacing them: a replacement would spend under the same
     limit), oldest pause first, as many as every limit has room for an hour
     of (credit_watch.SpendRoom) and the balance covers an hour of on top of
-    what runs (the auto-resume rule). One that fits but can't restart on its
-    machine (gone, or full) is stopped instead, so the fleet starts a
-    replacement elsewhere. Returns (how many are back or coming back, the
-    ids stopped for a replacement)."""
-    from greencompute_control_plane.application.services import CannotResumeInPlace
+    what runs (the auto-resume rule). One that fits but whose machine is gone
+    is deleted instead, so the fleet starts a replacement elsewhere; one whose
+    machine says it is full waits (a saved one always; an unsaved one until
+    the machine has said so for FULL_PASSES_BEFORE_REPLACING passes over
+    FULL_SECONDS_BEFORE_REPLACING). Returns (how many are back or coming back,
+    the ids deleted for a replacement, how many wait for room on their
+    machine)."""
+    import time
+
+    from greencompute_control_plane.application.services import MachineFull, MachineGone
     from greencompute_gateway.application.services import (
         AccountLimitError,
         InsufficientBalanceForRentalError,
@@ -231,7 +273,7 @@ def _resume_paused_at_cap(service, fleet: FleetORM, paused: list, run: "_Pass") 
     )
 
     room = run.spend_room()
-    back, dropped = 0, []
+    back, dropped, machine_full = 0, [], 0
     for _m, dep in paused:
         if dep.deployment_id in room.resuming:
             back += 1  # the auto-resume sweep (or another pass) already brought it back
@@ -242,16 +284,24 @@ def _resume_paused_at_cap(service, fleet: FleetORM, paused: list, run: "_Pass") 
             break
         try:
             service.resume_deployment(dep.deployment_id, user_id=fleet.owner_user_id)
-        except CannotResumeInPlace as exc:
-            # The limit has room, but its machine can't take it back: stop it
+        except MachineGone as exc:
+            # The limit has room, but its machine is gone for good: delete it
             # (releasing everything) and let this pass start a replacement.
             log.info("fleet %s: replacing %s, paused at a spend limit: %s", fleet.fleet_id, dep.deployment_id, exc)
-            try:
-                service.terminate_deployment(dep.deployment_id, actor_user_id=fleet.owner_user_id, admin=True)
-            except Exception:  # noqa: BLE001 - try again next pass
-                log.exception("fleet %s: could not stop %s", fleet.fleet_id, dep.deployment_id)
-                continue
-            dropped.append(dep.deployment_id)
+            if _drop_for_replacement(service, fleet, dep):
+                dropped.append(dep.deployment_id)
+            continue
+        except MachineFull as exc:
+            now = time.monotonic()
+            first, passes = _FULL_SEEN.get(dep.deployment_id, (now, 0))
+            _FULL_SEEN[dep.deployment_id] = (first, passes + 1)
+            persisted = passes + 1 >= FULL_PASSES_BEFORE_REPLACING and now - first >= FULL_SECONDS_BEFORE_REPLACING
+            if not dep.save_on_exhaustion and persisted and _drop_for_replacement(service, fleet, dep):
+                log.info("fleet %s: replacing unsaved %s, its machine full for %d passes: %s",
+                         fleet.fleet_id, dep.deployment_id, passes + 1, exc)
+                dropped.append(dep.deployment_id)
+            else:
+                machine_full += 1
             continue
         except ValueError as exc:
             # Already being resumed (by the auto-resume sweep, say) or no
@@ -267,10 +317,11 @@ def _resume_paused_at_cap(service, fleet: FleetORM, paused: list, run: "_Pass") 
         except Exception:  # noqa: BLE001 - say nothing to the customer; the next pass retries
             log.exception("fleet %s: could not resume %s", fleet.fleet_id, dep.deployment_id)
             break
+        _FULL_SEEN.pop(dep.deployment_id, None)
         room.add(dep)
         run.add(fleet.owner_user_id, room.hourly(dep))
         back += 1
-    return back, dropped
+    return back, dropped, machine_full
 
 
 def _member_cost_cents(service, workload, online: list[str] | None = None) -> int:
@@ -627,12 +678,13 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
     # work: deleting (or the expiry of) a capped key mustn't lift its cap.
     if paused_at_cap and fleet.replace and _pause_if_key_gone(service, fleet):
         return
-    back, dropped = (
-        _resume_paused_at_cap(service, fleet, paused_at_cap, run) if (paused_at_cap and fleet.replace) else (0, [])
+    back, dropped, machine_full = (
+        _resume_paused_at_cap(service, fleet, paused_at_cap, run) if (paused_at_cap and fleet.replace) else (0, [], 0)
     )
     if dropped:
         live = [(m, d) for m, d in live if d.deployment_id not in dropped]
-    cap_note = _spend_limit_note(fleet, len(paused_at_cap) - back - len(dropped), len(dropped))
+    cap_note = _spend_limit_note(
+        fleet, len(paused_at_cap) - back - len(dropped) - machine_full, len(dropped), machine_full)
 
     if fleet.replace:
         needed = fleet.target - len(live)

@@ -604,3 +604,17 @@ def test_the_auto_resume_sweep_leaves_keep_n_running_fleet_members_to_their_flee
                        target=1, replace=True, state="active"))
         s.add(FleetMemberORM(deployment_id=member.deployment_id, fleet_id="f1", slot=1, created_at=NOW))
     assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=Mail()) == [loose.deployment_id]
+
+
+def test_with_the_fleet_loop_off_the_sweep_resumes_fleet_members_too(world, resumes, monkeypatch):
+    from greencompute_persistence.orm import FleetMemberORM, FleetORM
+
+    gw, cp, billing = world
+    _set_balance(billing, "ann", 10_000)
+    member = _paused_at_cap(cp, "ann", "rig-01", resume_on_topup=True, when=NOW)
+    with session_scope(billing.session_factory) as s:
+        s.add(FleetORM(fleet_id="f1", owner_user_id="ann", workload_id=member.workload_id, name_prefix="rig",
+                       target=1, replace=True, state="active"))
+        s.add(FleetMemberORM(deployment_id=member.deployment_id, fleet_id="f1", slot=1, created_at=NOW))
+    monkeypatch.setenv("GREENCOMPUTE_FLEETS_ENABLED", "false")
+    assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=Mail()) == [member.deployment_id]

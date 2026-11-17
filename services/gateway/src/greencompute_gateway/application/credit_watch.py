@@ -399,8 +399,11 @@ class SpendRoom:
 
 
 def _fleet_resumed_members(service, deployment_ids: list[str]) -> set[str]:
-    """Of these, the members of an active keep-N-running fleet."""
-    if not deployment_ids:
+    """Of these, the members of an active keep-N-running fleet, which the
+    fleet loop brings back itself; none while the fleet loop is turned off."""
+    from greencompute_gateway.infrastructure.deposit_watcher import _bool_env
+
+    if not deployment_ids or not _bool_env("GREENCOMPUTE_FLEETS_ENABLED", True):
         return set()
     from greencompute_persistence.orm import FleetMemberORM, FleetORM
 

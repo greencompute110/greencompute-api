@@ -1176,6 +1176,10 @@ class GatewayService:
     def _resume_under_way(self, deployment_id: str) -> bool:
         """A SUSPENDED deployment whose lease is live again is being resumed
         (credit_watch's _LIVE_LEASE_STATUSES)."""
+        return self.lease_status(deployment_id) in ("assigned", "activating", "active")
+
+    def lease_status(self, deployment_id: str) -> str | None:
+        """The status of the deployment's lease, read now (None: no lease)."""
         from sqlalchemy import select
 
         from greencompute_persistence import session_scope
@@ -1184,11 +1188,10 @@ class GatewayService:
         repo = getattr(self.control_plane, "repository", None)
         factory = getattr(repo, "session_factory", None)
         if factory is None:
-            return False
+            return None
         with session_scope(factory) as session:
-            status = session.scalar(
+            return session.scalar(
                 select(LeaseAssignmentORM.status).where(LeaseAssignmentORM.deployment_id == deployment_id))
-        return status in ("assigned", "activating", "active")
 
     def _refuse_resume_at_spend_limits(self, deployment: DeploymentRecord, user_id: str) -> None:
         """Raise KeyLimitError when the key that started the deployment is at
@@ -1269,13 +1272,14 @@ class GatewayService:
         *,
         actor_user_id: str | None,
         admin: bool = False,
+        reason: str = "user terminated",
     ) -> DeploymentRecord:
         deployment = self.control_plane.repository.get_deployment(deployment_id)
         if deployment is None:
             raise KeyError(f"deployment not found: {deployment_id}")
         if not admin and not _owned_by(deployment.owner_user_id, actor_user_id):
             raise PermissionError(f"deployment terminate denied: {deployment_id}")
-        return self.control_plane.cleanup_deployment(deployment_id, reason="user terminated")
+        return self.control_plane.cleanup_deployment(deployment_id, reason=reason)
 
     # --- Commercial inquiries (public /contact-sales) ----------------------
 
