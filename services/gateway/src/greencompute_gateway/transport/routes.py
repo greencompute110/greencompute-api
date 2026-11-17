@@ -47,6 +47,7 @@ from greencompute_gateway.application.services import (
     model_url,
     service,
 )
+from greencompute_gateway.domain.inference_requests import InvalidInferenceRequestError
 from greencompute_gateway.domain.routing import NoReadyDeploymentError
 from greencompute_gateway.infrastructure.inference_client import (
     InferenceBadResponseError,
@@ -3293,7 +3294,7 @@ def _complete(
             status_code=402,
             detail={"message": "insufficient balance for inference", "reason": str(exc)},
         ) from exc
-    except (NoReadyDeploymentError, InferenceUpstreamError) as exc:
+    except (InvalidInferenceRequestError, NoReadyDeploymentError, InferenceUpstreamError) as exc:
         raise _inference_failure(exc) from exc
 
 
@@ -3314,6 +3315,12 @@ def _sse_chain(first: str | None, rest):
 def _inference_failure(exc: Exception) -> HTTPException:
     """The coded HTTP error for an inference request that failed (codes and
     what to do about each: transport/errors.py CODES, the docs' errors page)."""
+    if isinstance(exc, InvalidInferenceRequestError):
+        # Checked before anything reached a model: a malformed field is a
+        # 422 (`detail` names it, like FastAPI's own); something this model
+        # doesn't support, a 400.
+        metrics.increment("invoke.failure.invalid_request")
+        return coded(exc.status, "validation_error" if exc.status == 422 else "invalid_request", exc.detail())
     if isinstance(exc, NoReadyDeploymentError):
         metrics.increment("invoke.failure.no_ready_deployment")
         return coded(409, "model_not_ready", str(exc), {"Retry-After": "10"})

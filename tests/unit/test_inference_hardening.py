@@ -249,3 +249,81 @@ def test_a_refusal_isnt_sent_on_to_another_replica(api, cp, node):
     node.chat = (400, VLLM_400, None)
     assert chat(api).status_code == 400
     assert len(node.requests) == 1  # every replica would refuse it
+
+
+# --- item 3: requests that can't be valid never reach a model ----------------------------
+
+
+def _refused(res, status, field):
+    assert res.status_code == status, res.text
+    err = res.json()["error"]
+    assert err["retryable"] is False
+    return err
+
+
+def test_empty_messages_are_refused_before_any_backend(api, cp, node):
+    _, dep = catalog_model(cp, node)
+    res = api.post("/v1/chat/completions", json={"model": "qwen2.5-7b-instruct", "messages": []})
+    err = _refused(res, 422, "messages")
+    assert err["code"] == "validation_error" and "messages" in err["message"]
+    assert res.json()["detail"][0]["loc"] == ["body", "messages"]
+    assert node.requests == [] and node.health_probes == 0
+    assert failures(cp, dep) == 0
+
+
+@pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+def test_an_absurd_token_count_names_the_limit(api, cp, node, field):
+    catalog_model(cp, node)
+    err = _refused(chat(api, **{field: 10**9}), 422, field)
+    assert f"{field}: {field} must be a whole number from 1 to 131072" in err["message"]
+    assert _refused(chat(api, **{field: 0}), 422, field)
+    assert node.requests == []
+
+
+def test_the_limit_is_the_models_context_when_it_is_known(api, cp, node):
+    catalog_model(cp, node, max_model_len=32768)
+    err = _refused(chat(api, max_tokens=40000), 422, "max_tokens")
+    assert "from 1 to 32768 (the model's context length)" in err["message"]
+    assert chat(api, max_tokens=32768).status_code == 200  # vLLM still checks prompt + completion
+
+
+@pytest.mark.parametrize("field, value", [
+    ("n", 0), ("n", 9), ("n", "2"), ("temperature", 3), ("top_p", 0), ("top_p", 1.5),
+    ("presence_penalty", 5), ("frequency_penalty", -3), ("tools", "not-a-list"),
+])
+def test_other_impossible_values_are_422(api, cp, node, field, value):
+    catalog_model(cp, node)
+    res = chat(api, **{field: value})
+    err = _refused(res, 422, field)
+    assert err["code"] == "validation_error" and field in err["message"]
+    assert node.requests == []
+
+
+TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]
+
+
+def test_auto_tool_choice_on_a_model_not_started_for_it_says_so_up_front(api, cp, node):
+    catalog_model(cp, node)
+    for body in ({"tools": TOOLS}, {"tools": TOOLS, "tool_choice": "auto"}):
+        err = _refused(chat(api, **body), 400, "tool_choice")
+        assert err["code"] == "invalid_request" and "tool_choice" in err["message"]
+    assert node.requests == []
+    # A named function, or "required", needs no tool parser: passed through.
+    assert chat(api, tools=TOOLS, tool_choice="required").status_code == 200
+    assert chat(api, tools=TOOLS, tool_choice={"type": "function", "function": {"name": "get_weather"}}).status_code == 200
+    assert len(node.requests) == 2 and node.requests[0]["tools"] == TOOLS
+
+
+def test_tools_pass_through_to_a_model_started_with_a_tool_parser(api, cp, node):
+    catalog_model(cp, node, extra_engine_args=["--enable-auto-tool-choice", "--tool-call-parser", "hermes"])
+    assert chat(api, tools=TOOLS).status_code == 200
+    assert node.requests[0]["tools"] == TOOLS
+
+
+def test_several_completions_are_billed_as_several(gw):
+    from greencompute_protocol import ChatCompletionMessage, ChatCompletionRequest
+
+    request = ChatCompletionRequest(model="m", messages=[ChatCompletionMessage(role="user", content="hi")],
+                                    max_tokens=100, n=3)
+    assert gw._completion_token_bound(request) == 300
+    assert gw._clamp_reported_usage(request, 10, 300)[1] == 300

@@ -64,6 +64,12 @@ from greencompute_protocol import (
     WorkloadSpec,
     WorkloadUpdateRequest,
 )
+from greencompute_gateway.domain.inference_requests import (
+    MAX_N,
+    check_chat_request,
+    model_auto_tool_choice,
+    model_context_limit,
+)
 from greencompute_gateway.domain.routing import NoReadyDeploymentError
 from greencompute_gateway.infrastructure.inference_client import (
     HttpInferenceClient,
@@ -2117,6 +2123,8 @@ class GatewayService:
         # reads `.endpoint`.
         external = _external_model_upstreams().get((request.model or "").strip().lower())
         if external:
+            # Nothing known about it but its address: the generic checks only.
+            check_chat_request(request)
             record = DeploymentRecord(
                 workload_id=f"external:{request.model}",
                 state=DeploymentState.READY,
@@ -2136,6 +2144,13 @@ class GatewayService:
         # a private workload's existence is not enumerable via its id/alias/name.
         if not admin and not self._user_can_access_workload(workload, user_id):
             raise NoReadyDeploymentError(f"unknown model={request.model}")
+        # Before anything reaches (or probes) a backend: a request no model
+        # here can serve is answered at once, with the reason.
+        check_chat_request(
+            request,
+            context_limit=model_context_limit(workload),
+            auto_tool_choice=model_auto_tool_choice(workload),
+        )
         workload_id = workload.workload_id
         candidates = [
             deployment
@@ -2395,6 +2410,11 @@ class GatewayService:
             requested_max = max(requested_max or 0, max_completion_tokens)
         if requested_max:
             completion_bound = min(requested_max, completion_bound)
+        # `n` completions are generated (and reported) for one request: the
+        # bound is per completion. Validation keeps n within 1..MAX_N.
+        n = (request.model_extra or {}).get("n")
+        if isinstance(n, int) and not isinstance(n, bool) and n > 1:
+            completion_bound *= min(n, MAX_N)
         return completion_bound
 
     def _is_private_model(self, deployment: DeploymentRecord) -> bool:
