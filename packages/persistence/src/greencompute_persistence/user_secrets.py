@@ -144,3 +144,46 @@ def resolve_workload_secrets(workload, session_factory):
     if env:
         meta["env"] = env
     return workload.model_copy(update={"metadata": meta})
+
+
+# --- Keeping values out of error text ------------------------------------------------
+# A machine's error report can quote the command it ran, and a `docker run`
+# command line holds every `-e VAR=value`: the resolved secrets, the plain
+# env, HF_TOKEN (external review, Nov 2026: str(TimeoutExpired) is the whole
+# argv). The control plane passes every reported error through this before
+# it is stored (last_error, the lease's reason, the deployment event) or
+# sent on (bus, events, webhooks).
+
+MASK = "***"
+# `-e VAR=value` as a shell line, and `'-e', 'VAR=value'` as a Python argv repr.
+_ENV_FLAG_SHELL = re.compile(r"((?:^|\s)(?:-e|--env)(?:\s+|=))([A-Za-z_][A-Za-z0-9_]*)=(\S+)")
+_ENV_FLAG_REPR = re.compile(r"""((?:-e|--env)['"],\s*['"])([A-Za-z_][A-Za-z0-9_]*)=(.*?)(?=['"](?:,|\]))""")
+#: Plain env values shorter than this aren't masked on their own ("7", "1"
+#: would blank out every digit); after -e they always are.
+_MIN_BARE_VALUE = 4
+
+
+def workload_values(workload, session_factory) -> list[str]:
+    """The values a workload's configuration hands its machine: the secrets
+    it names, its plain env values and a legacy hf_token. Longest first."""
+    meta = workload.metadata or {}
+    found: set[str] = set()
+    names = set(secret_references(meta).values())
+    if names:
+        found |= set(secret_values(session_factory, workload.owner_user_id, names).values())
+    if isinstance(meta.get("env"), dict):
+        found |= {str(v) for v in meta["env"].values() if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
+    if isinstance(meta.get("hf_token"), str):
+        found.add(meta["hf_token"].strip())
+    return sorted((v for v in found if len(v) >= _MIN_BARE_VALUE), key=len, reverse=True)
+
+
+def mask_values(text: str | None, values=()) -> str | None:
+    """`text` with each of `values` and every -e VAR=value masked."""
+    if not text:
+        return text
+    for value in values:
+        if value:
+            text = text.replace(value, MASK)
+    text = _ENV_FLAG_REPR.sub(lambda m: f"{m.group(1)}{m.group(2)}={MASK}", text)
+    return _ENV_FLAG_SHELL.sub(lambda m: f"{m.group(1)}{m.group(2)}={MASK}", text)

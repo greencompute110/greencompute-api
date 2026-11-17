@@ -493,6 +493,10 @@ class ControlPlaneService:
         deployment = self.repository.get_deployment(update.deployment_id)
         if deployment is None:
             raise KeyError(f"deployment not found: {update.deployment_id}")
+        if update.error:
+            # The machine's text may quote the command it ran (`docker run -e
+            # VAR=value …`): no secret or env value is stored or sent on.
+            update = update.model_copy(update={"error": self._mask_workload_values(deployment, update.error)})
         # Terminal states (TERMINATED/FAILED) are absorbing. A miner that posts
         # a stale forward report (READY/STARTING/…) for a deployment the
         # control-plane already terminated/failed (orphan cleanup, scheduler
@@ -613,6 +617,20 @@ class ControlPlaneService:
         self.metrics.increment(f"deployment.state.{saved.state.value}")
         self._dispatch_ops_notification(saved, update.state)
         return saved
+
+    def _mask_workload_values(self, deployment: DeploymentRecord, text: str) -> str:
+        """`text` without the values the deployment's workload hands its
+        machine (its secrets, env values, HF token) or any `-e VAR=value`."""
+        from greencompute_persistence.user_secrets import mask_values, workload_values
+
+        values: list[str] = []
+        try:
+            workload = self.repository.get_workload(deployment.workload_id)
+            if workload is not None:
+                values = workload_values(workload, self.repository.session_factory)
+        except Exception:  # noqa: BLE001 - the -e patterns are still masked
+            logger.warning("could not load workload %s to mask its values", deployment.workload_id, exc_info=True)
+        return mask_values(text, values) or text
 
     def _dispatch_ops_notification(
         self, deployment: DeploymentRecord, state: DeploymentState

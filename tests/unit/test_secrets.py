@@ -345,3 +345,44 @@ def test_rent_gpu_passes_secret_env_through(world, monkeypatch):
     world.client.post("/mcp", headers=AUTH, json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
         "name": "rent_gpu", "arguments": {"ssh_public_keys": [PUBKEY], "secret_env": {"HF_TOKEN": "hf-read"}}}})
     assert seen["metadata"]["secret_env"] == {"HF_TOKEN": "hf-read"}
+
+
+# --- a machine's error text never carries the values ------------------------------
+
+
+def test_a_reported_error_quoting_docker_run_is_masked_before_it_is_stored(world, monkeypatch):
+    """str(TimeoutExpired) of a pod's `docker run` is its whole argv, every
+    -e VAR=value (external review, Nov 2026). The control plane masks the
+    workload's values (and any -e value) before last_error, the event, the
+    lease reason or the bus see it."""
+    import subprocess
+
+    from greencompute_protocol import DeploymentState, DeploymentStatusUpdate
+
+    _secret(world, "hf-read", VALUE)
+    wid = _pod(world, {"env": {"SEED": "7", "POOL_PASS": POOL, "WORKER": "rig-07"},
+                       "secret_env": {"HF_TOKEN": "hf-read"}}).json()["workload_id"]
+    dep = world.cp.create_deployment(DeploymentCreateRequest(workload_id=wid).model_dump() | {"owner_user_id": "ann"})
+    published = []
+    monkeypatch.setattr(world.cp.bus, "publish", lambda subject, payload: published.append(payload))
+    argv = ["docker", "run", "-d", "-e", f"HF_TOKEN={VALUE}", "-e", f"POOL_PASS={POOL}", "-e", "SEED=7",
+            "-e", "ROTATED=old-value-not-known-any-more", "-e", "AUTHORIZED_KEYS=ssh-ed25519 AAAA\nssh-rsa BBBB", "img"]
+    error = f"docker not available: {subprocess.TimeoutExpired(argv, 600)}"
+    for state in (DeploymentState.SCHEDULED, DeploymentState.FAILED):
+        world.cp.update_deployment_status(DeploymentStatusUpdate(
+            deployment_id=dep.deployment_id, state=state, error=error if state == DeploymentState.FAILED else None))
+    saved = world.cp.repository.get_deployment(dep.deployment_id)
+    stored = [saved.last_error, world.cp.repository.list_deployment_events(dep.deployment_id), published]
+    _no_values(stored)
+    text = json.dumps(stored, default=str)
+    assert "old-value-not-known-any-more" not in text and "BBBB" not in text
+    assert "'HF_TOKEN=***'" in saved.last_error and "'SEED=***'" in saved.last_error
+    assert saved.last_error.startswith("docker not available: Command") and "timed out after 600" in saved.last_error
+
+
+def test_masking_keeps_short_values_and_masks_shell_style_flags():
+    from greencompute_persistence.user_secrets import mask_values
+
+    text = "failed at step 7: docker run -e HF_TOKEN=abc123 --env=POOL=xyz img"
+    assert mask_values(text, []) == "failed at step 7: docker run -e HF_TOKEN=*** --env=POOL=*** img"
+    assert mask_values(None) is None
