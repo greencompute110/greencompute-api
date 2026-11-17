@@ -3268,11 +3268,15 @@ def _complete(
     authorization: str | None,
     x_api_key: str | None,
     host: str | None,
+    api_key=None,
+    text_completion: bool = False,
 ):
+    """One chat completion for a caller, streamed or not. `text_completion`
+    answers in the legacy /v1/completions shape instead."""
     from greencompute_gateway.application.services import InsufficientBalanceForInferenceError
     from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 
-    api_key = require_api_key(authorization, x_api_key)
+    api_key = api_key or require_api_key(authorization, x_api_key)
     enforce_rate_limit("chat_completions", api_key.key_id, limit=60, window_seconds=60)
     _enforce_key_limits(api_key)
     _enforce_account_spend_limit(api_key)
@@ -3311,8 +3315,9 @@ def _complete(
             # to it is made here, so a refusal or an outage gets its status
             # code instead of a 200 whose stream breaks off.
             first = next(stream, None)
+            body = _sse_chain(first, stream)
             return StreamingResponse(
-                _sse_chain(first, stream),
+                _as_text_completion_stream(body) if text_completion else body,
                 media_type="text/event-stream",
                 headers={"cache-control": "no-cache"},
             )
@@ -3324,7 +3329,7 @@ def _complete(
             admin=api_key.admin,
         ).model_dump(mode="json")
         metrics.increment("invoke.success")
-        return response
+        return _as_text_completion(response) if text_completion else response
     except InsufficientBalanceForInferenceError as exc:
         metrics.increment("invoke.failure.insufficient_balance")
         raise HTTPException(
@@ -3416,6 +3421,17 @@ def _inference_failure(exc: Exception) -> HTTPException:
     })
 
 
+#: Sampling fields a legacy completion passes on to the model unchanged.
+_COMPLETION_PASSTHROUGH = (
+    "top_p", "n", "stop", "presence_penalty", "frequency_penalty", "seed", "user", "stream_options", "logit_bias",
+    "top_k", "min_p", "repetition_penalty",
+)
+
+
+def _prompt_error(message: str) -> HTTPException:
+    return coded(422, "validation_error", [{"loc": ["body", "prompt"], "msg": message, "type": "value_error"}])
+
+
 @router.post("/v1/completions")
 def completions(
     payload: dict,
@@ -3423,15 +3439,36 @@ def completions(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     host: str | None = Header(default=None, alias="Host"),
 ) -> dict:
+    """OpenAI's legacy text completions: a `prompt` in, `choices[].text` out
+    (`object: "text_completion"`, and streamed chunks likewise). The prompt
+    reaches the model as one user message, so the model's chat template
+    applies: an instruction gets an answer rather than a raw continuation."""
+    api_key = require_api_key(authorization, x_api_key)
     if not payload.get("model"):
         raise HTTPException(status_code=400, detail="model required")
+    prompt = payload.get("prompt")
+    if isinstance(prompt, list) and len(prompt) == 1:
+        prompt = prompt[0]
+    if isinstance(prompt, list):
+        raise _prompt_error("send one prompt (a string) per request")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise _prompt_error("prompt must be a string that isn't empty")
+    unsupported = [k for k in ("suffix", "echo") if payload.get(k)]
+    unsupported += [k for k in ("logprobs",) if payload.get(k) is not None]
+    unsupported += [k for k in ("best_of",) if payload.get(k) not in (None, 1)]
+    if unsupported:
+        raise coded(422, "validation_error", [
+            {"loc": ["body", k], "msg": f"{k} isn't supported on /v1/completions here", "type": "value_error"}
+            for k in unsupported
+        ])
     try:
         request = ChatCompletionRequest(
             model=payload["model"],
-            messages=[{"role": "user", "content": payload.get("prompt", "")}],
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=payload.get("max_tokens", 128),
             temperature=payload.get("temperature", 0.7),
             stream=payload.get("stream", False),
+            **{k: payload[k] for k in _COMPLETION_PASSTHROUGH if k in payload},
         )
     except ValidationError as exc:
         detail = [
@@ -3439,7 +3476,71 @@ def completions(
             for e in exc.errors(include_url=False)
         ]
         raise HTTPException(status_code=422, detail=detail) from exc
-    return _complete(request, authorization=authorization, x_api_key=x_api_key, host=host)
+    return _complete(request, authorization=authorization, x_api_key=x_api_key, host=host, api_key=api_key,
+                     text_completion=True)
+
+
+def _as_text_completion(chat: dict) -> dict:
+    """A chat completion in the legacy `text_completion` shape."""
+    return {
+        "id": chat.get("id"),
+        "object": "text_completion",
+        "created": chat.get("created") or int(time.time()),
+        "model": chat.get("model"),
+        "choices": [
+            {
+                "text": ((choice.get("message") or {}).get("content") or ""),
+                "index": choice.get("index", i),
+                "logprobs": None,
+                "finish_reason": choice.get("finish_reason"),
+            }
+            for i, choice in enumerate(chat.get("choices") or [])
+        ],
+        "usage": chat.get("usage"),
+    }
+
+
+def _text_completion_line(line: str) -> str | None:
+    """One streamed line in the legacy shape (None: drop it, the chat
+    stream's opening role-only chunk). Anything not a chunk, `[DONE]` and
+    blank separators among them, passes as it is."""
+    stripped = line.strip()
+    if not stripped.startswith("data: ") or stripped == "data: [DONE]":
+        return line
+    try:
+        chunk = json.loads(stripped[6:])
+    except ValueError:
+        return line
+    if not isinstance(chunk, dict) or not isinstance(chunk.get("choices"), list):
+        return line
+    choices = []
+    for i, choice in enumerate(chunk["choices"]):
+        if not isinstance(choice, dict):
+            continue
+        text = (choice.get("delta") or {}).get("content") or ""
+        if not text and choice.get("finish_reason") is None:
+            continue
+        choices.append({"text": text, "index": choice.get("index", i), "logprobs": None,
+                        "finish_reason": choice.get("finish_reason")})
+    if chunk["choices"] and not choices:
+        return None
+    out = {"id": chunk.get("id"), "object": "text_completion", "created": chunk.get("created"),
+           "model": chunk.get("model"), "choices": choices}
+    if chunk.get("usage") is not None:
+        out["usage"] = chunk["usage"]
+    return f"data: {json.dumps(out)}\n"
+
+
+def _as_text_completion_stream(lines):
+    try:
+        for line in lines:
+            out = _text_completion_line(line)
+            if out is not None:
+                yield out
+    finally:
+        close = getattr(lines, "close", None)
+        if close is not None:
+            close()
 
 
 @router.post("/v1/embeddings")

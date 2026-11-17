@@ -582,3 +582,53 @@ def test_embeddings_never_answer_with_made_up_vectors(api, cp, node):
     res = api.post("/v1/embeddings", json={"input": "hello"})
     assert res.status_code == 400 and "no embedding model is available" in res.json()["error"]["message"].lower()
     assert node.requests == []
+
+
+# --- item 9: /v1/completions answers in the text_completion shape -------------------------
+
+
+def test_legacy_completions_answer_with_text(api, cp, node):
+    catalog_model(cp, node)
+    res = api.post("/v1/completions", json={"model": "qwen2.5-7b-instruct", "prompt": "Say hi", "max_tokens": 5,
+                                            "top_p": 0.9, "stop": ["\n"]})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["object"] == "text_completion"
+    assert body["choices"] == [{"text": "Hello", "index": 0, "logprobs": None, "finish_reason": "stop"}]
+    assert body["usage"]["completion_tokens"] == 2
+    sent = node.requests[-1]
+    assert [(m["role"], m["content"]) for m in sent["messages"]] == [("user", "Say hi")]
+    assert (sent["max_tokens"], sent["top_p"], sent["stop"]) == (5, 0.9, ["\n"])  # passed on
+
+
+def test_legacy_completions_stream_text_chunks(api, cp, node):
+    catalog_model(cp, node)
+    node.chat = "stream"
+    with api.stream("POST", "/v1/completions", json={"model": "qwen2.5-7b-instruct", "prompt": "Say hi",
+                                                     "stream": True}) as res:
+        assert res.status_code == 200
+        text = "".join(res.iter_text())
+    chunks = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: {")]
+    assert all(c["object"] == "text_completion" for c in chunks)
+    assert "".join(ch["text"] for c in chunks for ch in c["choices"]) == "Hello"
+    assert chunks[-1]["usage"]["total_tokens"] == 7 and chunks[-1]["choices"] == []
+    assert all("delta" not in ch for c in chunks for ch in c["choices"])
+    assert text.rstrip().endswith("data: [DONE]")
+
+
+@pytest.mark.parametrize("body, field", [
+    ({"prompt": ""}, "prompt"), ({"prompt": "   "}, "prompt"), ({}, "prompt"), ({"prompt": ["a", "b"]}, "prompt"),
+    ({"prompt": "hi", "echo": True}, "echo"), ({"prompt": "hi", "logprobs": 2}, "logprobs"),
+    ({"prompt": "hi", "max_tokens": 10**9}, "max_tokens"),
+])
+def test_legacy_completions_refuse_what_cant_work(api, cp, node, body, field):
+    catalog_model(cp, node)
+    res = api.post("/v1/completions", json={"model": "qwen2.5-7b-instruct", **body})
+    assert res.status_code == 422 and res.json()["error"]["code"] == "validation_error"
+    assert field in res.json()["error"]["message"]
+    assert node.requests == []
+
+
+def test_a_one_item_prompt_list_is_a_prompt(api, cp, node):
+    catalog_model(cp, node)
+    assert api.post("/v1/completions", json={"model": "qwen2.5-7b-instruct", "prompt": ["Say hi"]}).status_code == 200
