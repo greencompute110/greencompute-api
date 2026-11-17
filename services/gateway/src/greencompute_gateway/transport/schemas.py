@@ -7,12 +7,19 @@ describing every response as "any object". Agents generating clients from
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from pydantic import BaseModel, Field, create_model, field_validator
+from pydantic import BaseModel, Field, create_model, field_validator, model_validator
 
-from greencompute_protocol import CryptoInvoice, DeploymentRecord, LedgerEntry, WorkloadSpec
+from greencompute_protocol import (
+    APIKeyCreateRequest,
+    APIKeySummary,
+    CryptoInvoice,
+    DeploymentRecord,
+    LedgerEntry,
+    WorkloadSpec,
+)
 
 # Added to each row of GET /platform/deployments: what the deployment runs.
 _LIST_FIELDS = {
@@ -531,7 +538,42 @@ class WalletChallenge(BaseModel):
     next: str
 
 
-class WalletVerifyRequest(BaseModel):
+# --- API keys ----------------------------------------------------------------------
+#: The longest a key can be made to last (expires_in_days / expires_at).
+MAX_KEY_DAYS = 365
+
+
+class KeyExpiry(BaseModel):
+    """When a new key stops working: `expires_in_days` or `expires_at`, not
+    both; neither, never."""
+    expires_in_days: int | None = Field(default=None, ge=1, le=MAX_KEY_DAYS, description=(
+        f"The key stops working this many days from now (1-{MAX_KEY_DAYS}). Left out: never, unless the key "
+        "creating it expires (a key never outlives the key that made it)."))
+    expires_at: datetime | None = Field(default=None, description=(
+        f"Or an exact time (ISO 8601; without a timezone, UTC), in the future and at most {MAX_KEY_DAYS} days "
+        "away."))
+
+    @model_validator(mode="after")
+    def _one_expiry(self):
+        if self.expires_in_days is not None and self.expires_at is not None:
+            raise ValueError("send expires_in_days or expires_at, not both")
+        if self.expires_at is not None:
+            at = self.expires_at if self.expires_at.tzinfo else self.expires_at.replace(tzinfo=UTC)
+            now = datetime.now(UTC)
+            if at <= now:
+                raise ValueError("expires_at must be in the future")
+            if at > now + timedelta(days=MAX_KEY_DAYS, minutes=5):  # a little slack for clocks
+                raise ValueError(f"expires_at must be at most {MAX_KEY_DAYS} days from now")
+            self.expires_at = at.astimezone(UTC)
+        return self
+
+    def requested_expiry(self) -> datetime | None:
+        if self.expires_in_days is not None:
+            return datetime.now(UTC) + timedelta(days=self.expires_in_days)
+        return self.expires_at
+
+
+class WalletVerifyRequest(KeyExpiry):
     nonce: str = Field(min_length=1, max_length=64, description="From the challenge.")
     signature: str = Field(min_length=1, max_length=4096, description="The wallet's signature over `message`, hex (0x...).")
     key_name: str | None = Field(default=None, max_length=64, description="A name for the new key (default `wallet sign-in`).")
@@ -578,6 +620,7 @@ class WalletSignIn(BaseModel):
     scopes: list[str] = Field(default_factory=list, description="Empty: full access.")
     max_active_rentals: int | None = None
     daily_spend_limit_usd: float | None = None
+    expires_at: str | None = Field(default=None, description="When the key stops working (ISO 8601); null: never.")
     user_id: str | None = Field(description="The account. Null when revoking for a wallet with no account.")
     account_created: bool = Field(default=False, description="True the first time this wallet signs in.")
     has_email: bool = False
@@ -590,3 +633,14 @@ class WalletSignIn(BaseModel):
     credited: list[CreditedDeposit] = Field(default_factory=list, description=(
         "Payments this wallet sent in the last 30 days that no account had been credited for, added now."))
     next_steps: list[str] = Field(default_factory=list)
+
+
+class APIKeyCreate(KeyExpiry, APIKeyCreateRequest):
+    """POST /platform/api-keys: the protocol's fields plus an expiry."""
+
+
+class APIKeyOut(APIKeySummary):
+    """An API key without its secret (list and get)."""
+    expires_at: datetime | None = Field(default=None, description="When it stops working; null: never.")
+    expired: bool = Field(default=False, description="True once `expires_at` has passed: requests with it get 401 "
+                                                     "`api_key_expired`. Delete it and create a new one.")

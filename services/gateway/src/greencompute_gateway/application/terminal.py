@@ -171,11 +171,17 @@ def well_formed(ticket: str) -> bool:
 
 
 def key_still_allows(session_factory, key_id: str, user_id: str) -> bool:
-    """The key the ticket was made with still exists, is the user's, and may
-    still open a terminal (full access, or the `rentals` scope)."""
+    """The key the ticket was made with still exists, is the user's, hasn't
+    expired, and may still open a terminal (full access, or the `rentals`
+    scope)."""
+    from types import SimpleNamespace
+
+    from greencompute_persistence import key_expired
+
     with session_scope(session_factory) as session:
-        row = session.execute(select(APIKeyORM.user_id, APIKeyORM.scopes).where(APIKeyORM.key_id == key_id)).first()
-    if row is None or row[0] != user_id:
+        row = session.execute(select(APIKeyORM.user_id, APIKeyORM.scopes, APIKeyORM.expires_at).where(
+            APIKeyORM.key_id == key_id)).first()
+    if row is None or row[0] != user_id or key_expired(SimpleNamespace(expires_at=row[2])):
         return False
     scopes = row[1] or []
     return not scopes or "rentals" in scopes

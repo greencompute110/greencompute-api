@@ -21,8 +21,6 @@ from starlette.concurrency import run_in_threadpool
 from greencompute_protocol.ssh_host_keys import known_hosts_line, ssh_key_fingerprint
 from greencompute_protocol import (
     DeploymentState,
-    APIKeyCreateRequest,
-    APIKeySummary,
     BareMetalInquiryCreateRequest,
     BuildContextUploadRequest,
     BuildRequest,
@@ -182,9 +180,32 @@ def _inherit_wallet_tag(user_id: str | None, parent_key_id: str | None, child_ke
         return True
 
 
+def _api_key_out(key) -> dict:
+    """An API key without its secret, as list/get/delete return it."""
+    from greencompute_persistence import key_expired
+
+    return schemas.APIKeyOut(
+        key_id=key.key_id,
+        name=key.name,
+        user_id=key.user_id,
+        admin=key.admin,
+        scopes=key.scopes,
+        max_active_rentals=key.max_active_rentals,
+        daily_spend_limit_usd=key.daily_spend_limit_usd,
+        created_at=key.created_at,
+        expires_at=getattr(key, "expires_at", None),
+        expired=key_expired(key),
+    ).model_dump(mode="json")
+
+
+def _created_key_out(created) -> dict:
+    """The new key, with its secret (shown only now)."""
+    return {**created.model_dump(mode="json"), "expires_at": _api_key_out(created)["expires_at"], "expired": False}
+
+
 @router.post("/platform/api-keys", include_in_schema=False)
 def create_api_key(
-    payload: APIKeyCreateRequest,
+    payload: schemas.APIKeyCreate,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
@@ -220,7 +241,7 @@ def create_api_key(
             )
             if not _inherit_wallet_tag(api_key.user_id, api_key.key_id, created.key_id):
                 raise HTTPException(status_code=401, detail="invalid api key")
-            return created.model_dump(mode="json")
+            return _created_key_out(created)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except PermissionError as exc:
@@ -228,12 +249,12 @@ def create_api_key(
     # Privileged caller. Both the env master admin AND the provision secret may
     # bind the key to an explicit user_id (the UI provisions a key for the
     # newly-registered user). Only the master admin may grant admin=true.
-    return service.create_api_key(
+    return _created_key_out(service.create_api_key(
         payload,
         caller_user_id=caller.user_id,
         allow_user_id_override=True,
         allow_admin_grant=is_master_admin,
-    ).model_dump(mode="json")
+    ))
 
 
 @router.get("/platform/api-keys")
@@ -246,19 +267,7 @@ def list_api_keys(
     if not api_key.admin:
         # An admin's managed website key isn't one of "their" keys to manage.
         keys = [k for k in keys if not (k.admin and k.name == WEBSITE_ADMIN_KEY_NAME)]
-    return [
-        APIKeySummary(
-            key_id=k.key_id,
-            name=k.name,
-            user_id=k.user_id,
-            admin=k.admin,
-            scopes=k.scopes,
-            max_active_rentals=k.max_active_rentals,
-            daily_spend_limit_usd=k.daily_spend_limit_usd,
-            created_at=k.created_at,
-        ).model_dump(mode="json")
-        for k in keys
-    ]
+    return [_api_key_out(k) for k in keys]
 
 
 @router.get("/platform/api-keys/{key_id}")
@@ -271,16 +280,7 @@ def get_api_key(
     key = service.get_api_key(key_id, user_id=api_key.user_id, admin=api_key.admin)
     if key is None:
         raise HTTPException(status_code=404, detail="api key not found")
-    return APIKeySummary(
-        key_id=key.key_id,
-        name=key.name,
-        user_id=key.user_id,
-        admin=key.admin,
-        scopes=key.scopes,
-        max_active_rentals=key.max_active_rentals,
-        daily_spend_limit_usd=key.daily_spend_limit_usd,
-        created_at=key.created_at,
-    ).model_dump(mode="json")
+    return _api_key_out(key)
 
 
 @router.delete("/platform/api-keys/{key_id}")
@@ -298,16 +298,7 @@ def delete_api_key(
             raise HTTPException(status_code=403, detail="a scoped key can't delete a key broader than itself")
     try:
         deleted = service.delete_api_key(key_id, user_id=api_key.user_id, admin=api_key.admin)
-        return APIKeySummary(
-            key_id=deleted.key_id,
-            name=deleted.name,
-            user_id=deleted.user_id,
-            admin=deleted.admin,
-            scopes=deleted.scopes,
-            max_active_rentals=deleted.max_active_rentals,
-            daily_spend_limit_usd=deleted.daily_spend_limit_usd,
-            created_at=deleted.created_at,
-        ).model_dump(mode="json")
+        return _api_key_out(deleted)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -478,7 +469,7 @@ def wallet_auth_verify(
     Each sign-in revokes the keys this wallet's earlier sign-ins issued
     (`keep_existing_keys: true` keeps them), never other keys: lost a key?
     Sign in again. `scopes`, `max_active_rentals` and `daily_spend_limit_usd`
-    limit the new key. Payments this wallet sends to `deposit_addresses` are
+    limit the new key; `expires_in_days` or `expires_at` make it expire. Payments this wallet sends to `deposit_addresses` are
     credited automatically. A `revoke_keys` challenge revokes and issues
     nothing."""
     from greencompute_gateway.application import wallet_auth
@@ -491,6 +482,7 @@ def wallet_auth_verify(
             sf, nonce=payload.nonce, signature=payload.signature, key_name=payload.key_name,
             scopes=payload.scopes, max_active_rentals=payload.max_active_rentals,
             daily_spend_limit_usd=payload.daily_spend_limit_usd, keep_existing_keys=payload.keep_existing_keys,
+            expires_at=payload.requested_expiry(),
         )
     except wallet_auth.WalletAuthError as exc:
         raise _wallet_auth_error(exc) from exc
@@ -2332,8 +2324,8 @@ def _terminal_admission(ticket_value: str, deployment_id: str, presented_secret:
         if presented is None or presented.key_id != ticket.key_id:
             return ticket, None, invalid
     if not terminal.key_still_allows(security.credential_store.session_factory, ticket.key_id, ticket.user_id):
-        return ticket, None, (4403, "forbidden", "the API key this ticket was made with was deleted or can't "
-                                                  "open terminals any more")
+        return ticket, None, (4403, "forbidden", "the API key this ticket was made with was deleted, expired or "
+                                                  "can't open terminals any more")
     if sanctions.account_blocked(service.repository.session_factory, ticket.user_id):
         from greencompute_gateway.application.sanctions import BLOCKED_MESSAGE
 

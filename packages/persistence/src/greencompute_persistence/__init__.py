@@ -1,5 +1,5 @@
 from greencompute_persistence.bus import BusMessage, NatsJetStreamBus, SubjectBus, create_subject_bus
-from greencompute_persistence.credentials import CredentialStore
+from greencompute_persistence.credentials import CredentialStore, StoredAPIKey, key_expired
 from greencompute_persistence.db import create_db_engine, create_session_factory, init_database, session_scope
 from greencompute_persistence.metrics import MetricsStore, get_metrics_store, render_prometheus_text
 from greencompute_persistence.rate_limit import FixedWindowRateLimiter, RateLimitResult
@@ -11,6 +11,7 @@ __all__ = [
     "Base",
     "BusMessage",
     "CredentialStore",
+    "StoredAPIKey",
     "FixedWindowRateLimiter",
     "MetricsStore",
     "RateLimitResult",
@@ -25,6 +26,7 @@ __all__ = [
     "database_ready",
     "get_metrics_store",
     "init_database",
+    "key_expired",
     "load_runtime_settings",
     "render_prometheus_text",
     "session_scope",

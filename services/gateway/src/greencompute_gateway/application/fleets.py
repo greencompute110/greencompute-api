@@ -381,8 +381,17 @@ def _set_status(service, fleet_id: str, *, reason: str, state: str | None = None
             row.updated_at = _now()
 
 
-def _key_deleted(service, fleet: FleetORM) -> bool:
-    return bool(fleet.created_by_key_id) and service.repository.get_api_key(fleet.created_by_key_id) is None
+def _key_gone(service, fleet: FleetORM) -> str | None:
+    """"deleted" or "expired" when the key the fleet starts rentals with no
+    longer works, else None. Members already running keep running."""
+    if not fleet.created_by_key_id:
+        return None
+    from greencompute_persistence import key_expired
+
+    key = service.repository.get_api_key(fleet.created_by_key_id)
+    if key is None:
+        return "deleted"
+    return "expired" if key_expired(key) else None
 
 
 def _record_progress(service, members: list[tuple[dict, Any]]) -> None:
@@ -524,9 +533,11 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
         _set_status(service, fleet_id, state="paused", reason="Paused: its workload was deleted.")
         return
 
-    if _key_deleted(service, fleet):
+    gone = _key_gone(service, fleet)
+    if gone:
         _set_status(service, fleet_id, state="paused", reason=(
-            "Paused: the API key that created this fleet was deleted. Create the fleet again with a current key."))
+            f"Paused: the API key that created this fleet {'expired' if gone == 'expired' else 'was deleted'}. "
+            "Create the fleet again with a current key."))
         return
 
     # Credit: an hour of everything that would then be running.

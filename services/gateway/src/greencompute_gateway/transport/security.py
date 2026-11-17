@@ -5,10 +5,11 @@ import hmac
 import math
 import os
 import time
+from datetime import UTC
 
 from fastapi import HTTPException, status
 
-from greencompute_persistence import CredentialStore, FixedWindowRateLimiter, get_metrics_store
+from greencompute_persistence import CredentialStore, FixedWindowRateLimiter, get_metrics_store, key_expired
 from greencompute_protocol import APIKeyRecord
 
 
@@ -166,6 +167,28 @@ _AUTH_HEADERS = {
 }
 
 
+def _refuse_expired_key(api_key) -> None:
+    """401 api_key_expired for a key past its `expires_at`. Not an auth
+    failure for the per-IP throttle: the key is real, only old, and every
+    client behind the host's NAT shares one IP, so counting these would lock
+    everyone out over one agent's stale key."""
+    if not key_expired(api_key):
+        return
+    from greencompute_gateway.transport.errors import coded
+
+    metrics.increment("auth.failure.expired_api_key")
+    expires = api_key.expires_at if api_key.expires_at.tzinfo else api_key.expires_at.replace(tzinfo=UTC)
+    when = expires.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    raise coded(
+        status.HTTP_401_UNAUTHORIZED,
+        "api_key_expired",
+        f"expired api key: it expired at {when}. Create a new key at https://www.green-compute.com/settings",
+        headers={**_AUTH_HEADERS,
+                 "WWW-Authenticate": 'Bearer realm="green-compute", error="invalid_token", '
+                                     'error_description="the API key expired"'},
+    )
+
+
 def require_api_key(
     authorization: str | None,
     x_api_key: str | None,
@@ -199,6 +222,7 @@ def require_api_key(
             detail="invalid api key" + _AUTH_HELP,
             headers=_AUTH_HEADERS,
         )
+    _refuse_expired_key(api_key)
     if admin_required and not api_key.admin:
         metrics.increment("auth.failure.admin_required")
         _check_auth_failure_throttle(client_ip)
@@ -277,6 +301,7 @@ def require_provision_or_admin(
             detail="invalid api key" + _AUTH_HELP,
             headers=_AUTH_HEADERS,
         )
+    _refuse_expired_key(api_key)
     if not api_key.admin:
         metrics.increment("auth.failure.admin_required")
         _check_auth_failure_throttle(client_ip)

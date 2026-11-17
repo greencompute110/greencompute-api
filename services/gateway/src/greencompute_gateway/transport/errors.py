@@ -22,6 +22,7 @@ Error", into the same JSON.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -48,6 +49,8 @@ CODES: dict[str, tuple[int, str]] = {
     "invalid_request": (400, "The request can't be done as sent; `message` says why."),
     "gpu_unavailable": (400, "None of the GPU models asked for is offered; `detail.available` lists those that are."),
     "unauthenticated": (401, "The API key is missing or not valid."),
+    "api_key_expired": (401, "The API key is past its expiry (`expires_at`); create a new key. Rentals it "
+                             "started keep running."),
     "insufficient_balance": (402, "The balance doesn't cover an hour of what you're starting."),
     "forbidden": (403, "This key or account may not do this."),
     "scope_required": (403, "The key lacks a scope; `detail.required_scope` names it."),
@@ -157,6 +160,12 @@ def _message(code: str, detail: Any, text: str, retry_after: int | None) -> str:
     if code == "unauthenticated":
         return ("Your API key is missing or not valid. Send it as `Authorization: Bearer <key>`; "
                 "you can create one at https://www.green-compute.com/settings.")
+    if code == "api_key_expired":
+        when = re.search(r"expired at (\S+?)[.;,]?(?:\s|$)", text)
+        at = f" at {when.group(1)}" if when else ""
+        return (f"This API key expired{at}. Create a new key at https://www.green-compute.com/settings "
+                "(or with POST /platform/api-keys and a key that still works) and send it as "
+                "`Authorization: Bearer <key>`.")
     if code == "insufficient_balance":
         short = None
         if isinstance(d.get("required_cents"), int) and isinstance(d.get("current_cents"), int):

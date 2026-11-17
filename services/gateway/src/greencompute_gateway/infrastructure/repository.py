@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from greencompute_persistence import create_db_engine, create_session_factory, init_database, session_scope
+from greencompute_persistence.credentials import StoredAPIKey, stored_api_key
 from greencompute_persistence.db import needs_bootstrap
 from greencompute_persistence.orm import (
     AdminAccountORM,
@@ -149,6 +150,10 @@ class GatewayRepository:
             row.daily_spend_limit_cents = (
                 round(api_key.daily_spend_limit_usd * 100) if api_key.daily_spend_limit_usd is not None else None
             )
+            # Only a record that carries an expiry sets it: re-saving a key
+            # from a plain protocol record must not make it never expire.
+            if "expires_at" in type(api_key).model_fields:
+                row.expires_at = api_key.expires_at
             session.add(row)
         return api_key
 
@@ -504,18 +509,8 @@ class GatewayRepository:
         )
 
     @staticmethod
-    def _to_api_key(row: APIKeyORM) -> APIKeyRecord:
-        return APIKeyRecord(
-            key_id=row.key_id,
-            user_id=row.user_id,
-            name=row.name,
-            admin=row.admin,
-            scopes=row.scopes,
-            secret=row.secret,
-            created_at=row.created_at,
-            max_active_rentals=row.max_active_rentals,
-            daily_spend_limit_usd=(row.daily_spend_limit_cents / 100 if row.daily_spend_limit_cents is not None else None),
-        )
+    def _to_api_key(row: APIKeyORM) -> StoredAPIKey:
+        return stored_api_key(row)
 
     @staticmethod
     def _to_secret(row: UserSecretORM) -> UserSecretRecord:

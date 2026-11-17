@@ -80,6 +80,9 @@ class APIKeyORM(Base):
     # wallet (POST /platform/auth/wallet/verify). Signing in again revokes
     # exactly these, never the website's key or keys the user made.
     issued_by_wallet: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    # When the key stops working (401 api_key_expired); NULL: never. A key
+    # made with an expiring key never outlives it.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class HeartbeatORM(Base):

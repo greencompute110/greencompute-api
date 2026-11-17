@@ -390,12 +390,13 @@ def _key_out(row: APIKeyORM) -> dict:
         "scopes": list(row.scopes or []),
         "max_active_rentals": row.max_active_rentals,
         "daily_spend_limit_usd": row.daily_spend_limit_cents / 100 if row.daily_spend_limit_cents is not None else None,
+        "expires_at": row.expires_at.isoformat() if row.expires_at else None,
     }
 
 
 def _issue_key(
     session_factory, user_id: str, tag: str, *, name: str, scopes: list[str], max_active_rentals: int | None,
-    daily_spend_limit_usd: float | None, keep_existing_keys: bool,
+    daily_spend_limit_usd: float | None, keep_existing_keys: bool, expires_at: datetime | None = None,
 ) -> tuple[str, dict, list[str]]:
     """(secret, key fields, revoked key ids): the new key, and unless
     `keep_existing_keys` the earlier keys this wallet's sign-ins issued
@@ -413,7 +414,7 @@ def _issue_key(
             secret=f"gk_{secrets.token_urlsafe(24)}", created_at=now,
             max_active_rentals=max_active_rentals,
             daily_spend_limit_cents=round(daily_spend_limit_usd * 100) if daily_spend_limit_usd is not None else None,
-            issued_by_wallet=tag,
+            issued_by_wallet=tag, expires_at=expires_at,
         )
         session.add(row)
         session.flush()
@@ -474,9 +475,11 @@ def verify(
     max_active_rentals: int | None = None,
     daily_spend_limit_usd: float | None = None,
     keep_existing_keys: bool = False,
+    expires_at: datetime | None = None,
 ) -> dict:
     """Step 3 for an agent: a signed challenge in, an API key out (or, for
-    a revoke_keys challenge, the keys revoked)."""
+    a revoke_keys challenge, the keys revoked). `expires_at`: when the key
+    stops working (None: never)."""
     from greencompute_gateway.domain.scopes import normalize_scopes
 
     try:
@@ -505,7 +508,7 @@ def verify(
     secret, key, revoked = _issue_key(
         session_factory, user_id, wallet_tag(chain, address), name=name, scopes=scopes,
         max_active_rentals=max_active_rentals, daily_spend_limit_usd=daily_spend_limit_usd,
-        keep_existing_keys=keep_existing_keys,
+        keep_existing_keys=keep_existing_keys, expires_at=expires_at,
     )
     log.info("wallet sign-in: key %s for account %s (%s), revoked %d", key["key_id"], user_id, chain, len(revoked))
     return {

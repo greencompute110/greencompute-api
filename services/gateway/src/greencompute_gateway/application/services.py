@@ -24,6 +24,7 @@ from greencompute_control_plane.application.services import (
     service as default_control_plane_service,
 )
 from greencompute_control_plane.domain import metering
+from greencompute_persistence.credentials import StoredAPIKey
 from greencompute_protocol import (
     WorkloadKind,
     APIKeyCreateRequest,
@@ -677,7 +678,15 @@ class GatewayService:
         if allow_user_id_override is not False:
             max_active = request.max_active_rentals
             daily_limit = request.daily_spend_limit_usd
-        api_key = APIKeyRecord(
+        # When it stops working (schemas.KeyExpiry; a plain protocol request
+        # has none). A key never outlives the key that made it, so a leaked
+        # short-lived key can't mint itself a lasting one.
+        requested = getattr(request, "requested_expiry", None)
+        expires_at = requested() if callable(requested) else None
+        parent_expiry = getattr(caller_limits, "expires_at", None) if caller_limits is not None else None
+        if parent_expiry is not None:
+            expires_at = parent_expiry if expires_at is None else min(expires_at, parent_expiry)
+        api_key = StoredAPIKey(
             name=request.name,
             user_id=user_id,
             admin=admin,
@@ -685,6 +694,7 @@ class GatewayService:
             secret=f"gk_{secrets.token_urlsafe(24)}",
             max_active_rentals=max_active,
             daily_spend_limit_usd=daily_limit,
+            expires_at=expires_at,
         )
         return self.repository.save_api_key(api_key)
 

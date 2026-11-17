@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import HTTPException, status
 
-from greencompute_persistence import CredentialStore, get_metrics_store
+from greencompute_persistence import CredentialStore, get_metrics_store, key_expired
 from greencompute_control_plane.application.services import service
 from greencompute_control_plane.config import settings
 from greencompute_protocol import MemoryReplayStore, SignedRequest, verify_payload, verify_payload_hotkey
@@ -26,7 +26,7 @@ def caller_is_admin(authorization: str | None, x_api_key: str | None) -> bool:
     if not secret:
         return False
     api_key = credential_store.get_api_key_by_secret(secret)
-    return bool(api_key and api_key.admin)
+    return bool(api_key and api_key.admin and not key_expired(api_key))
 
 
 def require_admin_api_key(authorization: str | None, x_api_key: str | None) -> None:
@@ -44,6 +44,9 @@ def require_admin_api_key(authorization: str | None, x_api_key: str | None) -> N
     if api_key is None:
         metrics.increment("auth.failure.invalid_admin_key")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid admin api key")
+    if key_expired(api_key):
+        metrics.increment("auth.failure.expired_admin_key")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="expired admin api key")
     if not api_key.admin:
         metrics.increment("auth.failure.non_admin_key")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin api key required")
