@@ -1468,12 +1468,31 @@ class ControlPlaneService:
         if not deployment.hotkey:
             return False
         heartbeat = self.repository.get_heartbeat(deployment.hotkey)
-        if heartbeat is None or heartbeat.observed_at is None:
-            return True
-        if (now - self._ensure_utc(heartbeat.observed_at)).total_seconds() > settings.miner_heartbeat_timeout_seconds:
-            return True
         node = self._find_node(deployment.node_id) if deployment.node_id else None
-        return node is not None and self._is_node_stale(node, now=now)
+        return self._silent_at(
+            deployment.hotkey,
+            heartbeat.observed_at if heartbeat is not None else None,
+            node is not None,
+            self._as_datetime(node.observed_at) if node is not None and node.observed_at is not None else None,
+            now,
+        )
+
+    def _silent_at(
+        self, hotkey: str | None, heartbeat_seen: datetime | None, node_known: bool, node_seen: datetime | None,
+        now: datetime,
+    ) -> bool:
+        """_box_silent's rule from when the machine's heartbeat and its node's
+        inventory were last seen: no heartbeat, or one older than
+        miner_heartbeat_timeout_seconds, or a known node's inventory older
+        than node_inventory_timeout_seconds."""
+        if not hotkey:
+            return False
+        if heartbeat_seen is None:
+            return True
+        if (now - self._ensure_utc(heartbeat_seen)).total_seconds() > settings.miner_heartbeat_timeout_seconds:
+            return True
+        return (node_known and node_seen is not None
+                and (now - self._ensure_utc(node_seen)).total_seconds() > settings.node_inventory_timeout_seconds)
 
     def _end_offline_pod(self, deployment: DeploymentRecord, silent_for: float) -> None:
         reason = f"ended: the machine running it stopped reporting {int(silent_for // 3600)} hours ago"
@@ -2284,23 +2303,38 @@ class ControlPlaneService:
         private models ran since the meter's last tick (none while a machine
         is silent, at most SETTLE_TAIL_MAX_SECONDS), plus the sub-cent
         remainders and any shortfall carried on its deployments that can
-        still be charged. The balance less this is what is really left."""
+        still be charged. The balance less this is what is really left.
+
+        It is on every balance read (the website polls it), so it takes a
+        fixed number of queries: one, finding nothing, for an account with
+        nothing running or owed; else one each for those deployments, their
+        workloads, their machines' heartbeats and their nodes' last reports.
+        The meter's rules (hourly_charge_cents, _box_silent) applied to them."""
         now = now or datetime.now(UTC)
         rows = self.repository.metering_pending(user_id)
         if not rows:
             return 0
-        deployments = self.repository.get_deployments([r["deployment_id"] for r in rows])
-        workloads: dict[str, WorkloadSpec | None] = {}
+        running = {
+            r["deployment_id"] for r in rows
+            if r["state"] == DeploymentState.READY.value and r["metered_until"] is not None and not r["metered_silent"]
+        }
+        live = [r for r in rows if r["deployment_id"] in running]
+        workloads = self.repository.get_workloads({r["workload_id"] for r in live}) if live else {}
+        heartbeats = self.repository.heartbeats_seen({r["hotkey"] for r in live if r["hotkey"]}) if live else {}
+        nodes = self.repository.nodes_seen({r["node_id"] for r in live if r["node_id"]}) if live else {}
         total = 0
         for row in rows:
             mcents = max(0, row["remainder_mcents"])
-            dep = deployments.get(row["deployment_id"])
-            if (dep is not None and dep.state == DeploymentState.READY and row["metered_until"] is not None
-                    and not row["metered_silent"]):
-                if dep.workload_id not in workloads:
-                    workloads[dep.workload_id] = self.repository.get_workload(dep.workload_id)
-                per_hour = self.hourly_charge_cents(dep, workloads[dep.workload_id], now=now)
-                if per_hour:
+            if row["deployment_id"] in running:
+                workload = workloads.get(row["workload_id"])
+                shared_model = workload is not None and workload.kind == WorkloadKind.INFERENCE and not (
+                    row["owner_user_id"] and metering.is_private_model(
+                        row["owner_user_id"], workload.kind, workload.workload_id, workload.metadata))
+                silent = self._silent_at(row["hotkey"], heartbeats.get(row["hotkey"]), row["node_id"] in nodes,
+                                         nodes.get(row["node_id"]), now)
+                if not shared_model and not silent:
+                    gpu_count = (workload.requirements.gpu_count if workload else 1) or 1
+                    per_hour = (row["hourly_rate_cents"] or 10) * gpu_count * max(row["ready_instances"] or 0, 1)
                     tail = min(max(0.0, (now - row["metered_until"]).total_seconds()), self.SETTLE_TAIL_MAX_SECONDS)
                     mcents += round(per_hour * 1000 * tail / 3600)
             total += -(-mcents // 1000)

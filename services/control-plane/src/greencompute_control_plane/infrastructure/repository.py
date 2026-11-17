@@ -933,11 +933,14 @@ class ControlPlaneRepository:
     def metering_pending(self, owner_user_id: str) -> list[dict]:
         """The owner's deployments with usage accrued but not yet debited:
         an open READY spell (accounted up to `metered_until`) or a carried
-        remainder, on deployments that can still be charged (not ended)."""
+        remainder, on deployments that can still be charged (not ended), with
+        what the meter's rate needs. One query on the indexed owner column."""
         with session_scope(self.session_factory) as session:
             rows = session.execute(
                 select(
-                    DeploymentORM.deployment_id, DeploymentORM.state, DeploymentORM.metered_until,
+                    DeploymentORM.deployment_id, DeploymentORM.state, DeploymentORM.owner_user_id,
+                    DeploymentORM.workload_id, DeploymentORM.hotkey, DeploymentORM.node_id,
+                    DeploymentORM.hourly_rate_cents, DeploymentORM.ready_instances, DeploymentORM.metered_until,
                     DeploymentORM.metered_silent, DeploymentORM.metering_remainder_mcents,
                 ).where(
                     DeploymentORM.owner_user_id == owner_user_id,
@@ -949,12 +952,41 @@ class ControlPlaneRepository:
                 {
                     "deployment_id": r.deployment_id,
                     "state": r.state,
+                    "owner_user_id": r.owner_user_id,
+                    "workload_id": r.workload_id,
+                    "hotkey": r.hotkey,
+                    "node_id": r.node_id,
+                    "hourly_rate_cents": r.hourly_rate_cents,
+                    "ready_instances": r.ready_instances,
                     "metered_until": _aware(r.metered_until),
                     "metered_silent": bool(r.metered_silent),
                     "remainder_mcents": r.metering_remainder_mcents or 0,
                 }
                 for r in rows
             ]
+
+    def heartbeats_seen(self, hotkeys: set[str]) -> dict[str, datetime | None]:
+        """When each of these machines last reported (its heartbeat), in one
+        query; hotkeys never heard from are left out."""
+        if not hotkeys:
+            return {}
+        with session_scope(self.session_factory) as session:
+            rows = session.execute(
+                select(HeartbeatORM.hotkey, HeartbeatORM.observed_at).where(HeartbeatORM.hotkey.in_(hotkeys))
+            ).all()
+            return {hotkey: _aware(seen) for hotkey, seen in rows}
+
+    def nodes_seen(self, node_ids: set[str]) -> dict[str, datetime | None]:
+        """When each of these nodes' inventory was last reported, in one
+        query, without loading the inventories; unknown nodes are left out."""
+        if not node_ids:
+            return {}
+        with session_scope(self.session_factory) as session:
+            rows = session.execute(
+                select(NodeInventoryORM.node_id, NodeInventoryORM.observed_at).where(
+                    NodeInventoryORM.node_id.in_(node_ids))
+            ).all()
+            return {node_id: _aware(seen) for node_id, seen in rows}
 
     def save_assignment(self, assignment: LeaseAssignment) -> LeaseAssignment:
         with session_scope(self.session_factory) as session:

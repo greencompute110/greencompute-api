@@ -467,6 +467,43 @@ def test_pending_usage_leaves_out_a_silent_machine_and_counts_owed_cents(cp):
     assert cp.pending_usage_cents("u1") == 5  # the minute it couldn't pay, owed on a resume
 
 
+def _queries(cp, fn):
+    """(fn's result, the SQL statements it ran)."""
+    from sqlalchemy import event
+
+    ran = []
+
+    def count(conn, cursor, statement, *args):
+        ran.append(statement)
+
+    event.listen(cp.repository.engine, "before_cursor_execute", count)
+    try:
+        return fn(), ran
+    finally:
+        event.remove(cp.repository.engine, "before_cursor_execute", count)
+
+
+def test_pending_usage_takes_a_fixed_number_of_queries(cp, monkeypatch):
+    """The website polls the balance every 20 s per tab: one query for an
+    account with nothing running, and the same few however many run."""
+    def no_full_scans(*_):
+        raise AssertionError("pending usage must not load every node or heartbeat")
+
+    monkeypatch.setattr(cp.repository, "list_nodes", no_full_scans)
+    monkeypatch.setattr(cp.repository, "list_heartbeats", no_full_scans)
+    pending, idle = _queries(cp, lambda: cp.pending_usage_cents("u1"))
+    assert (pending, len(idle)) == (0, 1)
+    for _ in range(2):
+        _ready(cp, ready_for=30)
+    pending, few = _queries(cp, lambda: cp.pending_usage_cents("u1"))
+    assert pending == 6  # two rentals, 30 s each at 5¢/min: 2.5¢ → 3¢ each
+    for _ in range(4):
+        _ready(cp, _workload(cp, gpus=2), ready_for=21)
+    pending, many = _queries(cp, lambda: cp.pending_usage_cents("u1"))
+    assert pending == 6 + 4 * 4  # 2 GPUs for 21 s: 3.5¢ → 4¢ each
+    assert len(few) == len(many) <= 4
+
+
 def test_balance_and_forecast_show_pending_and_available(cp, monkeypatch):
     from types import SimpleNamespace
 
