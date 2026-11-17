@@ -80,6 +80,7 @@ from greencompute_gateway.domain.routing import (
 from greencompute_gateway.infrastructure.inference_client import (
     HttpInferenceClient,
     InferenceBadResponseError,
+    InferenceBusyError,
     InferenceConnectionError,
     InferenceRequestRejectedError,
     InferenceTimeoutError,
@@ -2606,7 +2607,11 @@ class GatewayService:
     ) -> None:
         failure_class = self._classify_inference_error(exc)
         decision = "failed"
-        if isinstance(exc, InferenceRequestRejectedError):
+        if isinstance(exc, InferenceBusyError):
+            # At its limit of requests at once: full, not failing.
+            decision = "busy"
+            self.metrics.increment("inference.replica_busy")
+        elif isinstance(exc, InferenceRequestRejectedError):
             # The model refused the request itself (a 4xx): the caller's
             # fault, never the model's. Counting these let three bad requests
             # from one caller mark a shared model FAILED for everyone.
@@ -2672,6 +2677,8 @@ class GatewayService:
     def _classify_inference_error(exc: RuntimeError) -> str:
         if isinstance(exc, InferenceRequestRejectedError):
             return "request_rejected"
+        if isinstance(exc, InferenceBusyError):
+            return "replica_busy"
         if isinstance(exc, InferenceTimeoutError):
             return "upstream_timeout"
         if isinstance(exc, InferenceConnectionError):

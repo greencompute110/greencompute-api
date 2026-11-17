@@ -74,6 +74,10 @@ class FakeNode(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         self.server.requests.append(body)
         chat = self.server.chat
+        messages = body.get("messages") or [{}]
+        if messages[-1].get("content") == "hold":  # generates until the test lets it finish
+            self.server.release.wait(10)
+            chat = (200, {"model": "m", "choices": [{"message": {"role": "assistant", "content": "held"}}]}, None)
         if chat == "hang":
             self.server.release.wait(5)
             return
@@ -175,18 +179,25 @@ def gw(cp):
 
 @pytest.fixture
 def api(gw, monkeypatch):
-    """The real /v1 routes on the service above, called as user u1."""
+    """The real /v1 routes on the service above, called as user u1 (or as
+    the user named in an X-API-Key header). One event loop for the client's
+    life, as under uvicorn."""
     caller = SimpleNamespace(user_id="u1", key_id="k1", admin=False)
+
+    def key(authorization=None, x_api_key=None, *a, **k):
+        if isinstance(x_api_key, str):
+            return SimpleNamespace(user_id=x_api_key, key_id=f"k-{x_api_key}", admin=False)
+        return caller
     monkeypatch.setattr(routes, "service", gw)
-    monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: caller)
+    monkeypatch.setattr(routes, "require_api_key", key)
     for name in ("enforce_rate_limit", "_enforce_key_limits", "_enforce_account_spend_limit", "_refuse_blocked_account"):
         monkeypatch.setattr(routes, name, lambda *a, **k: None)
     app = FastAPI()
     install_error_handlers(app)
     app.include_router(routes.router)
-    client = TestClient(app, raise_server_exceptions=False)
-    client.caller = caller
-    return client
+    with TestClient(app, raise_server_exceptions=False) as client:
+        client.caller = caller
+        yield client
 
 
 def chat(api, model="qwen2.5-7b-instruct", **body):
@@ -806,3 +817,105 @@ def test_a_passed_on_reason_is_capped(api, cp, node):
     node.chat = (400, {"object": "error", "message": "x" * 5000}, None)
     message = chat(api).json()["error"]["message"]
     assert len(message) < 400 and message.rstrip(".").endswith("…")
+
+
+# --- review H3: one account can't pin the gateway's threads ------------------------------
+
+
+def _hold(api, results, user, **body):
+    def run():
+        res = api.post("/v1/chat/completions", headers={"X-API-Key": user}, json={
+            "model": "qwen2.5-7b-instruct", "messages": [{"role": "user", "content": "hold"}], **body})
+        results.append(res.status_code)
+    t = threading.Thread(target=run)
+    t.start()
+    return t
+
+
+def _wait_for(predicate, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out waiting"
+        time.sleep(0.02)
+
+
+def test_an_account_has_a_few_requests_in_progress_at_most(api, cp, node, gw, monkeypatch):
+    from greencompute_gateway.transport import v1_capacity
+
+    monkeypatch.setattr(v1_capacity, "V1_MAX_IN_FLIGHT_PER_ACCOUNT", 2)
+    gw.inference_client.upstream_timeout_seconds = 15
+    catalog_model(cp, node)
+    results = []
+    threads = [_hold(api, results, "u1") for _ in range(2)]
+    _wait_for(lambda: len(node.requests) == 2)
+    res = chat(api)  # u1's third
+    assert res.status_code == 429 and res.headers["retry-after"] == "2"
+    err = res.json()["error"]
+    assert (err["code"], err["retryable"]) == ("rate_limited", True)
+    assert res.json()["detail"]["limit"] == 2 and "in progress" in err["message"]
+    api.caller.user_id = "u2"  # another account isn't held up
+    assert chat(api).status_code == 200
+    node.release.set()
+    for t in threads:
+        t.join()
+    assert results == [200, 200]
+    api.caller.user_id = "u1"
+    assert chat(api).status_code == 200  # its slots are free again
+    assert v1_capacity.in_flight("u1") == 0
+
+
+def test_a_finished_or_abandoned_stream_frees_its_slot(api, cp, node):
+    from greencompute_gateway.transport import v1_capacity
+
+    catalog_model(cp, node)
+    node.chat = "stream"
+    with api.stream("POST", "/v1/chat/completions", json={
+        "model": "qwen2.5-7b-instruct", "messages": [{"role": "user", "content": "hi"}], "stream": True,
+    }) as res:
+        "".join(res.iter_text())
+    assert v1_capacity.in_flight("u1") == 0
+    with api.stream("POST", "/v1/chat/completions", json={
+        "model": "qwen2.5-7b-instruct", "messages": [{"role": "user", "content": "hi"}], "stream": True,
+    }) as res:
+        next(res.iter_bytes())  # read a little, then hang up
+    import gc
+    gc.collect()
+    _wait_for(lambda: v1_capacity.in_flight("u1") == 0)
+
+
+def test_v1_runs_on_its_own_threads_so_platform_stays_responsive(api, cp, node, gw, monkeypatch):
+    """Every /v1 thread busy with long completions: /platform still answers
+    at once (it used to queue behind them on the one shared pool)."""
+    from greencompute_gateway.transport import v1_capacity
+
+    monkeypatch.setattr(v1_capacity, "V1_THREADS", 2)
+    monkeypatch.setattr(v1_capacity, "_limiters", __import__("weakref").WeakKeyDictionary())
+    import anyio.to_thread
+
+    # The shared pool as small as the /v1 one: if /v1 still ran on it, two
+    # held completions would take every thread /platform has.
+    api.portal.call(lambda: setattr(anyio.to_thread.current_default_thread_limiter(), "total_tokens", 2))
+    gw.inference_client.upstream_timeout_seconds = 15
+    catalog_model(cp, node)
+    results = []
+    threads = [_hold(api, results, "u1") for _ in range(3)]  # two run, one waits for a /v1 thread
+    _wait_for(lambda: len(node.requests) == 2)
+    started = time.monotonic()
+    assert api.get("/platform/nodes/supported").status_code == 200
+    assert time.monotonic() - started < 2
+    node.release.set()
+    for t in threads:
+        t.join()
+    assert results == [200, 200, 200]
+
+
+def test_a_full_replica_is_busy_not_failing(api, cp, node):
+    """The node's per-model limit of requests in progress: 503 model_busy."""
+    _, dep = catalog_model(cp, node)
+    node.chat = (503, {"detail": "busy", "reason": "model_busy"}, {"X-GC-Node-Error": "model_busy"})
+    for i in range(8):
+        api.caller.user_id = "u1" if i % 2 else "u2"
+        res = chat(api)
+        assert res.status_code == 503 and res.headers["retry-after"] == "2"
+        assert res.json()["error"]["code"] == "model_unavailable"
+    assert failures(cp, dep) == 0  # neither counted nor escalated

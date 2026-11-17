@@ -49,6 +49,12 @@ class InferenceBadResponseError(InferenceUpstreamError):
     pass
 
 
+class InferenceBusyError(InferenceUpstreamError):
+    """The node is at its limit of requests in progress for this model (a
+    503 with X-GC-Node-Error: model_busy). The model is fine: never counted
+    against it; another replica, or a retry in a moment, will do."""
+
+
 class InferenceRequestRejectedError(InferenceUpstreamError):
     """The model server refused the request itself, with a 4xx: empty
     `messages`, more tokens than its context, tools it wasn't started for.
@@ -143,6 +149,9 @@ def classify_http_error(exc: HTTPError, deployment_id: str | None) -> InferenceU
     if node_error == "model_unreachable":
         return InferenceConnectionError(f"the model server is unreachable for {where}", status_code=status,
                                         upstream_message=message, model_unreachable=True)
+    if node_error == "model_busy":
+        return InferenceBusyError(f"the model is at capacity for {where}", status_code=status,
+                                  upstream_message=message)
     if node_error == "model_timeout":
         return InferenceTimeoutError(f"upstream timed out for {where}", status_code=status, upstream_message=message)
     if status == 502 and message and message.startswith(_OLD_NODE_ERROR):

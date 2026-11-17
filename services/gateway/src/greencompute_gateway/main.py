@@ -57,6 +57,11 @@ async def lifespan(app: FastAPI):
         deposit_watcher_loop,
     )
 
+    # More threads for the sync routes (AnyIO's default is 40); /v1
+    # completions have their own (transport/v1_capacity).
+    from greencompute_gateway.transport.v1_capacity import raise_default_pool
+
+    raise_default_pool()
     tasks = [
         asyncio.create_task(deposit_watcher_loop(), name="deposit-watcher"),
         asyncio.create_task(billing_monitor_loop(), name="billing-monitor"),

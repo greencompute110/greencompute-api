@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+import weakref
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from urllib import parse as urllib_parse
@@ -56,12 +57,13 @@ from greencompute_gateway.domain.routing import (
 )
 from greencompute_gateway.infrastructure.inference_client import (
     InferenceBadResponseError,
+    InferenceBusyError,
     InferenceConnectionError,
     InferenceRequestRejectedError,
     InferenceTimeoutError,
     InferenceUpstreamError,
 )
-from greencompute_gateway.transport import schemas
+from greencompute_gateway.transport import schemas, v1_capacity
 from greencompute_gateway.transport.schemas import ok
 from greencompute_gateway.transport.errors import SUPPORT, coded
 from greencompute_gateway.transport.security import (
@@ -3375,13 +3377,33 @@ def _callable_model_id(workload, api_key) -> str | None:
 
 
 @router.post("/v1/chat/completions")
-def chat_completions(
+async def chat_completions(
     payload: ChatCompletionRequest,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     host: str | None = Header(default=None, alias="Host"),
 ) -> dict:
-    return _complete(payload, authorization=authorization, x_api_key=x_api_key, host=host)
+    # On the /v1 threads (v1_capacity), never the pool /platform routes use.
+    return _respond(await v1_capacity.run_v1(
+        _complete, payload, authorization=authorization, x_api_key=x_api_key, host=host))
+
+
+class _Streamed:
+    """A primed answer stream and the in-flight slot it holds until it ends."""
+
+    def __init__(self, body, slot) -> None:
+        self.body = body
+        self.slot = slot
+
+
+def _respond(result):
+    if isinstance(result, _Streamed):
+        return StreamingResponse(
+            v1_capacity.v1_stream(result.body, result.slot),
+            media_type="text/event-stream",
+            headers={"cache-control": "no-cache"},
+        )
+    return result
 
 
 def _complete(
@@ -3393,16 +3415,33 @@ def _complete(
     api_key=None,
     text_completion: bool = False,
 ):
-    """One chat completion for a caller, streamed or not. `text_completion`
-    answers in the legacy /v1/completions shape instead."""
-    from greencompute_gateway.application.services import InsufficientBalanceForInferenceError
-    from greencompute_gateway.infrastructure.billing_repository import BillingRepository
-
+    """One chat completion for a caller, streamed or not (blocking: run it on
+    the /v1 threads). `text_completion` answers in the legacy
+    /v1/completions shape instead."""
     api_key = api_key or require_api_key(authorization, x_api_key)
     enforce_rate_limit("chat_completions", api_key.key_id, limit=60, window_seconds=60)
     _enforce_key_limits(api_key)
     _enforce_account_spend_limit(api_key)
     _refuse_blocked_account(api_key)
+    slot = v1_capacity.claim_slot(api_key)  # at most a few in progress per account
+    try:
+        result = _complete_in_slot(payload, api_key=api_key, host=host, text_completion=text_completion)
+    except BaseException:
+        slot.release()
+        raise
+    if isinstance(result, _Streamed):
+        # Held until the stream ends, or its body is dropped unread (the
+        # caller left before it began): either way it is freed.
+        result.slot = slot
+        weakref.finalize(result.body, slot.release)
+    else:
+        slot.release()
+    return result
+
+
+def _complete_in_slot(payload: ChatCompletionRequest, *, api_key, host: str | None, text_completion: bool):
+    from greencompute_gateway.application.services import InsufficientBalanceForInferenceError
+    from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 
     # Pre-flight balance gate: require any positive balance. Per-request cost
     # is fractions of a cent for small prompts, so we don't need a large
@@ -3438,11 +3477,7 @@ def _complete(
             # code instead of a 200 whose stream breaks off.
             first = next(stream, None)
             body = _sse_chain(first, stream)
-            return StreamingResponse(
-                _as_text_completion_stream(body) if text_completion else body,
-                media_type="text/event-stream",
-                headers={"cache-control": "no-cache"},
-            )
+            return _Streamed(_as_text_completion_stream(body) if text_completion else body, None)
         response = service.invoke_chat_completion(
             payload,
             api_key_id=api_key.key_id,
@@ -3513,6 +3548,12 @@ def _inference_failure(exc: Exception) -> HTTPException:
             "message": f"The model rejected the request: {reason}",
             "upstream_status": exc.status_code,
         })
+    if isinstance(exc, InferenceBusyError):
+        metrics.increment("invoke.failure.busy")
+        return coded(503, "model_unavailable", {
+            "message": "The model is at capacity right now (every replica has as many requests in progress as "
+                       "it takes). Send the request again in a moment.",
+        }, {"Retry-After": "2"})
     # The model failed on it. `model_healthy` is the gateway's health probe
     # right after (services._handle_upstream_failure).
     metrics.increment(
@@ -3555,7 +3596,7 @@ def _prompt_error(message: str) -> HTTPException:
 
 
 @router.post("/v1/completions")
-def completions(
+async def completions(
     payload: dict,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -3565,6 +3606,11 @@ def completions(
     (`object: "text_completion"`, and streamed chunks likewise). The prompt
     reaches the model as one user message, so the model's chat template
     applies: an instruction gets an answer rather than a raw continuation."""
+    return _respond(await v1_capacity.run_v1(
+        _legacy_completion, payload, authorization=authorization, x_api_key=x_api_key, host=host))
+
+
+def _legacy_completion(payload: dict, *, authorization: str | None, x_api_key: str | None, host: str | None):
     api_key = require_api_key(authorization, x_api_key)
     if not payload.get("model"):
         raise HTTPException(status_code=400, detail="model required")
