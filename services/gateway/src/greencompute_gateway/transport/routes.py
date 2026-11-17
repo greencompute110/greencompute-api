@@ -682,10 +682,24 @@ def _account_limits_out(user_id: str) -> dict:
     ).model_dump(mode="json")
 
 
+def _unrestricted_key(api_key) -> bool:
+    """Full access (no scopes, or admin) with no per-key limits and no
+    expiry: the account's website key and a wallet's website-session keys,
+    or a key made like them."""
+    return (
+        (api_key.admin or not api_key.scopes)
+        and getattr(api_key, "max_active_rentals", None) is None
+        and getattr(api_key, "daily_spend_limit_usd", None) is None
+        and getattr(api_key, "expires_at", None) is None
+    )
+
+
 def _set_account_limits(payload: schemas.AccountLimitsUpdate, api_key, *, replace: bool) -> dict:
     """Only a full-access key may change them, as only one may turn on a
     wallet's sign-in: a rent-only or read-only key (a leaked agent's, say)
-    must not be able to lift the cap that stops it."""
+    must not be able to lift the cap that stops it. Raising or clearing one
+    (PUT: for any field it raises or clears) needs more: a full-access key
+    with no limits or expiry of its own. Any full-access key may tighten."""
     if api_key.scopes and not api_key.admin:
         raise coded(403, "scope_required", {
             "message": "changing the account's limits needs a full-access key",
@@ -702,11 +716,29 @@ def _set_account_limits(payload: schemas.AccountLimitsUpdate, api_key, *, replac
             raise HTTPException(status_code=404, detail="user not found")
         if not BillingRepository.caller_still_in(session, api_key.user_id, api_key.key_id):
             raise HTTPException(status_code=401, detail="invalid api key")
+        changes: dict[str, int | None] = {}
         if replace or "daily_spend_limit_usd" in sent:
             usd = payload.daily_spend_limit_usd
-            user.daily_spend_limit_cents = round(usd * 100) if usd is not None else None
+            changes["daily_spend_limit_cents"] = round(usd * 100) if usd is not None else None
         if replace or "max_active_rentals" in sent:
-            user.max_active_rentals = payload.max_active_rentals
+            changes["max_active_rentals"] = payload.max_active_rentals
+        names = {"daily_spend_limit_cents": "daily_spend_limit_usd", "max_active_rentals": "max_active_rentals"}
+        loosened = [
+            names[column] for column, new in changes.items()
+            if getattr(user, column) is not None and (new is None or new > getattr(user, column))
+        ]
+        if loosened and not _unrestricted_key(api_key):
+            raise coded(403, "unrestricted_key_required", {
+                "message": "raising or clearing the account's limits needs a key with full access and no limits "
+                           "or expiry of its own",
+                "code": "unrestricted_key_required",
+                "loosening": loosened,
+                "hint": "change them under Settings > Account limits at https://www.green-compute.com/settings, or "
+                        "with a key without scopes, limits or an expiry; this key may only lower a limit or set "
+                        "one where there is none",
+            })
+        for column, new in changes.items():
+            setattr(user, column, new)
         cents, rentals = user.daily_spend_limit_cents, user.max_active_rentals
     log.info("account limits: user_id=%s key_id=%s daily_spend_limit_cents=%s max_active_rentals=%s",
              api_key.user_id, api_key.key_id, cents, rentals)
@@ -741,7 +773,9 @@ def put_account_limits(
     account_spend_limit_reached and running rentals are paused (suspended,
     suspended_reason "spend_limit", disks kept as when credit runs out); at the
     rentals limit, new rentals get 403 account_rental_limit_reached (lowering
-    it stops nothing). Needs a full-access key."""
+    it stops nothing). Needs a full-access key; raising or clearing a limit
+    (also by leaving it out) needs one with no limits or expiry of its own,
+    such as the website's (403 unrestricted_key_required)."""
     return _set_account_limits(payload, _user_key(authorization, x_api_key), replace=True)
 
 
@@ -753,7 +787,8 @@ def patch_account_limits(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     """Change only the limits sent, e.g. {"max_active_rentals": null} to
-    clear one. Needs a full-access key."""
+    clear one. Needs a full-access key; raising or clearing a limit needs one
+    with no limits or expiry of its own (403 unrestricted_key_required)."""
     return _set_account_limits(payload, _user_key(authorization, x_api_key), replace=False)
 
 

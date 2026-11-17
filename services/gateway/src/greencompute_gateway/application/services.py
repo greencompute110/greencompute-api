@@ -677,19 +677,20 @@ class GatewayService:
                     f"a key with scopes {sorted(caller_scopes)} can only create keys with some of those scopes"
                 )
             admin = False
-            # Limits are inherited and can only get tighter: a limited key
-            # can't mint itself an unlimited one.
+            # A key with limits of its own makes no keys: each new key would
+            # start with a fresh 24-hour budget and rental count, so the
+            # limits wouldn't bound a leaked key. (An expiring key may: what it
+            # makes expires no later, below.)
+            if caller_limits is not None and (
+                caller_limits.max_active_rentals is not None or caller_limits.daily_spend_limit_usd is not None
+            ):
+                raise PermissionError(
+                    "a key with its own limits (max_active_rentals or daily_spend_limit_usd) can't create keys; "
+                    "create keys under Settings at https://www.green-compute.com/settings, or with a key without "
+                    "limits"
+                )
             max_active = request.max_active_rentals
             daily_limit = request.daily_spend_limit_usd
-            if caller_limits is not None:
-                if caller_limits.max_active_rentals is not None:
-                    if max_active is not None and max_active > caller_limits.max_active_rentals:
-                        raise PermissionError("a new key can't allow more running rentals than the key creating it")
-                    max_active = caller_limits.max_active_rentals if max_active is None else max_active
-                if caller_limits.daily_spend_limit_usd is not None:
-                    if daily_limit is not None and daily_limit > caller_limits.daily_spend_limit_usd:
-                        raise PermissionError("a new key can't have a higher spend limit than the key creating it")
-                    daily_limit = caller_limits.daily_spend_limit_usd if daily_limit is None else daily_limit
         if allow_user_id_override is not False:
             max_active = request.max_active_rentals
             daily_limit = request.daily_spend_limit_usd

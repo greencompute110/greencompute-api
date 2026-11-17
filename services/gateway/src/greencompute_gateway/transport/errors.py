@@ -56,6 +56,9 @@ CODES: dict[str, tuple[int, str]] = {
     "insufficient_balance": (402, "The balance doesn't cover an hour of what you're starting."),
     "forbidden": (403, "This key or account may not do this."),
     "scope_required": (403, "The key lacks a scope; `detail.required_scope` names it."),
+    "unrestricted_key_required": (403, "Raising or clearing an account limit needs a key with full access and no "
+                                       "limits or expiry of its own, such as the website's; any full-access key may "
+                                       "lower one."),
     "key_limit": (403, "The key is at one of its limits (rentals at once, or spend per 24 hours)."),
     "account_spend_limit_reached": (403, "The account (every key together) reached the spend limit per 24 hours its "
                                          "owner set; running rentals are paused too (suspended, resumable once under it). `detail` has the numbers."),

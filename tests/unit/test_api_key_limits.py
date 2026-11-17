@@ -103,19 +103,33 @@ def test_rental_and_inference_refused_at_the_spend_limit(db, gateway):
     routes._enforce_key_limits(_key(daily_spend_limit_usd=3.0))
 
 
-def test_new_keys_inherit_limits_and_can_only_tighten_them():
+def test_a_key_with_limits_of_its_own_creates_no_keys():
+    """Each new key would start a fresh 24-hour budget and rental count, so
+    per-key limits wouldn't bound a leaked key that could mint more."""
     svc = GatewayService(repository=SimpleNamespace(save_api_key=lambda rec: rec))
-    caller = _key(max_active_rentals=2, daily_spend_limit_usd=10.0)
-    mint = lambda **kw: svc.create_api_key(APIKeyCreateRequest(name="x", **kw), caller_user_id="u1",
-                                           allow_user_id_override=False, caller_limits=caller)
-    inherited = mint()
-    assert (inherited.max_active_rentals, inherited.daily_spend_limit_usd) == (2, 10.0)
-    tighter = mint(max_active_rentals=1, daily_spend_limit_usd=5.0)
-    assert (tighter.max_active_rentals, tighter.daily_spend_limit_usd) == (1, 5.0)
-    with pytest.raises(PermissionError):
-        mint(max_active_rentals=3)
-    with pytest.raises(PermissionError):
-        mint(daily_spend_limit_usd=20.0)
+
+    def mint(caller, **kw):
+        return svc.create_api_key(APIKeyCreateRequest(name="x", **kw), caller_user_id="u1",
+                                  allow_user_id_override=False, caller_limits=caller)
+
+    for caller in (_key(max_active_rentals=2), _key(daily_spend_limit_usd=10.0),
+                   _key(max_active_rentals=2, daily_spend_limit_usd=10.0)):
+        with pytest.raises(PermissionError, match="create keys under Settings"):
+            mint(caller, max_active_rentals=1, daily_spend_limit_usd=1.0)  # not even tighter ones
+    made = mint(_key(), max_active_rentals=1, daily_spend_limit_usd=5.0)  # a key without limits may
+    assert (made.max_active_rentals, made.daily_spend_limit_usd) == (1, 5.0)
+
+
+def test_the_route_refuses_a_limited_key_with_a_clear_message(db, gateway, monkeypatch):
+    from greencompute_gateway.transport import schemas
+
+    limited = _key(daily_spend_limit_usd=10.0)
+    monkeypatch.setattr(routes, "require_provision_or_admin", lambda *a, **k: (_ for _ in ()).throw(
+        HTTPException(status_code=403, detail="admin api key required")))
+    monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: limited)
+    with pytest.raises(HTTPException) as exc:
+        routes.create_api_key(schemas.APIKeyCreate(name="child"), "Bearer s", None)
+    assert exc.value.status_code == 403 and "create keys under Settings" in exc.value.detail
 
 
 def test_running_rentals_stop_when_their_key_reaches_its_limit(db):

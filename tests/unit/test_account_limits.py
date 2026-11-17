@@ -422,3 +422,53 @@ def test_a_rental_paused_at_the_cap_is_kept_like_one_whose_credit_ran_out(db, mo
     assert svc.suspension_terms(db.cp.get_deployment(saved))[0] > 0  # storage charge while kept
     assert svc.reap_exhausted_pods(now=paused_at + timedelta(minutes=settings.pod_unsaved_grace_minutes, seconds=5)) == [unsaved]
     assert db.cp.get_deployment(saved).state == DeploymentState.SUSPENDED
+
+
+# --- loosening needs an unrestricted key ------------------------------------------------------
+
+
+@pytest.fixture
+def restricted(api):
+    """Full-access keys that are limited some other way: their own spend
+    limit, or an expiry."""
+    with session_scope(api.sf) as s:
+        s.add(APIKeyORM(key_id="k-capped", user_id="u1", name="capped", admin=False, scopes=[], secret="capped",
+                        daily_spend_limit_cents=1000, created_at=datetime.now(UTC)))
+        s.add(APIKeyORM(key_id="k-exp", user_id="u1", name="exp", admin=False, scopes=[], secret="expiring",
+                        expires_at=datetime.now(UTC) + timedelta(days=3), created_at=datetime.now(UTC)))
+    return api
+
+
+def test_any_full_access_key_tightens_but_only_an_unrestricted_one_loosens(restricted):
+    for key in ("capped", "expiring"):
+        call("PUT", "/platform/account/limits", "full", {"daily_spend_limit_usd": None, "max_active_rentals": None})
+        status, body = call("PATCH", "/platform/account/limits", key, {"daily_spend_limit_usd": 50})  # set: tighter
+        assert status == 200 and body["daily_spend_limit_usd"] == 50.0, (key, body)
+        status, body = call("PATCH", "/platform/account/limits", key, {"daily_spend_limit_usd": 40, "max_active_rentals": 3})
+        assert status == 200 and (body["daily_spend_limit_usd"], body["max_active_rentals"]) == (40.0, 3)
+        for loosen in ({"daily_spend_limit_usd": 41}, {"daily_spend_limit_usd": None}, {"max_active_rentals": 4},
+                       {"max_active_rentals": None}):
+            status, body = call("PATCH", "/platform/account/limits", key, loosen)
+            assert status == 403 and body["error"]["code"] == "unrestricted_key_required", (key, loosen)
+            assert body["detail"]["loosening"] == list(loosen)
+        # PUT clears what it leaves out: that loosens too.
+        status, body = call("PUT", "/platform/account/limits", key, {"daily_spend_limit_usd": 40})
+        assert status == 403 and body["detail"]["loosening"] == ["max_active_rentals"]
+        status, _ = call("PUT", "/platform/account/limits", key, {"daily_spend_limit_usd": 30, "max_active_rentals": 3})
+        assert status == 200  # unchanged or lower: fine
+    with session_scope(restricted.sf) as s:
+        assert (s.get(UserORM, "u1").daily_spend_limit_cents, s.get(UserORM, "u1").max_active_rentals) == (3000, 3)
+    status, body = call("PUT", "/platform/account/limits", "full", {})  # the website's kind of key: clears both
+    assert status == 200 and (body["daily_spend_limit_usd"], body["max_active_rentals"]) == (None, None)
+
+
+def test_the_website_s_keys_count_as_unrestricted(api):
+    """The account's website key (made at sign-up, no limits or expiry) and a
+    wallet's website-session key may raise the limits."""
+    from greencompute_gateway.application import wallet_auth
+
+    secret, _key_id = wallet_auth._issue_web_key(api.sf, "u1", "evm", "0x" + "ab" * 20)
+    assert routes._unrestricted_key(security.credential_store.get_api_key_by_secret(secret))
+    assert routes._unrestricted_key(security.credential_store.get_api_key_by_secret("full"))
+    for limited in ("read", "rent"):
+        assert not routes._unrestricted_key(security.credential_store.get_api_key_by_secret(limited))
