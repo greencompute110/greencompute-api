@@ -9,10 +9,11 @@ and two sweeps for customers whose credit runs out.
   within 24 hours, and once more within 2 hours. A top-up that lifts them back
   above 24 hours (or nothing of theirs running) re-arms both levels.
 - `auto_resume_once()`: resumes deployments the customer flagged
-  `resume_on_topup` that the meter suspended for an empty balance
-  (`suspended_reason == "balance"`), once the balance covers an hour of
-  everything that would then be running. Oldest suspension first, one email
-  per customer per sweep saying what came back.
+  `resume_on_topup` that were paused for an empty balance
+  (`suspended_reason == "balance"`) or at a spend limit ("spend_limit"),
+  once the balance covers an hour of everything that would then be running
+  and every spend limit on it has room for an hour (SpendRoom). Oldest
+  suspension first, one email per customer per sweep saying what came back.
 
 What a deployment costs per hour, and whether it is billed at all, comes from
 the control plane's `hourly_charge_cents`, the meter's own rule.
@@ -41,10 +42,13 @@ from greencompute_protocol import DeploymentRecord, DeploymentState, WorkloadKin
 log = logging.getLogger(__name__)
 
 #: `suspended_reason` the meter stamps when it drains a balance (as opposed to
-#: "idle", a private model nobody called, which resumes on its next request,
-#: and "spend_limit", paused at a spend limit, which resumes by hand). Only
-#: these are auto-resumed.
+#: "idle", a private model nobody called, which resumes on its next request).
 SUSPENDED_FOR_BALANCE = "balance"
+#: Paused at a spend limit (the control plane's SUSPENDED_FOR_SPEND_LIMIT).
+SUSPENDED_FOR_SPEND_LIMIT = "spend_limit"
+#: What auto-resume brings back, for deployments flagged resume_on_topup:
+#: a spend-limit pause only once every limit has room for an hour (SpendRoom).
+AUTO_RESUMED = (SUSPENDED_FOR_BALANCE, SUSPENDED_FOR_SPEND_LIMIT)
 
 #: Email when the balance lasts less than this many hours, each level once.
 WARN_LEVELS_HOURS = (24.0, 2.0)
@@ -294,15 +298,18 @@ def _mark_informed(repo, user_id: str, balance_cents: int, cents_per_hour: int, 
                 hours_left=hours_left, running=None))
 
 
-def _committed_by_owner(control_plane, workloads: _Workloads, now: datetime) -> tuple[dict[str, int], set[str]]:
-    """Cents per hour each owner is already paying or about to (running,
-    starting up, waiting to be placed, or resumed and not yet reported
-    running), and the ids of suspended deployments whose resume is under way.
-    Loaded once per sweep."""
+def _committed(
+    control_plane, workloads: _Workloads, now: datetime,
+) -> tuple[dict[str, int], dict[str, int], set[str]]:
+    """Cents per hour each owner, and each API key (by the deployments it
+    started), is already paying or about to (running, starting up, waiting to
+    be placed, or resumed and not yet reported running), and the ids of
+    suspended deployments whose resume is under way. Loaded once per sweep."""
     live_lease = {
         a.deployment_id for a in control_plane.repository.list_assignments(statuses=_LIVE_LEASE_STATUSES)
     }
-    committed: dict[str, int] = {}
+    by_owner: dict[str, int] = {}
+    by_key: dict[str, int] = {}
     resuming: set[str] = set()
     for state in _COMMITTED_STATES + (DeploymentState.SUSPENDED,):
         for dep in control_plane.repository.list_deployments_by_state(state):
@@ -314,18 +321,82 @@ def _committed_by_owner(control_plane, workloads: _Workloads, now: datetime) -> 
                 resuming.add(dep.deployment_id)
             charge = control_plane.hourly_charge_cents(dep, workloads.get(dep.workload_id), now=now)
             if charge:
-                committed[dep.owner_user_id] = committed.get(dep.owner_user_id, 0) + charge
-    return committed, resuming
+                by_owner[dep.owner_user_id] = by_owner.get(dep.owner_user_id, 0) + charge
+                if dep.created_by_key_id:
+                    by_key[dep.created_by_key_id] = by_key.get(dep.created_by_key_id, 0) + charge
+    return by_owner, by_key, resuming
+
+
+def _committed_by_owner(control_plane, workloads: _Workloads, now: datetime) -> tuple[dict[str, int], set[str]]:
+    """_committed per owner, and the deployments being resumed."""
+    by_owner, _by_key, resuming = _committed(control_plane, workloads, now)
+    return by_owner, resuming
+
+
+class SpendRoom:
+    """May a deployment paused at a spend limit come back automatically? Only
+    when every spend limit in force on it (the key that started it, the
+    account's own, a new wallet account's first-week one) leaves room for an
+    hour of everything that would then run under that limit: what runs or
+    is coming up now, what this sweep already brought back, and this one.
+    With less, it would be paused again within the hour as older spending
+    slides out of the window and new spending comes in: it would flap.
+
+    One per sweep (the auto-resume sweep, a fleet loop pass): `fits`, then
+    `add` after each resume. Resuming by hand isn't held to this; it is only
+    refused while a limit is reached (GatewayService.resume_deployment)."""
+
+    def __init__(self, service, workloads: _Workloads | None = None, now: datetime | None = None) -> None:
+        self.service = service
+        self.cp = service.control_plane
+        self.workloads = workloads or _Workloads(self.cp)
+        self.now = now or datetime.now(UTC)
+        self.by_owner, self.by_key, self.resuming = _committed(self.cp, self.workloads, self.now)
+        self._limits: dict[str, dict | None] = {}
+
+    def hourly(self, dep: DeploymentRecord) -> int:
+        """What it costs per hour once up (a suspended row has no instances)."""
+        wl = self.workloads.get(dep.workload_id)
+        return self.cp.hourly_charge_cents(dep.model_copy(update={"ready_instances": 1}), wl, now=self.now) or 0
+
+    def fits(self, dep: DeploymentRecord) -> bool:
+        from greencompute_persistence.key_limits import account_limits, account_spend_cents, key_spend_cents
+
+        sf = self.service.repository.session_factory
+        cost = self.hourly(dep)
+        key_id = dep.created_by_key_id
+        key = self.service.repository.get_api_key(key_id) if key_id else None
+        if key is not None and not key.admin and key.daily_spend_limit_usd is not None:
+            cap = round(key.daily_spend_limit_usd * 100)
+            if key_spend_cents(sf, key_id) + self.by_key.get(key_id, 0) + cost > cap:
+                return False
+        owner = dep.owner_user_id
+        if owner not in self._limits:
+            self._limits[owner] = account_limits(sf, owner)
+        limits = self._limits[owner]
+        if limits is not None and limits["daily_spend_limit_cents"] is not None:
+            if account_spend_cents(sf, owner) + self.by_owner.get(owner, 0) + cost > limits["daily_spend_limit_cents"]:
+                return False
+        return True
+
+    def add(self, dep: DeploymentRecord) -> None:
+        cost = self.hourly(dep)
+        self.by_owner[dep.owner_user_id] = self.by_owner.get(dep.owner_user_id, 0) + cost
+        if dep.created_by_key_id:
+            self.by_key[dep.created_by_key_id] = self.by_key.get(dep.created_by_key_id, 0) + cost
+        self.resuming.add(dep.deployment_id)
 
 
 def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=None, notify=_notify) -> list[str]:
-    """Resume deployments flagged `resume_on_topup` that the meter suspended
-    for an empty balance, oldest suspension first, while the owner's balance
-    covers an hour of everything that would then be running (what runs or is
-    coming up already, plus each one brought back). Resume by hand only asks
-    for an hour of the one deployment; this is automatic, so it is more
-    careful, or a $0.40 top-up would bring back three pods that all stop again
-    within the hour. Returns the deployment ids resumed."""
+    """Resume deployments flagged `resume_on_topup` that were paused for an
+    empty balance or at a spend limit, oldest pause first, while the owner's
+    balance covers an hour of everything that would then be running (what
+    runs or is coming up already, plus each one brought back) and every spend
+    limit on it has room for an hour too (SpendRoom). Resume by hand only
+    asks for an hour of the one deployment and that no limit is reached; this
+    is automatic, so it is more careful, or a $0.40 top-up would bring back
+    three pods that all stop again within the hour. Returns the deployment
+    ids resumed."""
     from greencompute_gateway.application.services import (
         AccountLimitError,
         InsufficientBalanceForRentalError,
@@ -339,13 +410,14 @@ def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=
     cp = svc.control_plane
     flagged = [
         d for d in cp.repository.list_deployments_by_state(DeploymentState.SUSPENDED)
-        if d.owner_user_id and d.resume_on_topup and d.suspended_reason == SUSPENDED_FOR_BALANCE
+        if d.owner_user_id and d.resume_on_topup and d.suspended_reason in AUTO_RESUMED
     ]
     if not flagged:
         return []
     repo = billing_repo or _billing_repo()
     workloads = _Workloads(cp)
-    committed, resuming = _committed_by_owner(cp, workloads, now)
+    room = SpendRoom(svc, workloads, now)
+    committed, resuming = dict(room.by_owner), set(room.resuming)
     candidates = sorted(
         (d for d in flagged if d.deployment_id not in resuming),
         key=lambda d: _utc(d.suspended_at or d.updated_at),
@@ -359,6 +431,8 @@ def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=
         cost = cp.hourly_charge_cents(dep.model_copy(update={"ready_instances": 1}), workload, now=now) or 0
         if repo.get_balance(uid) < committed.get(uid, 0) + cost:
             continue  # not enough for an hour of everything yet; maybe after the next top-up
+        if not room.fits(dep):
+            continue  # a spend limit has no room for an hour of it yet; it would only be paused again
         try:
             svc.resume_deployment(dep.deployment_id, user_id=uid)
         except InsufficientBalanceForRentalError:
@@ -379,6 +453,7 @@ def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=
             continue
         resumed.append(dep.deployment_id)
         committed[uid] = committed.get(uid, 0) + cost
+        room.add(dep)
         came_back.setdefault(uid, []).append(_label(dep, workload))
     for uid, labels in came_back.items():
         balance = repo.get_balance(uid)

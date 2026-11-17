@@ -425,15 +425,70 @@ def _account_cap(billing, user_id, cents):
         s.get(UserORM, user_id).daily_spend_limit_cents = cents
 
 
-def test_a_pod_paused_at_a_spend_limit_is_never_auto_resumed(world, resumes):
-    """Auto-resume is for an empty balance a top-up fixes; a spend limit isn't."""
+def _paused_at_cap(cp, owner, name, *, resume_on_topup, when, key_id=None, rate=40):
+    return cp.repository.create_deployment(DeploymentRecord(
+        workload_id=_pod(cp, owner, name).workload_id, owner_user_id=owner, state=DeploymentState.SUSPENDED,
+        hourly_rate_cents=rate, resume_on_topup=resume_on_topup, suspended_at=when, suspended_reason="spend_limit",
+        last_error="paused: its account reached its spend limit of $5.00 for the last 24 hours",
+        created_by_key_id=key_id, ready_instances=1,
+    ))
+
+
+def test_a_pod_paused_at_a_spend_limit_comes_back_only_if_flagged_and_with_room_for_an_hour(world, resumes):
     gw, cp, billing = world
-    capped = _deployment(cp, _pod(cp, "ann", "capped"), "ann", state=DeploymentState.SUSPENDED, resume_on_topup=True,
-                         last_error="paused: its account reached its spend limit of $1.00 for the last 24 hours",
-                         suspended_at=NOW, suspended_reason="spend_limit")
+    flagged = _paused_at_cap(cp, "ann", "flagged", resume_on_topup=True, when=NOW - timedelta(hours=2))
+    manual = _paused_at_cap(cp, "ann", "manual", resume_on_topup=False, when=NOW - timedelta(hours=3))
+    _set_balance(billing, "ann", 10_000)
+    _account_cap(billing, "ann", 500)
+    _spent(billing, "ann", 470)  # under the cap, but $0.30 of room is less than an hour (40c)
+    mail = Mail()
+    assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=mail) == []  # no flapping
+    _account_cap(billing, "ann", 510)  # room for exactly an hour of it
+    assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=mail) == [flagged.deployment_id]
+    assert cp.repository.get_deployment(manual.deployment_id).state == DeploymentState.SUSPENDED  # not flagged
+
+
+def test_auto_resume_counts_what_runs_and_what_it_brought_back_against_the_cap(world, resumes):
+    """Room for an hour of everything that would then run under the cap, not
+    only of the one pod: else each passes alone and all are paused again."""
+    gw, cp, billing = world
+    _deployment(cp, _pod(cp, "ann", "running"), "ann", state=DeploymentState.READY, rate=40)  # 40c/h already
+    first = _paused_at_cap(cp, "ann", "a", resume_on_topup=True, when=NOW - timedelta(hours=2))
+    second = _paused_at_cap(cp, "ann", "b", resume_on_topup=True, when=NOW - timedelta(hours=1))
+    _set_balance(billing, "ann", 10_000)
+    _account_cap(billing, "ann", 1000)
+    _spent(billing, "ann", 900)  # $1.00 room: the running one (40c) + one more (40c), not two more
+    assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=Mail()) == [first.deployment_id]
+    assert cp.repository.get_deployment(second.deployment_id).state == DeploymentState.SUSPENDED
+
+
+def test_a_key_s_limit_needs_room_for_an_hour_too(world, resumes):
+    from greencompute_persistence.orm import APIKeyORM
+
+    gw, cp, billing = world
+    with session_scope(billing.session_factory) as s:
+        s.add(APIKeyORM(key_id="agent", user_id="ann", name="agent", admin=False, scopes=[], secret="s-a",
+                        daily_spend_limit_cents=100, created_at=NOW))
+    pod = _paused_at_cap(cp, "ann", "k", resume_on_topup=True, when=NOW, key_id="agent")
+    _set_balance(billing, "ann", 10_000)
+    _spent(billing, "ann", 70, ref=pod.deployment_id)  # 30c room under the key's $1: less than 40c
+    assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=Mail()) == []
+    with session_scope(billing.session_factory) as s:
+        s.get(APIKeyORM, "agent").daily_spend_limit_cents = 110
+    assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=Mail()) == [pod.deployment_id]
+
+
+def test_a_resume_already_under_way_is_not_resumed_twice(world, resumes):
+    """The auto-resume sweep and a fleet may both pick the same pod; the
+    second sees its lease live again and leaves it."""
+    gw, cp, billing = world
+    pod = _paused_at_cap(cp, "ann", "p", resume_on_topup=True, when=NOW)
+    cp.repository.save_assignment(LeaseAssignment(
+        deployment_id=pod.deployment_id, workload_id=pod.workload_id, hotkey="hk", node_id="n1", status="active"))
+    with pytest.raises(ValueError, match="already being resumed"):
+        gw.resume_deployment(pod.deployment_id, user_id="ann")
     _set_balance(billing, "ann", 10_000)
     assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=Mail()) == []
-    assert resumes == [] and cp.repository.get_deployment(capped.deployment_id).state == DeploymentState.SUSPENDED
 
 
 def test_auto_resume_waits_while_the_account_is_at_its_spend_limit(world, resumes):

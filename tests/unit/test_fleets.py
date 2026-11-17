@@ -436,3 +436,106 @@ def test_the_accounts_own_limits_are_respected(world):
     fleets.reconcile(world.gw, f.fleet_id)
     v = _view(world, f.fleet_id)
     assert len(v["members"]) == 2 and "has spent its daily limit ($1.00" in v["status"]
+
+
+# --- members paused at a spend limit -------------------------------------------------------
+
+
+def _ledger(world, cents, *, hours_ago=0.0):
+    from datetime import UTC, datetime, timedelta
+    from uuid import uuid4
+
+    from greencompute_persistence.orm import LedgerEntryORM
+
+    with session_scope(world.gw._billing_repo.session_factory) as s:
+        s.add(LedgerEntryORM(entry_id=str(uuid4()), user_id="ann", amount_cents=-cents, balance_after=0,
+                             kind="usage", created_at=datetime.now(UTC) - timedelta(hours=hours_ago)))
+
+
+def _age_out_spending(world):
+    """Move every charge out of the 24-hour window."""
+    from datetime import UTC, datetime, timedelta
+
+    from greencompute_persistence.orm import LedgerEntryORM
+
+    with session_scope(world.gw._billing_repo.session_factory) as s:
+        for row in s.query(LedgerEntryORM).filter(LedgerEntryORM.user_id == "ann"):
+            row.created_at = datetime.now(UTC) - timedelta(hours=25)
+
+
+@pytest.fixture
+def capped(world, monkeypatch):
+    """A fleet of 2, both running, then paused at the account's $5 cap. Resume
+    is faked (no node): it records and flips the member to READY."""
+    resumed = []
+
+    def fake_resume(deployment_id):
+        dep = world.cp.repository.get_deployment(deployment_id)
+        dep.state = DeploymentState.READY
+        world.cp.repository.update_deployment(dep)
+        resumed.append(deployment_id)
+        return dep
+
+    monkeypatch.setattr(world.cp, "resume_deployment", fake_resume)
+    with session_scope(world.gw._billing_repo.session_factory) as s:
+        s.get(UserORM, "ann").daily_spend_limit_cents = 500
+    return resumed
+
+
+def _two_paused(world, *, replace=True):
+    f = _create(world, target=2, replace=replace)
+    members = _view(world, f.fleet_id)["members"]
+    for m in members:
+        _set(world, m["deployment_id"], DeploymentState.READY)
+    _ledger(world, 500)
+    paused = world.cp.stop_rentals_over_account_limits()
+    assert sorted(paused) == sorted(m["deployment_id"] for m in members)
+    return f, sorted(m["deployment_id"] for m in members)
+
+
+def test_a_keep_n_running_fleet_resumes_its_members_paused_at_a_spend_limit(world, capped):
+    """The reviewer's case: 2 members paused at the cap; once the spending has
+    left the window they are resumed, not replaced."""
+    f, ids = _two_paused(world)
+    fleets.reconcile(world.gw, f.fleet_id)
+    v = _view(world, f.fleet_id)
+    assert capped == [] and len(v["members"]) == 2  # at the cap: neither resumed nor replaced
+    assert "2 paused at a spend limit" in v["status"] and "room for an hour" in v["status"]
+    _age_out_spending(world)
+    fleets.reconcile(world.gw, f.fleet_id)
+    v = _view(world, f.fleet_id)
+    assert sorted(capped) == ids and len(v["members"]) == 2  # the same two, back
+    assert {m["state"] for m in v["members"]} == {"ready"} and v["status"] == "All 2 running."
+
+
+def test_no_flapping_a_fleet_waits_until_there_is_room_for_an_hour(world, capped):
+    f, ids = _two_paused(world)
+    _age_out_spending(world)
+    _ledger(world, 450)  # 50c of room: one member (40c/h) fits for an hour, two don't
+    fleets.reconcile(world.gw, f.fleet_id)
+    assert len(capped) == 1 and capped[0] in ids
+    v = _view(world, f.fleet_id)
+    assert "1 paused at a spend limit" in v["status"]
+    _ledger(world, 60)  # now over: nothing more comes back
+    fleets.reconcile(world.gw, f.fleet_id)
+    assert len(capped) == 1
+
+
+def test_a_start_n_once_fleet_leaves_its_paused_members_alone(world, capped):
+    f, _ids = _two_paused(world, replace=False)
+    _age_out_spending(world)
+    fleets.reconcile(world.gw, f.fleet_id)
+    v = _view(world, f.fleet_id)
+    assert capped == [] and len(v["members"]) == 2
+    assert {m["state"] for m in v["members"]} == {"suspended"} and "resume them on My Rentals" in v["status"]
+
+
+def test_a_fleet_skips_a_member_the_auto_resume_sweep_already_brought_back(world, capped):
+    from greencompute_protocol import LeaseAssignment
+
+    f, ids = _two_paused(world)
+    _age_out_spending(world)
+    world.cp.repository.save_assignment(LeaseAssignment(
+        deployment_id=ids[0], workload_id=world.wl.workload_id, hotkey="hk", node_id="n1", status="active"))
+    fleets.reconcile(world.gw, f.fleet_id)
+    assert ids[0] not in capped  # being resumed already: not resumed twice

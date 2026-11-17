@@ -19,6 +19,8 @@ one). Each member is named `<prefix>-NN` (its slot): a replacement takes the
 slot of the one it replaces, so a pool's worker names stay put. The loop never
 replaces a member that is only paused (suspended, e.g. for an empty balance),
 and waits rather than retries when GPUs, credit, or the key's limits run out.
+A keep-N-running fleet brings back its own members paused at a spend limit
+once every limit has room for an hour of them (credit_watch.SpendRoom).
 If three members in a row fail before ever becoming ready (a broken image,
 say), the fleet pauses with the reason; resuming it clears that count.
 
@@ -146,6 +148,15 @@ class _Pass:
             self._online = self.service.control_plane.online_gpu_models()
         return self._online
 
+    def spend_room(self):
+        """credit_watch.SpendRoom for this pass, shared by every fleet in it,
+        so two fleets of one account can't both use the same room."""
+        if getattr(self, "_room", None) is None:
+            from greencompute_gateway.application.credit_watch import SpendRoom, _Workloads
+
+            self._room = SpendRoom(self.service, _Workloads(self.service.control_plane), _now())
+        return self._room
+
 
 # --- reading -------------------------------------------------------------------
 
@@ -183,6 +194,63 @@ def _live(dep) -> bool:
     return dep is not None and dep.state not in _FINISHED
 
 
+def _paused_at_spend_limit(dep) -> bool:
+    return (dep is not None and dep.state == DeploymentState.SUSPENDED
+            and getattr(dep, "suspended_reason", None) == "spend_limit")
+
+
+def _spend_limit_note(fleet, waiting: int) -> str:
+    if not waiting:
+        return ""
+    if fleet.replace:
+        return (f" {waiting} paused at a spend limit: they resume when the limit has room for an hour of them "
+                "(Settings > Account limits).")
+    return f" {waiting} paused at a spend limit: resume them on My Rentals once you're under it."
+
+
+def _resume_paused_at_cap(service, fleet: FleetORM, paused: list, run: "_Pass") -> int:
+    """A keep-N-running fleet brings back its own members paused at a spend
+    limit (not replacing them: a replacement would spend under the same
+    limit), oldest pause first, as many as every limit has room for an hour
+    of (credit_watch.SpendRoom). Returns how many are back or coming back."""
+    from greencompute_gateway.application.services import (
+        AccountLimitError,
+        InsufficientBalanceForRentalError,
+        KeyLimitError,
+        NewAccountLimitError,
+        SanctionedAccountError,
+    )
+
+    room = run.spend_room()
+    back = 0
+    for _m, dep in paused:
+        if dep.deployment_id in room.resuming:
+            back += 1  # the auto-resume sweep (or another pass) already brought it back
+            continue
+        if not room.fits(dep):
+            break
+        try:
+            service.resume_deployment(dep.deployment_id, user_id=fleet.owner_user_id)
+        except ValueError as exc:
+            # Resumed meanwhile by the auto-resume sweep, or its machine is
+            # full right now: leave it to the next pass.
+            log.info("fleet %s: %s not resumed now: %s", fleet.fleet_id, dep.deployment_id, exc)
+            continue
+        except (KeyError, PermissionError):
+            continue
+        except (InsufficientBalanceForRentalError, AccountLimitError, NewAccountLimitError, KeyLimitError,
+                SanctionedAccountError) as exc:
+            log.info("fleet %s: paused members wait: %s", fleet.fleet_id, exc)
+            break
+        except Exception:  # noqa: BLE001 - say nothing to the customer; the next pass retries
+            log.exception("fleet %s: could not resume %s", fleet.fleet_id, dep.deployment_id)
+            break
+        room.add(dep)
+        run.add(fleet.owner_user_id, room.hourly(dep))
+        back += 1
+    return back
+
+
 def _member_cost_cents(service, workload, online: list[str] | None = None) -> int:
     """What one member costs per hour: the rate a new deployment of this
     workload is quoted (the dearest GPU it may get), times its GPUs."""
@@ -204,6 +272,7 @@ def view(service, fleet: FleetORM, members: list | None = None, online: list[str
     if fleet.state == "active" and len(live) >= fleet.target:
         status = (f"All {fleet.target} running." if running >= fleet.target
                   else f"{len(live)} of {fleet.target} started; {running} running.")
+        status += _spend_limit_note(fleet, sum(1 for _, d in live if _paused_at_spend_limit(d)))
     return {
         "fleet_id": fleet.fleet_id,
         "workload_id": fleet.workload_id,
@@ -515,6 +584,15 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
         _set_status(service, fleet_id, reason=f"Stopping {len(live) - fleet.target} to get down to {fleet.target}.")
         return
 
+    # Members paused at a spend limit still count as live (never replaced);
+    # a keep-N-running fleet brings them back when there's room for an hour.
+    paused_at_cap = sorted(
+        ((m, d) for m, d in live if _paused_at_spend_limit(d)),
+        key=lambda md: _utc(md[1].suspended_at) or md[0]["created_at"] or _now(),
+    )
+    back = _resume_paused_at_cap(service, fleet, paused_at_cap, run) if (paused_at_cap and fleet.replace) else 0
+    cap_note = _spend_limit_note(fleet, len(paused_at_cap) - back)
+
     if fleet.replace:
         needed = fleet.target - len(live)
     else:
@@ -526,7 +604,7 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
         running = sum(1 for _, d in live if d.state == DeploymentState.READY)
         _set_status(service, fleet_id, reason=(
             f"All {fleet.target} running." if running == fleet.target
-            else f"{len(live)} of {fleet.target} started; {running} running."))
+            else f"{len(live)} of {fleet.target} started; {running} running.") + cap_note)
         return
 
     workload = service.control_plane.repository.get_workload(fleet.workload_id)
@@ -625,7 +703,7 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
         started += 1
         run.add(fleet.owner_user_id, cost)
     head = f"{len(live) + started} of {fleet.target} started."
-    _set_status(service, fleet_id, reason=f"{head} {reasons[0]}" if reasons else head)
+    _set_status(service, fleet_id, reason=(f"{head} {reasons[0]}" if reasons else head) + cap_note)
 
 
 def fleet_once(service=None) -> int:

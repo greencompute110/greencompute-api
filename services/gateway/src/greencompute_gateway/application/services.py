@@ -1137,6 +1137,11 @@ class GatewayService:
                 f"deployment {deployment_id} is not suspended "
                 f"(current state: {old.state.value})"
             )
+        if self._resume_under_way(deployment_id):
+            # Its lease is live again: someone (the auto-resume sweep, a fleet,
+            # another request) already resumed it and the machine hasn't
+            # reported it running yet. A second resume would hold its GPUs twice.
+            raise ValueError(f"deployment {deployment_id} is already being resumed")
         if not admin and user_id is not None:
             from greencompute_gateway.application.sanctions import account_blocked
 
@@ -1167,6 +1172,23 @@ class GatewayService:
 
         # In-place restart of the SAME container — preserves the saved work.
         return self.control_plane.resume_deployment(deployment_id)
+
+    def _resume_under_way(self, deployment_id: str) -> bool:
+        """A SUSPENDED deployment whose lease is live again is being resumed
+        (credit_watch's _LIVE_LEASE_STATUSES)."""
+        from sqlalchemy import select
+
+        from greencompute_persistence import session_scope
+        from greencompute_persistence.orm import LeaseAssignmentORM
+
+        repo = getattr(self.control_plane, "repository", None)
+        factory = getattr(repo, "session_factory", None)
+        if factory is None:
+            return False
+        with session_scope(factory) as session:
+            status = session.scalar(
+                select(LeaseAssignmentORM.status).where(LeaseAssignmentORM.deployment_id == deployment_id))
+        return status in ("assigned", "activating", "active")
 
     def _refuse_resume_at_spend_limits(self, deployment: DeploymentRecord, user_id: str) -> None:
         """Raise KeyLimitError when the key that started the deployment is at
