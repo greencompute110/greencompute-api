@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import secrets
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -86,6 +87,16 @@ from greencompute_gateway.infrastructure.inference_client import (
 )
 from greencompute_gateway.infrastructure.repository import GatewayRepository
 from greencompute_gateway.transport.security import metrics as gateway_metrics
+
+
+#: A replica whose health check passes but that fails this many requests in a
+#: row (5xx, timeouts, dropped answers; no success between), from at least
+#: SILENT_FAILURE_MIN_ACCOUNTS accounts, counts one health failure (and then
+#: the control plane's spread-over-a-window rule). A hung engine or a
+#: misconfigured server is failed over and replaced that way; one caller's
+#: crafted requests can't do it alone.
+SILENT_FAILURE_ESCALATION = int(os.getenv("GREENCOMPUTE_SILENT_FAILURE_ESCALATION", "5"))
+SILENT_FAILURE_MIN_ACCOUNTS = int(os.getenv("GREENCOMPUTE_SILENT_FAILURE_MIN_ACCOUNTS", "2"))
 
 
 def _external_model_upstreams() -> dict[str, str]:
@@ -1955,7 +1966,7 @@ class GatewayService:
                 response = self._invoke_upstream_response(deployment, request, request_id=request_id)
             except RuntimeError as exc:
                 last_exc = exc
-                self._handle_upstream_failure(deployment, routing, exc)
+                self._handle_upstream_failure(deployment, routing, exc, caller=user_id or api_key_id)
                 self._record_invocation(
                     deployment,
                     request,
@@ -2126,7 +2137,7 @@ class GatewayService:
                 raise
             except RuntimeError as exc:
                 last_exc = exc
-                self._handle_upstream_failure(deployment, routing, exc)
+                self._handle_upstream_failure(deployment, routing, exc, caller=user_id or api_key_id)
                 self._record_invocation(
                     deployment,
                     request,
@@ -2551,6 +2562,8 @@ class GatewayService:
     def _handle_upstream_success(self, deployment: DeploymentRecord, routing: dict) -> None:
         if not self._is_external(deployment):
             self.control_plane.clear_deployment_health_failures(deployment.deployment_id)
+            with self._silent_lock():
+                self._silent_failures().pop(deployment.deployment_id, None)
         self.repository.record_routing_decision(
             {
                 **routing,
@@ -2561,7 +2574,36 @@ class GatewayService:
             }
         )
 
-    def _handle_upstream_failure(self, deployment: DeploymentRecord, routing: dict, exc: RuntimeError) -> None:
+    def _silent_failures(self) -> dict[str, tuple[int, set[str]]]:
+        """deployment id -> (requests failed in a row while its health check
+        passed, the accounts they came from)."""
+        if getattr(self, "_silent_failure_counts", None) is None:
+            self._silent_failure_counts = {}
+        return self._silent_failure_counts
+
+    def _silent_lock(self):
+        if getattr(self, "_silent_failure_lock", None) is None:
+            self._silent_failure_lock = threading.Lock()
+        return self._silent_failure_lock
+
+    def _note_silent_failure(self, deployment: DeploymentRecord, caller: str | None) -> tuple[int, int] | None:
+        """Count a request the replica failed although its health check
+        passed. (requests, accounts) once that reaches the escalation rule,
+        then the count starts over; else None."""
+        with self._silent_lock():
+            failures = self._silent_failures()
+            count, accounts = failures.get(deployment.deployment_id, (0, set()))
+            count += 1
+            accounts = accounts | {caller or "anonymous"}
+            if count >= SILENT_FAILURE_ESCALATION and len(accounts) >= SILENT_FAILURE_MIN_ACCOUNTS:
+                failures.pop(deployment.deployment_id, None)
+                return count, len(accounts)
+            failures[deployment.deployment_id] = (count, accounts)
+            return None
+
+    def _handle_upstream_failure(
+        self, deployment: DeploymentRecord, routing: dict, exc: RuntimeError, *, caller: str | None = None,
+    ) -> None:
         failure_class = self._classify_inference_error(exc)
         decision = "failed"
         if isinstance(exc, InferenceRequestRejectedError):
@@ -2590,6 +2632,16 @@ class GatewayService:
             if healthy:
                 decision = "failed_model_healthy"
                 self.metrics.increment("inference.failure.model_healthy")
+                escalated = self._note_silent_failure(deployment, caller)
+                if escalated is not None:
+                    # It answers its health check but fails every request (a
+                    # hung engine, a misconfigured server): treat it as down.
+                    self.metrics.increment("inference.failure.silent_escalated")
+                    self.control_plane.record_deployment_health_failure(
+                        deployment.deployment_id,
+                        f"its health check passes but it failed {escalated[0]} requests in a row, from "
+                        f"{escalated[1]} accounts: {exc}",
+                    )
             else:
                 self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
         self.repository.record_routing_decision(
@@ -2606,12 +2658,13 @@ class GatewayService:
     def _worth_another_replica(exc: RuntimeError) -> bool:
         """Whether a failed request should be sent to the next replica. Not
         when the request itself was refused (every replica would refuse it),
-        nor when a healthy model timed out or failed on it (another would
-        most likely do the same, after another full wait). Yes when the
-        model is down or the connection to it dropped."""
+        nor when a healthy model ran out of time on it (a long generation:
+        another would take as long, after another full wait). Yes when the
+        model is down, the connection dropped, or it answered with a 5xx
+        (another replica may well serve it)."""
         if isinstance(exc, InferenceRequestRejectedError):
             return False
-        if getattr(exc, "model_healthy", None) is True and not isinstance(exc, InferenceConnectionError):
+        if isinstance(exc, InferenceTimeoutError) and getattr(exc, "model_healthy", None) is True:
             return False
         return True
 

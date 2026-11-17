@@ -368,10 +368,12 @@ def test_a_timeout_on_a_healthy_model_is_a_504_and_never_counts(api, cp, node):
     assert charges(cp) == []
 
 
-def test_a_5xx_on_a_healthy_model_is_a_502_with_its_reason_and_never_counts(api, cp, node):
+def test_a_5xx_on_a_healthy_model_from_one_account_never_counts(api, cp, node):
+    """One caller's requests that make the model fail (crafted or not)
+    can't take a shared model down by themselves."""
     _, dep = catalog_model(cp, node)
     node.chat = (502, {"object": "error", "message": "CUDA error on this input"}, {"X-Upstream-Status": "500"})
-    for _ in range(4):
+    for _ in range(12):
         res = chat(api)
         assert res.status_code == 502
         err = res.json()["error"]
@@ -723,3 +725,53 @@ def test_a_15_second_node_restart_under_traffic_fails_nothing(api, cp, node, clo
     node.health = 200
     node.chat = (200, {"model": "m", "choices": [{"message": {"role": "assistant", "content": "back"}}]}, None)
     assert chat(api).status_code == 200 and failures(cp, dep) == 0
+
+
+# --- review H2: a replica that passes /health but fails every request --------------------
+
+
+def test_a_replica_failing_everyones_requests_is_escalated_then_failed(api, cp, node, clock):
+    """A hung engine or a misconfigured server: /health passes, every request
+    fails. Five in a row from two accounts count one health failure; the
+    window rule then fails it after 30 s of that."""
+    _, dep = catalog_model(cp, node)
+    node.chat = (502, {"object": "error", "message": "engine hung"}, {"X-Upstream-Status": "500"})
+    for i in range(5):
+        api.caller.user_id = "u1" if i % 2 else "u2"
+        assert chat(api).status_code == 502
+    assert failures(cp, dep) == 1 and state(cp, dep) == DeploymentState.READY
+    for _ in range(2):
+        clock(16)
+        for i in range(5):
+            api.caller.user_id = "u1" if i % 2 else "u2"
+            chat(api)
+    assert state(cp, dep) == DeploymentState.FAILED
+
+
+def test_a_success_between_restarts_the_count(api, cp, node):
+    _, dep = catalog_model(cp, node)
+    bad = (502, {"object": "error", "message": "sometimes"}, None)
+    good = (200, {"model": "m", "choices": [{"message": {"role": "assistant", "content": "ok"}}]}, None)
+    for i in range(12):
+        api.caller.user_id = "u1" if i % 2 else "u2"
+        node.chat = good if i % 4 == 3 else bad
+        chat(api)
+    assert failures(cp, dep) == 0
+
+
+def test_a_5xx_from_a_healthy_replica_fails_over_to_another(api, cp, node, monkeypatch):
+    workload, first = catalog_model(cp, node)
+    second = ready_deployment(cp, workload, node)
+    calls = []
+    original = routes.service.inference_client.invoke_chat_completion
+
+    def invoke(deployment, request, *, request_id):
+        calls.append(deployment.deployment_id)
+        if len(calls) == 1:
+            from greencompute_gateway.infrastructure.inference_client import InferenceUpstreamError
+            raise InferenceUpstreamError("boom", status_code=502, upstream_message="engine error")
+        return original(deployment, request, request_id=request_id)
+
+    monkeypatch.setattr(routes.service.inference_client, "invoke_chat_completion", invoke)
+    assert chat(api).status_code == 200
+    assert len(calls) == 2 and set(calls) == {first.deployment_id, second.deployment_id}
