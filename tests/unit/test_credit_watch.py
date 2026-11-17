@@ -569,3 +569,38 @@ def test_resuming_by_hand_is_refused_while_the_key_that_started_it_is_at_its_lim
     assert (exc.value.status_code, exc.value.error_code) == (403, "key_limit")
     assert exc.value.detail["key_id"] == "agent" and exc.value.detail["daily_spend_limit_usd"] == 2.0
     assert resumes == []
+
+
+def test_deleting_or_expiring_the_key_that_was_capped_does_not_bring_its_pods_back(world, resumes):
+    """Only the owner resuming by hand brings these back."""
+    from greencompute_persistence.orm import APIKeyORM
+
+    gw, cp, billing = world
+    _set_balance(billing, "ann", 10_000)
+    with session_scope(billing.session_factory) as s:
+        s.add(APIKeyORM(key_id="gone", user_id="ann", name="gone", admin=False, scopes=[], secret="s-gone",
+                        daily_spend_limit_cents=100, created_at=NOW))
+        s.add(APIKeyORM(key_id="old", user_id="ann", name="old", admin=False, scopes=[], secret="s-old",
+                        daily_spend_limit_cents=100, created_at=NOW, expires_at=NOW - timedelta(hours=1)))
+    deleted_keys_pod = _paused_at_cap(cp, "ann", "a", resume_on_topup=True, when=NOW, key_id="gone")
+    expired_keys_pod = _paused_at_cap(cp, "ann", "b", resume_on_topup=True, when=NOW, key_id="old")
+    with session_scope(billing.session_factory) as s:
+        s.delete(s.get(APIKeyORM, "gone"))
+    assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=Mail()) == []
+    gw.resume_deployment(deleted_keys_pod.deployment_id, user_id="ann")  # the owner by hand: allowed
+    gw.resume_deployment(expired_keys_pod.deployment_id, user_id="ann")
+    assert resumes == [deleted_keys_pod.deployment_id, expired_keys_pod.deployment_id]
+
+
+def test_the_auto_resume_sweep_leaves_keep_n_running_fleet_members_to_their_fleet(world, resumes):
+    from greencompute_persistence.orm import FleetMemberORM, FleetORM
+
+    gw, cp, billing = world
+    _set_balance(billing, "ann", 10_000)
+    member = _paused_at_cap(cp, "ann", "rig-01", resume_on_topup=True, when=NOW)
+    loose = _paused_at_cap(cp, "ann", "solo", resume_on_topup=True, when=NOW + timedelta(seconds=1))
+    with session_scope(billing.session_factory) as s:
+        s.add(FleetORM(fleet_id="f1", owner_user_id="ann", workload_id=member.workload_id, name_prefix="rig",
+                       target=1, replace=True, state="active"))
+        s.add(FleetMemberORM(deployment_id=member.deployment_id, fleet_id="f1", slot=1, created_at=NOW))
+    assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=Mail()) == [loose.deployment_id]

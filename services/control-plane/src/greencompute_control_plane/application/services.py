@@ -34,6 +34,13 @@ from greencompute_control_plane.infrastructure.repository import ControlPlaneRep
 
 logger = logging.getLogger(__name__)
 
+
+class CannotResumeInPlace(ValueError):
+    """resume_deployment can't restart this deployment where it was: its
+    placement is gone, its machine is no longer registered, or the machine has
+    no room for its GPUs now. A ValueError like the others (the route's 409),
+    told apart so a fleet can replace such a member instead of waiting on it."""
+
 # What a customer whose rental found no GPU should do next: the waitlist (a
 # capacity alert) or the team, never a count of what is free.
 NO_CAPACITY_NEXT_STEP = (
@@ -1136,7 +1143,7 @@ class ControlPlaneService:
                 f"(current state: {deployment.state.value})"
             )
         if not deployment.hotkey or not deployment.node_id:
-            raise ValueError(
+            raise CannotResumeInPlace(
                 f"deployment {deployment_id} has no recoverable placement to resume"
             )
 
@@ -1153,7 +1160,7 @@ class ControlPlaneService:
         # otherwise-unchanged node.
         node = self._find_node(deployment.node_id)
         if node is None:
-            raise ValueError(
+            raise CannotResumeInPlace(
                 f"node {deployment.node_id} for deployment {deployment_id} is no longer "
                 "registered; cannot resume in place"
             )
@@ -1168,7 +1175,7 @@ class ControlPlaneService:
                 "resume %s refused: node %s has %d effective free, needs %d",
                 deployment_id, deployment.node_id, available, gpu_count,
             )
-            raise ValueError(
+            raise CannotResumeInPlace(
                 f"insufficient capacity to resume deployment {deployment_id}: the machine it was on "
                 f"doesn't have room for its {gpu_count} GPU(s) right now. Try again later, or write to "
                 "support@green-compute.com"

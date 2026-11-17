@@ -360,12 +360,18 @@ class SpendRoom:
         return self.cp.hourly_charge_cents(dep.model_copy(update={"ready_instances": 1}), wl, now=self.now) or 0
 
     def fits(self, dep: DeploymentRecord) -> bool:
+        from greencompute_persistence import key_expired
         from greencompute_persistence.key_limits import account_limits, account_spend_cents, key_spend_cents
 
         sf = self.service.repository.session_factory
         cost = self.hourly(dep)
         key_id = dep.created_by_key_id
         key = self.service.repository.get_api_key(key_id) if key_id else None
+        if dep.suspended_reason == SUSPENDED_FOR_SPEND_LIMIT and key_id and (key is None or key_expired(key)):
+            # The key it was started with (maybe the one whose limit paused
+            # it) was deleted or expired: that mustn't lift its limit. It
+            # comes back only when the owner resumes it.
+            return False
         if key is not None and not key.admin and key.daily_spend_limit_usd is not None:
             cap = round(key.daily_spend_limit_usd * 100)
             if key_spend_cents(sf, key_id) + self.by_key.get(key_id, 0) + cost > cap:
@@ -379,12 +385,32 @@ class SpendRoom:
                 return False
         return True
 
+    def balance_covers(self, dep: DeploymentRecord, balance_cents: int) -> bool:
+        """The auto-resume balance rule: the balance covers an hour of
+        everything that would then run for the owner, this one included."""
+        return balance_cents >= self.by_owner.get(dep.owner_user_id, 0) + self.hourly(dep)
+
     def add(self, dep: DeploymentRecord) -> None:
         cost = self.hourly(dep)
         self.by_owner[dep.owner_user_id] = self.by_owner.get(dep.owner_user_id, 0) + cost
         if dep.created_by_key_id:
             self.by_key[dep.created_by_key_id] = self.by_key.get(dep.created_by_key_id, 0) + cost
         self.resuming.add(dep.deployment_id)
+
+
+def _fleet_resumed_members(service, deployment_ids: list[str]) -> set[str]:
+    """Of these, the members of an active keep-N-running fleet."""
+    if not deployment_ids:
+        return set()
+    from greencompute_persistence.orm import FleetMemberORM, FleetORM
+
+    with session_scope(service.repository.session_factory) as session:
+        return set(session.scalars(
+            select(FleetMemberORM.deployment_id)
+            .join(FleetORM, FleetORM.fleet_id == FleetMemberORM.fleet_id)
+            .where(FleetMemberORM.deployment_id.in_(deployment_ids), FleetORM.state == "active",
+                   FleetORM.replace.is_(True))
+        ).all())
 
 
 def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=None, notify=_notify) -> list[str]:
@@ -417,9 +443,13 @@ def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=
     repo = billing_repo or _billing_repo()
     workloads = _Workloads(cp)
     room = SpendRoom(svc, workloads, now)
-    committed, resuming = dict(room.by_owner), set(room.resuming)
+    committed = room.by_owner  # an hour of what runs per owner; grows as this sweep resumes
+    # Members of keep-N-running fleets paused at a spend limit are their
+    # fleet's to bring back (fleets._resume_paused_at_cap): not both loops.
+    fleet_handled = _fleet_resumed_members(svc, [d.deployment_id for d in flagged
+                                                 if d.suspended_reason == SUSPENDED_FOR_SPEND_LIMIT])
     candidates = sorted(
-        (d for d in flagged if d.deployment_id not in resuming),
+        (d for d in flagged if d.deployment_id not in room.resuming and d.deployment_id not in fleet_handled),
         key=lambda d: _utc(d.suspended_at or d.updated_at),
     )
     resumed: list[str] = []
@@ -427,9 +457,7 @@ def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=
     for dep in candidates:
         uid = dep.owner_user_id
         workload = workloads.get(dep.workload_id)
-        # What it will cost once up (a suspended row has no instances yet).
-        cost = cp.hourly_charge_cents(dep.model_copy(update={"ready_instances": 1}), workload, now=now) or 0
-        if repo.get_balance(uid) < committed.get(uid, 0) + cost:
+        if not room.balance_covers(dep, repo.get_balance(uid)):
             continue  # not enough for an hour of everything yet; maybe after the next top-up
         if not room.fits(dep):
             continue  # a spend limit has no room for an hour of it yet; it would only be paused again
@@ -452,8 +480,7 @@ def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=
             log.exception("auto-resume %s failed", dep.deployment_id)
             continue
         resumed.append(dep.deployment_id)
-        committed[uid] = committed.get(uid, 0) + cost
-        room.add(dep)
+        room.add(dep)  # also adds an hour of it to committed[uid]
         came_back.setdefault(uid, []).append(_label(dep, workload))
     for uid, labels in came_back.items():
         balance = repo.get_balance(uid)

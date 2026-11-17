@@ -539,3 +539,91 @@ def test_a_fleet_skips_a_member_the_auto_resume_sweep_already_brought_back(world
         deployment_id=ids[0], workload_id=world.wl.workload_id, hotkey="hk", node_id="n1", status="active"))
     fleets.reconcile(world.gw, f.fleet_id)
     assert ids[0] not in capped  # being resumed already: not resumed twice
+
+
+def test_a_member_its_machine_cannot_take_back_is_replaced(world, capped, monkeypatch):
+    """The reviewer's case: the limit has room, but resuming in place fails
+    (machine full or gone): the member is stopped and a replacement started."""
+    from greencompute_control_plane.application.services import CannotResumeInPlace
+
+    f, ids = _two_paused(world)
+    _age_out_spending(world)
+    full = ids[0]
+    real = world.cp.resume_deployment
+
+    def resume(deployment_id):
+        if deployment_id == full:
+            raise CannotResumeInPlace(f"insufficient capacity to resume deployment {deployment_id}")
+        return real(deployment_id)
+
+    monkeypatch.setattr(world.cp, "resume_deployment", resume)
+    fleets.reconcile(world.gw, f.fleet_id)
+    assert world.cp.repository.get_deployment(full).state == DeploymentState.TERMINATED
+    v = _view(world, f.fleet_id)
+    live = [m for m in v["members"] if m["state"] not in ("terminated", "failed")]
+    assert len(live) == 2 and full not in {m["deployment_id"] for m in live}  # a replacement took its place
+    assert ids[1] in capped  # the other one came back in place
+    replacement = next(m for m in live if m["deployment_id"] not in ids)
+    gone = next(m for m in v["members"] if m["deployment_id"] == full)
+    assert replacement["name"] == gone["name"]  # same slot, same name
+
+
+def test_a_member_already_being_resumed_is_not_stopped(world, capped, monkeypatch):
+    f, ids = _two_paused(world)
+    _age_out_spending(world)
+
+    def busy(deployment_id):
+        raise ValueError(f"deployment {deployment_id} is already being resumed")
+
+    monkeypatch.setattr(world.gw, "resume_deployment", lambda dep_id, **kw: busy(dep_id))
+    fleets.reconcile(world.gw, f.fleet_id)
+    assert {world.cp.repository.get_deployment(i).state for i in ids} == {DeploymentState.SUSPENDED}
+    assert len(_view(world, f.fleet_id)["members"]) == 2  # nothing stopped, nothing started
+
+
+def test_deleting_or_expiring_the_capped_key_does_not_lift_its_cap(world, capped):
+    """The reviewer's probe: a fleet whose key's limit paused its members;
+    the key is deleted (or expires); the window ages out: nothing resumes,
+    the fleet pauses as it does for a deleted key."""
+    from datetime import UTC, datetime, timedelta
+
+    from greencompute_persistence.credentials import StoredAPIKey
+
+    for how in ("deleted", "expired"):
+        key = world.gw.repository.save_api_key(StoredAPIKey(name=f"agent-{how}", user_id="ann",
+                                                            daily_spend_limit_usd=1.0))
+        f = _create(world, target=2, key_id=key.key_id, name_prefix=f"k{how}")
+        members = _view(world, f.fleet_id)["members"]
+        for m in members:
+            _set(world, m["deployment_id"], DeploymentState.READY)
+            _ledger_for(world, m["deployment_id"], 100)
+        assert sorted(world.cp.stop_rentals_over_key_limits()) == sorted(m["deployment_id"] for m in members)
+        if how == "deleted":
+            world.gw.repository.delete_api_key(key.key_id)
+        else:
+            world.gw.repository.save_api_key(key.model_copy(update={"expires_at": datetime.now(UTC) - timedelta(hours=1)}))
+        _age_out_spending(world)
+        fleets.reconcile(world.gw, f.fleet_id)
+        v = _view(world, f.fleet_id)
+        assert capped == [] and v["state"] == "paused" and how.replace("deleted", "was deleted") in v["status"]
+        assert {m["state"] for m in v["members"]} == {"suspended"}
+
+
+def test_a_fleet_resumes_only_as_many_as_the_balance_covers_an_hour_of(world, capped):
+    f, ids = _two_paused(world)
+    _age_out_spending(world)
+    with session_scope(world.gw._billing_repo.session_factory) as s:
+        s.get(UserORM, "ann").balance_credits = 50  # an hour of one member (40c), not two
+    fleets.reconcile(world.gw, f.fleet_id)
+    assert len(capped) == 1
+
+
+def _ledger_for(world, deployment_id, cents):
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from greencompute_persistence.orm import LedgerEntryORM
+
+    with session_scope(world.gw._billing_repo.session_factory) as s:
+        s.add(LedgerEntryORM(entry_id=str(uuid4()), user_id="ann", amount_cents=-cents, balance_after=0,
+                             kind="usage", reference_id=deployment_id, created_at=datetime.now(UTC)))
