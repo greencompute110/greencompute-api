@@ -54,6 +54,20 @@ def _aware(value: datetime | None) -> datetime | None:
     return value if value is None or value.tzinfo else value.replace(tzinfo=UTC)
 
 
+def _later(current: datetime | None, at: datetime) -> datetime:
+    """A spell's metered_until moved to `at`, never back."""
+    current = _aware(current)
+    return at if current is None or _aware(at) > current else current
+
+
+def _open_spell(row, at: datetime) -> None:
+    """Start the deployment row's READY spell at `at` (see DeploymentORM)."""
+    row.billable_since = at
+    row.metered_until = at
+    row.spell_billed_seconds = 0.0
+    row.spell_billed_mcents = 0
+
+
 def _serialize_port_mappings(pm: dict[int, int]) -> dict[str, int]:
     # JSON object keys must be strings; store {container_port_str: host_port_int}.
     return {str(k): int(v) for k, v in (pm or {}).items()}
@@ -621,7 +635,11 @@ class ControlPlaneRepository:
             rows = session.scalars(select(DeploymentORM).where(DeploymentORM.deployment_id.in_(deployment_ids))).all()
             return {row.deployment_id: self._to_deployment(row) for row in rows}
 
-    def update_deployment(self, deployment: DeploymentRecord) -> DeploymentRecord:
+    def update_deployment(self, deployment: DeploymentRecord, *, open_spell_at: datetime | None = None) -> DeploymentRecord:
+        """Save the deployment. `open_spell_at`: it has just become READY, so
+        its READY spell (billable_since, set_billable_since) starts then, in
+        the same transaction as the state, so no meter tick sees it READY
+        with the previous spell's clock."""
         with session_scope(self.session_factory) as session:
             # Locked: two saves at once must not both see the old state and
             # both record the change.
@@ -659,6 +677,8 @@ class ControlPlaneRepository:
             row.health_check_failures = deployment.health_check_failures
             row.created_at = deployment.created_at
             row.updated_at = deployment.updated_at
+            if open_spell_at is not None:
+                _open_spell(row, open_spell_at)
             session.add(row)
             # Same transaction: the event exists exactly when the change does.
             add_event(session, deployment_event(row, previous_state))
@@ -734,8 +754,10 @@ class ControlPlaneRepository:
         whole-cent portion gets debited from the user; the remainder stays
         on the row for the next cycle so hourly totals converge exactly.
         `billed_seconds` (what `add_mcents` pays for) and `add_mcents` are
-        added to the READY spell, accounted up to `at` (metered_until), for
-        the settlement when it stops (settle_metering_spell).
+        added to the READY spell, accounted up to `at` (metered_until, which
+        never moves back: a tick whose `now` was taken before the spell began
+        leaves it at the start), for the settlement when it stops
+        (settle_metering_spell).
 
         Atomic — a single SELECT FOR UPDATE / UPDATE inside one session so
         two concurrent metering cycles (shouldn't happen, but) can't both
@@ -755,7 +777,7 @@ class ControlPlaneRepository:
             row.metering_remainder_mcents = remainder
             row.spell_billed_seconds = (row.spell_billed_seconds or 0.0) + max(0.0, billed_seconds)
             row.spell_billed_mcents = (row.spell_billed_mcents or 0) + add_mcents
-            row.metered_until = at or datetime.now(UTC)
+            row.metered_until = _later(row.metered_until, at or datetime.now(UTC))
             session.add(row)
             return whole_cents, remainder
 
@@ -814,10 +836,7 @@ class ControlPlaneRepository:
         with session_scope(self.session_factory) as session:
             row = session.get(DeploymentORM, deployment_id, with_for_update=True)
             if row is not None:
-                row.billable_since = at
-                row.metered_until = at
-                row.spell_billed_seconds = 0.0
-                row.spell_billed_mcents = 0
+                _open_spell(row, at)
                 session.add(row)
 
     def skip_metering(self, deployment_id: str, at: datetime) -> None:
@@ -832,7 +851,7 @@ class ControlPlaneRepository:
             if row.metered_until is None:
                 row.spell_billed_seconds = 0.0
                 row.spell_billed_mcents = 0
-            row.metered_until = at
+            row.metered_until = _later(row.metered_until, at)
             session.add(row)
 
     def settle_metering_spell(

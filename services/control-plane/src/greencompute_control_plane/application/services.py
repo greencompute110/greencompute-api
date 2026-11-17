@@ -572,11 +572,12 @@ class ControlPlaneService:
             DeploymentState.TERMINATED,
         }:
             self.repository.release_gpu_reservation(update.deployment_id)
-        saved = self.repository.update_deployment(deployment)
-        if became_ready:
-            # The hourly meter charges from here: not for time spent starting,
-            # nor (after a resume) for the time it was paused.
-            self.repository.set_billable_since(saved.deployment_id, datetime.now(UTC))
+        # Becoming READY starts the spell the hourly meter charges, in the
+        # same transaction: not for time spent starting, nor (after a resume)
+        # for the time it was paused.
+        saved = self.repository.update_deployment(
+            deployment, open_spell_at=datetime.now(UTC) if became_ready else None,
+        )
         if was_ready is not None:
             # After the save: a meter tick from now on sees it isn't READY and
             # accrues nothing, so the settlement is the spell's last charge.

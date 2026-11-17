@@ -203,6 +203,33 @@ def test_several_ready_spells_each_pay_their_started_minutes(cp):
     assert sum(1 for _, text in _charges(cp) if text.endswith("(final minute)")) == 3
 
 
+def test_a_tick_taken_before_the_spell_began_doesnt_move_its_clock_back(cp):
+    """The meter took its `now`, then the pod became READY, then the meter
+    reached it: that tick bills nothing and leaves the spell's clock at its
+    start (it set it 5 s earlier, so a 56 s spell was charged 2 minutes)."""
+    dep_id = _ready(cp, ready_for=56)
+    since = cp.repository.get_billable_since(dep_id)
+    _tick(cp, since - timedelta(seconds=5), 60)
+    assert (_row(cp, dep_id)["seconds"], _row(cp, dep_id)["metered_until"]) == (0.0, since.replace(tzinfo=None))
+    _report(cp, dep_id, DeploymentState.TERMINATED)
+    assert _charged(cp) == 5  # 56 s: 1 minute
+
+
+def test_becoming_ready_opens_the_spell_in_the_same_write(cp, monkeypatch):
+    """No meter tick can find it READY with no spell (or the last one's)."""
+    seen = []
+    original = cp.repository.update_deployment
+
+    def update(deployment, **kw):
+        saved = original(deployment, **kw)
+        seen.append((deployment.state, _row(cp, deployment.deployment_id)["metered_until"] is not None))
+        return saved
+
+    monkeypatch.setattr(cp.repository, "update_deployment", update)
+    _ready(cp)
+    assert seen == [(DeploymentState.READY, True)]
+
+
 # --- billing pauses while the machine is silent --------------------------------------
 
 
