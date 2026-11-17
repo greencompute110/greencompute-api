@@ -3447,18 +3447,32 @@ def embeddings(
     payload: dict,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    host: str | None = Header(default=None, alias="Host"),
 ) -> dict:
+    """No embedding model is served yet, so this never answers with vectors.
+
+    It used to return made-up ones with a 200 (one number per character of
+    the input, at most 16): a client stored them as if they were real. Now an
+    unknown model is a 404, and any other request a 400 saying there is no
+    embedding model, so nothing downstream mistakes them for embeddings."""
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("embeddings", api_key.key_id, limit=60, window_seconds=60)
-    _enforce_key_limits(api_key)
-    _enforce_account_spend_limit(api_key)
-    text = payload.get("input", "")
-    vector = [round(((ord(char) % 32) / 31.0), 6) for char in str(text)[:16]]
-    return {
-        "object": "list",
-        "data": [{"object": "embedding", "index": 0, "embedding": vector}],
-        "model": payload.get("model", "greencompute-embedding"),
-    }
+    model = payload.get("model") if isinstance(payload, dict) else None
+    none_here = ("no embedding model is available: Green Compute serves chat models only for now "
+                 "(GET /v1/models lists them)")
+    if not isinstance(model, str) or not model.strip():
+        raise coded(400, "invalid_request", none_here)
+    try:
+        workload, _ = service.resolve_workload_reference(
+            model, routed_host=host, user_id=api_key.user_id, admin=api_key.admin)
+        known = api_key.admin or service._user_can_access_workload(workload, api_key.user_id)
+    except NoReadyDeploymentError:
+        from greencompute_gateway.application.services import _external_model_upstreams
+
+        known = model.strip().lower() in _external_model_upstreams()
+    if not known:
+        raise coded(404, "model_not_found", f"unknown model={model}")
+    raise coded(400, "invalid_request", f"{model} isn't an embedding model, and {none_here}")
 
 
 from greencompute_gateway.domain.gpu_catalog import normalize_gpu_model as _normalize_gpu_model

@@ -136,7 +136,9 @@ curl -X POST https://api.green-compute.com/v1/chat/completions \
   -d '{ "model": "Qwen/Qwen2.5-7B-Instruct",
         "messages": [{"role":"user","content":"hello"}] }'
 ```
-`/v1/completions` and `/v1/embeddings` work the same way. Point any OpenAI SDK at
+`/v1/completions` (a `prompt` instead of `messages`, answered in the
+`text_completion` shape) works the same way. `/v1/embeddings` answers 400: no
+embedding model is served yet. Point any OpenAI SDK at
 `https://api.green-compute.com/v1` with your key as the API key.
 
 ### 4e. Spin it down (terminate)
@@ -244,7 +246,7 @@ greencompute workloads create-pod --name a4000-pod \
 | `POST` | `/platform/deployments/{id}/resume` | Resume a suspended deployment |
 | `GET` | `/platform/deployments/{id}/ssh` | SSH host/port/user + private key — **pods only**, `ready` only (§4f) |
 | `GET` | `/platform/deployments/{id}/stats` | Live utilization |
-| `POST` | `/v1/chat/completions` · `/v1/completions` · `/v1/embeddings` | Inference (OpenAI-compatible) |
+| `POST` | `/v1/chat/completions` · `/v1/completions` | Inference (OpenAI-compatible); `/v1/embeddings` answers 400 (no embedding model yet) |
 | `GET` | `/platform/nodes/supported` | GPU classes the fleet can serve |
 
 ---

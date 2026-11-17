@@ -564,3 +564,21 @@ def test_a_crashed_private_model_is_replaced_and_says_so(api, cp, node):
     # While it starts, callers are told to retry shortly.
     res = chat(api, model=mine.workload_id)
     assert res.status_code == 409 and res.json()["error"]["code"] == "model_not_ready"
+
+
+# --- item 8: embeddings are never made up ------------------------------------------------
+
+
+def test_embeddings_never_answer_with_made_up_vectors(api, cp, node):
+    catalog_model(cp, node)
+    for body in ({"model": "qwen2.5-7b-instruct", "input": "hello"},
+                 {"model": "qwen2.5-7b-instruct", "input": ["a", "b"]}):
+        res = api.post("/v1/embeddings", json=body)
+        assert res.status_code == 400 and "data" not in res.json()
+        err = res.json()["error"]
+        assert err["code"] == "invalid_request" and "no embedding model is available" in err["message"]
+    res = api.post("/v1/embeddings", json={"model": "text-embedding-3-small", "input": "hello"})
+    assert res.status_code == 404 and res.json()["error"]["code"] == "model_not_found"
+    res = api.post("/v1/embeddings", json={"input": "hello"})
+    assert res.status_code == 400 and "no embedding model is available" in res.json()["error"]["message"].lower()
+    assert node.requests == []
