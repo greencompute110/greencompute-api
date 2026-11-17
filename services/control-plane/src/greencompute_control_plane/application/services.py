@@ -190,6 +190,8 @@ class ControlPlaneService:
     def create_deployment(self, request: DeploymentCreateRequest | dict) -> DeploymentRecord:
         owner_user_id = request.get("owner_user_id") if isinstance(request, dict) else None
         created_by_key_id = request.get("created_by_key_id") if isinstance(request, dict) else None
+        # A replacement is never quoted above what its predecessor was charged.
+        rate_cap = request.get("max_hourly_rate_cents") if isinstance(request, dict) else None
         payload = request if isinstance(request, DeploymentCreateRequest) else DeploymentCreateRequest(**request)
         workload = self.repository.get_workload(payload.workload_id)
         if workload is None:
@@ -207,6 +209,8 @@ class ControlPlaneService:
             fee_acknowledged=payload.accept_fee,
             hourly_rate_cents=self._quoted_hourly_rate_cents(workload, self.online_gpu_models()),
         )
+        if rate_cap:
+            deployment.hourly_rate_cents = min(deployment.hourly_rate_cents, rate_cap)
         self.repository.create_deployment(deployment)
         self.bus.publish(
             "deployment.requested",
@@ -806,11 +810,9 @@ class ControlPlaneService:
             "max_runtime_minutes": remaining_minutes,
             "owner_user_id": failed.owner_user_id,
             "created_by_key_id": failed.created_by_key_id,
+            # Never dearer than what its owner was paying (placement only lowers it).
+            "max_hourly_rate_cents": failed.hourly_rate_cents,
         })
-        if failed.hourly_rate_cents and replacement.hourly_rate_cents > failed.hourly_rate_cents:
-            # Never dearer than what its owner was paying.
-            replacement = self.repository.update_deployment(
-                replacement.model_copy(update={"hourly_rate_cents": failed.hourly_rate_cents}))
         failed.last_error = (
             f"{failed.last_error or 'failed its health checks'}. "
             f"Restarted automatically as deployment {replacement.deployment_id}."

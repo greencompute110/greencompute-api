@@ -1899,8 +1899,13 @@ class GatewayService:
                 for line in self._invoke_upstream_stream(deployment, request, request_id=request_id):
                     stripped = line.strip()
                     if stripped.startswith("data: ") and stripped != "data: [DONE]":
-                        payload = loads(stripped[6:])
-                        choices = payload.get("choices", [])
+                        try:
+                            payload = loads(stripped[6:])
+                        except ValueError:
+                            payload = {}  # a line cut off: passed on, but nothing to count in it
+                        if not isinstance(payload, dict):
+                            payload = {}
+                        choices = payload.get("choices") or []
                         if choices and choices[0].get("delta", {}).get("content"):
                             chunk_count += 1
                         # OpenAI streams emit usage ONLY in the final chunk
@@ -2172,7 +2177,7 @@ class GatewayService:
                     "created_at": datetime.now(UTC).isoformat(),
                 }
             )
-            raise self._why_no_replica(workload, request.model)
+            raise self._why_no_replica(workload, request.model, owner_view=admin or _owned_by(workload.owner_user_id, user_id))
 
         healthy: list[DeploymentRecord] = []
         for deployment in candidates:
@@ -2241,12 +2246,14 @@ class GatewayService:
     _STARTING = frozenset({DeploymentState.PENDING, DeploymentState.SCHEDULED, DeploymentState.PULLING,
                            DeploymentState.STARTING})
 
-    def _why_no_replica(self, workload: WorkloadSpec, model: str) -> NoReadyDeploymentError:
+    def _why_no_replica(self, workload: WorkloadSpec, model: str, *, owner_view: bool = False) -> NoReadyDeploymentError:
         """Why a known model has nothing to route to, as the error the caller
         acts on: starting (retry shortly), its machine silent or a shared
         model with no replica up (the platform brings one back: retry later),
         or a customer's own model that isn't running (paused or ended:
-        retrying won't help until it is resumed or redeployed)."""
+        retrying won't help until it is resumed or redeployed). Which
+        deployment, and why it stopped, only for its owner (`owner_view`):
+        someone it is shared with learns just that it isn't running."""
         deployments = self.control_plane.repository.list_deployments_for_workload(workload.workload_id)
         states = {d.state for d in deployments}
         if states & self._STARTING:
@@ -2265,6 +2272,11 @@ class GatewayService:
 
         latest = sorted(deployments, key=when, reverse=True)
         paused = next((d for d in latest if d.state == DeploymentState.SUSPENDED), None)
+        if not owner_view:
+            return ModelNotRunningError(
+                f"model={model} isn't running right now; its owner can resume or redeploy it",
+                paused=paused is not None,
+            )
         if paused is not None:
             why = paused.last_error or "no requests for a while"
             return ModelNotRunningError(

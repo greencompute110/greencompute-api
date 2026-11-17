@@ -84,6 +84,9 @@ class FakeNode(BaseHTTPRequestHandler):
             data = "".join(f"data: {json.dumps(x)}\n\n" for x in lines) + "data: [DONE]\n\n"
             self._send(200, data.encode(), content_type="text/event-stream")
             return
+        if chat[0] == "raw-stream":
+            self._send(200, chat[1], content_type="text/event-stream")
+            return
         status, payload, headers = chat
         self._send(status, payload, headers)
 
@@ -632,3 +635,36 @@ def test_legacy_completions_refuse_what_cant_work(api, cp, node, body, field):
 def test_a_one_item_prompt_list_is_a_prompt(api, cp, node):
     catalog_model(cp, node)
     assert api.post("/v1/completions", json={"model": "qwen2.5-7b-instruct", "prompt": ["Say hi"]}).status_code == 200
+
+
+# --- review follow-ups -------------------------------------------------------------------
+
+
+def test_a_cut_off_stream_line_doesnt_crash_billing(api, cp, node):
+    catalog_model(cp, node)
+    good = json.dumps({"choices": [{"index": 0, "delta": {"content": "Hi"}}], "id": "c", "created": 1, "model": "m"})
+    node.chat = ("raw-stream", f"data: {good}\n\ndata: {{\"choices\": [{{\"delta\": {{\"cont\n".encode())
+    with api.stream("POST", "/v1/chat/completions", json={
+        "model": "qwen2.5-7b-instruct", "messages": [{"role": "user", "content": "hi"}], "stream": True,
+    }) as res:
+        assert res.status_code == 200
+        text = "".join(res.iter_text())
+    assert '"Hi"' in text
+    assert len(charges(cp)) == 1  # what was served is billed
+
+
+def test_someone_its_shared_with_isnt_told_the_owners_details(api, cp, node):
+    workload = cp.repository.upsert_workload(WorkloadSpec(
+        name="u1-public-llama", image="vllm", kind=WorkloadKind.INFERENCE, owner_user_id="u1", public=True,
+        requirements={"gpu_count": 1}))
+    cp.repository.create_deployment(DeploymentRecord(
+        workload_id=workload.workload_id, owner_user_id="u1", state=DeploymentState.SUSPENDED,
+        last_error="insufficient balance: $0.00 left"))
+    api.caller.user_id = "u2"
+    body = chat(api, model=workload.workload_id).json()
+    assert body["error"]["code"] == "model_not_running"
+    assert body["detail"]["deployment_id"] is None
+    assert "balance" not in body["error"]["message"] and "/resume" not in body["error"]["message"]
+    api.caller.user_id = "u1"  # its owner is told which, and why
+    body = chat(api, model=workload.workload_id).json()
+    assert body["detail"]["deployment_id"] and "balance" in body["error"]["message"]
