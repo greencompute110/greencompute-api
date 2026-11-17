@@ -73,10 +73,42 @@ def _is_rejection(status: int) -> bool:
     return 400 <= status < 500 and status not in _NOT_THE_REQUESTS_FAULT
 
 
+#: Longest upstream reason passed on to a caller.
+MAX_UPSTREAM_MESSAGE_CHARS = 300
+
+
+def _capped(text: str | None) -> str | None:
+    if not text:
+        return None
+    text = " ".join(text.split())
+    return text if len(text) <= MAX_UPSTREAM_MESSAGE_CHARS else text[: MAX_UPSTREAM_MESSAGE_CHARS - 1] + "…"
+
+
+def is_model_error_body(raw: bytes) -> bool:
+    """Whether an error body is the model server's own, in vLLM's or
+    OpenAI's shape: `{"object": "error", "message": ...}` or `{"error":
+    {"message": ...}}`. Only those make a 4xx the request's fault; an HTML
+    page or a stray JSON from something else on the port is the server's."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("object") == "error" and isinstance(data.get("message"), str):
+        return True
+    err = data.get("error")
+    return isinstance(err, dict) and isinstance(err.get("message"), str)
+
+
 def upstream_message(raw: bytes) -> str | None:
-    """The reason in an error body: vLLM's `{"message": ...}` (or the newer
-    `{"error": {"message": ...}}`), a node agent's `{"detail": ...}`, or the
-    text itself."""
+    """The reason in an error body (at most MAX_UPSTREAM_MESSAGE_CHARS):
+    vLLM's `{"message": ...}` (or the newer `{"error": {"message": ...}}`),
+    a node agent's `{"detail": ...}`, or the text itself."""
+    return _capped(_message_in(raw))
+
+
+def _message_in(raw: bytes) -> str | None:
     try:
         data = json.loads(raw)
     except ValueError:
@@ -127,7 +159,7 @@ def classify_http_error(exc: HTTPError, deployment_id: str | None) -> InferenceU
             return InferenceTimeoutError(f"upstream timed out for {where}", status_code=status)
         return InferenceConnectionError(f"the model server is unreachable for {where}", status_code=status,
                                         model_unreachable=True)
-    if _is_rejection(status):
+    if _is_rejection(status) and is_model_error_body(raw):
         return InferenceRequestRejectedError(f"the model rejected the request for {where}: {message or status}",
                                              status_code=status, upstream_message=message)
     return InferenceUpstreamError(f"upstream invocation failed for {where} (HTTP {status})",

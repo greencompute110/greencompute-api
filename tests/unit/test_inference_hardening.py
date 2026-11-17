@@ -775,3 +775,34 @@ def test_a_5xx_from_a_healthy_replica_fails_over_to_another(api, cp, node, monke
     monkeypatch.setattr(routes.service.inference_client, "invoke_chat_completion", invoke)
     assert chat(api).status_code == 200
     assert len(calls) == 2 and set(calls) == {first.deployment_id, second.deployment_id}
+
+
+# --- review M1: a 4xx is the request's fault only in the model server's own words ---------
+
+
+@pytest.mark.parametrize("body", [
+    {"object": "error", "message": "bad", "type": "BadRequestError", "code": 400},  # vLLM 0.8
+    {"error": {"message": "bad", "type": "BadRequestError", "param": None, "code": 400}},  # newer vLLM, OpenAI
+])
+def test_a_model_shaped_4xx_is_the_callers(api, cp, node, body):
+    _, dep = catalog_model(cp, node)
+    node.chat = (400, body, None)
+    res = chat(api)
+    assert res.status_code == 400 and res.json()["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.parametrize("body", [b"<html><body>404 Not Found</body></html>", {"detail": "Not Found"}, {"ok": False}])
+def test_any_other_4xx_is_the_servers(api, cp, node, body):
+    """Something else answering on the model's port (a proxy's HTML page, a
+    stray service) is a server problem, not the caller's."""
+    _, dep = catalog_model(cp, node)
+    node.chat = (400, body, None)
+    res = chat(api)
+    assert res.status_code == 502 and res.json()["error"]["code"] == "upstream_error"
+
+
+def test_a_passed_on_reason_is_capped(api, cp, node):
+    catalog_model(cp, node)
+    node.chat = (400, {"object": "error", "message": "x" * 5000}, None)
+    message = chat(api).json()["error"]["message"]
+    assert len(message) < 400 and message.rstrip(".").endswith("…")
