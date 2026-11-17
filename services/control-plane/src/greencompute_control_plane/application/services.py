@@ -1999,8 +1999,12 @@ class ControlPlaneService:
 
         billing_repo = BillingRepository()
         # Spells that ended by a path that didn't settle them (a crash in
-        # between, a direct state write): settled here, at the latest a minute on.
-        self.settle_unsettled_spells(now)
+        # between, a direct state write): settled here, at the latest a minute
+        # on. Never in the way of metering what runs.
+        try:
+            self.settle_unsettled_spells(now)
+        except Exception:
+            logger.exception("settling ended spells failed; metering continues")
         ready_deployments = self.repository.list_deployments_by_state(DeploymentState.READY)
         result: dict[str, int] = {}
 
@@ -2262,9 +2266,16 @@ class ControlPlaneService:
         (when it left READY, as near as is known). Returns how many."""
         now = now or datetime.now(UTC)
         count = 0
-        for deployment, changed_at in self.repository.list_unsettled_spells():
-            self.settle_ready_spell(deployment, ended_at=min(changed_at or now, now))
-            count += 1
+        for deployment_id, changed_at in self.repository.list_unsettled_spells():
+            # One row that can't be read or settled doesn't hold up the rest.
+            try:
+                deployment = self.repository.get_deployment(deployment_id)
+                if deployment is None or deployment.state == DeploymentState.READY:
+                    continue
+                self.settle_ready_spell(deployment, ended_at=min(changed_at or now, now))
+                count += 1
+            except Exception:
+                logger.exception("settling the ended spell of %s failed", deployment_id)
         return count
 
     def pending_usage_cents(self, user_id: str, now: datetime | None = None) -> int:

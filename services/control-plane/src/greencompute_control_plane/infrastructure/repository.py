@@ -917,18 +917,18 @@ class ControlPlaneRepository:
             return {"cents": int(cents), "billed_seconds": seconds, "minutes": minutes,
                     "extra_mcents": int(extra_mcents)}
 
-    def list_unsettled_spells(self) -> list[tuple[DeploymentRecord, datetime]]:
+    def list_unsettled_spells(self) -> list[tuple[str, datetime | None]]:
         """Deployments no longer READY whose READY spell was never settled (a
         path that stopped one without the settlement, or a crash in
-        between), with when the row last changed."""
+        between): their ids, with when each row last changed."""
         with session_scope(self.session_factory) as session:
-            rows = session.scalars(
-                select(DeploymentORM).where(
+            rows = session.execute(
+                select(DeploymentORM.deployment_id, DeploymentORM.updated_at).where(
                     DeploymentORM.metered_until.is_not(None),
                     DeploymentORM.state != DeploymentState.READY.value,
                 )
             ).all()
-            return [(self._to_deployment(row), _aware(row.updated_at)) for row in rows]
+            return [(deployment_id, _aware(updated_at)) for deployment_id, updated_at in rows]
 
     def metering_pending(self, owner_user_id: str) -> list[dict]:
         """The owner's deployments with usage accrued but not yet debited:

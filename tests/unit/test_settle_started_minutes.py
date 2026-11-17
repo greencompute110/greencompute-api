@@ -333,6 +333,35 @@ def test_a_spell_left_open_by_another_path_is_settled_by_the_meter(cp):
     assert _charged(cp) == 5
 
 
+def test_a_failure_settling_ended_spells_doesnt_stop_the_meter(cp, monkeypatch):
+    dep_id = _ready(cp, ready_for=600)
+
+    def boom():
+        raise RuntimeError("bad row")
+
+    monkeypatch.setattr(cp.repository, "list_unsettled_spells", boom)
+    assert cp.meter_usage(elapsed_seconds=60) == {dep_id: 5}
+
+
+def test_one_bad_ended_spell_doesnt_hold_up_the_others(cp, monkeypatch):
+    first, second = _ready(cp, ready_for=10), _ready(cp, ready_for=10)
+    for dep_id in (first, second):  # direct state writes: left open
+        dep = cp.repository.get_deployment(dep_id)
+        dep.state = DeploymentState.TERMINATED
+        cp.repository.update_deployment(dep)
+    original = cp.repository.get_deployment
+
+    def get(dep_id):
+        if dep_id == first:
+            raise ValueError("unreadable row")
+        return original(dep_id)
+
+    monkeypatch.setattr(cp.repository, "get_deployment", get)
+    assert cp.settle_unsettled_spells() == 1
+    assert _charged(cp) == 5  # the second's minute
+    assert _row(cp, first)["metered_until"] is not None  # tried again next minute
+
+
 def test_the_reviewers_eleven_short_rentals(cp):
     """11 rentals at $0.40/hr READY 3-137 s each (~380 s), the meter ticking
     every minute: charged 1¢ in all before (the 137 s one's second tick);
