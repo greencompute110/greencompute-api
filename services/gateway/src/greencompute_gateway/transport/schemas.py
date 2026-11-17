@@ -642,11 +642,29 @@ class APIKeyCreate(KeyExpiry, APIKeyCreateRequest):
     """POST /platform/api-keys: the protocol's fields plus an expiry."""
 
 
+class APIKeyCreatePublic(KeyExpiry):
+    """POST /platform/api-keys, as a customer sends it (the spec shows this;
+    the fields for staff tools, `user_id` and `admin`, are ignored for anyone
+    else)."""
+    name: str = Field(min_length=1, max_length=64)
+    scopes: list[str] = Field(default_factory=list, description=(
+        "Empty: full access. Otherwise any of read, rentals, inference, billing, keys; never broader than the "
+        "key creating it."))
+    max_active_rentals: int | None = Field(default=None, ge=0, le=100, description="Rentals it may have running at once.")
+    daily_spend_limit_usd: float | None = Field(default=None, gt=0, le=100000, description=(
+        "What it may spend (rentals and inference) in any 24 hours."))
+
+
 class APIKeyOut(APIKeySummary):
     """An API key without its secret (list and get)."""
     expires_at: datetime | None = Field(default=None, description="When it stops working; null: never.")
     expired: bool = Field(default=False, description="True once `expires_at` has passed: requests with it get 401 "
                                                      "`api_key_expired`. Delete it and create a new one.")
+
+
+class APIKeyCreated(APIKeyOut):
+    """The new key: as listed, plus its secret, which is shown only here."""
+    secret: str = Field(description="Send it as `Authorization: Bearer <secret>`. Store it: it isn't shown again.")
 
 
 # --- Account-wide limits -----------------------------------------------------------

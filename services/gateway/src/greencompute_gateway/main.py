@@ -213,9 +213,16 @@ def readiness() -> dict[str, str]:
     return {"status": "ok", "service": settings.service_name, "database": "ok"}
 
 
-@app.get("/_metrics")
+@app.get("/_metrics", include_in_schema=False)
 def prometheus_metrics() -> PlainTextResponse:
     return PlainTextResponse(
         render_prometheus_text(settings.service_name, gateway_metrics),
         media_type="text/plain; version=0.0.4",
     )
+
+
+# The spec: auth schemes, coded error responses, rate-limit headers (after
+# every route above is added; it is generated once, on first request).
+from greencompute_gateway.transport import openapi as _openapi_doc  # noqa: E402
+
+_openapi_doc.install(app)

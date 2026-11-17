@@ -204,7 +204,14 @@ def _created_key_out(created) -> dict:
     return {**created.model_dump(mode="json"), "expires_at": _api_key_out(created)["expires_at"], "expired": False}
 
 
-@router.post("/platform/api-keys", include_in_schema=False)
+@router.post("/platform/api-keys", response_model=None,
+             responses=ok(schemas.APIKeyCreated, "The new key, with its secret (shown only now)"),
+             openapi_extra={"requestBody": {"required": True, "content": {"application/json": {
+                 "schema": {"$ref": "#/components/schemas/APIKeyCreatePublic"}}}}},
+             description=("Create another API key for your account: optionally with narrower `scopes` (never "
+                          "broader than the key making it), its own limits, and an expiry (never later than the "
+                          "key making it). Needs a full-access key or one with the `keys` scope. The secret is "
+                          "in this answer only."))
 def create_api_key(
     payload: schemas.APIKeyCreate,
     authorization: str | None = Header(default=None),
@@ -1581,9 +1588,7 @@ def get_workload_utilization(
     return service.workload_utilization(workload_id)
 
 
-def _warmup(workload_id: str, authorization: str | None, x_api_key: str | None,
-            headers: dict | None = None) -> StreamingResponse:
-    api_key = require_api_key(authorization, x_api_key)
+def _warmup(workload_id: str, api_key, headers: dict | None = None) -> StreamingResponse:
     workload = service.get_workload(workload_id, user_id=api_key.user_id, admin=api_key.admin)
     if workload is None:
         raise HTTPException(status_code=404, detail="workload not found")
@@ -1607,7 +1612,7 @@ def workload_warmup(
 ) -> StreamingResponse:
     """Warm a workload up: a server-sent event stream, `warmup_started` then
     `warmup_complete`. Needs the `rentals` scope."""
-    return _warmup(workload_id, authorization, x_api_key)
+    return _warmup(workload_id, require_api_key(authorization, x_api_key))
 
 
 @router.get("/platform/workloads/{workload_id}/warmup", include_in_schema=False, deprecated=True)
@@ -1618,7 +1623,7 @@ def workload_warmup_deprecated(
 ) -> StreamingResponse:
     """Deprecated: a GET that starts something. Still answers as before, with
     a `Deprecation` header and a Link to POST, its successor."""
-    return _warmup(workload_id, authorization, x_api_key, headers={
+    return _warmup(workload_id, require_api_key(authorization, x_api_key), headers={
         "Deprecation": "true",
         "Link": f'</platform/workloads/{workload_id}/warmup>; rel="successor-version"',
     })
@@ -3773,7 +3778,7 @@ def guess_vllm_config(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/logos")
+@router.post("/logos", include_in_schema=False)
 def upload_logo(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -3782,7 +3787,7 @@ def upload_logo(
     _feature_disabled("logos")
 
 
-@router.get("/logos/{logo_id}.{ext}")
+@router.get("/logos/{logo_id}.{ext}", include_in_schema=False)
 def get_logo(
     logo_id: str,
     ext: str,
@@ -3793,7 +3798,7 @@ def get_logo(
     _feature_disabled("logos")
 
 
-@router.get("/bounties")
+@router.get("/bounties", include_in_schema=False)
 def list_bounties(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -3831,7 +3836,7 @@ def audit_download(
     _feature_disabled("audit")
 
 
-@router.get("/misc/proxy")
+@router.get("/misc/proxy", include_in_schema=False)
 def misc_proxy(
     url: str = Query(""),
     authorization: str | None = Header(default=None),
@@ -3841,7 +3846,7 @@ def misc_proxy(
     _feature_disabled("misc_proxy")
 
 
-@router.get("/misc/hf_repo_info")
+@router.get("/misc/hf_repo_info", include_in_schema=False)
 def misc_hf_repo_info(
     repo: str = Query(""),
     path: str = Query(""),
@@ -3852,7 +3857,7 @@ def misc_hf_repo_info(
     _feature_disabled("misc_hf_repo_info")
 
 
-@router.get("/e2e/instances/{workload_id}")
+@router.get("/e2e/instances/{workload_id}", include_in_schema=False)
 def e2e_instances(
     workload_id: str,
     authorization: str | None = Header(default=None),
@@ -3862,12 +3867,12 @@ def e2e_instances(
     _feature_disabled("e2e_instances")
 
 
-@router.get("/idp/scopes")
+@router.get("/idp/scopes", include_in_schema=False)
 def idp_scopes() -> list[str]:
     _feature_disabled("idp")
 
 
-@router.get("/idp/authorize")
+@router.get("/idp/authorize", include_in_schema=False)
 def idp_authorize(
     client_id: str = Query(""),
     redirect_uri: str = Query(""),
@@ -3877,12 +3882,12 @@ def idp_authorize(
     _feature_disabled("idp")
 
 
-@router.post("/idp/token")
+@router.post("/idp/token", include_in_schema=False)
 def idp_token(payload: dict) -> dict:
     _feature_disabled("idp")
 
 
-@router.post("/e2e/invoke")
+@router.post("/e2e/invoke", include_in_schema=False)
 def e2e_invoke(
     payload: dict,
     authorization: str | None = Header(default=None),
