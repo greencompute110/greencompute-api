@@ -318,3 +318,47 @@ def test_without_room_it_retries_then_says_so(cp):
     assert cp.replace_failed_private_model(dep.deployment_id, final_attempt=True) is not None
     failed = cp.repository.get_deployment(dep.deployment_id)
     assert "no GPU it fits on is free right now" in failed.last_error and others(cp, workload, dep) == []
+
+
+# --- review round 2, M2: a replacement is never lost --------------------------------------
+
+
+def test_a_replacement_left_processing_by_a_restart_is_retried(cp):
+    workload = private_model(cp)
+    dep = serving(cp, workload)
+    for _ in range(settings.deployment_health_failure_threshold):
+        CLOCK[0] += 20
+        cp.record_deployment_health_failure(dep.deployment_id, "x")
+    # The worker claimed it and then died (a restart) before finishing.
+    claimed = cp.bus.claim_pending("control-plane-worker", ["deployment.replacement_requested"], limit=10)
+    assert len(claimed) == 1
+    cp.recover_inflight_events(stale_after_seconds=0)
+    cp.process_pending_events()
+    assert len(others(cp, workload, dep)) == 1
+
+
+def test_when_making_it_keeps_failing_its_owner_is_told(cp, monkeypatch):
+    workload = private_model(cp)
+    dep = serving(cp, workload)
+
+    def broken(*a, **k):
+        raise RuntimeError("database hiccup")
+    monkeypatch.setattr(cp, "replace_failed_private_model", broken)
+    for _ in range(settings.deployment_health_failure_threshold):
+        CLOCK[0] += 20
+        cp.record_deployment_health_failure(dep.deployment_id, "x")
+    for _ in range(cp._MAX_EVENT_ATTEMPTS):
+        _make_due(cp)
+        cp.process_pending_events()
+    failed = cp.repository.get_deployment(dep.deployment_id)
+    assert "Not restarted automatically: making its replacement failed" in failed.last_error
+
+
+def _make_due(cp):
+    """Retries wait (backoff); bring them forward."""
+    from greencompute_persistence import session_scope as _scope
+    from greencompute_persistence.orm import BusDeliveryORM
+
+    with _scope(cp.repository.session_factory) as s:
+        for row in s.query(BusDeliveryORM).all():
+            row.available_at = datetime.now(UTC) - timedelta(seconds=1)

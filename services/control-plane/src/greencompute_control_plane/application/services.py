@@ -887,6 +887,15 @@ class ControlPlaneService:
         self.bus.mark_completed(event.delivery_id)
         return result
 
+    def _note_replacement_given_up(self, event, exc: BaseException) -> None:
+        """Its owner reads last_error: say the automatic restart was given up."""
+        try:
+            failed = self.repository.get_deployment(str(event.payload.get("deployment_id")))
+            if failed is not None and failed.state == DeploymentState.FAILED:
+                self._note_not_replaced(failed, f"making its replacement failed {event.attempts} times")
+        except Exception:  # noqa: BLE001
+            logger.exception("couldn't note the given-up replacement of %s", event.payload)
+
     def replace_failed_private_model(self, deployment_id: str, *, final_attempt: bool = True) -> DeploymentRecord | None:
         """Redeploy a customer's own model that was serving and then FAILED
         its health checks (its model server crashed, its machine went away),
@@ -1033,7 +1042,10 @@ class ControlPlaneService:
         in-flight. Periodic callers on a live worker MUST pass a threshold
         comfortably above the slowest legitimate handler, or they'll requeue
         (and double-run) an event that's merely slow."""
-        subjects = ["deployment.requested", "usage.recorded", "invocation.recorded"]
+        # Every subject the worker handles: a replacement left 'processing' by
+        # a crash or restart is retried, never lost.
+        subjects = ["deployment.requested", "usage.recorded", "invocation.recorded",
+                    "deployment.replacement_requested"]
         if stale_after_seconds is None:
             stale_after_seconds = max(self.runtime_settings.worker_poll_interval_seconds * 4, 2.0)
         requeued = self.bus.requeue_stale_processing(
@@ -1900,6 +1912,8 @@ class ControlPlaneService:
                     self._MAX_EVENT_ATTEMPTS,
                     retryable,
                 )
+                if not retryable and event.subject == "deployment.replacement_requested":
+                    self._note_replacement_given_up(event, exc)
                 try:
                     self.bus.mark_failed(
                         event.delivery_id,
