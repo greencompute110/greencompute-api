@@ -49,6 +49,11 @@ from greencompute_protocol import (
 )
 
 
+def _aware(value: datetime | None) -> datetime | None:
+    """SQLite hands back naive datetimes for UTC columns."""
+    return value if value is None or value.tzinfo else value.replace(tzinfo=UTC)
+
+
 def _serialize_port_mappings(pm: dict[int, int]) -> dict[str, int]:
     # JSON object keys must be strings; store {container_port_str: host_port_int}.
     return {str(k): int(v) for k, v in (pm or {}).items()}
@@ -720,25 +725,37 @@ class ControlPlaneRepository:
         deployment_id: str,
         *,
         add_mcents: int,
+        billed_seconds: float = 0.0,
+        at: datetime | None = None,
     ) -> tuple[int, int]:
         """Accumulate per-minute fractional-cent usage on the deployment row.
 
         Returns (whole_cents_to_debit, new_remainder_mcents). Only the
         whole-cent portion gets debited from the user; the remainder stays
         on the row for the next cycle so hourly totals converge exactly.
+        `billed_seconds` (what `add_mcents` pays for) and `add_mcents` are
+        added to the READY spell, accounted up to `at` (metered_until), for
+        the settlement when it stops (settle_metering_spell).
 
         Atomic — a single SELECT FOR UPDATE / UPDATE inside one session so
         two concurrent metering cycles (shouldn't happen, but) can't both
-        read and double-debit. Returns (0, 0) if the deployment is missing.
+        read and double-debit. A row that is no longer READY (stopped, and so
+        settled, since the meter listed it) accrues nothing: (0, remainder).
+        Returns (0, 0) if the deployment is missing.
         """
         with session_scope(self.session_factory) as session:
             row = session.get(DeploymentORM, deployment_id, with_for_update=True)
             if row is None:
                 return 0, 0
+            if row.state != DeploymentState.READY.value:
+                return 0, row.metering_remainder_mcents or 0
             total = (row.metering_remainder_mcents or 0) + add_mcents
             whole_cents = total // 1000
             remainder = total - whole_cents * 1000
             row.metering_remainder_mcents = remainder
+            row.spell_billed_seconds = (row.spell_billed_seconds or 0.0) + max(0.0, billed_seconds)
+            row.spell_billed_mcents = (row.spell_billed_mcents or 0) + add_mcents
+            row.metered_until = at or datetime.now(UTC)
             session.add(row)
             return whole_cents, remainder
 
@@ -792,11 +809,124 @@ class ControlPlaneRepository:
             return since if since.tzinfo else since.replace(tzinfo=UTC)
 
     def set_billable_since(self, deployment_id: str, at: datetime) -> None:
+        """Start a READY spell at `at`: the meter charges from then, and the
+        settlement when it stops (settle_metering_spell) counts from then."""
         with session_scope(self.session_factory) as session:
-            row = session.get(DeploymentORM, deployment_id)
+            row = session.get(DeploymentORM, deployment_id, with_for_update=True)
             if row is not None:
                 row.billable_since = at
+                row.metered_until = at
+                row.spell_billed_seconds = 0.0
+                row.spell_billed_mcents = 0
                 session.add(row)
+
+    def skip_metering(self, deployment_id: str, at: datetime) -> None:
+        """A meter tick that charged nothing because the machine was silent:
+        the spell is accounted up to `at` anyway, so the settlement never
+        charges the silent time either. Opens a spell on a READY row that has
+        none (one running since before spells existed)."""
+        with session_scope(self.session_factory) as session:
+            row = session.get(DeploymentORM, deployment_id, with_for_update=True)
+            if row is None or row.state != DeploymentState.READY.value:
+                return
+            if row.metered_until is None:
+                row.spell_billed_seconds = 0.0
+                row.spell_billed_mcents = 0
+            row.metered_until = at
+            session.add(row)
+
+    def settle_metering_spell(
+        self,
+        deployment_id: str,
+        *,
+        ended_at: datetime,
+        mcents_per_hour: int,
+        charge_tail: bool,
+        max_tail_seconds: float,
+    ) -> dict | None:
+        """Close the deployment's READY spell, once: what is still owed for it
+        when it stops, by the rule "every started minute it was READY".
+
+        The meter charged `spell_billed_seconds` of it (`spell_billed_mcents`).
+        Add the seconds since its last tick (`metered_until` to `ended_at`, at
+        most `max_tail_seconds`, none when `charge_tail` is False: the machine
+        is silent, so billing is paused) and round up to started minutes: the
+        spell owes those minutes at `mcents_per_hour`, less what the meter
+        charged, plus the remainder carried on the row, rounded up to a whole
+        cent. Counting from the rule rather than adding up the tail keeps the
+        meter's per-tick rounding out of it.
+
+        Under the row lock, and the spell is closed in the same transaction
+        (metered_until NULL), so a repeated stop, a re-report or the reaper
+        and the user stopping it together settle it exactly once. Returns
+        None when there is no open spell, else {"cents": whole cents to
+        debit, "billed_seconds": the spell's seconds, "minutes": started
+        minutes, "extra_mcents": what the settlement added}. The cents are
+        taken off the row's remainder here; the caller debits them and
+        carries back any it couldn't (return_metering_mcents)."""
+        import math
+
+        with session_scope(self.session_factory) as session:
+            row = session.get(DeploymentORM, deployment_id, with_for_update=True)
+            if row is None or row.metered_until is None:
+                return None
+            metered_until, ended = _aware(row.metered_until), _aware(ended_at)
+            tail = 0.0
+            if charge_tail:
+                tail = min(max(0.0, (ended - metered_until).total_seconds()), max(0.0, max_tail_seconds))
+            seconds = (row.spell_billed_seconds or 0.0) + tail
+            # A millisecond of float noise (60.0004 s of monotonic deltas)
+            # doesn't start another minute.
+            minutes = math.ceil((seconds - 0.001) / 60) if seconds > 0.001 else 0
+            owed = math.ceil(max(0, mcents_per_hour) * minutes / 60 - 1e-6) if minutes else 0
+            extra_mcents = max(0, owed - (row.spell_billed_mcents or 0))
+            total = (row.metering_remainder_mcents or 0) + extra_mcents
+            cents = -(-total // 1000) if total > 0 else 0
+            row.metering_remainder_mcents = 0 if total > 0 else total
+            row.metered_until = None
+            row.spell_billed_seconds = None
+            row.spell_billed_mcents = None
+            session.add(row)
+            return {"cents": int(cents), "billed_seconds": seconds, "minutes": minutes,
+                    "extra_mcents": int(extra_mcents)}
+
+    def list_unsettled_spells(self) -> list[tuple[DeploymentRecord, datetime]]:
+        """Deployments no longer READY whose READY spell was never settled (a
+        path that stopped one without the settlement, or a crash in
+        between), with when the row last changed."""
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(DeploymentORM).where(
+                    DeploymentORM.metered_until.is_not(None),
+                    DeploymentORM.state != DeploymentState.READY.value,
+                )
+            ).all()
+            return [(self._to_deployment(row), _aware(row.updated_at)) for row in rows]
+
+    def metering_pending(self, owner_user_id: str) -> list[dict]:
+        """The owner's deployments with usage accrued but not yet debited:
+        an open READY spell (accounted up to `metered_until`) or a carried
+        remainder, on deployments that can still be charged (not ended)."""
+        with session_scope(self.session_factory) as session:
+            rows = session.execute(
+                select(
+                    DeploymentORM.deployment_id, DeploymentORM.state, DeploymentORM.metered_until,
+                    DeploymentORM.metering_remainder_mcents,
+                ).where(
+                    DeploymentORM.owner_user_id == owner_user_id,
+                    DeploymentORM.state.not_in([DeploymentState.TERMINATED.value, DeploymentState.FAILED.value]),
+                    or_(DeploymentORM.metered_until.is_not(None), DeploymentORM.metering_remainder_mcents != 0),
+                )
+            ).all()
+            return [
+                {
+                    "deployment_id": r.deployment_id,
+                    "state": r.state,
+                    "metered_until": _aware(r.metered_until),
+                    "remainder_mcents": r.metering_remainder_mcents or 0,
+                }
+                for r in rows
+            ]
 
     def save_assignment(self, assignment: LeaseAssignment) -> LeaseAssignment:
         with session_scope(self.session_factory) as session:

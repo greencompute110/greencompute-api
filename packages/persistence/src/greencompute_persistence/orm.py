@@ -197,6 +197,16 @@ class DeploymentORM(Base):
     # started being billed by the hour), so it is charged from then, not from
     # ready_at. NULL on rentals that were running before it existed.
     billable_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The current READY spell, for the settlement when it leaves READY (a
+    # rental pays for every started minute it was READY): metered_until is
+    # up to when the meter accounted for it (charged, or skipped while the
+    # machine was silent), spell_billed_seconds / spell_billed_mcents what it
+    # charged. Opened when the deployment becomes READY (or on the meter's
+    # first tick for one without), cleared by the settlement: NULL
+    # metered_until = no open spell.
+    metered_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    spell_billed_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spell_billed_mcents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Credit-exhaustion lifecycle (opt-in "save my pod").
     # save_on_exhaustion: preserve this pod (storage-billed) when credits run
     #   out instead of deleting it shortly after. Defaults TRUE (opt-OUT) so a
