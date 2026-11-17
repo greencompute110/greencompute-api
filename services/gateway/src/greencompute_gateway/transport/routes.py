@@ -1286,7 +1286,7 @@ def _new_account_limit(reason: str, numbers: dict) -> HTTPException:
         )
         hint = "wait for earlier spending to fall out of the 24-hour window"
     if lift:
-        message += f" until they have paid in ${numbers['lifts_after_deposit_usd']:.2f} in crypto"
+        message += f", until they have paid in ${numbers['lifts_after_deposit_usd']:.2f} in crypto"
     deposited = numbers.get("deposited_usd")
     return coded(403, "new_account_limit", {
         "code": "new_account_limit",

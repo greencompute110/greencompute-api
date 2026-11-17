@@ -153,7 +153,7 @@ def test_the_403_says_how_much_more_to_deposit_or_when_it_ends(db, monkeypatch):
     detail = exc.value.detail
     assert (exc.value.error_code, detail["limit"]) == ("new_account_limit", "spend")
     assert (detail["lifts_after_deposit_usd"], detail["deposited_usd"]) == (20.0, 12.5)
-    assert detail["message"] == ("New wallet accounts can spend $50.00 in any 24 hours for their first 7 days "
+    assert detail["message"] == ("New wallet accounts can spend $50.00 in any 24 hours for their first 7 days, "
                                  "until they have paid in $20.00 in crypto")
     assert "deposit $7.50 more in crypto (TAO, alpha, USDC or USDT)" in detail["hint"]
     assert "add an email address on the website (Settings)" in detail["hint"]
