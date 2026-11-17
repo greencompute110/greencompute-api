@@ -51,6 +51,7 @@ from greencompute_gateway.domain.routing import NoReadyDeploymentError
 from greencompute_gateway.infrastructure.inference_client import (
     InferenceBadResponseError,
     InferenceConnectionError,
+    InferenceRequestRejectedError,
     InferenceTimeoutError,
     InferenceUpstreamError,
 )
@@ -3220,6 +3221,16 @@ def chat_completions(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     host: str | None = Header(default=None, alias="Host"),
 ) -> dict:
+    return _complete(payload, authorization=authorization, x_api_key=x_api_key, host=host)
+
+
+def _complete(
+    payload: ChatCompletionRequest,
+    *,
+    authorization: str | None,
+    x_api_key: str | None,
+    host: str | None,
+):
     from greencompute_gateway.application.services import InsufficientBalanceForInferenceError
     from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 
@@ -3251,14 +3262,19 @@ def chat_completions(
     try:
         if payload.stream:
             metrics.increment("invoke.stream")
+            stream = service.stream_chat_completion(
+                payload,
+                api_key_id=api_key.key_id,
+                user_id=api_key.user_id,
+                routed_host=host,
+                admin=api_key.admin,
+            )
+            # Wait for the model's first line before answering: the request
+            # to it is made here, so a refusal or an outage gets its status
+            # code instead of a 200 whose stream breaks off.
+            first = next(stream, None)
             return StreamingResponse(
-                service.stream_chat_completion(
-                    payload,
-                    api_key_id=api_key.key_id,
-                    user_id=api_key.user_id,
-                    routed_host=host,
-                    admin=api_key.admin,
-                ),
+                _sse_chain(first, stream),
                 media_type="text/event-stream",
                 headers={"cache-control": "no-cache"},
             )
@@ -3277,21 +3293,50 @@ def chat_completions(
             status_code=402,
             detail={"message": "insufficient balance for inference", "reason": str(exc)},
         ) from exc
-    except NoReadyDeploymentError as exc:
+    except (NoReadyDeploymentError, InferenceUpstreamError) as exc:
+        raise _inference_failure(exc) from exc
+
+
+def _sse_chain(first: str | None, rest):
+    """The stream the caller reads: the line already received, then the
+    rest. Closing it (the caller hung up) closes the inner stream, which
+    bills what was served."""
+    try:
+        if first is not None:
+            yield first
+        yield from rest
+    finally:
+        close = getattr(rest, "close", None)
+        if close is not None:
+            close()
+
+
+def _inference_failure(exc: Exception) -> HTTPException:
+    """The coded HTTP error for an inference request that failed (codes and
+    what to do about each: transport/errors.py CODES, the docs' errors page)."""
+    if isinstance(exc, NoReadyDeploymentError):
         metrics.increment("invoke.failure.no_ready_deployment")
-        raise coded(409, "model_not_ready", str(exc), {"Retry-After": "10"}) from exc
-    except InferenceTimeoutError as exc:
+        return coded(409, "model_not_ready", str(exc), {"Retry-After": "10"})
+    if isinstance(exc, InferenceRequestRejectedError):
+        # The model refused the request itself: hand the caller its reason.
+        # 413 and 422 mean something to clients; any other refusal is a 400.
+        metrics.increment("invoke.failure.rejected")
+        status = exc.status_code if exc.status_code in (413, 422) else 400
+        reason = exc.upstream_message or "the request isn't valid for this model"
+        return coded(status, "invalid_request", {
+            "message": f"The model rejected the request: {reason}",
+            "upstream_status": exc.status_code,
+        })
+    if isinstance(exc, InferenceTimeoutError):
         metrics.increment("invoke.failure.timeout")
-        raise HTTPException(status_code=504, detail=str(exc)) from exc
-    except InferenceConnectionError as exc:
+        return HTTPException(status_code=504, detail=str(exc))
+    if isinstance(exc, InferenceConnectionError):
         metrics.increment("invoke.failure.connection")
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except InferenceBadResponseError as exc:
+    elif isinstance(exc, InferenceBadResponseError):
         metrics.increment("invoke.failure.bad_response")
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except InferenceUpstreamError as exc:
+    else:
         metrics.increment("invoke.failure.upstream")
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return HTTPException(status_code=502, detail=str(exc))
 
 
 @router.post("/v1/completions")
@@ -3317,7 +3362,7 @@ def completions(
             for e in exc.errors(include_url=False)
         ]
         raise HTTPException(status_code=422, detail=detail) from exc
-    return chat_completions(request, authorization=authorization, x_api_key=x_api_key, host=host)
+    return _complete(request, authorization=authorization, x_api_key=x_api_key, host=host)
 
 
 @router.post("/v1/embeddings")

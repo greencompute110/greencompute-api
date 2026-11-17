@@ -69,7 +69,9 @@ from greencompute_gateway.infrastructure.inference_client import (
     HttpInferenceClient,
     InferenceBadResponseError,
     InferenceConnectionError,
+    InferenceRequestRejectedError,
     InferenceTimeoutError,
+    InferenceUpstreamError,
 )
 from greencompute_gateway.infrastructure.repository import GatewayRepository
 from greencompute_gateway.transport.security import metrics as gateway_metrics
@@ -1759,6 +1761,8 @@ class GatewayService:
                     status="failed",
                     error_class=self._classify_inference_error(exc),
                 )
+                if not self._worth_another_replica(exc):
+                    raise
                 continue
             self._handle_upstream_success(deployment, routing)
             self._record_usage(deployment, stream=False, stream_chunk_count=0)
@@ -1924,7 +1928,7 @@ class GatewayService:
                     error_class=self._classify_inference_error(exc),
                 )
                 # Only retry if no chunks have been yielded yet
-                if chunk_count > 0:
+                if chunk_count > 0 or not self._worth_another_replica(exc):
                     raise
                 continue
             self._finalize_stream(
@@ -2291,7 +2295,14 @@ class GatewayService:
 
     def _handle_upstream_failure(self, deployment: DeploymentRecord, routing: dict, exc: RuntimeError) -> None:
         failure_class = self._classify_inference_error(exc)
-        if not self._is_external(deployment):
+        decision = "failed"
+        if isinstance(exc, InferenceRequestRejectedError):
+            # The model refused the request itself (a 4xx): the caller's
+            # fault, never the model's. Counting these let three bad requests
+            # from one caller mark a shared model FAILED for everyone.
+            decision = "rejected"
+            self.metrics.increment("inference.request_rejected")
+        elif not self._is_external(deployment):
             self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
         else:
             log.warning("external upstream failed model=%s: %s", routing.get("model"), exc)
@@ -2299,14 +2310,22 @@ class GatewayService:
             {
                 **routing,
                 "deployment_id": deployment.deployment_id,
-                "decision": "failed",
+                "decision": decision,
                 "reason": failure_class,
                 "created_at": datetime.now(UTC).isoformat(),
             }
         )
 
     @staticmethod
+    def _worth_another_replica(exc: RuntimeError) -> bool:
+        """Whether a failed request should be sent to the next replica. Not
+        when the request itself was refused: every replica would refuse it."""
+        return not isinstance(exc, InferenceRequestRejectedError)
+
+    @staticmethod
     def _classify_inference_error(exc: RuntimeError) -> str:
+        if isinstance(exc, InferenceRequestRejectedError):
+            return "request_rejected"
         if isinstance(exc, InferenceTimeoutError):
             return "upstream_timeout"
         if isinstance(exc, InferenceConnectionError):
