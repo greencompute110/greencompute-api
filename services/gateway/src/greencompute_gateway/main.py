@@ -154,25 +154,51 @@ app.add_middleware(
     ],
 )
 
-@app.middleware("http")
-async def _stash_client_ip(request, call_next):
-    """Record the per-request client IP in a ContextVar so the auth helpers can
-    apply a per-IP auth-failure rate limit without threading `request` through
-    every handler; likewise the route (for scopes) and a slot for the key's
-    rate limit, whose X-RateLimit-* headers are added to the response here."""
-    token = current_client_ip.set(_client_ip_from_request(request))
-    route_token = current_request_route.set((request.method, request.url.path))
-    rate_state = {"path": request.url.path, "counted": False, "headers": None}
-    rate_token = current_rate_limit.set(rate_state)
-    try:
-        response = await call_next(request)
-        for name, value in (rate_state.get("headers") or {}).items():
-            response.headers[name] = value
-        return response
-    finally:
-        current_rate_limit.reset(rate_token)
-        current_request_route.reset(route_token)
-        current_client_ip.reset(token)
+class _RequestContext:
+    """Records the per-request client IP in a ContextVar so the auth helpers
+    can apply a per-IP auth-failure rate limit without threading `request`
+    through every handler; likewise the route (for scopes) and a slot for
+    the key's rate limit, whose X-RateLimit-* headers are added to the
+    response as it starts.
+
+    Plain ASGI, not @app.middleware("http"): Starlette's BaseHTTPMiddleware
+    runs the app in a task of its own and relays the body through a stream,
+    and a caller hanging up mid-stream left the inner answer stream (with
+    its in-flight slot, its node connection and its billing) suspended in a
+    reference cycle until the garbage collector ran, minutes to hours later.
+    Nothing in this app's stack may be a BaseHTTPMiddleware (review H1)."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        from starlette.datastructures import MutableHeaders
+        from starlette.requests import Request
+
+        token = current_client_ip.set(_client_ip_from_request(Request(scope)))
+        route_token = current_request_route.set((scope.get("method"), scope.get("path")))
+        rate_state = {"path": scope.get("path"), "counted": False, "headers": None}
+        rate_token = current_rate_limit.set(rate_state)
+
+        async def send_with_rate_headers(message):
+            if message["type"] == "http.response.start" and rate_state.get("headers"):
+                headers = MutableHeaders(scope=message)
+                for name, value in rate_state["headers"].items():
+                    headers[name] = value
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_rate_headers)
+        finally:
+            current_rate_limit.reset(rate_token)
+            current_request_route.reset(route_token)
+            current_client_ip.reset(token)
+
+
+app.add_middleware(_RequestContext)
 
 
 app.include_router(router)

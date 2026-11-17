@@ -26,6 +26,7 @@ from typing import Any
 
 import anyio
 import anyio.to_thread
+from starlette.responses import StreamingResponse
 
 from greencompute_gateway.transport.errors import coded
 
@@ -154,6 +155,23 @@ def v1_stream(body: Iterator[str], slot: Slot | None) -> AsyncIterator[str]:
     if slot is not None:
         weakref.finalize(stream, slot.release)
     return stream
+
+
+class ClosingStreamingResponse(StreamingResponse):
+    """A StreamingResponse that always closes its body when it is done,
+    including when the caller hung up. Starlette leaves an unfinished body
+    iterator to the garbage collector, and one caught in a reference cycle
+    (an exception's traceback holds it) kept its in-flight slot, its node
+    connection and its billing waiting for minutes to hours (review H1)."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                with anyio.CancelScope(shield=True):
+                    await aclose()
 
 
 def raise_default_pool() -> None:

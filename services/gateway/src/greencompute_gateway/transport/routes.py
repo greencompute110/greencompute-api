@@ -3429,7 +3429,7 @@ class _Streamed:
 
 def _respond(result):
     if isinstance(result, _Streamed):
-        return StreamingResponse(
+        return v1_capacity.ClosingStreamingResponse(
             v1_capacity.v1_stream(result.body, result.slot),
             media_type="text/event-stream",
             headers={"cache-control": "no-cache"},
