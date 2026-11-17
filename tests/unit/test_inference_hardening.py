@@ -543,3 +543,24 @@ def test_a_private_model_named_like_a_shared_one_is_listed_by_its_id(api, cp, no
     assert sorted(listed) == sorted(["qwen2.5-7b-instruct", mine.workload_id])
     # Each id reaches what it says.
     assert chat(api, model=mine.workload_id).status_code == 200
+
+
+# --- item 6: a private model that crashes is brought back --------------------------------
+
+
+def test_a_crashed_private_model_is_replaced_and_says_so(api, cp, node):
+    mine = _private(cp)
+    dep = ready_deployment(cp, mine, node, owner="u1")
+    cp.repository.update_deployment(cp.repository.get_deployment(dep.deployment_id).model_copy(
+        update={"ready_at": datetime.now(UTC)}))
+    node.health = 503  # vLLM died: every probe fails
+    for _ in range(3):
+        res = chat(api, model=mine.workload_id)
+        assert res.status_code == 503 and res.json()["error"]["code"] == "model_unavailable"
+    assert state(cp, dep) == DeploymentState.FAILED
+    replacement = [d for d in cp.repository.list_deployments_for_workload(mine.workload_id)
+                   if d.deployment_id != dep.deployment_id]
+    assert [d.state for d in replacement] == [DeploymentState.PENDING]
+    # While it starts, callers are told to retry shortly.
+    res = chat(api, model=mine.workload_id)
+    assert res.status_code == 409 and res.json()["error"]["code"] == "model_not_ready"

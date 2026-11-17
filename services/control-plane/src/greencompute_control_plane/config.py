@@ -49,6 +49,11 @@ class Settings(BaseModel):
     deployment_reassign_retry_limit: int = Field(default=10, ge=1)
     deployment_request_retry_delay_seconds: int = Field(default=10, ge=1)
     deployment_health_failure_threshold: int = Field(default=3, ge=1)
+    # A customer's own model that was serving and then FAILED its health
+    # checks is redeployed at once (a new deployment of the same workload), at
+    # most this many times an hour per model; 0 turns it off. Shared catalog
+    # models are Flux's to replace.
+    private_model_auto_replace_per_hour: int = Field(default=3, ge=0)
     placement_failure_cooldown_seconds: int = Field(default=120, ge=1)
     placement_failure_threshold: int = Field(default=3, ge=1)
     # Private-endpoint inference: auto-suspend if zero invocations within this
@@ -89,6 +94,7 @@ settings = Settings(
     deployment_reassign_retry_limit=_int("GREENCOMPUTE_DEPLOYMENT_REASSIGN_RETRY_LIMIT", 10),
     deployment_request_retry_delay_seconds=_int("GREENCOMPUTE_DEPLOYMENT_REQUEST_RETRY_DELAY_SECONDS", 10),
     deployment_health_failure_threshold=_int("GREENCOMPUTE_DEPLOYMENT_HEALTH_FAILURE_THRESHOLD", 3),
+    private_model_auto_replace_per_hour=_int("GREENCOMPUTE_PRIVATE_MODEL_AUTO_REPLACE_PER_HOUR", 3),
     placement_failure_cooldown_seconds=_int("GREENCOMPUTE_PLACEMENT_FAILURE_COOLDOWN_SECONDS", 120),
     placement_failure_threshold=_int("GREENCOMPUTE_PLACEMENT_FAILURE_THRESHOLD", 3),
     idle_private_endpoint_timeout_seconds=_int("GREENCOMPUTE_IDLE_PRIVATE_ENDPOINT_TIMEOUT_SECONDS", 1800),

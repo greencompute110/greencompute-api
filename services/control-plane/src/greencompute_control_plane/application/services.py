@@ -33,6 +33,9 @@ from greencompute_control_plane.domain.state import transition_state
 from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
 
 logger = logging.getLogger(__name__)
+#: Serializes counting health failures (and the FAILED + replace that can
+#: follow) in this process; the gateway is the only process that counts them.
+_HEALTH_FAILURE_LOCK = threading.RLock()
 
 
 class CannotResumeInPlace(ValueError):
@@ -694,25 +697,127 @@ class ControlPlaneService:
         return ready[0] if ready else None
 
     def record_deployment_health_failure(self, deployment_id: str, error: str) -> DeploymentRecord:
-        deployment = self.repository.get_deployment(deployment_id)
-        if deployment is None:
-            raise KeyError(f"deployment not found: {deployment_id}")
-        deployment.health_check_failures += 1
-        deployment.last_error = error
-        deployment.failure_class = "health_check_failure"
-        deployment.updated_at = datetime.now(UTC)
-        if deployment.health_check_failures >= settings.deployment_health_failure_threshold:
-            self.repository.update_deployment(deployment)
-            return self.update_deployment_status(
-                DeploymentStatusUpdate(
-                    deployment_id=deployment_id,
-                    state=DeploymentState.FAILED,
-                    error=error,
-                    observed_at=deployment.updated_at,
+        # One at a time: two requests failing together must not both take
+        # the deployment to FAILED and each replace it (two replicas of a
+        # private model, both billed by the hour).
+        with _HEALTH_FAILURE_LOCK:
+            deployment = self.repository.get_deployment(deployment_id)
+            if deployment is None:
+                raise KeyError(f"deployment not found: {deployment_id}")
+            was_ready = deployment.state == DeploymentState.READY
+            deployment.health_check_failures += 1
+            deployment.last_error = error
+            deployment.failure_class = "health_check_failure"
+            deployment.updated_at = datetime.now(UTC)
+            if deployment.health_check_failures >= settings.deployment_health_failure_threshold:
+                self.repository.update_deployment(deployment)
+                failed = self.update_deployment_status(
+                    DeploymentStatusUpdate(
+                        deployment_id=deployment_id,
+                        state=DeploymentState.FAILED,
+                        error=error,
+                        observed_at=deployment.updated_at,
+                    )
                 )
-            )
-        self.metrics.increment("deployment.health.failed")
-        return self.repository.update_deployment(deployment)
+                if was_ready and failed.state == DeploymentState.FAILED:
+                    # It failed its health checks, whatever the error's words
+                    # (update_deployment_status classifies by text).
+                    failed.failure_class = "health_check_failure"
+                    failed = self.repository.update_deployment(failed)
+                    failed = self._replace_failed_private_model(failed) or failed
+                return failed
+            self.metrics.increment("deployment.health.failed")
+            return self.repository.update_deployment(deployment)
+
+    _LIVE_STATES = frozenset({
+        DeploymentState.PENDING, DeploymentState.SCHEDULED, DeploymentState.PULLING, DeploymentState.STARTING,
+        DeploymentState.READY, DeploymentState.DRAINING,
+    })
+
+    def _replace_failed_private_model(self, failed: DeploymentRecord) -> DeploymentRecord | None:
+        """Redeploy a customer's own model that was serving and then FAILED
+        its health checks (its model server crashed, its machine went away),
+        instead of leaving it failed until its owner notices and redeploys.
+        A new deployment of the same workload goes through normal placement:
+        a fresh container, on the same machine or another, with the model's
+        address, name and id unchanged. Shared catalog models are Flux's.
+
+        Not when: the model never served (a start problem would only fail
+        again); it failed this way more than private_model_auto_replace_per_hour
+        times in the last hour (it keeps crashing: its owner should look);
+        another of its deployments is live (no second replica, billed twice);
+        its runtime cap is used up (the replacement gets what is left of it);
+        its owner's balance doesn't cover an hour of it (what starting one
+        needs) or the account is blocked. Returns the failed deployment with
+        `last_error` naming the replacement, or None when nothing was done."""
+        limit = settings.private_model_auto_replace_per_hour
+        if limit <= 0 or failed.ready_at is None or not failed.owner_user_id:
+            return None
+        workload = self.repository.get_workload(failed.workload_id)
+        if workload is None or not self.is_private_model(failed, workload):
+            return None
+        now = datetime.now(UTC)
+        siblings = self.repository.list_deployments_for_workload(workload.workload_id)
+        if any(d.deployment_id != failed.deployment_id and d.state in self._LIVE_STATES for d in siblings):
+            return None
+        recent = [
+            d for d in siblings
+            if d.state == DeploymentState.FAILED and d.failure_class == "health_check_failure" and d.ready_at
+            and (now - self._ensure_utc(d.updated_at)) <= timedelta(hours=1)
+        ]
+        if len(recent) > limit:
+            return self._note_not_replaced(failed, f"it failed {len(recent)} times in the last hour")
+        remaining_minutes = None
+        if failed.max_runtime_minutes:
+            ran_minutes = (now - self._ensure_utc(failed.ready_at)).total_seconds() / 60
+            remaining_minutes = int(failed.max_runtime_minutes - ran_minutes)
+            if remaining_minutes < 1:
+                return None  # its runtime cap is used up: it would have stopped now anyway
+        hourly_cents = (failed.hourly_rate_cents or 10) * ((workload.requirements.gpu_count if workload else 1) or 1)
+        try:
+            from greencompute_gateway.application.sanctions import account_blocked
+            from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+
+            if account_blocked(self.repository.session_factory, failed.owner_user_id):
+                return None
+            balance = BillingRepository().get_balance(failed.owner_user_id)
+        except Exception:  # noqa: BLE001 - can't check: leave it failed, as before
+            logger.exception("auto-replace of %s: couldn't check the owner's account", failed.deployment_id)
+            return None
+        if balance < hourly_cents:
+            return self._note_not_replaced(failed, "the balance doesn't cover an hour of it")
+        replacement = self.create_deployment({
+            "workload_id": failed.workload_id,
+            "name": failed.name,
+            "requested_instances": failed.requested_instances,
+            "save_on_exhaustion": failed.save_on_exhaustion,
+            "resume_on_topup": failed.resume_on_topup,
+            "max_runtime_minutes": remaining_minutes,
+            "owner_user_id": failed.owner_user_id,
+            "created_by_key_id": failed.created_by_key_id,
+        })
+        if failed.hourly_rate_cents and replacement.hourly_rate_cents > failed.hourly_rate_cents:
+            # Never dearer than what its owner was paying.
+            replacement = self.repository.update_deployment(
+                replacement.model_copy(update={"hourly_rate_cents": failed.hourly_rate_cents}))
+        failed.last_error = (
+            f"{failed.last_error or 'failed its health checks'}. "
+            f"Restarted automatically as deployment {replacement.deployment_id}."
+        )
+        self.metrics.increment("deployment.private_model.auto_replaced")
+        logger.warning("private model %s failed its health checks; replaced %s with %s",
+                       workload.workload_id, failed.deployment_id, replacement.deployment_id)
+        self.bus.publish("deployment.replaced", {
+            "deployment_id": failed.deployment_id,
+            "replacement_deployment_id": replacement.deployment_id,
+            "workload_id": failed.workload_id,
+        })
+        return self.repository.update_deployment(failed)
+
+    def _note_not_replaced(self, failed: DeploymentRecord, why: str) -> DeploymentRecord:
+        failed.last_error = f"{failed.last_error or 'failed its health checks'}. Not restarted automatically: {why}."
+        self.metrics.increment("deployment.private_model.not_replaced")
+        return self.repository.update_deployment(failed)
 
     def clear_deployment_health_failures(self, deployment_id: str) -> DeploymentRecord:
         deployment = self.repository.get_deployment(deployment_id)
