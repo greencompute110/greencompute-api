@@ -75,6 +75,11 @@ class FakeNode(BaseHTTPRequestHandler):
         self.server.requests.append(body)
         chat = self.server.chat
         messages = body.get("messages") or [{}]
+        self.server.canaries += body.get("max_tokens") == 1
+        if body.get("max_tokens") == 1 and not self.server.wedged:
+            # The gateway's 1-token canary: a working model answers it, however
+            # it fails other requests.
+            chat = (200, {"model": "m", "choices": [{"message": {"role": "assistant", "content": "OK"}}]}, None)
         if messages[-1].get("content") == "hold":  # generates until the test lets it finish
             self.server.release.wait(10)
             chat = (200, {"model": "m", "choices": [{"message": {"role": "assistant", "content": "held"}}]}, None)
@@ -106,6 +111,7 @@ def node():
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeNode)
     server.daemon_threads = True
     server.health, server.health_probes, server.requests = 200, 0, []
+    server.canaries, server.wedged = 0, False
     server.release = threading.Event()
     server.chat = (200, {"id": "x", "object": "chat.completion", "created": 1, "model": "m",
                          "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"},
@@ -379,9 +385,9 @@ def test_a_timeout_on_a_healthy_model_is_a_504_and_never_counts(api, cp, node):
     assert charges(cp) == []
 
 
-def test_a_5xx_on_a_healthy_model_from_one_account_never_counts(api, cp, node):
-    """One caller's requests that make the model fail (crafted or not)
-    can't take a shared model down by themselves."""
+def test_a_5xx_on_a_healthy_model_from_one_account_never_counts(api, cp, node, canaries):
+    """Requests that make the model fail (crafted or not) can't take a
+    shared model down: the canary they lead to passes."""
     _, dep = catalog_model(cp, node)
     node.chat = (502, {"object": "error", "message": "CUDA error on this input"}, {"X-Upstream-Status": "500"})
     for _ in range(12):
@@ -390,6 +396,8 @@ def test_a_5xx_on_a_healthy_model_from_one_account_never_counts(api, cp, node):
         err = res.json()["error"]
         assert (err["code"], err["retryable"]) == ("upstream_error", False)
         assert "CUDA error on this input" in err["message"]
+    _wait_for(lambda: node.canaries >= 1)
+    time.sleep(0.3)
     assert failures(cp, dep) == 0 and state(cp, dep) == DeploymentState.READY
 
 
@@ -740,25 +748,66 @@ def test_a_15_second_node_restart_under_traffic_fails_nothing(api, cp, node, clo
     assert chat(api).status_code == 200 and failures(cp, dep) == 0
 
 
-# --- review H2: a replica that passes /health but fails every request --------------------
+# --- review H2 / round 2: a replica that passes /health but fails every request ----------
 
 
-def test_a_replica_failing_everyones_requests_is_escalated_then_failed(api, cp, node, clock):
-    """A hung engine or a misconfigured server: /health passes, every request
-    fails. Five in a row from two accounts count one health failure; the
-    window rule then fails it after 30 s of that."""
+@pytest.fixture
+def canaries(monkeypatch):
+    """Canaries on a test's time scale: the window rule over 1 s, a canary
+    every 0.3 s that may take 0.5 s."""
+    from greencompute_control_plane.config import settings as cp_settings
+    from greencompute_gateway.application import services as gw_services
+
+    monkeypatch.setattr(cp_settings, "deployment_health_failure_window_seconds", 1)
+    monkeypatch.setattr(gw_services, "CANARY_INTERVAL_SECONDS", 0.3)
+    monkeypatch.setattr(gw_services, "CANARY_TIMEOUT_SECONDS", 0.5)
+
+
+def _wait_state(cp, dep, wanted, seconds=10.0):
+    deadline = time.monotonic() + seconds
+    while state(cp, dep) != wanted:
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def test_a_wedged_model_is_failed_by_its_canary_with_one_callers_traffic(api, cp, node, canaries):
+    """It accepts requests and never answers (its health check passes): five
+    failures in a row from one account start canaries; each fails; the
+    window rule then fails it."""
     _, dep = catalog_model(cp, node)
-    node.chat = (502, {"object": "error", "message": "engine hung"}, {"X-Upstream-Status": "500"})
-    for i in range(5):
-        api.caller.user_id = "u1" if i % 2 else "u2"
-        assert chat(api).status_code == 502
-    assert failures(cp, dep) == 1 and state(cp, dep) == DeploymentState.READY
-    for _ in range(2):
-        clock(16)
+    node.chat, node.wedged = "hang", True
+    for _ in range(5):
+        assert chat(api).status_code == 504
+    assert _wait_state(cp, dep, DeploymentState.FAILED)
+    assert node.canaries >= 3  # three canaries, spread over the window
+
+
+def test_long_requests_from_two_accounts_never_fail_a_healthy_model(api, cp, node, canaries):
+    """The review's probe: requests that just run past the gateway's timeout
+    on a healthy shared model, from two accounts, wave after wave. The
+    canary (1 token) is answered, so the model stays up."""
+    _, dep = catalog_model(cp, node)
+    node.chat = "hang"  # long generations; the model itself is fine
+    for wave in range(3):
         for i in range(5):
-            api.caller.user_id = "u1" if i % 2 else "u2"
-            chat(api)
-    assert state(cp, dep) == DeploymentState.FAILED
+            api.caller.user_id = "u1" if i % 2 == 0 else "u2"
+            assert chat(api, max_tokens=100000).status_code == 504
+        time.sleep(0.6)
+    assert node.canaries >= 1
+    assert state(cp, dep) == DeploymentState.READY and failures(cp, dep) == 0
+    assert charges(cp, "u1") == [] and charges(cp, "u2") == []  # timeouts aren't billed, nor is the canary
+
+
+def test_a_canary_is_billed_to_nobody(api, cp, node, canaries):
+    _, dep = catalog_model(cp, node)
+    node.chat = (502, {"object": "error", "message": "x"}, None)
+    for _ in range(5):
+        chat(api)
+    _wait_for(lambda: node.canaries >= 1)
+    time.sleep(0.2)
+    assert charges(cp, "u1") == [] and charges(cp) == []
 
 
 def test_a_success_between_restarts_the_count(api, cp, node):
@@ -969,3 +1018,4 @@ def test_an_owner_facing_last_error_is_short(api, cp, node):
         last_error="container exited prematurely\n" + "log line\n" * 500))
     message = chat(api, model=workload.workload_id).json()["error"]["message"]
     assert len(message) < 500 and "\n" not in message
+

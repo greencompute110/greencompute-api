@@ -274,6 +274,7 @@ class HttpInferenceClient:
         payload: ChatCompletionRequest,
         *,
         request_id: str | None = None,
+        timeout: float | None = None,
     ) -> ChatCompletionResponse:
         if not deployment.endpoint:
             raise InferenceUpstreamError(f"deployment endpoint missing: {deployment.deployment_id}")
@@ -285,7 +286,7 @@ class HttpInferenceClient:
             method="POST",
         )
         try:
-            with request.urlopen(upstream, timeout=self._timeout_for(payload)) as response:  # noqa: S310
+            with request.urlopen(upstream, timeout=timeout or self._timeout_for(payload)) as response:  # noqa: S310
                 raw = response.read()
         except HTTPError as exc:
             raise classify_http_error(exc, deployment.deployment_id) from exc

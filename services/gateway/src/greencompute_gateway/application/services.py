@@ -90,14 +90,22 @@ from greencompute_gateway.infrastructure.repository import GatewayRepository
 from greencompute_gateway.transport.security import metrics as gateway_metrics
 
 
-#: A replica whose health check passes but that fails this many requests in a
-#: row (5xx, timeouts, dropped answers; no success between), from at least
-#: SILENT_FAILURE_MIN_ACCOUNTS accounts, counts one health failure (and then
-#: the control plane's spread-over-a-window rule). A hung engine or a
-#: misconfigured server is failed over and replaced that way; one caller's
-#: crafted requests can't do it alone.
-SILENT_FAILURE_ESCALATION = int(os.getenv("GREENCOMPUTE_SILENT_FAILURE_ESCALATION", "5"))
-SILENT_FAILURE_MIN_ACCOUNTS = int(os.getenv("GREENCOMPUTE_SILENT_FAILURE_MIN_ACCOUNTS", "2"))
+#: A replica whose health check passes but that fails this many requests in
+#: a row (5xx, timeouts, dropped answers; no success between, any callers)
+#: gets a canary: the gateway's own 1-token completion, through the node,
+#: billed to nobody. Only a failed canary counts as a health failure (then
+#: the control plane's spread-over-a-window rule applies), so callers'
+#: requests can never decide it: long requests running out of time on a
+#: healthy model leave it alone, a wedged engine is caught even with one
+#: customer's traffic. A canary that passes ends the streak.
+CANARY_AFTER_FAILURES = int(os.getenv("GREENCOMPUTE_CANARY_AFTER_FAILURES", "5"))
+#: How long a canary may take (it asks for 1 token).
+CANARY_TIMEOUT_SECONDS = float(os.getenv("GREENCOMPUTE_CANARY_TIMEOUT_SECONDS", "20"))
+#: At most one canary per deployment this often. While canaries keep failing
+#: they repeat at this pace, so a wedged model is FAILED (three counted
+#: failures over 30 s) about a minute after the first.
+CANARY_INTERVAL_SECONDS = float(os.getenv("GREENCOMPUTE_CANARY_INTERVAL_SECONDS", "30"))
+_BUSY = object()  # a canary told the model is at capacity: no answer either way
 
 
 def _short(text: str | None, limit: int = 300) -> str | None:
@@ -2585,7 +2593,7 @@ class GatewayService:
     def _handle_upstream_success(self, deployment: DeploymentRecord, routing: dict) -> None:
         if not self._is_external(deployment):
             self.control_plane.clear_deployment_health_failures(deployment.deployment_id)
-            with self._silent_lock():
+            with self._canary_lock():
                 self._silent_failures().pop(deployment.deployment_id, None)
         self.repository.record_routing_decision(
             {
@@ -2597,32 +2605,93 @@ class GatewayService:
             }
         )
 
-    def _silent_failures(self) -> dict[str, tuple[int, set[str]]]:
-        """deployment id -> (requests failed in a row while its health check
-        passed, the accounts they came from)."""
+    def _silent_failures(self) -> dict[str, int]:
+        """deployment id -> requests failed in a row while its health check
+        passed."""
         if getattr(self, "_silent_failure_counts", None) is None:
             self._silent_failure_counts = {}
         return self._silent_failure_counts
 
-    def _silent_lock(self):
-        if getattr(self, "_silent_failure_lock", None) is None:
-            self._silent_failure_lock = threading.Lock()
-        return self._silent_failure_lock
+    def _canary_lock(self):
+        if getattr(self, "_canary_state_lock", None) is None:
+            self._canary_state_lock = threading.Lock()
+            self._canaries_running: set[str] = set()
+            self._canary_last_at: dict[str, float] = {}
+        return self._canary_state_lock
 
-    def _note_silent_failure(self, deployment: DeploymentRecord, caller: str | None) -> tuple[int, int] | None:
+    def _note_silent_failure(self, deployment: DeploymentRecord) -> None:
         """Count a request the replica failed although its health check
-        passed. (requests, accounts) once that reaches the escalation rule,
-        then the count starts over; else None."""
-        with self._silent_lock():
+        passed; at CANARY_AFTER_FAILURES in a row, send it a canary."""
+        with self._canary_lock():
             failures = self._silent_failures()
-            count, accounts = failures.get(deployment.deployment_id, (0, set()))
-            count += 1
-            accounts = accounts | {caller or "anonymous"}
-            if count >= SILENT_FAILURE_ESCALATION and len(accounts) >= SILENT_FAILURE_MIN_ACCOUNTS:
-                failures.pop(deployment.deployment_id, None)
-                return count, len(accounts)
-            failures[deployment.deployment_id] = (count, accounts)
-            return None
+            failures[deployment.deployment_id] = count = failures.get(deployment.deployment_id, 0) + 1
+            due = (
+                count >= CANARY_AFTER_FAILURES
+                and deployment.deployment_id not in self._canaries_running
+                and perf_counter() - self._canary_last_at.get(deployment.deployment_id, -1e9) >= CANARY_INTERVAL_SECONDS
+            )
+            if due:
+                self._canaries_running.add(deployment.deployment_id)
+        if due:
+            threading.Thread(target=self._canary_loop, args=(deployment,), daemon=True,
+                             name=f"canary-{deployment.deployment_id[:8]}").start()
+
+    def _canary_loop(self, deployment: DeploymentRecord) -> None:
+        """Canaries for one deployment, CANARY_INTERVAL_SECONDS apart, until
+        one passes (the streak ends) or it is no longer READY (FAILED by
+        them, or anything else). Off the request path; never raises."""
+        dep_id = deployment.deployment_id
+        try:
+            for _ in range(20):  # at most ~10 min of canaries, then a new streak starts them again
+                with self._canary_lock():
+                    self._canary_last_at[dep_id] = perf_counter()
+                error = self._run_canary(deployment)
+                if error is _BUSY:
+                    # At capacity: it can't say, and full isn't failing.
+                    self._canary_sleep(CANARY_INTERVAL_SECONDS)
+                    continue
+                if error is None:
+                    self.metrics.increment("inference.canary.passed")
+                    with self._canary_lock():
+                        self._silent_failures().pop(dep_id, None)
+                    return
+                self.metrics.increment("inference.canary.failed")
+                log.warning("canary failed for deployment %s: %s", dep_id, error)
+                record = self.control_plane.record_deployment_health_failure(
+                    dep_id, f"its health check passes but a 1-token test request failed: {error}")
+                if record.state != DeploymentState.READY:
+                    return
+                self._canary_sleep(CANARY_INTERVAL_SECONDS)
+                current = self.control_plane.repository.get_deployment(dep_id)
+                if current is None or current.state != DeploymentState.READY:
+                    return
+        except Exception:  # noqa: BLE001 - a canary must never take anything else down
+            log.exception("canary loop for deployment %s stopped", dep_id)
+        finally:
+            with self._canary_lock():
+                self._canaries_running.discard(dep_id)
+
+    @staticmethod
+    def _canary_sleep(seconds: float) -> None:
+        import time as _time
+
+        _time.sleep(seconds)
+
+    def _run_canary(self, deployment: DeploymentRecord) -> str | None:
+        """One 1-token completion straight to the deployment (no billing, no
+        invocation record). None when it answered, else why not."""
+        workload = self.control_plane.repository.get_workload(deployment.workload_id)
+        model = (workload.runtime.model_identifier if workload is not None and workload.runtime else None) or (
+            workload.name if workload is not None else "model")
+        probe = ChatCompletionRequest(model=model, messages=[{"role": "user", "content": "Say OK."}], max_tokens=1,
+                                      temperature=0.0)
+        try:
+            self.inference_client.invoke_chat_completion(deployment, probe, timeout=CANARY_TIMEOUT_SECONDS)
+        except InferenceBusyError:
+            return _BUSY
+        except InferenceUpstreamError as exc:
+            return str(exc)
+        return None
 
     def _handle_upstream_failure(
         self, deployment: DeploymentRecord, routing: dict, exc: RuntimeError, *, caller: str | None = None,
@@ -2659,16 +2728,10 @@ class GatewayService:
             if healthy:
                 decision = "failed_model_healthy"
                 self.metrics.increment("inference.failure.model_healthy")
-                escalated = self._note_silent_failure(deployment, caller)
-                if escalated is not None:
-                    # It answers its health check but fails every request (a
-                    # hung engine, a misconfigured server): treat it as down.
-                    self.metrics.increment("inference.failure.silent_escalated")
-                    self.control_plane.record_deployment_health_failure(
-                        deployment.deployment_id,
-                        f"its health check passes but it failed {escalated[0]} requests in a row, from "
-                        f"{escalated[1]} accounts: {exc}",
-                    )
+                # It answers its health check yet failed this request: after a
+                # few in a row, the gateway's own canary decides (a hung
+                # engine, a misconfigured server), never the callers' requests.
+                self._note_silent_failure(deployment)
             else:
                 self.control_plane.record_deployment_health_failure(deployment.deployment_id, str(exc))
         self.repository.record_routing_decision(
