@@ -405,3 +405,112 @@ def test_a_resume_email_is_not_followed_by_a_low_credit_email_saying_the_same(wo
     _set_balance(billing, "ann", 10)  # dropped further: that is news
     assert cw.low_credit_once(now=NOW + timedelta(minutes=9), control_plane=cp, billing_repo=billing, notify=mail) == []
     # (still level 2, already told); a later top-up above 24 h re-arms as before
+
+
+# --- spend limits (a capped rental is paused, not deleted, and resumes by hand) ----------
+
+
+def _spent(billing, user_id, cents, ref=None):
+    from uuid import uuid4
+
+    from greencompute_persistence.orm import LedgerEntryORM
+
+    with session_scope(billing.session_factory) as s:
+        s.add(LedgerEntryORM(entry_id=str(uuid4()), user_id=user_id, amount_cents=-cents, balance_after=0,
+                             kind="usage", reference_id=ref, created_at=datetime.now(UTC)))
+
+
+def _account_cap(billing, user_id, cents):
+    with session_scope(billing.session_factory) as s:
+        s.get(UserORM, user_id).daily_spend_limit_cents = cents
+
+
+def test_a_pod_paused_at_a_spend_limit_is_never_auto_resumed(world, resumes):
+    """Auto-resume is for an empty balance a top-up fixes; a spend limit isn't."""
+    gw, cp, billing = world
+    capped = _deployment(cp, _pod(cp, "ann", "capped"), "ann", state=DeploymentState.SUSPENDED, resume_on_topup=True,
+                         last_error="paused: its account reached its spend limit of $1.00 for the last 24 hours",
+                         suspended_at=NOW, suspended_reason="spend_limit")
+    _set_balance(billing, "ann", 10_000)
+    assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=Mail()) == []
+    assert resumes == [] and cp.repository.get_deployment(capped.deployment_id).state == DeploymentState.SUSPENDED
+
+
+def test_auto_resume_waits_while_the_account_is_at_its_spend_limit(world, resumes):
+    gw, cp, billing = world
+    pod = _suspended_for_balance(cp, "ann", "flagged", resume_on_topup=True, when=NOW - timedelta(hours=1))
+    _set_balance(billing, "ann", 10_000)
+    _account_cap(billing, "ann", 500)
+    _spent(billing, "ann", 500)
+    mail = Mail()
+    assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=mail) == []  # waits, no error
+    assert resumes == [] and mail.sent == []
+    _account_cap(billing, "ann", 1000)  # raised (or the spending left the window): it comes back
+    assert cw.auto_resume_once(now=NOW, service=gw, billing_repo=billing, notify=mail) == [pod.deployment_id]
+
+
+def test_resuming_by_hand_is_refused_at_the_account_s_spend_limit(world, resumes, monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from greencompute_gateway.application.services import AccountLimitError
+
+    gw, cp, billing = world
+    pod = _deployment(cp, _pod(cp, "ann", "p"), "ann", state=DeploymentState.SUSPENDED, suspended_at=NOW,
+                      suspended_reason="spend_limit", last_error="paused: …")
+    _set_balance(billing, "ann", 10_000)
+    _account_cap(billing, "ann", 300)
+    _spent(billing, "ann", 300)
+    with pytest.raises(AccountLimitError):
+        gw.resume_deployment(pod.deployment_id, user_id="ann")
+    monkeypatch.setattr(routes, "service", gw)
+    monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: SimpleNamespace(user_id="ann", key_id="k", admin=False))
+    with pytest.raises(HTTPException) as exc:
+        routes.resume_deployment(pod.deployment_id, authorization="Bearer x", x_api_key=None)
+    assert (exc.value.status_code, exc.value.error_code) == (403, "account_spend_limit_reached")
+    assert exc.value.detail["spent_last_24h_usd"] == 3.0
+    gw.resume_deployment(pod.deployment_id, admin=True)  # staff aren't held to it
+    assert resumes == [pod.deployment_id]
+
+
+def test_resuming_by_hand_is_refused_at_a_new_wallet_account_s_first_week_limit(world, resumes):
+    from greencompute_gateway.application.services import NewAccountLimitError
+
+    gw, cp, billing = world
+    with session_scope(billing.session_factory) as s:
+        s.add(UserORM(user_id="w1", username="w1", email=None, balance_credits=10_000, signup_method="wallet",
+                      created_at=datetime.now(UTC) - timedelta(days=1)))
+    pod = _deployment(cp, _pod(cp, "w1", "p"), "w1", state=DeploymentState.SUSPENDED, suspended_at=NOW,
+                      suspended_reason="spend_limit")
+    _spent(billing, "w1", 5000)  # the $50 first-week day
+    with pytest.raises(NewAccountLimitError):
+        gw.resume_deployment(pod.deployment_id, user_id="w1")
+
+
+def test_resuming_by_hand_is_refused_while_the_key_that_started_it_is_at_its_limit(world, resumes, monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from greencompute_gateway.application.services import KeyLimitError
+    from greencompute_persistence.orm import APIKeyORM
+
+    gw, cp, billing = world
+    with session_scope(billing.session_factory) as s:
+        s.add(APIKeyORM(key_id="agent", user_id="ann", name="agent", admin=False, scopes=[], secret="s-agent",
+                        daily_spend_limit_cents=200, created_at=NOW))
+    pod = cp.repository.create_deployment(DeploymentRecord(
+        workload_id=_pod(cp, "ann", "p").workload_id, owner_user_id="ann", state=DeploymentState.SUSPENDED,
+        hourly_rate_cents=40, suspended_at=NOW, suspended_reason="spend_limit", created_by_key_id="agent"))
+    _set_balance(billing, "ann", 10_000)
+    _spent(billing, "ann", 200, ref=pod.deployment_id)  # the key's own spend: its rentals' charges
+    with pytest.raises(KeyLimitError):
+        gw.resume_deployment(pod.deployment_id, user_id="ann")
+    monkeypatch.setattr(routes, "service", gw)
+    monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: SimpleNamespace(user_id="ann", key_id="web", admin=False))
+    with pytest.raises(HTTPException) as exc:
+        routes.resume_deployment(pod.deployment_id, authorization="Bearer x", x_api_key=None)
+    assert (exc.value.status_code, exc.value.error_code) == (403, "key_limit")
+    assert exc.value.detail["key_id"] == "agent" and exc.value.detail["daily_spend_limit_usd"] == 2.0
+    assert resumes == []

@@ -202,6 +202,8 @@ def test_running_rentals_stop_when_a_new_wallet_account_reaches_its_daily_spend(
     stopped = svc.stop_rentals_over_account_limits()
     assert len(stopped) == 1
     dep = cp.get_deployment(stopped[0])
-    assert dep.owner_user_id == over and dep.state == DeploymentState.TERMINATED
-    assert "$50.00 in 24 hours" in dep.last_error and "email" in dep.last_error
+    assert dep.owner_user_id == over and dep.state == DeploymentState.SUSPENDED
+    assert dep.suspended_reason == "spend_limit"
+    assert dep.last_error.startswith("paused: a new wallet account can spend $50.00 in 24 hours")
+    assert "email" in dep.last_error
     assert svc.stop_rentals_over_account_limits() == []  # nothing left over the limit

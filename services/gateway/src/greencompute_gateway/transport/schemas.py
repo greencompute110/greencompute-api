@@ -657,7 +657,7 @@ class AccountLimitsUpdate(BaseModel):
     daily_spend_limit_usd: float | None = Field(default=None, ge=1, le=100000, description=(
         "What the whole account, every key together, may spend in any 24 hours (rentals, storage and "
         "inference), at least $1. At it: new rentals and paid model requests are refused and running "
-        "rentals are stopped."))
+        "rentals are paused (suspended, kept as when credit runs out) until spending is back under it."))
     max_active_rentals: int | None = Field(default=None, ge=1, le=1000, description=(
         "Rentals (and private models) the account may have running at once. Lowering it below what runs "
         "now stops nothing; it refuses new ones until enough have ended."))
@@ -679,6 +679,8 @@ class AccountLimits(BaseModel):
     max_active_rentals: int | None = Field(description="Set by you; null: no limit.")
     spent_last_24h_usd: float = Field(description="Everything charged in the last 24 hours, by any key or none.")
     active_rentals: int = Field(description="Deployments not yet ended (starting, running or paused), any key's.")
+    running_rentals: int = Field(default=0, description=(
+        "Of those, the ones running (`ready`): what reaching the spend limit would pause."))
     new_account_limits: NewAccountLimits | None = Field(
         default=None, description="A new wallet account's first-week limits, while they last.")
     in_force: AccountLimitsInForce

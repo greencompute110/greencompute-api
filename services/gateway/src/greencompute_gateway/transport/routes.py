@@ -638,6 +638,17 @@ _RAISE_LIMIT = ("raise or clear it with PUT /platform/account/limits (a full-acc
                 "Account limits")
 
 
+def _account_running_rentals(session_factory, user_id: str) -> int:
+    from sqlalchemy import func, select
+
+    from greencompute_persistence import session_scope
+    from greencompute_persistence.orm import DeploymentORM
+
+    with session_scope(session_factory) as session:
+        return session.scalar(select(func.count()).select_from(DeploymentORM).where(
+            DeploymentORM.owner_user_id == user_id, DeploymentORM.state == DeploymentState.READY.value)) or 0
+
+
 def _account_limits_out(user_id: str) -> dict:
     from greencompute_persistence.key_limits import (
         account_active_rentals,
@@ -660,6 +671,7 @@ def _account_limits_out(user_id: str) -> dict:
         max_active_rentals=own["max_active_rentals"],
         spent_last_24h_usd=round(account_spend_cents(sf, user_id) / 100, 2),
         active_rentals=account_active_rentals(sf, user_id),
+        running_rentals=_account_running_rentals(sf, user_id),
         new_account_limits={**new, "until": new["until"].isoformat()} if new else None,
         in_force=schemas.AccountLimitsInForce(
             daily_spend_limit_usd=in_force_cents / 100 if in_force_cents is not None else None,
@@ -726,7 +738,8 @@ def put_account_limits(
     """Set both account-wide limits: {"daily_spend_limit_usd": 100,
     "max_active_rentals": 10}; one left out or null means no limit. At the
     spend limit, new rentals and paid model requests get 403
-    account_spend_limit_reached and running rentals are stopped; at the
+    account_spend_limit_reached and running rentals are paused (suspended,
+    suspended_reason "spend_limit", disks kept as when credit runs out); at the
     rentals limit, new rentals get 403 account_rental_limit_reached (lowering
     it stops nothing). Needs a full-access key."""
     return _set_account_limits(payload, _user_key(authorization, x_api_key), replace=True)
@@ -2727,9 +2740,16 @@ def resume_deployment(
     container (preserves the user's saved work) after a 1-hour credit gate.
     Returns the same deployment record (SUSPENDED until the miner re-reports
     READY). 402 if balance can't cover an hour, 409 if the original node is
-    full / its placement is gone.
+    full / its placement is gone, 403 while the account or the key that
+    started it is at its spend limit.
     """
-    from greencompute_gateway.application.services import InsufficientBalanceForRentalError, SanctionedAccountError
+    from greencompute_gateway.application.services import (
+        AccountLimitError,
+        InsufficientBalanceForRentalError,
+        KeyLimitError,
+        NewAccountLimitError,
+        SanctionedAccountError,
+    )
 
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("resume_deployment", api_key.key_id, limit=30, window_seconds=60)
@@ -2750,6 +2770,19 @@ def resume_deployment(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except InsufficientBalanceForRentalError as exc:
         raise HTTPException(status_code=402, detail=_hour_of_credit_detail(exc, "resume")) from exc
+    except AccountLimitError as exc:
+        raise _account_limit_error(exc.reason, exc.numbers) from exc
+    except NewAccountLimitError as exc:
+        raise _new_account_limit(exc.reason, exc.numbers) from exc
+    except KeyLimitError as exc:
+        raise coded(403, "key_limit", {
+            "message": "the API key that started this rental has reached its spend limit for the last 24 hours",
+            "code": "key_limit",
+            "key_id": exc.numbers.get("key_id"),
+            "daily_spend_limit_usd": exc.daily_spend_limit_usd,
+            "spent_last_24h_usd": round(exc.numbers.get("spent_cents", 0) / 100, 2),
+            "hint": "wait for earlier spending to fall out of the 24-hour window, then resume it",
+        }) from exc
 
 
 @router.post("/platform/secrets")

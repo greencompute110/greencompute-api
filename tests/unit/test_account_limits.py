@@ -210,10 +210,12 @@ def test_paid_model_requests_are_refused_at_the_account_s_spend_limit(db, monkey
 # --- running rentals ----------------------------------------------------------------------
 
 
-def test_running_rentals_stop_at_the_account_s_spend_limit_the_way_a_key_s_do(db):
-    """Same mechanism as stop_rentals_over_key_limits: the READY deployments
-    are TERMINATED with the reason in last_error (a deployment.terminated
-    event), whichever key started them; others' and non-ready ones stay."""
+def test_running_rentals_pause_at_the_account_s_spend_limit_the_way_a_key_s_do(db):
+    """Same mechanism as stop_rentals_over_key_limits, and as an empty
+    balance: the READY deployments are SUSPENDED (disk kept) with
+    suspended_reason "spend_limit" and the reason in last_error (a
+    deployment.suspended event), whichever key started them; others' and
+    non-ready ones stay, and a paused one isn't paused again."""
     svc = ControlPlaneService(repository=db.cp)
     published = []
     svc.bus = SimpleNamespace(publish=lambda subject, data: published.append((subject, data)))
@@ -233,14 +235,16 @@ def test_running_rentals_stop_at_the_account_s_spend_limit_the_way_a_key_s_do(db
     assert sorted(svc.stop_rentals_over_account_limits()) == sorted([a, b])
     for dep_id in (a, b):
         dep = db.cp.get_deployment(dep_id)
-        assert dep.state == DeploymentState.TERMINATED
-        assert dep.last_error == ("stopped: its account reached its spend limit of $10.00 for the last 24 hours "
+        assert (dep.state, dep.suspended_reason) == (DeploymentState.SUSPENDED, "spend_limit")
+        assert dep.suspended_at is not None  # the saved-pod clock (storage charge, reaper) runs from here
+        assert dep.last_error == ("paused: its account reached its spend limit of $10.00 for the last 24 hours "
                                   "(Settings > Account limits)")
     assert db.cp.get_deployment(paused).state == DeploymentState.SUSPENDED
     assert db.cp.get_deployment(under).state == DeploymentState.READY
     assert db.cp.get_deployment(free).state == DeploymentState.READY
-    assert [s for s, _ in published].count("deployment.terminated") == 2
-    assert svc.stop_rentals_over_account_limits() == []
+    assert [s for s, _ in published].count("deployment.suspended") == 2
+    assert "deployment.terminated" not in [s for s, _ in published]
+    assert svc.stop_rentals_over_account_limits() == []  # not paused again each tick
 
     # And a key's limit does it the same way (the comparison this mirrors).
     with session_scope(db.sf) as s:
@@ -249,7 +253,7 @@ def test_running_rentals_stop_at_the_account_s_spend_limit_the_way_a_key_s_do(db
     keyed = _rental(db.sf, "free", key_id="k9")
     _charge(db.sf, "free", 100, ref=keyed)
     assert svc.stop_rentals_over_key_limits() == [keyed]
-    assert db.cp.get_deployment(keyed).state == DeploymentState.TERMINATED
+    assert db.cp.get_deployment(keyed).suspended_reason == "spend_limit"
 
 
 def test_lowering_the_rentals_limit_below_what_runs_stops_nothing(db):
@@ -314,7 +318,7 @@ def test_any_key_of_the_account_reads_the_limits_and_where_it_stands(api):
         assert status == 200, (key, body)
     assert body == {
         "daily_spend_limit_usd": None, "max_active_rentals": None, "spent_last_24h_usd": 12.34,
-        "active_rentals": 1, "new_account_limits": None,
+        "active_rentals": 1, "running_rentals": 1, "new_account_limits": None,
         "in_force": {"daily_spend_limit_usd": None, "daily_spend_limit_source": None,
                      "max_active_rentals": None, "max_active_rentals_source": None},
     }
@@ -393,3 +397,28 @@ def test_migration_0080_adds_and_removes_the_columns_on_sqlite(tmp_path):
     assert not {"daily_spend_limit_cents", "max_active_rentals"} & columns()
     with engine.connect() as conn:
         assert conn.execute(sa.text("SELECT username FROM users")).scalar() == "ada"
+
+
+def test_a_rental_paused_at_the_cap_is_kept_like_one_whose_credit_ran_out(db, monkeypatch):
+    """Disk kept: a saved pod for the saved-pod retention (at the storage
+    charge), an unsaved one for the unsaved grace, by the existing reaper."""
+    from greencompute_control_plane.config import settings
+    from greencompute_protocol import WorkloadSpec
+
+    monkeypatch.setattr(settings, "pod_exhaustion_reaper_enabled", True)
+    monkeypatch.setattr(settings, "pod_storage_billing_enabled", True)
+    svc = ControlPlaneService(repository=db.cp)
+    pod = db.cp.upsert_workload(WorkloadSpec(name="pod", image="ubuntu", kind="pod", owner_user_id="u1"))
+    _account(db.sf, spend_cents=100)
+    saved, unsaved = _rental(db.sf), _rental(db.sf)
+    with session_scope(db.sf) as s:
+        for dep_id, keep in ((saved, True), (unsaved, False)):
+            row = s.get(DeploymentORM, dep_id)
+            row.workload_id, row.save_on_exhaustion = pod.workload_id, keep
+    _charge(db.sf, "u1", 100)
+    assert sorted(svc.stop_rentals_over_account_limits()) == sorted([saved, unsaved])
+    paused_at = db.cp.get_deployment(saved).suspended_at
+    paused_at = paused_at if paused_at.tzinfo else paused_at.replace(tzinfo=UTC)
+    assert svc.suspension_terms(db.cp.get_deployment(saved))[0] > 0  # storage charge while kept
+    assert svc.reap_exhausted_pods(now=paused_at + timedelta(minutes=settings.pod_unsaved_grace_minutes, seconds=5)) == [unsaved]
+    assert db.cp.get_deployment(saved).state == DeploymentState.SUSPENDED

@@ -41,7 +41,9 @@ from greencompute_protocol import DeploymentRecord, DeploymentState, WorkloadKin
 log = logging.getLogger(__name__)
 
 #: `suspended_reason` the meter stamps when it drains a balance (as opposed to
-#: "idle", a private model nobody called, which resumes on its next request).
+#: "idle", a private model nobody called, which resumes on its next request,
+#: and "spend_limit", paused at a spend limit, which resumes by hand). Only
+#: these are auto-resumed.
 SUSPENDED_FOR_BALANCE = "balance"
 
 #: Email when the balance lasts less than this many hours, each level once.
@@ -324,7 +326,13 @@ def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=
     for an hour of the one deployment; this is automatic, so it is more
     careful, or a $0.40 top-up would bring back three pods that all stop again
     within the hour. Returns the deployment ids resumed."""
-    from greencompute_gateway.application.services import InsufficientBalanceForRentalError, SanctionedAccountError
+    from greencompute_gateway.application.services import (
+        AccountLimitError,
+        InsufficientBalanceForRentalError,
+        KeyLimitError,
+        NewAccountLimitError,
+        SanctionedAccountError,
+    )
 
     now = now or datetime.now(UTC)
     svc = service or _service()
@@ -354,6 +362,11 @@ def auto_resume_once(*, now: datetime | None = None, service=None, billing_repo=
         try:
             svc.resume_deployment(dep.deployment_id, user_id=uid)
         except InsufficientBalanceForRentalError:
+            continue
+        except (AccountLimitError, NewAccountLimitError, KeyLimitError) as exc:
+            # At a spend limit: it stays waiting and is tried again on a later
+            # sweep, once earlier spending has left the 24-hour window.
+            log.info("auto-resume %s waits: %s", dep.deployment_id, exc)
             continue
         except (ValueError, KeyError, PermissionError, SanctionedAccountError) as exc:
             # Its machine is full, its placement or workload is gone, the

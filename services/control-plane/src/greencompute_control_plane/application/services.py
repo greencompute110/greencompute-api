@@ -2284,18 +2284,46 @@ class ControlPlaneService:
         return reaped
 
 
+    #: `suspended_reason` for a deployment paused at a spend limit (a key's,
+    #: the account's, or a new wallet account's first-week one). Not "balance",
+    #: so credit_watch's auto-resume after a top-up leaves it alone: it resumes
+    #: by hand once the spending is back under the limit.
+    SUSPENDED_FOR_SPEND_LIMIT = "spend_limit"
+
+    def _pause_at_spend_limit(self, deployment: DeploymentRecord, reason: str, metric: str) -> bool:
+        """Pause a running deployment at a spend limit the way the meter
+        pauses one whose balance ran out (meter_usage): SUSPENDED, so its disk
+        is kept (a saved pod for the saved-pod retention, at the storage
+        charge; otherwise the unsaved grace) and it can be resumed. Only READY
+        deployments are passed in, so one already paused isn't paused again."""
+        try:
+            self.update_deployment_status(
+                DeploymentStatusUpdate(
+                    deployment_id=deployment.deployment_id,
+                    state=DeploymentState.SUSPENDED,
+                    error=reason,
+                    suspended_reason=self.SUSPENDED_FOR_SPEND_LIMIT,
+                )
+            )
+        except Exception as exc:
+            logger.error("Failed to pause deployment %s at a spend limit: %s", deployment.deployment_id, exc)
+            return False
+        self.metrics.increment(metric)
+        logger.info("Paused deployment %s: %s", deployment.deployment_id, reason)
+        return True
+
     def stop_rentals_over_key_limits(self) -> list[str]:
-        """Terminate running rentals started by an API key that has reached
-        its spend limit for the last 24 hours, so the limit actually stops
-        spending rather than only blocking new rentals. Returns the stopped
-        deployment ids."""
+        """Pause (suspend) running rentals started by an API key that has
+        reached its spend limit for the last 24 hours, so the limit actually
+        stops spending rather than only blocking new rentals; their disks are
+        kept as when credit runs out. Returns the paused deployment ids."""
         from greencompute_persistence.key_limits import key_spend_cents, keys_with_spend_limits
 
         limits = keys_with_spend_limits(self.repository.session_factory)
         if not limits:
             return []
         spent: dict[str, int] = {}
-        stopped: list[str] = []
+        paused: list[str] = []
         for deployment in self.repository.list_deployments_by_state(DeploymentState.READY):
             key_id = deployment.created_by_key_id
             if key_id not in limits:
@@ -2305,31 +2333,20 @@ class ControlPlaneService:
             if spent[key_id] < limits[key_id]:
                 continue
             reason = (
-                f"stopped: its API key reached its spend limit of ${limits[key_id] / 100:.2f} for the last 24 hours"
+                f"paused: its API key reached its spend limit of ${limits[key_id] / 100:.2f} for the last 24 hours"
             )
-            try:
-                self.update_deployment_status(
-                    DeploymentStatusUpdate(
-                        deployment_id=deployment.deployment_id,
-                        state=DeploymentState.TERMINATED,
-                        error=reason,
-                    )
-                )
-                self.metrics.increment("deployment.stopped.key_limit")
-                stopped.append(deployment.deployment_id)
-                logger.info("Stopped deployment %s: %s", deployment.deployment_id, reason)
-            except Exception as exc:
-                logger.error("Failed to stop deployment %s at its key's limit: %s", deployment.deployment_id, exc)
-        return stopped
+            if self._pause_at_spend_limit(deployment, reason, "deployment.suspended.key_limit"):
+                paused.append(deployment.deployment_id)
+        return paused
 
     def stop_rentals_over_account_limits(self) -> list[str]:
-        """Terminate the running deployments of an account that has reached
-        its spend limit for the last 24 hours, every key together: the one its
-        owner set (key_limits.account_own_limits) or, for a new wallet account,
-        its first-week limit (key_limits.new_account_limits), whichever is
-        stricter. The same stop as a key's limit (stop_rentals_over_key_limits),
-        so the limit holds for rentals already running, not only new ones.
-        Returns the stopped deployment ids."""
+        """Pause (suspend) the running deployments of an account that has
+        reached its spend limit for the last 24 hours, every key together: the
+        one its owner set (key_limits.account_own_limits) or, for a new wallet
+        account, its first-week limit (key_limits.new_account_limits),
+        whichever is stricter. The same pause as at a key's limit
+        (stop_rentals_over_key_limits), so the limit holds for rentals already
+        running, not only new ones. Returns the paused deployment ids."""
         from greencompute_persistence.key_limits import (
             NEW_ACCOUNT,
             account_spend_cents,
@@ -2342,7 +2359,7 @@ class ControlPlaneService:
         own_limits = accounts_with_spend_limits(sf)
         # user -> (limit in cents, its source) when over it, else None
         verdict: dict[str, tuple[int, str] | None] = {}
-        stopped: list[str] = []
+        paused: list[str] = []
         for deployment in self.repository.list_deployments_by_state(DeploymentState.READY):
             user_id = deployment.owner_user_id
             if not user_id:
@@ -2358,29 +2375,19 @@ class ControlPlaneService:
             limit, source = verdict[user_id]
             if source == NEW_ACCOUNT:
                 reason = (
-                    f"stopped: a new wallet account can spend ${limit / 100:.2f} in 24 hours in its first "
+                    f"paused: a new wallet account can spend ${limit / 100:.2f} in 24 hours in its first "
                     "week, and this one has; add an email to the account (Settings) to lift the limit"
                 )
+                metric = "deployment.suspended.new_account_limit"
             else:
                 reason = (
-                    f"stopped: its account reached its spend limit of ${limit / 100:.2f} for the last 24 hours "
+                    f"paused: its account reached its spend limit of ${limit / 100:.2f} for the last 24 hours "
                     "(Settings > Account limits)"
                 )
-            try:
-                self.update_deployment_status(
-                    DeploymentStatusUpdate(
-                        deployment_id=deployment.deployment_id,
-                        state=DeploymentState.TERMINATED,
-                        error=reason,
-                    )
-                )
-                self.metrics.increment(
-                    "deployment.stopped.account_limit" if source == NEW_ACCOUNT else "deployment.stopped.account_spend_limit")
-                stopped.append(deployment.deployment_id)
-                logger.info("Stopped deployment %s: %s", deployment.deployment_id, reason)
-            except Exception as exc:
-                logger.error("Failed to stop deployment %s at its account's limit: %s", deployment.deployment_id, exc)
-        return stopped
+                metric = "deployment.suspended.account_spend_limit"
+            if self._pause_at_spend_limit(deployment, reason, metric):
+                paused.append(deployment.deployment_id)
+        return paused
 
     def stop_expired_runtimes(self, now: datetime | None = None) -> list[str]:
         """Terminate ready deployments that have run for their

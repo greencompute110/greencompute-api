@@ -2,7 +2,7 @@
 
 - users.daily_spend_limit_cents: what the whole account (every key
   together) may spend in any 24 hours; at it, new rentals and paid inference
-  are refused and running rentals are stopped.
+  are refused and running rentals are paused (suspended).
 - users.max_active_rentals: rentals the account may have running at once.
 
 Both NULL, as for every account so far: no limit. Nullable columns with no

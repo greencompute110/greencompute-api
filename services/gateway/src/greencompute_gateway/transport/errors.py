@@ -58,7 +58,7 @@ CODES: dict[str, tuple[int, str]] = {
     "scope_required": (403, "The key lacks a scope; `detail.required_scope` names it."),
     "key_limit": (403, "The key is at one of its limits (rentals at once, or spend per 24 hours)."),
     "account_spend_limit_reached": (403, "The account (every key together) reached the spend limit per 24 hours its "
-                                         "owner set; running rentals are stopped too. `detail` has the numbers."),
+                                         "owner set; running rentals are paused too (suspended, resumable once under it). `detail` has the numbers."),
     "account_rental_limit_reached": (403, "The account has as many rentals running as the limit its owner set; "
                                           "stop one or raise the limit."),
     "new_account_limit": (403, "A wallet account's first 7 days: at most 2 rentals at once and $50 of spend per 24 hours."),

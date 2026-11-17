@@ -1160,9 +1160,33 @@ class GatewayService:
                     requested_instances=1,
                     private_model=self.control_plane.is_private_model(old, workload),
                 )
+            # Not while a spend limit that paused it (or would pause it again
+            # at once) is reached.
+            self._refuse_resume_at_spend_limits(old, user_id)
 
         # In-place restart of the SAME container — preserves the saved work.
         return self.control_plane.resume_deployment(deployment_id)
+
+    def _refuse_resume_at_spend_limits(self, deployment: DeploymentRecord, user_id: str) -> None:
+        """Raise KeyLimitError when the key that started the deployment is at
+        its own spend limit, and AccountLimitError / NewAccountLimitError when
+        the account is at the spend limit in force (its own or, for a new
+        wallet account, the stricter first-week one). The control plane pauses
+        a deployment at either (stop_rentals_over_*_limits); resuming it there
+        would only spend more past the limit."""
+        from greencompute_persistence.key_limits import NEW_ACCOUNT, account_room, key_spend_cents
+
+        sf = self.repository.session_factory
+        key = self.repository.get_api_key(deployment.created_by_key_id) if deployment.created_by_key_id else None
+        if key is not None and not key.admin and key.daily_spend_limit_usd is not None:
+            spent = key_spend_cents(sf, key.key_id)
+            if spent >= round(key.daily_spend_limit_usd * 100):
+                raise KeyLimitError("spend", max_active_rentals=key.max_active_rentals,
+                                    daily_spend_limit_usd=key.daily_spend_limit_usd,
+                                    numbers={"spent_cents": spent, "key_id": key.key_id})
+        why, source, numbers = account_room(sf, user_id, starting_rental=False)
+        if why == "spend":
+            raise NewAccountLimitError(why, numbers) if source == NEW_ACCOUNT else AccountLimitError(why, numbers)
 
     def list_deployments(self, user_id: str | None = None, *, admin: bool = False) -> list[DeploymentRecord]:
         deployments = self.control_plane.list_deployments()

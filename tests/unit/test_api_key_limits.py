@@ -130,6 +130,10 @@ def test_running_rentals_stop_when_their_key_reaches_its_limit(db):
     _charge(db.sf, 9999, unlimited)
 
     assert svc.stop_rentals_over_key_limits() == [over]
-    assert db.cp.get_deployment(over).state == DeploymentState.TERMINATED
-    assert "spend limit of $1.00" in db.cp.get_deployment(over).last_error
+    paused = db.cp.get_deployment(over)
+    # Paused like a rental whose credit ran out (disk kept), not deleted.
+    assert (paused.state, paused.suspended_reason) == (DeploymentState.SUSPENDED, "spend_limit")
+    assert paused.last_error == "paused: its API key reached its spend limit of $1.00 for the last 24 hours"
+    assert paused.suspended_at is not None
     assert db.cp.get_deployment(unlimited).state == DeploymentState.READY
+    assert svc.stop_rentals_over_key_limits() == []  # a paused one isn't paused again
