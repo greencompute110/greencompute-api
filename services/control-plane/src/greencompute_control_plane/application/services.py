@@ -2284,7 +2284,8 @@ class ControlPlaneService:
         for row in rows:
             mcents = max(0, row["remainder_mcents"])
             dep = deployments.get(row["deployment_id"])
-            if dep is not None and dep.state == DeploymentState.READY and row["metered_until"] is not None:
+            if (dep is not None and dep.state == DeploymentState.READY and row["metered_until"] is not None
+                    and not row["metered_silent"]):
                 if dep.workload_id not in workloads:
                     workloads[dep.workload_id] = self.repository.get_workload(dep.workload_id)
                 per_hour = self.hourly_charge_cents(dep, workloads[dep.workload_id], now=now)

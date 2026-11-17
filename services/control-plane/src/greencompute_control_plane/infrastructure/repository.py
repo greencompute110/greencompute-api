@@ -64,6 +64,7 @@ def _open_spell(row, at: datetime) -> None:
     """Start the deployment row's READY spell at `at` (see DeploymentORM)."""
     row.billable_since = at
     row.metered_until = at
+    row.metered_silent = False
     row.spell_billed_seconds = 0.0
     row.spell_billed_mcents = 0
 
@@ -778,6 +779,7 @@ class ControlPlaneRepository:
             row.spell_billed_seconds = (row.spell_billed_seconds or 0.0) + max(0.0, billed_seconds)
             row.spell_billed_mcents = (row.spell_billed_mcents or 0) + add_mcents
             row.metered_until = _later(row.metered_until, at or datetime.now(UTC))
+            row.metered_silent = False
             session.add(row)
             return whole_cents, remainder
 
@@ -841,9 +843,11 @@ class ControlPlaneRepository:
 
     def skip_metering(self, deployment_id: str, at: datetime) -> None:
         """A meter tick that charged nothing because the machine was silent:
-        the spell is accounted up to `at` anyway, so the settlement never
-        charges the silent time either. Opens a spell on a READY row that has
-        none (one running since before spells existed)."""
+        the spell is accounted up to `at` anyway, and marked silent, so the
+        settlement never charges the silent time either, nor the time after
+        this tick (the machine may come back and the rental stop before the
+        next tick sees it). Opens a spell on a READY row that has none (one
+        running since before spells existed)."""
         with session_scope(self.session_factory) as session:
             row = session.get(DeploymentORM, deployment_id, with_for_update=True)
             if row is None or row.state != DeploymentState.READY.value:
@@ -852,6 +856,7 @@ class ControlPlaneRepository:
                 row.spell_billed_seconds = 0.0
                 row.spell_billed_mcents = 0
             row.metered_until = _later(row.metered_until, at)
+            row.metered_silent = True
             session.add(row)
 
     def settle_metering_spell(
@@ -868,8 +873,9 @@ class ControlPlaneRepository:
 
         The meter charged `spell_billed_seconds` of it (`spell_billed_mcents`).
         Add the seconds since its last tick (`metered_until` to `ended_at`, at
-        most `max_tail_seconds`, none when `charge_tail` is False: the machine
-        is silent, so billing is paused) and round up to started minutes: the
+        most `max_tail_seconds`; none when `charge_tail` is False, the machine
+        being silent, or when that tick was skipped as silent) and round up to
+        started minutes: the
         spell owes those minutes at `mcents_per_hour`, less what the meter
         charged, plus the remainder carried on the row, rounded up to a whole
         cent. Counting from the rule rather than adding up the tail keeps the
@@ -891,7 +897,8 @@ class ControlPlaneRepository:
                 return None
             metered_until, ended = _aware(row.metered_until), _aware(ended_at)
             tail = 0.0
-            if charge_tail:
+            # Not after a silent tick: up to the next tick, it was silent.
+            if charge_tail and not row.metered_silent:
                 tail = min(max(0.0, (ended - metered_until).total_seconds()), max(0.0, max_tail_seconds))
             seconds = (row.spell_billed_seconds or 0.0) + tail
             # A millisecond of float noise (60.0004 s of monotonic deltas)
@@ -903,6 +910,7 @@ class ControlPlaneRepository:
             cents = -(-total // 1000) if total > 0 else 0
             row.metering_remainder_mcents = 0 if total > 0 else total
             row.metered_until = None
+            row.metered_silent = None
             row.spell_billed_seconds = None
             row.spell_billed_mcents = None
             session.add(row)
@@ -930,7 +938,7 @@ class ControlPlaneRepository:
             rows = session.execute(
                 select(
                     DeploymentORM.deployment_id, DeploymentORM.state, DeploymentORM.metered_until,
-                    DeploymentORM.metering_remainder_mcents,
+                    DeploymentORM.metered_silent, DeploymentORM.metering_remainder_mcents,
                 ).where(
                     DeploymentORM.owner_user_id == owner_user_id,
                     DeploymentORM.state.not_in([DeploymentState.TERMINATED.value, DeploymentState.FAILED.value]),
@@ -942,6 +950,7 @@ class ControlPlaneRepository:
                     "deployment_id": r.deployment_id,
                     "state": r.state,
                     "metered_until": _aware(r.metered_until),
+                    "metered_silent": bool(r.metered_silent),
                     "remainder_mcents": r.metering_remainder_mcents or 0,
                 }
                 for r in rows

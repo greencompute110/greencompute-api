@@ -1,4 +1,4 @@
-"""deployments: metered_until, spell_billed_seconds, spell_billed_mcents
+"""deployments: metered_until, metered_silent, spell_billed_seconds, spell_billed_mcents
 
 A rental is charged for every started minute it was READY, settled when it
 leaves READY (stop, failure, delete, pause). The minute meter keeps charging
@@ -9,6 +9,8 @@ tick, the rest of the started minute, and the sub-cent remainder.
   spell (charged it, or skipped it while the machine was silent). Set when
   the deployment becomes READY, cleared by the settlement: non-NULL is an
   open spell, which is what makes settling it exactly once possible.
+- metered_silent: the meter's last tick of the spell was skipped because
+  the machine was silent, so the time since it isn't charged either.
 - spell_billed_seconds, spell_billed_mcents: the seconds of the current
   spell the meter charged, and what it charged for them (millicents).
 
@@ -42,6 +44,7 @@ def _short_lock_wait() -> None:
 def upgrade() -> None:
     _short_lock_wait()
     op.add_column("deployments", sa.Column("metered_until", sa.DateTime(timezone=True), nullable=True))
+    op.add_column("deployments", sa.Column("metered_silent", sa.Boolean(), nullable=True))
     op.add_column("deployments", sa.Column("spell_billed_seconds", sa.Float(), nullable=True))
     op.add_column("deployments", sa.Column("spell_billed_mcents", sa.BigInteger(), nullable=True))
 
@@ -53,4 +56,5 @@ def downgrade() -> None:
     with op.batch_alter_table("deployments") as batch:
         batch.drop_column("spell_billed_mcents")
         batch.drop_column("spell_billed_seconds")
+        batch.drop_column("metered_silent")
         batch.drop_column("metered_until")

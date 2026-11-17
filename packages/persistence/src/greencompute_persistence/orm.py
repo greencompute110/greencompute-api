@@ -205,6 +205,9 @@ class DeploymentORM(Base):
     # first tick for one without), cleared by the settlement: NULL
     # metered_until = no open spell.
     metered_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The meter's last tick of the spell was skipped (machine silent): the
+    # time since isn't charged by the settlement either.
+    metered_silent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     spell_billed_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     spell_billed_mcents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Credit-exhaustion lifecycle (opt-in "save my pod").

@@ -253,18 +253,33 @@ def test_time_while_the_machine_was_silent_is_never_charged(cp):
     assert _charged(cp) == 5
 
 
-def test_after_the_machine_is_back_only_time_since_the_last_tick_is_added(cp):
-    t0 = datetime.now(UTC) - timedelta(seconds=590)
+def test_back_from_silence_and_stopped_before_the_next_tick_adds_no_tail(cp):
+    """The machine comes back and its first report says the container is
+    gone: the time since the last tick was silent, so it isn't charged."""
+    t0 = datetime.now(UTC) - timedelta(seconds=659)
     _heartbeat(cp, t0)
     dep_id = _ready(cp)
     cp.repository.set_billable_since(dep_id, t0)
     cp.meter_usage(elapsed_seconds=60, now=t0 + timedelta(seconds=60))
-    for second in range(180, 600, 60):
+    for second in range(180, 601, 60):
         cp.meter_usage(elapsed_seconds=60, now=t0 + timedelta(seconds=second))
     _heartbeat(cp, datetime.now(UTC))  # reporting again
+    _report(cp, dep_id, DeploymentState.FAILED, error="container exited")
+    assert _charged(cp) == 5  # the 60 s metered: 1 minute
+
+
+def test_after_the_machine_is_back_a_real_tick_counts_again(cp):
+    t0 = datetime.now(UTC) - timedelta(seconds=590)
+    _heartbeat(cp, t0)
+    dep_id = _ready(cp)
+    cp.repository.set_billable_since(dep_id, t0)
+    cp.meter_usage(elapsed_seconds=60, now=t0 + timedelta(seconds=60))  # 1 minute, 5¢
+    for second in range(180, 480, 60):
+        cp.meter_usage(elapsed_seconds=60, now=t0 + timedelta(seconds=second))  # silent
+    _tick(cp, t0 + timedelta(seconds=540), 60)  # reporting again: another 60 s
     _report(cp, dep_id, DeploymentState.TERMINATED)
-    # 60 s metered + the ~50 s since the last (silent) tick = 2 minutes.
-    assert _charged(cp) == 10
+    # 120 s metered + the ~50 s since that tick = 3 minutes.
+    assert _charged(cp) == 15
 
 
 def test_a_stale_meter_tick_adds_at_most_90_seconds(cp):
@@ -375,13 +390,13 @@ def test_migration_0081_adds_and_removes_the_columns_on_sqlite(tmp_path):
     def columns():
         return {c["name"] for c in sa.inspect(engine).get_columns("deployments")}
 
-    new = {"metered_until", "spell_billed_seconds", "spell_billed_mcents"}
+    new = {"metered_until", "metered_silent", "spell_billed_seconds", "spell_billed_mcents"}
     run(m.upgrade)
     assert new <= columns()
     with engine.connect() as conn:
         assert conn.execute(sa.text(
-            "SELECT metered_until, spell_billed_seconds, spell_billed_mcents FROM deployments")).first() == (
-            None, None, None)
+            "SELECT metered_until, metered_silent, spell_billed_seconds, spell_billed_mcents FROM deployments")
+        ).first() == (None, None, None, None)
     run(m.downgrade)
     assert not new & columns()
     with engine.connect() as conn:
@@ -400,6 +415,15 @@ def test_pending_usage_is_what_ran_since_the_last_tick_plus_the_remainder(cp):
     _report(cp, dep_id, DeploymentState.TERMINATED)
     assert cp.pending_usage_cents("u1") == 0  # settled: 2 minutes, 2¢
     assert _charged(cp) == 2
+
+
+def test_pending_usage_leaves_out_the_time_after_a_silent_tick(cp):
+    dep_id = _ready(cp, ready_for=100)
+    since = cp.repository.get_billable_since(dep_id)
+    _heartbeat(cp, since - timedelta(minutes=10))
+    cp.meter_usage(elapsed_seconds=60, now=since + timedelta(seconds=60))  # silent: skipped
+    _heartbeat(cp, datetime.now(UTC))  # back, but no real tick yet
+    assert cp.pending_usage_cents("u1") == 0
 
 
 def test_pending_usage_leaves_out_a_silent_machine_and_counts_owed_cents(cp):
