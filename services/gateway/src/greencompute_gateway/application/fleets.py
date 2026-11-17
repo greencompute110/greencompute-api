@@ -640,6 +640,8 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
         NewAccountLimitError,
         NoCapacityError,
         SanctionedAccountError,
+        SecretReferenceError,
+        TooManyGpusError,
         UnsupportedGPUError,
     )
 
@@ -795,6 +797,18 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
         except (KeyError, PermissionError):
             _set_status(service, fleet_id, state="paused",
                         reason="Paused: its workload was deleted or is no longer yours.")
+            return
+        except (SecretReferenceError, TooManyGpusError) as exc:
+            # It would fail the same way every pass until the owner acts:
+            # pause with the reason (one log line, at the change), not a
+            # trace every 30 seconds.
+            if isinstance(exc, SecretReferenceError):
+                reason = (f"Paused: its workload names a secret you no longer have ({exc}). Create it again "
+                          "(POST /platform/secrets), then resume the fleet.")
+            else:
+                reason = f"Paused: {exc}."
+            log.info("fleet %s paused: %s", fleet_id, exc)
+            _set_status(service, fleet_id, state="paused", reason=reason)
             return
         except Exception as exc:  # noqa: BLE001 - say so, retry next pass
             log.exception("fleet %s: could not start a member", fleet_id)

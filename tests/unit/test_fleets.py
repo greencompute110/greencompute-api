@@ -331,6 +331,30 @@ def test_an_unexpected_error_starting_a_member_is_shown_not_hidden(world, monkey
     assert "Couldn't start a rental (control plane said no)" in v["status"]
 
 
+def test_a_deleted_secret_pauses_the_fleet_once_with_the_reason(world, monkeypatch, caplog):
+    """A member that can't start because its workload's secret was deleted
+    would fail every 30 s with a full trace; the fleet pauses instead."""
+    from greencompute_gateway.application.services import SecretReferenceError
+
+    calls = []
+
+    def missing_secret(*a, **k):
+        calls.append(1)
+        raise SecretReferenceError([{"loc": ["body", "metadata", "secret_env", "HF_TOKEN"],
+                                     "msg": "you have no secret named 'hf-read'", "type": "value_error"}])
+
+    monkeypatch.setattr(world.gw, "create_deployment", missing_secret)
+    with caplog.at_level("INFO", logger="greencompute_gateway.application.fleets"):
+        f = _create(world, target=2)
+        for _ in range(3):
+            fleets.fleet_once(world.gw)
+    v = _view(world, f.fleet_id)
+    assert v["state"] == "paused" and "no secret named 'hf-read'" in v["status"] and "resume" in v["status"]
+    assert len(calls) == 1  # paused: no more attempts until resumed
+    assert not [r for r in caplog.records if r.exc_info]
+    assert len([r for r in caplog.records if "paused" in r.getMessage()]) == 1
+
+
 def test_the_locks_hold_one_connection_from_lock_to_unlock():
     """On Postgres the advisory lock must be released on the connection that
     took it; a Session returns its connection to the pool on commit."""
