@@ -1426,15 +1426,28 @@ def _create_workload(payload_data: dict, api_key) -> dict:
         # Template builders raise ValueError (e.g. "model must be org/model
         # format"); without this it would surface as a 500.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    from greencompute_gateway.application.services import SecretReferenceError
+    from greencompute_gateway.application.services import SecretReferenceError, TooManyGpusError
 
     try:
+        if not api_key.admin:
+            service.check_gpu_count(request)
         workload = service.create_workload(request, api_key.user_id)
+    except TooManyGpusError as exc:
+        raise _too_many_gpus(exc, ["body", "requirements", "gpu_count"]) from exc
     except SecretReferenceError as exc:
         raise coded(422, "validation_error", exc.errors) from exc
     except ValueError as exc:  # e.g. an ingress_host outside the model zone
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _redact_workload(workload.model_dump(mode="json"))
+
+
+def _too_many_gpus(exc, loc: list) -> HTTPException:
+    """422 for more GPUs than one machine has, in a 422's usual `detail` shape
+    with the limit in `ctx.le`."""
+    return coded(422, "validation_error", [{
+        "loc": loc, "msg": str(exc), "type": "less_than_equal",
+        "ctx": {"le": exc.limit, "max_gpus_per_machine": exc.limit}, "input": exc.requested,
+    }])
 
 
 def _is_secret_meta_key(key: str) -> bool:
@@ -1704,6 +1717,7 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         NoCapacityError,
         SanctionedAccountError,
         SecretReferenceError,
+        TooManyGpusError,
         UnsupportedGPUError,
     )
 
@@ -1720,6 +1734,9 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
     except SecretReferenceError as exc:
         # A secret the workload names was deleted since: nothing was created.
         raise coded(422, "validation_error", exc.errors) from exc
+    except TooManyGpusError as exc:
+        # A workload made before gpu_count was checked at create.
+        raise _too_many_gpus(exc, ["body", "workload_id"]) from exc
     except NewAccountLimitError as exc:
         raise _new_account_limit(exc.reason, exc.numbers) from exc
     except AccountLimitError as exc:

@@ -61,6 +61,16 @@ NO_CAPACITY_NEXT_STEP = (
 )
 
 
+def _public_rental_families() -> list[str]:
+    """GPU families customers may rent (GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES):
+    internal machines of other families stay out of every public answer."""
+    return [
+        f.strip().lower()
+        for f in os.getenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", "4090,5090").split(",")
+        if f.strip()
+    ]
+
+
 class ControlPlaneService:
     def __init__(
         self,
@@ -340,14 +350,25 @@ class ControlPlaneService:
         has 0 free is "busy" (503); one that isn't online is "never" (400).
         The same node filter as every other answer here, so a drained or
         unhealthy miner is offline, not "rented, try again in a minute"."""
-        families = [
-            f.strip().lower()
-            for f in os.getenv("GREENCOMPUTE_PUBLIC_RENTAL_GPU_FAMILIES", "4090,5090").split(",")
-            if f.strip()
-        ]
+        families = _public_rental_families()
         nodes, _, _ = self._schedulable_nodes()
         live = {normalize_gpu_model(n.gpu_model) for n in nodes}
         return sorted(m for m in live if m and (not families or any(f in m for f in families)))
+
+    def max_gpus_per_machine(self, gpu_models: list[str] | None = None) -> int | None:
+        """The most GPUs any one registered machine of the public rental
+        families has (of `gpu_models`, when any of those is registered): a
+        rental or model runs on one machine, so it can never have more.
+        Every registered machine counts, online or not, so a machine that is
+        down for a while doesn't lower it. None when none is registered."""
+        families = _public_rental_families()
+        public = [
+            n for n in self.repository.list_nodes()
+            if (m := normalize_gpu_model(n.gpu_model)) and (not families or any(f in m for f in families))
+        ]
+        wanted = {normalize_gpu_model(m) for m in gpu_models or [] if m}
+        matching = [n for n in public if normalize_gpu_model(n.gpu_model) in wanted]
+        return max((n.gpu_count for n in matching or public), default=None)
 
     def _assign_lease(self, workload: WorkloadSpec, deployment_id: str) -> LeaseAssignment | None:
         nodes, total_nodes, skip_reasons = self._schedulable_nodes(deployment_id)

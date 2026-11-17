@@ -370,6 +370,47 @@ class SecretReferenceError(ValueError):
         super().__init__("; ".join(f"{'.'.join(str(p) for p in e['loc'][1:])}: {e['msg']}" for e in errors))
 
 
+#: The most GPUs on one machine when no machine is registered to say (the
+#: fleet's are 8-GPU boxes). GREENCOMPUTE_MAX_GPUS_PER_MACHINE overrides it.
+DEFAULT_MAX_GPUS_PER_MACHINE = 8
+
+
+class TooManyGpusError(ValueError):
+    """More GPUs than any one machine has: a rental or model runs on one
+    machine, so it could never be placed (shown as 422 with the limit)."""
+
+    def __init__(self, requested: int, limit: int) -> None:
+        self.requested = requested
+        self.limit = limit
+        super().__init__(
+            f"at most {limit} GPUs: a rental or model runs on one machine, and the largest has {limit} "
+            f"(asked for {requested}). For more, start several, or write to support@green-compute.com"
+        )
+
+
+def max_gpus_per_machine(control_plane, gpu_models: list[str] | None = None) -> int:
+    """The most GPUs one rental (or model replica) can have: the largest
+    registered machine of those GPU models (any public one, if none of those
+    is registered), else GREENCOMPUTE_MAX_GPUS_PER_MACHINE (8)."""
+    found = control_plane.max_gpus_per_machine(gpu_models)
+    if found:
+        return int(found)
+    try:
+        return max(1, int(os.environ.get("GREENCOMPUTE_MAX_GPUS_PER_MACHINE") or DEFAULT_MAX_GPUS_PER_MACHINE))
+    except ValueError:
+        return DEFAULT_MAX_GPUS_PER_MACHINE
+
+
+def check_gpu_count(control_plane, workload) -> None:
+    """TooManyGpusError when the workload asks for more GPUs than one machine has."""
+    requested = int(workload.requirements.gpu_count or 1)
+    if requested <= 1:
+        return
+    limit = max_gpus_per_machine(control_plane, list(workload.requirements.supported_gpu_models or []))
+    if requested > limit:
+        raise TooManyGpusError(requested, limit)
+
+
 class SecretNameTakenError(Exception):
     """The account already has a secret with this name (shown as 409)."""
 
@@ -988,6 +1029,12 @@ class GatewayService:
             workload.ingress_host = self._assign_ingress_host(workload)
         return self.control_plane.upsert_workload(workload)
 
+    def max_gpus_per_machine(self, gpu_models: list[str] | None = None) -> int:
+        return max_gpus_per_machine(self.control_plane, gpu_models)
+
+    def check_gpu_count(self, workload: WorkloadCreateRequest | WorkloadSpec) -> None:
+        check_gpu_count(self.control_plane, workload)
+
     def _check_workload_secrets(self, workload: WorkloadSpec) -> None:
         """The secrets a workload names must be the owner's (422 otherwise).
         Only names are stored; values are filled in for the machine."""
@@ -1082,6 +1129,8 @@ class GatewayService:
 
             if account_blocked(self.repository.session_factory, user_id):
                 raise SanctionedAccountError(user_id)
+        if not admin:
+            check_gpu_count(self.control_plane, workload)  # one made before the check at create
         if workload.owner_user_id and any(k in (workload.metadata or {}) for k in ("secret_env", "hf_token_secret")):
             # A secret it names may have been deleted since the workload was made.
             self._check_workload_secrets(workload.model_copy(deep=True))
