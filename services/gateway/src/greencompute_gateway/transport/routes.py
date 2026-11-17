@@ -868,6 +868,7 @@ def get_user_balance(
         "user_id": user_id,
         "balance_credits": user.balance_credits,
         "balance_usd": round(user.balance_credits / 100.0, 2),
+        **_pending_usage(user_id, user.balance_credits),
     }
 
 
@@ -3811,10 +3812,27 @@ def billing_balance(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
+    """Your balance, and what you have used but not yet been charged: the
+    meter charges running rentals and private models once a minute, so
+    `pending_usage_cents` is what they ran since (plus sub-cent amounts it
+    carries), and `available_cents` the balance less that."""
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
-    return _get_billing().get_balance(api_key.user_id)
+    out = _get_billing().get_balance(api_key.user_id)
+    return {**out, **_pending_usage(api_key.user_id, out["balance_credits"])}
+
+
+def _pending_usage(user_id: str, balance_cents: int) -> dict:
+    """`pending_usage_cents` (used, not yet charged: see
+    ControlPlaneService.pending_usage_cents) and `available_cents` (the
+    balance less it), for the balance and forecast responses."""
+    try:
+        pending = service.control_plane.pending_usage_cents(user_id)
+    except Exception:  # never fail a balance read over it
+        log.exception("pending usage for %s", user_id)
+        pending = 0
+    return {"pending_usage_cents": pending, "available_cents": balance_cents - pending}
 
 
 @router.get("/platform/billing/forecast", response_model=None, responses=ok(schemas.Forecast, "How long your balance lasts at the current rate"))
@@ -3831,7 +3849,8 @@ def billing_forecast(
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
     from greencompute_gateway.application.credit_watch import forecast
 
-    return forecast(api_key.user_id, control_plane=service.control_plane)
+    out = forecast(api_key.user_id, control_plane=service.control_plane)
+    return {**out, **_pending_usage(api_key.user_id, out["balance_cents"])}
 
 
 @router.get("/platform/billing/spending", response_model=None, responses=ok(schemas.SpendingSummary, "What you spent, per day and per deployment"))

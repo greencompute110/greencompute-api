@@ -104,9 +104,17 @@ class SSHAccess(BaseModel):
     )
 
 
+_PENDING = ("Used but not yet charged, in cents: what your running rentals and private models ran since the "
+            "meter's last tick (once a minute), plus the sub-cent amounts it carries, each rounded up. Charged as "
+            "it adds up to whole cents, and in full (to the end of the started minute) when the rental stops.")
+_AVAILABLE = "The balance less `pending_usage_cents`: what is really left (negative when you owe more than you hold)."
+
+
 class Balance(BaseModel):
     balance_credits: int = Field(description="Balance in cents.")
     balance_usd: float
+    pending_usage_cents: int = Field(description=_PENDING)
+    available_cents: int = Field(description=_AVAILABLE)
 
 
 class RunningCost(BaseModel):
@@ -132,6 +140,8 @@ class Forecast(BaseModel):
     hours_left: float | None = Field(description="balance / burn; null when nothing is running.")
     runs_out_at: str | None = Field(description="When the balance reaches zero at this rate (ISO 8601), or null.")
     running: list[RunningCost]
+    pending_usage_cents: int = Field(description=_PENDING)
+    available_cents: int = Field(description=_AVAILABLE)
 
 
 class SpendingDay(BaseModel):

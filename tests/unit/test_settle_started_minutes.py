@@ -359,3 +359,51 @@ def test_migration_0081_adds_and_removes_the_columns_on_sqlite(tmp_path):
     assert not new & columns()
     with engine.connect() as conn:
         assert conn.execute(sa.text("SELECT state FROM deployments")).scalar() == "ready"
+
+
+# --- pending usage (balance and forecast) -------------------------------------------
+
+
+def test_pending_usage_is_what_ran_since_the_last_tick_plus_the_remainder(cp):
+    dep_id = _ready(cp, rate=40, ready_for=100)
+    since = cp.repository.get_billable_since(dep_id)
+    _tick(cp, since + timedelta(seconds=60), 60)  # 0.67¢ carried, nothing debited
+    # ~40 s since that tick at $0.40/hr (0.44¢) + the 0.67¢ carried = 1.11¢ → 2¢.
+    assert cp.pending_usage_cents("u1") == 2
+    _report(cp, dep_id, DeploymentState.TERMINATED)
+    assert cp.pending_usage_cents("u1") == 0  # settled: 2 minutes, 2¢
+    assert _charged(cp) == 2
+
+
+def test_pending_usage_leaves_out_a_silent_machine_and_counts_owed_cents(cp):
+    dep_id = _ready(cp, ready_for=30)
+    _heartbeat(cp, datetime.now(UTC) - timedelta(minutes=10))
+    assert cp.pending_usage_cents("u1") == 0  # paused while its machine is silent
+    _heartbeat(cp, datetime.now(UTC))
+    assert cp.pending_usage_cents("u1") == 3  # 30 s at 5¢/min = 2.5¢ → 3¢
+    with session_scope(cp.repository.session_factory) as s:
+        s.get(UserORM, "u1").balance_credits = 0
+    _report(cp, dep_id, DeploymentState.SUSPENDED, error="balance", suspended_reason="balance")
+    assert cp.pending_usage_cents("u1") == 5  # the minute it couldn't pay, owed on a resume
+
+
+def test_balance_and_forecast_show_pending_and_available(cp, monkeypatch):
+    from types import SimpleNamespace
+
+    from greencompute_gateway.application import credit_watch
+    from greencompute_gateway.application.billing_service import BillingService
+    from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+    from greencompute_gateway.transport import routes
+
+    billing = BillingRepository()  # this test's database (the environment)
+    monkeypatch.setattr(routes, "service", SimpleNamespace(control_plane=cp))
+    monkeypatch.setattr(routes, "_get_billing", lambda: BillingService(billing))
+    monkeypatch.setattr(credit_watch, "_billing_repo", lambda: billing)
+    monkeypatch.setattr(routes, "require_api_key", lambda *a, **k: SimpleNamespace(user_id="u1", admin=False))
+    _ready(cp, ready_for=30)
+    balance = routes.billing_balance(authorization="Bearer k", x_api_key=None)
+    assert (balance["balance_credits"], balance["balance_usd"]) == (10_000, 100.0)
+    assert (balance["pending_usage_cents"], balance["available_cents"]) == (3, 9_997)
+    forecast = routes.billing_forecast(authorization="Bearer k", x_api_key=None)
+    assert forecast["burn_cents_per_hour"] == RATE
+    assert (forecast["pending_usage_cents"], forecast["available_cents"]) == (3, 9_997)
