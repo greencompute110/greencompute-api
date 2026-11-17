@@ -90,11 +90,14 @@ def test_gateway_routes_require_api_key_and_rate_limit(monkeypatch: pytest.Monke
     assert build["status"] == "accepted"
 
     for _ in range(60):
-        payload = gateway_routes.embeddings(
-            {"input": "hello", "model": "test-embedding"},
-            authorization=f"Bearer {admin_secret}",
-        )
-        assert payload["object"] == "list"
+        # No embedding model is served: an unknown one is a 404 (never
+        # made-up vectors), and every answer counts toward the rate limit.
+        with pytest.raises(HTTPException) as unknown:
+            gateway_routes.embeddings(
+                {"input": "hello", "model": "test-embedding"},
+                authorization=f"Bearer {admin_secret}",
+            )
+        assert unknown.value.status_code == 404
 
     with pytest.raises(HTTPException) as limited:
         gateway_routes.embeddings(
