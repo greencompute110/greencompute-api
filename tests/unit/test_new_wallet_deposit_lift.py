@@ -1,8 +1,8 @@
 """A new wallet account's first-week limits (2 rentals at once, $50 of spend
 per 24 hours) also end once it has paid in $20 in crypto (owner decision,
-2026-11-17): deposits credited from the chain, by the watchers or staff
-assigning one, never a staff credit or a card payment. A confirmed email
-still ends them, and so does the end of the week."""
+2026-11-17): crypto top-ups credited to it (the ledger), by the watchers or
+staff assigning one, without the alpha bonus, never a staff credit or a card
+payment. A confirmed email still ends them, and so does the end of the week."""
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
@@ -158,6 +158,46 @@ def test_the_403_says_how_much_more_to_deposit_or_when_it_ends(db, monkeypatch):
     assert "deposit $7.50 more in crypto (TAO, alpha, USDC or USDT)" in detail["hint"]
     assert "add an email address on the website (Settings)" in detail["hint"]
     assert detail["until"][:10] in detail["hint"]
+
+
+def test_alpha_counts_what_was_paid_not_its_bonus(db):
+    uid = _wallet_account(db.sf)
+    _deposit(db.sf, uid, 2001, currency="alpha")  # $18.19 of alpha + 10%
+    assert new_account_limits(db.sf, uid)["deposited_usd"] == 18.19
+    _deposit(db.sf, uid, 200, currency="alpha")  # $1.82 more → $20.01 paid
+    assert new_account_limits(db.sf, uid) is None
+
+
+def test_an_invoice_payment_takes_its_own_bonus_out(db):
+    from greencompute_persistence.orm import CryptoInvoiceORM
+
+    uid = _wallet_account(db.sf)
+    with session_scope(db.sf) as s:
+        s.add(CryptoInvoiceORM(invoice_id="inv-a", user_id=uid, currency="alpha", amount_crypto=1.0,
+                               amount_usd=19.0, bonus_pct=0.10, total_credits=2090, deposit_address="5Ours",
+                               status="confirmed", expires_at=datetime.now(UTC)))
+        s.add(LedgerEntryORM(entry_id=str(uuid4()), user_id=uid, amount_cents=2090, balance_after=0, kind="topup",
+                             reference_id="inv-a", deposit_ref="alpha:7:1", created_at=datetime.now(UTC)))
+    assert new_account_limits(db.sf, uid)["deposited_usd"] == 19.0
+
+
+def test_a_payment_in_two_transfers_staff_confirmed_counts_once(db):
+    """An admin confirm credits the invoice once (deposit_ref "manual:…") and
+    marks every logged transfer of the transaction with the invoice total."""
+    from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+
+    uid = _wallet_account(db.sf)
+    with session_scope(db.sf) as s:
+        for i in (1, 2):
+            s.add(CryptoDepositORM(deposit_ref=f"usdc-base:0xabc:{i}", currency="usdc-base", tx_hash="0xabc",
+                                   sender="0xs", deposit_address="0xd", amount_raw=7_500_000, decimals=6,
+                                   block_number=1, usd_price=1.0, status="unmatched"))
+    _staff_credit(db.sf, uid, 1500, deposit_ref="manual:usdc-base:0xabc")  # the $15 invoice, confirmed
+    billing = BillingRepository.__new__(BillingRepository)
+    billing.session_factory = db.sf
+    billing.mark_deposits_by_tx(None, "0xabc", status="credited", matched_by="admin_invoice", user_id=uid,
+                                credited_cents=1500)
+    assert new_account_limits(db.sf, uid)["deposited_usd"] == 15.0
 
 
 def test_the_lift_text():
