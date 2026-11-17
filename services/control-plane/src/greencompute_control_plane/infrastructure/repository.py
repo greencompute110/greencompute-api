@@ -680,7 +680,10 @@ class ControlPlaneRepository:
             row.health_check_failures = deployment.health_check_failures
             row.created_at = deployment.created_at
             row.updated_at = deployment.updated_at
-            if open_spell_at is not None:
+            # Only on the change to READY, judged on the locked row: two READY
+            # reports at once must not both open a spell (the second would
+            # drop the first's ticks and charge a minute twice).
+            if open_spell_at is not None and previous_state != "ready":
                 _open_spell(row, open_spell_at)
             session.add(row)
             # Same transaction: the event exists exactly when the change does.
