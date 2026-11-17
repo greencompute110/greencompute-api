@@ -4009,7 +4009,7 @@ LEDGER_PAGE_MAX = 1000
 
 @router.get("/platform/billing/ledger", response_model=None, responses=ok(list[schemas.LedgerItem], "Top-ups and charges, newest first"))
 def billing_ledger(
-    limit: Annotated[int, Query(ge=1, description="At most this many (up to 1000).")] = 50,
+    limit: Annotated[int, Query(ge=1, description="At most this many; a limit above 1000 returns 1000 (page on with offset).")] = 50,
     offset: Annotated[int, Query(ge=0, description="Skip this many of the newest first.")] = 0,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
