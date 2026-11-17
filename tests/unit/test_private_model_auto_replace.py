@@ -12,7 +12,15 @@ from greencompute_control_plane.config import settings
 from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
 from greencompute_persistence import session_scope
 from greencompute_persistence.orm import UserORM
-from greencompute_protocol import DeploymentRecord, DeploymentState, WorkloadKind, WorkloadSpec
+from greencompute_protocol import (
+    CapacityUpdate,
+    DeploymentRecord,
+    DeploymentState,
+    Heartbeat,
+    NodeCapability,
+    WorkloadKind,
+    WorkloadSpec,
+)
 
 
 CLOCK = [1000.0]
@@ -37,6 +45,11 @@ def cp(tmp_path, monkeypatch):
     with session_scope(repo.session_factory) as s:
         s.add(UserORM(user_id="u1", username="u1", email="u1@x.io", balance_credits=1000))
         s.add(UserORM(user_id="broke", username="broke", email="b@x.io", balance_credits=10))
+    seen = datetime.now(UTC)  # a machine with room for a replacement
+    repo.upsert_heartbeat(Heartbeat(hotkey="hk", healthy=True, observed_at=seen))
+    repo.upsert_capacity(CapacityUpdate(hotkey="hk", observed_at=seen, nodes=[NodeCapability(
+        hotkey="hk", node_id="n1", gpu_model="rtx4090", gpu_count=8, available_gpus=6, vram_gb_per_gpu=24,
+        cpu_cores=64, memory_gb=256, observed_at=seen)]))
     return ControlPlaneService(repository=repo)
 
 
@@ -57,10 +70,13 @@ def serving(cp, workload, owner="u1", **fields):
 
 
 def fail(cp, deployment):
+    """Fail its health checks (spread over the window), then let the
+    control-plane worker act on the replacement it asked for."""
     for _ in range(settings.deployment_health_failure_threshold):
         CLOCK[0] += 20
-        out = cp.record_deployment_health_failure(deployment.deployment_id, "upstream timed out for deployment=x")
-    return out
+        cp.record_deployment_health_failure(deployment.deployment_id, "upstream timed out for deployment=x")
+    cp.process_pending_events()
+    return cp.repository.get_deployment(deployment.deployment_id)
 
 
 def others(cp, workload, deployment):
@@ -98,6 +114,8 @@ def test_two_requests_failing_at_once_replace_it_once(cp):
         t.start()
     for t in threads:
         t.join()
+    cp.process_pending_events()
+    cp.process_pending_events()
     assert len(others(cp, workload, dep)) == 1
 
 
@@ -214,3 +232,89 @@ def test_failing_for_the_whole_window_fails_it(cp, clock):
         clock(1)
     assert cp.repository.get_deployment(dep.deployment_id).state == DeploymentState.FAILED
     assert CLOCK[0] - started >= settings.deployment_health_failure_window_seconds
+
+
+# --- review M2: the same checks as a deploy, off the request path ------------------------
+
+
+def test_the_failing_request_only_asks_for_it(cp):
+    """The replacement is made by the control-plane worker, not in the
+    request that failed the model."""
+    workload = private_model(cp)
+    dep = serving(cp, workload)
+    for _ in range(settings.deployment_health_failure_threshold):
+        CLOCK[0] += 20
+        cp.record_deployment_health_failure(dep.deployment_id, "x")
+    assert others(cp, workload, dep) == []  # nothing yet: asked for
+    cp.process_pending_events()
+    assert len(others(cp, workload, dep)) == 1
+
+
+def test_a_failure_asking_for_it_never_fails_the_caller(cp, monkeypatch):
+    workload = private_model(cp)
+    dep = serving(cp, workload)
+
+    publish = cp.bus.publish
+
+    def broken(subject, payload):
+        if subject == "deployment.replacement_requested":
+            raise RuntimeError("bus down")
+        return publish(subject, payload)
+    monkeypatch.setattr(cp.bus, "publish", broken)
+    for _ in range(settings.deployment_health_failure_threshold):
+        CLOCK[0] += 20
+        out = cp.record_deployment_health_failure(dep.deployment_id, "x")  # must not raise
+    assert out.state == DeploymentState.FAILED
+
+
+@pytest.mark.parametrize("limits, says", [
+    ({"max_active_rentals": 1}, "limit on rentals at once is reached"),
+    ({"daily_spend_limit_usd": 1.0}, "spend limit for 24 hours is reached"),
+])
+def test_not_past_the_accounts_own_limits(cp, limits, says):
+    from greencompute_persistence.orm import LedgerEntryORM
+
+    workload = private_model(cp)
+    dep = serving(cp, workload)
+    other = cp.repository.upsert_workload(WorkloadSpec(name="pod", image="ubuntu", kind=WorkloadKind.POD,
+                                                       owner_user_id="u1", requirements={"gpu_count": 1}))
+    serving(cp, other)  # another rental running
+    with session_scope(cp.repository.session_factory) as s:
+        user = s.get(UserORM, "u1")
+        if "max_active_rentals" in limits:
+            user.max_active_rentals = limits["max_active_rentals"]
+        else:
+            user.daily_spend_limit_cents = int(limits["daily_spend_limit_usd"] * 100)
+            s.add(LedgerEntryORM(entry_id="e1", user_id="u1", kind="usage", amount_cents=-500, balance_after=500,
+                                 reference_id="r", description="spent", created_at=datetime.now(UTC)))
+    failed = fail(cp, dep)
+    assert others(cp, workload, dep) == []
+    assert says in failed.last_error
+
+
+def test_not_for_a_blocked_account(cp, monkeypatch):
+    from greencompute_gateway.application import sanctions
+
+    monkeypatch.setattr(sanctions, "account_blocked", lambda sf, user: "OFAC")
+    workload = private_model(cp)
+    dep = serving(cp, workload)
+    failed = fail(cp, dep)
+    assert others(cp, workload, dep) == []
+    assert "the account can't start rentals" in failed.last_error
+
+
+def test_without_room_it_retries_then_says_so(cp):
+    workload = private_model(cp)
+    dep = serving(cp, workload)
+    seen = datetime.now(UTC)
+    cp.repository.upsert_capacity(CapacityUpdate(hotkey="hk", observed_at=seen, nodes=[NodeCapability(
+        hotkey="hk", node_id="n1", gpu_model="rtx4090", gpu_count=8, available_gpus=0, vram_gb_per_gpu=24,
+        cpu_cores=64, memory_gb=256, observed_at=seen)]))
+    failed = fail(cp, dep)
+    assert "Not restarted" not in (failed.last_error or "")  # not yet: it tries again in a moment
+    pending = cp.bus.list_deliveries(consumer="control-plane-worker", subjects=["deployment.replacement_requested"],
+                                     statuses=["pending"])
+    assert len(pending) == 1
+    assert cp.replace_failed_private_model(dep.deployment_id, final_attempt=True) is not None
+    failed = cp.repository.get_deployment(dep.deployment_id)
+    assert "no GPU it fits on is free right now" in failed.last_error and others(cp, workload, dep) == []

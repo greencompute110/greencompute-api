@@ -31,6 +31,8 @@ SUBJECT_CONSUMERS: dict[str, list[str]] = {
     "build.accepted": ["builder-worker"],
     "build.job.progress": ["builder-worker"],
     "deployment.requested": ["control-plane-worker"],
+    # A private model that failed its health checks, to be redeployed.
+    "deployment.replacement_requested": ["control-plane-worker"],
     "invocation.recorded": ["control-plane-worker"],
     "usage.recorded": ["control-plane-worker"],
     "probe.result.recorded": ["validator-worker"],

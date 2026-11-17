@@ -594,6 +594,7 @@ def test_a_crashed_private_model_is_replaced_and_says_so(api, cp, node, clock):
         res = chat(api, model=mine.workload_id)
         assert res.status_code == 503 and res.json()["error"]["code"] == "model_unavailable"
     assert state(cp, dep) == DeploymentState.FAILED
+    cp.process_pending_events()  # the control-plane worker makes the replacement
     replacement = [d for d in cp.repository.list_deployments_for_workload(mine.workload_id)
                    if d.deployment_id != dep.deployment_id]
     assert [d.state for d in replacement] == [DeploymentState.PENDING]

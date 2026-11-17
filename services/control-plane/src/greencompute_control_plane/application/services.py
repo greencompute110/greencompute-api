@@ -51,6 +51,10 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+class _NoRoomYet(Exception):
+    """No GPU free for a replacement yet: the worker tries again shortly."""
+
+
 class CannotResumeInPlace(ValueError):
     """resume_deployment can't restart this deployment where it was: its
     placement is gone, its machine is no longer registered, or the machine has
@@ -793,7 +797,7 @@ class ControlPlaneService:
                     # (update_deployment_status classifies by text).
                     failed.failure_class = "health_check_failure"
                     failed = self.repository.update_deployment(failed)
-                    failed = self._replace_failed_private_model(failed) or failed
+                    self._request_replacement(failed)
                 return failed
             self.metrics.increment("deployment.health.failed")
             return self.repository.update_deployment(deployment)
@@ -824,28 +828,76 @@ class ControlPlaneService:
         DeploymentState.READY, DeploymentState.DRAINING,
     })
 
-    def _replace_failed_private_model(self, failed: DeploymentRecord) -> DeploymentRecord | None:
+    def _request_replacement(self, failed: DeploymentRecord) -> None:
+        """Ask the control-plane worker to replace a private model that just
+        FAILED its health checks. Only the cheap checks run here, in the
+        request that failed it; the real ones (and the new deployment) run
+        off it (replace_failed_private_model), and nothing here may fail the
+        caller's request."""
+        try:
+            if settings.private_model_auto_replace_per_hour <= 0 or failed.ready_at is None or not failed.owner_user_id:
+                return
+            workload = self.repository.get_workload(failed.workload_id)
+            if workload is None or not self.is_private_model(failed, workload):
+                return
+            self.bus.publish("deployment.replacement_requested", {
+                "deployment_id": failed.deployment_id, "workload_id": failed.workload_id,
+            })
+        except Exception:  # noqa: BLE001 - a missed replacement leaves it failed, as before
+            logger.exception("couldn't ask for a replacement of %s", failed.deployment_id)
+
+    #: Tries at placing a replacement before telling its owner there is no
+    #: room: the failed container's GPU is only reported free once its machine
+    #: has removed it, a reconcile or two later.
+    _REPLACE_ATTEMPTS = 5
+
+    def _process_replacement_request(self, event) -> DeploymentRecord | None:
+        deployment_id = str(event.payload.get("deployment_id"))
+        try:
+            result = self.replace_failed_private_model(
+                deployment_id, final_attempt=event.attempts >= self._REPLACE_ATTEMPTS)
+        except _NoRoomYet:
+            self.bus.mark_failed(event.delivery_id, "no GPU free for the replacement yet", retryable=True,
+                                 retry_after_seconds=30.0)
+            return None
+        self.bus.mark_completed(event.delivery_id)
+        return result
+
+    def replace_failed_private_model(self, deployment_id: str, *, final_attempt: bool = True) -> DeploymentRecord | None:
         """Redeploy a customer's own model that was serving and then FAILED
         its health checks (its model server crashed, its machine went away),
         instead of leaving it failed until its owner notices and redeploys.
-        A new deployment of the same workload goes through normal placement:
-        a fresh container, on the same machine or another, with the model's
-        address, name and id unchanged. Shared catalog models are Flux's.
+        Run by the control-plane worker. A new deployment of the same
+        workload goes through normal placement: a fresh container, on the
+        same machine or another, with the model's address, name and id
+        unchanged. Shared catalog models are Flux's.
 
-        Not when: the model never served (a start problem would only fail
+        Only when a deploy by its owner would be allowed now, checked for the
+        account (the key that started it may be gone): not blocked, an hour
+        of it in credit, under the account's limits (rentals at once, spend
+        per 24 hours, a new account's), and a GPU it fits on free. And not
+        when: the model never served (a start problem would only fail
         again); it failed this way more than private_model_auto_replace_per_hour
         times in the last hour (it keeps crashing: its owner should look);
         another of its deployments is live (no second replica, billed twice);
-        its runtime cap is used up (the replacement gets what is left of it);
-        its owner's balance doesn't cover an hour of it (what starting one
-        needs) or the account is blocked. Returns the failed deployment with
-        `last_error` naming the replacement, or None when nothing was done."""
+        its runtime cap is used up (the replacement gets what is left of it).
+        Whenever it isn't replaced for a reason its owner can act on,
+        `last_error` says why. Returns the failed deployment, or None."""
+        failed = self.repository.get_deployment(deployment_id)
         limit = settings.private_model_auto_replace_per_hour
+        if failed is None or failed.state != DeploymentState.FAILED:
+            return None
         if limit <= 0 or failed.ready_at is None or not failed.owner_user_id:
             return None
         workload = self.repository.get_workload(failed.workload_id)
         if workload is None or not self.is_private_model(failed, workload):
             return None
+        with _health_failure_lock(failed.workload_id):
+            return self._replace_locked(failed, workload, limit, final_attempt)
+
+    def _replace_locked(
+        self, failed: DeploymentRecord, workload: WorkloadSpec, limit: int, final_attempt: bool,
+    ) -> DeploymentRecord | None:
         now = datetime.now(UTC)
         siblings = self.repository.list_deployments_for_workload(workload.workload_id)
         if any(d.deployment_id != failed.deployment_id and d.state in self._LIVE_STATES for d in siblings):
@@ -864,18 +916,35 @@ class ControlPlaneService:
             if remaining_minutes < 1:
                 return None  # its runtime cap is used up: it would have stopped now anyway
         hourly_cents = (failed.hourly_rate_cents or 10) * ((workload.requirements.gpu_count if workload else 1) or 1)
+        owner = failed.owner_user_id
         try:
             from greencompute_gateway.application.sanctions import account_blocked
-            from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+            from greencompute_persistence import session_scope
+            from greencompute_persistence.key_limits import NEW_ACCOUNT, account_room
+            from greencompute_persistence.orm import UserORM
 
-            if account_blocked(self.repository.session_factory, failed.owner_user_id):
-                return None
-            balance = BillingRepository().get_balance(failed.owner_user_id)
+            if account_blocked(self.repository.session_factory, owner):
+                return self._note_not_replaced(failed, "the account can't start rentals")
+            with session_scope(self.repository.session_factory) as session:
+                user = session.get(UserORM, owner)
+                balance = user.balance_credits if user is not None else 0
+            why, source, _numbers = account_room(self.repository.session_factory, owner)
+            can_place, _capacity = self.placement_preview(workload)
         except Exception:  # noqa: BLE001 - can't check: leave it failed, as before
             logger.exception("auto-replace of %s: couldn't check the owner's account", failed.deployment_id)
-            return None
+            return self._note_not_replaced(failed, "its account couldn't be checked")
         if balance < hourly_cents:
             return self._note_not_replaced(failed, "the balance doesn't cover an hour of it")
+        if why == "active":
+            limit_name = "a new account's" if source == NEW_ACCOUNT else "the account's"
+            return self._note_not_replaced(failed, f"{limit_name} limit on rentals at once is reached")
+        if why == "spend":
+            limit_name = "a new account's" if source == NEW_ACCOUNT else "the account's"
+            return self._note_not_replaced(failed, f"{limit_name} spend limit for 24 hours is reached")
+        if not can_place:
+            if not final_attempt:
+                raise _NoRoomYet()
+            return self._note_not_replaced(failed, "no GPU it fits on is free right now")
         replacement = self.create_deployment({
             "workload_id": failed.workload_id,
             "name": failed.name,
@@ -903,6 +972,7 @@ class ControlPlaneService:
         return self.repository.update_deployment(failed)
 
     def _note_not_replaced(self, failed: DeploymentRecord, why: str) -> DeploymentRecord:
+        logger.info("private model deployment %s not replaced: %s", failed.deployment_id, why)
         failed.last_error = f"{failed.last_error or 'failed its health checks'}. Not restarted automatically: {why}."
         self.metrics.increment("deployment.private_model.not_replaced")
         return self.repository.update_deployment(failed)
@@ -1738,7 +1808,7 @@ class ControlPlaneService:
     def process_pending_events(self, limit: int = 10) -> dict[str, list]:
         events = self.bus.claim_pending(
             "control-plane-worker",
-            ["deployment.requested", "usage.recorded", "invocation.recorded"],
+            ["deployment.requested", "usage.recorded", "invocation.recorded", "deployment.replacement_requested"],
             limit=limit,
         )
         scheduled: list[DeploymentRecord] = []
@@ -1765,6 +1835,8 @@ class ControlPlaneService:
                     invocation_record = self._process_invocation_record(event)
                     if invocation_record is not None:
                         invocation_records.append(invocation_record)
+                elif event.subject == "deployment.replacement_requested":
+                    self._process_replacement_request(event)
                 else:
                     self.bus.mark_failed(
                         event.delivery_id, f"unsupported workflow subject={event.subject}"
