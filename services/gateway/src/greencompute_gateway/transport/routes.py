@@ -1426,8 +1426,12 @@ def _create_workload(payload_data: dict, api_key) -> dict:
         # Template builders raise ValueError (e.g. "model must be org/model
         # format"); without this it would surface as a 500.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    from greencompute_gateway.application.services import SecretReferenceError
+
     try:
         workload = service.create_workload(request, api_key.user_id)
+    except SecretReferenceError as exc:
+        raise coded(422, "validation_error", exc.errors) from exc
     except ValueError as exc:  # e.g. an ingress_host outside the model zone
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _redact_workload(workload.model_dump(mode="json"))
@@ -1444,10 +1448,13 @@ def _redact_workload(d: dict) -> dict:
     any client, owner or not. Public keys / ports / other config stay intact.
     (A workload is visible cross-user when public, so an un-redacted hf_token
     would otherwise leak to every authenticated user.)"""
+    from greencompute_persistence.user_secrets import REFERENCE_KEYS
+
     meta = d.get("metadata")
     if isinstance(meta, dict):
+        # secret_env / hf_token_secret name secrets and hold no values: shown as given.
         d["metadata"] = {
-            k: ("***redacted***" if _is_secret_meta_key(k) else v)
+            k: ("***redacted***" if _is_secret_meta_key(k) and k not in REFERENCE_KEYS else v)
             for k, v in meta.items()
         }
         # A pod's environment usually carries tokens: return the names only.
@@ -1494,12 +1501,12 @@ def update_workload(
 ) -> dict:
     api_key = require_api_key(authorization, x_api_key)
     try:
-        return service.update_workload(
+        return _redact_workload(service.update_workload(
             workload_id,
             payload,
             actor_user_id=api_key.user_id,
             admin=api_key.admin,
-        ).model_dump(mode="json")
+        ).model_dump(mode="json"))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1537,11 +1544,11 @@ def delete_workload(
 ) -> dict:
     api_key = require_api_key(authorization, x_api_key)
     try:
-        return service.delete_workload(
+        return _redact_workload(service.delete_workload(
             workload_id,
             actor_user_id=api_key.user_id,
             admin=api_key.admin,
-        ).model_dump(mode="json")
+        ).model_dump(mode="json"))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1675,6 +1682,7 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         NewAccountLimitError,
         NoCapacityError,
         SanctionedAccountError,
+        SecretReferenceError,
         UnsupportedGPUError,
     )
 
@@ -1688,6 +1696,9 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         ), api_key.admin)
     except SanctionedAccountError as exc:
         raise _wallet_blocked() from exc
+    except SecretReferenceError as exc:
+        # A secret the workload names was deleted since: nothing was created.
+        raise coded(422, "validation_error", exc.errors) from exc
     except NewAccountLimitError as exc:
         raise _new_account_limit(exc.reason, exc.numbers) from exc
     except AccountLimitError as exc:
@@ -2818,19 +2829,57 @@ def resume_deployment(
         }) from exc
 
 
-@router.post("/platform/secrets")
+def _secret_out(secret) -> dict:
+    """A secret as every route returns it: its name and dates, never its
+    value (the value is only ever handed to the machine running a rental that
+    names it). An `ssh-key:` entry's SSH public key, which isn't secret, comes
+    back as `public_key`."""
+    from greencompute_persistence.user_secrets import public_key_of
+
+    return schemas.Secret(
+        secret_id=secret.secret_id,
+        user_id=secret.user_id,
+        name=secret.name,
+        public_key=public_key_of(secret.name, secret.value),
+        created_at=secret.created_at,
+        updated_at=secret.updated_at,
+    ).model_dump(mode="json")
+
+
+def _secret_field_error(field: str, exc: ValueError) -> HTTPException:
+    detail = [{"loc": ["body", field], "msg": str(exc), "type": "value_error"}]
+    return coded(422, "validation_error", detail)
+
+
+@router.post("/platform/secrets", response_model=None, responses=ok(schemas.Secret, "The secret's name, not its value"))
 def create_secret(
     payload: UserSecretCreateRequest,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
+    """Store a value under a name, for rentals to use as environment variables
+    (`metadata.secret_env`) or for a model's Hugging Face token
+    (`metadata.hf_token_secret`). The value is never returned by any request;
+    names are unique (409 if taken: replace the value with PUT)."""
+    from greencompute_gateway.application.services import SecretNameTakenError
+
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
-    return service.create_secret(api_key.user_id, payload).model_dump(mode="json")
+    try:
+        return _secret_out(service.create_secret(api_key.user_id, payload))
+    except SecretNameTakenError as exc:
+        raise coded(409, "conflict", {
+            "message": f"you already have a secret named {exc.existing.name!r}",
+            "secret_id": exc.existing.secret_id,
+            "hint": f"replace its value with PUT /platform/secrets/{exc.existing.secret_id}, "
+                    "or delete it first",
+        }) from exc
+    except ValueError as exc:
+        raise _secret_field_error("value" if "public key" in str(exc) else "name", exc) from exc
 
 
-@router.get("/platform/secrets")
+@router.get("/platform/secrets", response_model=None, responses=ok(list[schemas.Secret], "Names and dates, never values"))
 def list_secrets(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -2838,22 +2887,41 @@ def list_secrets(
     api_key = require_api_key(authorization, x_api_key)
     if api_key.user_id is None:
         raise HTTPException(status_code=403, detail="api key must be bound to a user")
-    return [secret.model_dump(mode="json") for secret in service.list_secrets(api_key.user_id)]
+    return [_secret_out(secret) for secret in service.list_secrets(api_key.user_id)]
 
 
-@router.delete("/platform/secrets/{secret_id}")
+@router.put("/platform/secrets/{secret_id}", response_model=None, responses=ok(schemas.Secret, "The secret, value replaced"))
+def replace_secret(
+    secret_id: str,
+    payload: schemas.SecretUpdate,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Replace a secret's value; its name, and every workload using it, stay.
+    Rentals started from now on get the new value; running ones keep theirs."""
+    api_key = require_api_key(authorization, x_api_key)
+    try:
+        return _secret_out(service.update_secret(secret_id, payload.value, user_id=api_key.user_id,
+                                                 admin=api_key.admin))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="secret not found") from exc
+    except ValueError as exc:
+        raise _secret_field_error("value", exc) from exc
+
+
+@router.delete("/platform/secrets/{secret_id}", response_model=None, responses=ok(schemas.Secret, "The deleted secret"))
 def delete_secret(
     secret_id: str,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
+    """Delete a secret. Running rentals keep the value they started with; a
+    new deployment of a workload that names it is refused (422)."""
     api_key = require_api_key(authorization, x_api_key)
     try:
-        return service.delete_secret(secret_id, user_id=api_key.user_id, admin=api_key.admin).model_dump(mode="json")
+        return _secret_out(service.delete_secret(secret_id, user_id=api_key.user_id, admin=api_key.admin))
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail="secret not found") from exc
 
 
 # ---------------------------------------------------------------------------

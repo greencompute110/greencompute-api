@@ -185,7 +185,7 @@ def t_rent_gpu(auth: tuple, args: dict) -> dict:
             "`ssh_public_keys` needs at least one SSH public key, e.g. [\"ssh-ed25519 AAAA… me@laptop\"] "
             "(the contents of ~/.ssh/id_ed25519.pub); without one you couldn't log in")
     metadata: dict[str, Any] = {"ssh_public_keys": keys, "volume_size_gb": _int(args, "disk_gb", 50, 10, 500)}
-    for key in ("command", "restart_policy", "env"):
+    for key in ("command", "restart_policy", "env", "secret_env"):
         if args.get(key) is not None:
             metadata[key] = args[key]
     body: dict[str, Any] = {"workload_id": "pending"}
@@ -325,6 +325,9 @@ TOOLS: list[dict[str, Any]] = [
          "command": {"type": "string", "description": "Optional command to run when it starts (output in /workspace/greencompute-command.log)."},
          "restart_policy": {"type": "string", "enum": ["never", "on-failure", "always"], "description": "Run the command again when it exits."},
          "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment variables."},
+         "secret_env": {"type": "object", "additionalProperties": {"type": "string"}, "description": (
+             "Environment variables filled from your saved secrets: {\"VAR\": \"<secret name>\"} (POST "
+             "/platform/secrets). The values never appear in any response.")},
          "max_runtime_minutes": {"type": "integer", "minimum": 1, "description": "Stop it automatically after this long."},
          "disk_gb": {"type": "integer", "minimum": 10, "maximum": 500, "description": "Disk at /workspace (default 50)."},
          "idempotency_key": {"type": "string", "description": "Send the same key when retrying, so a retry never rents twice."},

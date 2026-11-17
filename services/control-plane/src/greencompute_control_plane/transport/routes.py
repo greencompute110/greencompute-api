@@ -153,6 +153,13 @@ def get_workload(
     workload = service.repository.get_workload(workload_id)
     if workload is None:
         raise HTTPException(status_code=404, detail="workload not found")
+    # The secrets it names (metadata.secret_env / hf_token_secret) are filled
+    # in here and only here, for the miner holding one of its leases: the
+    # machine that starts it. Any other miner gets the names alone.
+    if any(lease.workload_id == workload_id for lease in service.list_leases(hotkey)):
+        from greencompute_persistence.user_secrets import resolve_workload_secrets
+
+        workload = resolve_workload_secrets(workload, service.repository.session_factory)
     return workload.model_dump(mode="json")
 
 

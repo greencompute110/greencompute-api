@@ -687,3 +687,27 @@ class AccountLimits(BaseModel):
     new_account_limits: NewAccountLimits | None = Field(
         default=None, description="A new wallet account's first-week limits, while they last.")
     in_force: AccountLimitsInForce
+
+
+# --- Secrets -------------------------------------------------------------------------
+
+
+class Secret(BaseModel):
+    """A stored secret: its name and dates. The value is never returned."""
+    secret_id: str
+    user_id: str
+    name: str = Field(description=(
+        "Unique on the account. Use it in a pod's `metadata.secret_env` ({\"VAR\": \"<name>\"}) or as a model's "
+        "`metadata.hf_token_secret`."))
+    public_key: str | None = Field(default=None, description=(
+        "Only for an `ssh-key:<label>` entry (the website's saved SSH keys): the SSH public key it holds, which "
+        "isn't secret. null for every other secret."))
+    created_at: datetime
+    updated_at: datetime
+
+
+class SecretUpdate(BaseModel):
+    """PUT /platform/secrets/{secret_id}: the new value."""
+    model_config = {"extra": "forbid"}
+
+    value: str = Field(min_length=1, max_length=4096)
