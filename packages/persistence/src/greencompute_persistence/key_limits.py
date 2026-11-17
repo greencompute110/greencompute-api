@@ -19,8 +19,10 @@ from greencompute_persistence.orm import APIKeyORM, DeploymentORM, InvocationRec
 
 SPEND_WINDOW = timedelta(hours=24)
 
-# Ledger debits that aren't spending: staff clawing back a payment.
-_NOT_SPEND = ("refund", "chargeback")
+# Ledger debits that aren't spending: staff taking money out of an account
+# (an adjustment, clawing back a payment, credit forfeited when the account
+# closed). The same as billing_monitor.MANUAL_DEBITS (a test keeps them equal).
+_NOT_SPEND = ("adjustment", "refund", "chargeback", "account_closed")
 
 # Deployments in these states no longer count towards max_active_rentals.
 _FINISHED_STATES = ("terminated", "failed")
@@ -37,6 +39,7 @@ def key_spend_cents(session_factory, key_id: str, since: datetime | None = None)
             .where(
                 DeploymentORM.created_by_key_id == key_id,
                 LedgerEntryORM.amount_cents < 0,
+                LedgerEntryORM.kind.not_in(_NOT_SPEND),
                 LedgerEntryORM.created_at >= since,
             )
         ) or 0

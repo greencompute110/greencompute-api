@@ -53,6 +53,7 @@ def test_spend_adds_rentals_and_inference_for_that_key_only(db):
     _charge(db.sf, 20, d1, kind="storage")
     _charge(db.sf, 500, d1, when=datetime.now(UTC) - timedelta(hours=30))  # outside the 24h window
     _charge(db.sf, 70, _deployment(db.sf, "k2"))
+    _charge(db.sf, 40, d1, kind="adjustment")  # staff taking money out isn't the key spending
     _inference(db.sf, "k1", 30)
     _inference(db.sf, "k2", 5)
     assert key_spend_cents(db.sf, "k1") == 150

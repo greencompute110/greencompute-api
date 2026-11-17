@@ -491,3 +491,19 @@ def test_model_requests_use_the_stricter_of_the_own_and_the_first_week_cap(db, m
     _account(db.sf, "w-under", wallet=True, age=timedelta(days=1), spend_cents=90_000)
     _charge(db.sf, "w-under", 4999, kind="inference")
     routes._enforce_account_spend_limit(key("w-under"))  # under both
+
+
+def test_staff_debits_are_not_spending(db):
+    """An adjustment (or a clawed-back payment, or credit forfeited on closing)
+    is staff taking money out, which billing_monitor reports as a manual
+    debit: it must not push an account over its spend limit."""
+    from greencompute_gateway.application.billing_monitor import MANUAL_DEBITS
+    from greencompute_persistence import key_limits
+
+    assert set(MANUAL_DEBITS) == set(key_limits._NOT_SPEND)
+    _account(db.sf, spend_cents=1000)
+    for kind in MANUAL_DEBITS:
+        _charge(db.sf, "u1", 5000, kind=kind)
+    _charge(db.sf, "u1", 999)
+    assert key_limits.account_spend_cents(db.sf, "u1") == 999
+    assert account_room(db.sf, "u1", starting_rental=False)[0] is None
