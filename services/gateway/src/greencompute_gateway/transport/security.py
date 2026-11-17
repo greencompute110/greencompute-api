@@ -9,13 +9,97 @@ from datetime import UTC
 
 from fastapi import HTTPException, status
 
-from greencompute_persistence import CredentialStore, FixedWindowRateLimiter, get_metrics_store, key_expired
+from greencompute_persistence import (
+    CredentialStore,
+    FixedWindowRateLimiter,
+    TokenBucketRateLimiter,
+    get_metrics_store,
+    key_expired,
+)
 from greencompute_protocol import APIKeyRecord
 
 
 credential_store = CredentialStore()
 rate_limiter = FixedWindowRateLimiter()
 metrics = get_metrics_store("greencompute-gateway")
+
+# --- Per-key request rate (every authenticated /platform route and /mcp) --------
+# A token bucket per API key: GREENCOMPUTE_KEY_RATE_PER_SECOND requests a
+# second on average (default 20), in bursts of up to GREENCOMPUTE_KEY_RATE_BURST
+# (default 40); 0 per second turns it off. Per key, never per IP: every
+# client reaches the API from one address (the host's NAT). Admin keys (and
+# the env master key) are exempt. In memory, in this process: no database
+# round-trip; the gateway runs as one process, so the limit is exact (with N
+# workers it would be N times as much). Each response says where the key
+# stands: X-RateLimit-Limit (the burst), X-RateLimit-Remaining (requests
+# that may be sent now) and X-RateLimit-Reset (seconds until it is full
+# again); a 429 `rate_limited` adds Retry-After.
+key_rate_limiter = TokenBucketRateLimiter()
+KEY_RATE_PER_SECOND_DEFAULT = 20.0
+KEY_RATE_BURST_DEFAULT = 40
+
+# Set per HTTP request by the middleware (main.py): {"path", "counted",
+# "headers"}. The first successful key check of a request takes one token
+# and leaves the headers here for the middleware to add; later checks in the
+# same request (an MCP tool runs its REST calls in-process) take none.
+# Outside a request (tests, in-process callers, the terminal WebSocket) it is
+# None and nothing is limited.
+current_rate_limit: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "gateway_current_rate_limit", default=None
+)
+
+
+def key_rate_settings() -> tuple[float, int]:
+    """(requests per second, burst) from the environment."""
+    def number(name: str, default: float) -> float:
+        try:
+            value = float(os.environ.get(name, "") or default)
+        except ValueError:
+            return default
+        return value if math.isfinite(value) and value >= 0 else default
+
+    rate = number("GREENCOMPUTE_KEY_RATE_PER_SECOND", KEY_RATE_PER_SECOND_DEFAULT)
+    burst = int(number("GREENCOMPUTE_KEY_RATE_BURST", KEY_RATE_BURST_DEFAULT))
+    return rate, max(1, burst)
+
+
+def _rate_limited_path(path: str) -> bool:
+    return path.startswith("/platform/") or path.rstrip("/") == "/mcp"
+
+
+def _apply_key_rate_limit(api_key) -> None:
+    """Take one request from the key's allowance (once per HTTP request) and
+    raise 429 rate_limited when there is none left."""
+    state = current_rate_limit.get()
+    if state is None or state.get("counted") or not _rate_limited_path(state.get("path") or ""):
+        return
+    state["counted"] = True
+    if getattr(api_key, "admin", False):
+        return
+    rate, burst = key_rate_settings()
+    if rate <= 0:
+        return
+    result = key_rate_limiter.take(api_key.key_id, rate=rate, burst=burst)
+    headers = {
+        "X-RateLimit-Limit": str(result.limit),
+        "X-RateLimit-Remaining": str(result.remaining),
+        "X-RateLimit-Reset": str(math.ceil(result.reset_seconds)),
+    }
+    state["headers"] = headers
+    if result.allowed:
+        return
+    from greencompute_gateway.transport.errors import coded
+
+    retry_after = max(1, math.ceil(result.retry_after_seconds))
+    metrics.increment("rate_limit.hit.api_key")
+    raise coded(429, "rate_limited", {
+        "message": (f"too many requests with this API key: at most {rate:g} a second on average, in bursts of "
+                    f"up to {burst}. Wait {retry_after} s, then send it again"),
+        "limit_per_second": rate,
+        "burst": burst,
+        "retry_after_seconds": retry_after,
+        "hint": "space requests out, or poll GET /platform/events instead of each rental",
+    }, headers={**headers, "Retry-After": str(retry_after)})
 
 # Per-IP auth-FAILURE rate limit. Each failed auth attempt (missing/invalid
 # key, admin-required, bad provision secret) consumes one slot in a fixed
@@ -223,6 +307,7 @@ def require_api_key(
             headers=_AUTH_HEADERS,
         )
     _refuse_expired_key(api_key)
+    _apply_key_rate_limit(api_key)
     if admin_required and not api_key.admin:
         metrics.increment("auth.failure.admin_required")
         _check_auth_failure_throttle(client_ip)

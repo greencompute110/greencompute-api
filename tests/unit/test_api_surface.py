@@ -27,8 +27,11 @@ def test_every_admin_or_provisioning_route_is_hidden_from_the_spec():
     """The spec is what agents read to decide what to call; admin routes in it
     are noise for them and a map for anyone probing the API."""
     exposed = []
+    # POST /platform/api-keys is a customer route (a key makes another key);
+    # staff tools also use it, through require_provision_or_admin.
+    customer = {"create_api_key"}
     for fn, body, decorators in _route_functions():
-        internal = (
+        internal = fn.name not in customer and (
             "admin_required=True" in body
             or "require_provision_or_admin" in body
             or fn.name == "billing_stripe_webhook"

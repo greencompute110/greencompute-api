@@ -199,6 +199,44 @@ class GatewayRepository:
             session.add(row)
         return secret
 
+    def create_secret_unique(self, secret: UserSecretRecord) -> UserSecretRecord | None:
+        """Save a new secret unless the account already has one by that name:
+        None then (the caller answers 409). The account's row is locked while
+        it looks, so two creates sent at once can't both add the name."""
+        with session_scope(self.session_factory) as session:
+            session.get(UserORM, secret.user_id, with_for_update=True)
+            taken = session.scalar(
+                select(func.count()).select_from(UserSecretORM).where(
+                    UserSecretORM.user_id == secret.user_id, UserSecretORM.name == secret.name)
+            )
+            if taken:
+                return None
+            session.add(UserSecretORM(
+                secret_id=secret.secret_id, user_id=secret.user_id, name=secret.name, value=secret.value,
+                created_at=secret.created_at, updated_at=secret.updated_at,
+            ))
+        return secret
+
+    def find_secret_by_name(self, user_id: str, name: str) -> UserSecretRecord | None:
+        """The account's secret with this name (the newest, if older rows share it)."""
+        with session_scope(self.session_factory) as session:
+            row = session.scalars(
+                select(UserSecretORM)
+                .where(UserSecretORM.user_id == user_id, UserSecretORM.name == name)
+                .order_by(UserSecretORM.updated_at.desc())
+                .limit(1)
+            ).first()
+            return self._to_secret(row) if row else None
+
+    def update_secret_value(self, secret_id: str, value: str, updated_at: datetime) -> UserSecretRecord | None:
+        with session_scope(self.session_factory) as session:
+            row = session.get(UserSecretORM, secret_id)
+            if row is None:
+                return None
+            row.value = value
+            row.updated_at = updated_at
+            return self._to_secret(row)
+
     def list_secrets(self, user_id: str) -> list[UserSecretRecord]:
         with session_scope(self.session_factory) as session:
             rows = session.scalars(select(UserSecretORM).where(UserSecretORM.user_id == user_id)).all()

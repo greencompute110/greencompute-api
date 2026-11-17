@@ -8,7 +8,7 @@ from fastapi.responses import PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 
 from greencompute_persistence import database_ready, load_runtime_settings, render_prometheus_text
-from greencompute_gateway.transport.security import current_client_ip, current_request_route
+from greencompute_gateway.transport.security import current_client_ip, current_rate_limit, current_request_route
 from greencompute_gateway.transport.security import metrics as gateway_metrics
 from greencompute_gateway.transport.mcp import router as mcp_router
 from greencompute_gateway.transport.routes import router
@@ -141,21 +141,31 @@ app.add_middleware(
     allow_headers=["*"],
     # "*" exposes every header only to requests without credentials; with
     # credentials browsers read it as a header named "*". So the ones clients
-    # read are also named: paging (X-Next-Cursor, Link), Retry-After and
-    # Idempotent-Replayed.
-    expose_headers=["*", "X-Next-Cursor", "Link", "Retry-After", "Idempotent-Replayed"],
+    # read are also named: paging (X-Next-Cursor, Link), Retry-After,
+    # Idempotent-Replayed, the per-key rate limit and Deprecation.
+    expose_headers=[
+        "*", "X-Next-Cursor", "Link", "Retry-After", "Idempotent-Replayed",
+        "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "Deprecation",
+    ],
 )
 
 @app.middleware("http")
 async def _stash_client_ip(request, call_next):
     """Record the per-request client IP in a ContextVar so the auth helpers can
     apply a per-IP auth-failure rate limit without threading `request` through
-    every handler."""
+    every handler; likewise the route (for scopes) and a slot for the key's
+    rate limit, whose X-RateLimit-* headers are added to the response here."""
     token = current_client_ip.set(_client_ip_from_request(request))
     route_token = current_request_route.set((request.method, request.url.path))
+    rate_state = {"path": request.url.path, "counted": False, "headers": None}
+    rate_token = current_rate_limit.set(rate_state)
     try:
-        return await call_next(request)
+        response = await call_next(request)
+        for name, value in (rate_state.get("headers") or {}).items():
+            response.headers[name] = value
+        return response
     finally:
+        current_rate_limit.reset(rate_token)
         current_request_route.reset(route_token)
         current_client_ip.reset(token)
 
@@ -180,6 +190,7 @@ def api_index() -> dict:
         "interactive_docs": "https://api.green-compute.com/docs",
         "pricing": "https://api.green-compute.com/platform/pricing",
         "gpu_models": "https://api.green-compute.com/platform/nodes/supported",
+        "status": "https://api.green-compute.com/platform/status",
         "inference_base_url": "https://api.green-compute.com/v1",
         "auth": "Authorization: Bearer <api key> -- create one at https://www.green-compute.com/settings",
         "wallet_sign_in": "No account yet? POST /platform/auth/wallet/challenge, sign the message with your "
@@ -203,9 +214,16 @@ def readiness() -> dict[str, str]:
     return {"status": "ok", "service": settings.service_name, "database": "ok"}
 
 
-@app.get("/_metrics")
+@app.get("/_metrics", include_in_schema=False)
 def prometheus_metrics() -> PlainTextResponse:
     return PlainTextResponse(
         render_prometheus_text(settings.service_name, gateway_metrics),
         media_type="text/plain; version=0.0.4",
     )
+
+
+# The spec: auth schemes, coded error responses, rate-limit headers (after
+# every route above is added; it is generated once, on first request).
+from greencompute_gateway.transport import openapi as _openapi_doc  # noqa: E402
+
+_openapi_doc.install(app)

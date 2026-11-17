@@ -262,6 +262,9 @@ class FleetORM(Base):
     failures_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Set by DELETE /platform/fleets/{id} (with state "stopped"): no longer
+    # listed, and 404 by id.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class FleetMemberORM(Base):

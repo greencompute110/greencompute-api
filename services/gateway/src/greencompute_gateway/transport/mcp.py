@@ -15,6 +15,15 @@ each call runs as that REST request. Errors come back as tool results with
 
 A platform-made SSH private key is never put in a tool result: it would land
 in the assistant's context. Pass your own public key to rent_gpu instead.
+
+rent_gpu, get_rental and stop_rental return the rental as GET
+/platform/deployments/{id} does (flat), plus the same summary under `rental`
+as before. rent_gpu needs a workload for the rental: it reuses one it made
+before for the account with exactly the same settings (marked
+`metadata.created_by_tool: "mcp.rent_gpu"`), so renting the same machine
+again and again doesn't pile up workloads, and makes one otherwise.
+stop_rental leaves the workload: deleting a workload deletes its rentals'
+history (get_rental, list_rentals, statements).
 """
 from __future__ import annotations
 
@@ -44,6 +53,9 @@ INSTRUCTIONS = (
     "https://www.green-compute.com/docs"
 )
 ACTIVE_STATES = "pending,scheduled,pulling,starting,ready,suspended"
+#: metadata.created_by_tool on the workload rent_gpu makes, so a later
+#: rent_gpu with the same settings reuses it rather than making another.
+RENT_GPU_MARK = "mcp.rent_gpu"
 
 # --- tools -----------------------------------------------------------------------
 
@@ -141,7 +153,7 @@ def t_get_rental(auth: tuple, args: dict) -> dict:
     dep_id = _str(args, "deployment_id", required=True)
     dep = _as("GET", f"/platform/deployments/{dep_id}",
               lambda: r.get_deployment(dep_id, authorization=auth[0], x_api_key=auth[1]))
-    out: dict[str, Any] = {"rental": _brief(dep)}
+    out: dict[str, Any] = {**dep, "rental": _brief(dep)}
     endpoint = str(dep.get("endpoint") or "")
     if dep.get("state") == "ready" and endpoint.startswith("ssh://"):
         user_host = endpoint[len("ssh://"):]
@@ -184,8 +196,9 @@ def t_rent_gpu(auth: tuple, args: dict) -> dict:
         raise ToolInputError(
             "`ssh_public_keys` needs at least one SSH public key, e.g. [\"ssh-ed25519 AAAA… me@laptop\"] "
             "(the contents of ~/.ssh/id_ed25519.pub); without one you couldn't log in")
-    metadata: dict[str, Any] = {"ssh_public_keys": keys, "volume_size_gb": _int(args, "disk_gb", 50, 10, 500)}
-    for key in ("command", "restart_policy", "env"):
+    metadata: dict[str, Any] = {"ssh_public_keys": keys, "volume_size_gb": _int(args, "disk_gb", 50, 10, 500),
+                                "created_by_tool": RENT_GPU_MARK}
+    for key in ("command", "restart_policy", "env", "secret_env"):
         if args.get(key) is not None:
             metadata[key] = args[key]
     body: dict[str, Any] = {"workload_id": "pending"}
@@ -211,25 +224,56 @@ def t_rent_gpu(auth: tuple, args: dict) -> dict:
         "metadata": metadata,
     }
     idem = _str(args, "idempotency_key")
-    wl = _as("POST", "/platform/workloads", lambda: r.create_workload(
-        workload, Response(), authorization=auth[0], x_api_key=auth[1],
-        idempotency_key=f"{idem}:workload" if idem else None))
+    reused = _reusable_workload(auth, workload)
+    if reused:
+        wl = {"workload_id": reused}
+    else:
+        wl = _as("POST", "/platform/workloads", lambda: r.create_workload(
+            workload, Response(), authorization=auth[0], x_api_key=auth[1],
+            idempotency_key=f"{idem}:workload" if idem else None))
     body["workload_id"] = wl["workload_id"]
     try:
         dep = _as("POST", "/platform/deployments", lambda: r.create_deployment(
             GatewayDeploymentCreateRequest(**body), Response(), authorization=auth[0], x_api_key=auth[1],
             idempotency_key=idem))
     except Exception:
-        # Nothing was rented: don't leave the workload behind. (With an
-        # idempotency key a retry must find the same workload, so it stays.)
-        if not idem:
+        # Nothing was rented: don't leave a workload made for it behind. (With
+        # an idempotency key a retry must find the same workload, so it
+        # stays; one reused from before stays too.)
+        if not idem and not reused:
             try:
                 _as("DELETE", f"/platform/workloads/{wl['workload_id']}",
                     lambda: r.delete_workload(wl["workload_id"], authorization=auth[0], x_api_key=auth[1]))
             except Exception:  # noqa: BLE001
                 log.warning("mcp rent_gpu: could not remove workload %s after a failed rent", wl["workload_id"])
         raise
-    return {"rental": _brief(dep), "next": "Starting. Call get_rental in 30 seconds; it is usually ready in 1-3 minutes."}
+    return {**dep, "rental": _brief(dep), "workload_reused": bool(reused),
+            "next": "Starting. Call get_rental in 30 seconds; it is usually ready in 1-3 minutes."}
+
+
+def _reusable_workload(auth: tuple, workload: dict) -> str | None:
+    """The id of a workload rent_gpu made before for this account with
+    exactly these settings (image, GPUs, SSH keys, disk, command, env,
+    secret_env, name), else None. Looked up as the POST /platform/workloads
+    it stands in for, so a key that couldn't create one can't reuse one."""
+    from greencompute_gateway.application.services import _tidy_secret_references, normalize_pod_start
+    from greencompute_protocol import WorkloadCreateRequest
+
+    r = _routes()
+    try:
+        api_key = _as("POST", "/platform/workloads", lambda: r.require_api_key(auth[0], auth[1]))
+        wanted = WorkloadCreateRequest(**workload)
+        metadata = _tidy_secret_references(normalize_pod_start(dict(wanted.metadata)))
+    except Exception:  # noqa: BLE001 - no reuse: the create reports the problem
+        return None
+    if getattr(api_key, "user_id", None) is None:
+        return None
+    for existing in r.service.control_plane.repository.list_workloads_by_name(wanted.name, api_key.user_id):
+        if ((existing.metadata or {}).get("created_by_tool") == RENT_GPU_MARK
+                and existing.kind == wanted.kind and existing.image == wanted.image
+                and existing.requirements == wanted.requirements and (existing.metadata or {}) == metadata):
+            return existing.workload_id
+    return None
 
 
 def t_stop_rental(auth: tuple, args: dict) -> dict:
@@ -237,7 +281,7 @@ def t_stop_rental(auth: tuple, args: dict) -> dict:
     dep_id = _str(args, "deployment_id", required=True)
     dep = _as("DELETE", f"/platform/deployments/{dep_id}",
               lambda: r.terminate_deployment(dep_id, authorization=auth[0], x_api_key=auth[1]))
-    return {"rental": _brief(dep), "note": "Stopped: billing has stopped and its disk is deleted."}
+    return {**dep, "rental": _brief(dep), "note": "Stopped: billing has stopped and its disk is deleted."}
 
 
 def t_rental_logs(auth: tuple, args: dict) -> dict:
@@ -310,7 +354,8 @@ TOOLS: list[dict[str, Any]] = [
          "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "At most this many per page."},
          "cursor": {"type": "string", "description": "next_cursor from the previous page, unchanged."}}}},
     {"name": "get_rental", "title": "Get a rental", "handler": t_get_rental, "readOnly": True,
-     "description": "One rental's state and, once it is ready, how to SSH in (command and host keys).",
+     "description": ("One rental, as GET /platform/deployments/{id} returns it, and once it is ready, how to SSH "
+                     "in (command and host keys)."),
      "inputSchema": {"type": "object", "properties": _ID, "required": ["deployment_id"]}},
     {"name": "rent_gpu", "title": "Rent a GPU", "handler": t_rent_gpu, "readOnly": False,
      "description": ("Start a GPU rental (a pod with SSH, billed by the minute once ready). Returns its deployment_id; "
@@ -325,6 +370,9 @@ TOOLS: list[dict[str, Any]] = [
          "command": {"type": "string", "description": "Optional command to run when it starts (output in /workspace/greencompute-command.log)."},
          "restart_policy": {"type": "string", "enum": ["never", "on-failure", "always"], "description": "Run the command again when it exits."},
          "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment variables."},
+         "secret_env": {"type": "object", "additionalProperties": {"type": "string"}, "description": (
+             "Environment variables filled from your saved secrets: {\"VAR\": \"<secret name>\"} (POST "
+             "/platform/secrets). The values never appear in any response.")},
          "max_runtime_minutes": {"type": "integer", "minimum": 1, "description": "Stop it automatically after this long."},
          "disk_gb": {"type": "integer", "minimum": 10, "maximum": 500, "description": "Disk at /workspace (default 50)."},
          "idempotency_key": {"type": "string", "description": "Send the same key when retrying, so a retry never rents twice."},
@@ -432,7 +480,9 @@ async def mcp(request: Request) -> Response:
     try:
         api_key = await run_in_threadpool(require_api_key, authorization, x_api_key)
     except HTTPException as exc:
-        body = {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": describe_error(
+        # -32002: over the key's request rate (429); -32001: the key itself.
+        body = {"jsonrpc": "2.0", "id": None, "error": {"code": -32002 if exc.status_code == 429 else -32001,
+                                                        "message": describe_error(
             exc.status_code, exc.detail, exc.headers, getattr(exc, "error_code", None))["message"]}}
         return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
     try:
