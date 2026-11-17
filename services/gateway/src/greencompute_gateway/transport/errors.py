@@ -38,7 +38,7 @@ SUPPORT = "support@green-compute.com"
 #: Codes whose request may succeed if sent again later, unchanged.
 RETRYABLE = frozenset({
     "no_capacity", "rate_limited", "idempotency_in_progress", "model_not_ready", "unavailable", "server_error",
-    "terminal_limit",
+    "terminal_limit", "account_busy",
 })
 
 #: Every code, its usual status, and what it means: the table in the docs.
@@ -77,6 +77,8 @@ CODES: dict[str, tuple[int, str]] = {
     "method_not_allowed": (405, "That HTTP method isn't used on this path."),
     "conflict": (409, "The resource's current state doesn't allow this."),
     "active_deployments": (409, "Stop the running rentals and models first."),
+    "account_busy": (409, "Another rental is being started for this account right now (it has a limit on rentals "
+                          "at once, so they start one at a time); send it again after `retry_after_seconds`."),
     "idempotency_in_progress": (409, "A request with this Idempotency-Key is still running."),
     "model_not_ready": (409, "The model has no replica ready yet (starting or moving); retry shortly."),
     "terminal_idle": (408, "The terminal closed after 15 minutes with no input or output; open a new one."),

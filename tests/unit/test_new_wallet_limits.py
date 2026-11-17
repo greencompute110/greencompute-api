@@ -184,6 +184,10 @@ def test_a_busy_new_account_hears_to_send_it_again(monkeypatch):
         routes._create_deployment(DeploymentCreateRequest(workload_id="w"), key)
     assert (exc.value.status_code, exc.value.headers["Retry-After"]) == (409, "2")
     assert "again in a moment" in exc.value.detail
+    from greencompute_gateway.transport.errors import describe_error
+
+    err = describe_error(409, exc.value.detail, exc.value.headers, exc.value.error_code)
+    assert (err["code"], err["retryable"], err["retry_after_seconds"]) == ("account_busy", True, 2)
 
 
 def test_running_rentals_stop_when_a_new_wallet_account_reaches_its_daily_spend(tmp_path):

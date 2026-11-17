@@ -1696,7 +1696,7 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         raise _account_limit_error(exc.reason, exc.numbers) from exc
     except NewAccountBusyError as exc:
         raise coded(
-            409, "conflict",
+            409, "account_busy",
             "another rental is being started for this account right now; send this one again in a moment",
             headers={"Retry-After": "2"},
         ) from exc
