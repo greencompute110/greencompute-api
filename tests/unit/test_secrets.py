@@ -154,6 +154,15 @@ def test_only_real_public_keys_count():
     assert not is_ssh_public_key(VALUE)
 
 
+def test_an_old_ssh_key_entry_saved_with_a_stray_line_break_still_shows(world):
+    with session_scope(world.gw.repository.session_factory) as s:
+        s.add(UserSecretORM(secret_id="s1", user_id="ann", name="ssh-key:old", value=PUBKEY + "\r\n"))
+        s.add(UserSecretORM(secret_id="s2", user_id="ann", name="ssh-key:priv",
+                            value="-----BEGIN OPENSSH PRIVATE KEY-----\nssh-ed25519 AAAA\n"))
+    keys = {s["secret_id"]: s["public_key"] for s in world.client.get("/platform/secrets", headers=AUTH).json()}
+    assert keys == {"s1": PUBKEY, "s2": None}
+
+
 def test_an_old_ssh_key_entry_holding_a_secret_is_not_returned(world):
     with session_scope(world.gw.repository.session_factory) as s:
         s.add(UserSecretORM(secret_id="s1", user_id="ann", name="ssh-key:weird", value=VALUE))

@@ -65,9 +65,18 @@ def is_ssh_public_key(value: str | None) -> bool:
     return blob[4:4 + size] == match.group(1).encode()
 
 
+_PUBLIC_LINE = re.compile(r"^(\S+) [A-Za-z0-9+/]+={0,3}(?:\s.*)?$")
+
+
 def public_key_of(name: str, value: str) -> str | None:
-    """The SSH public key an `ssh-key:` secret holds, else None."""
-    if name.startswith(SSH_KEY_PREFIX) and is_ssh_public_key(value):
+    """The SSH public key(s) an `ssh-key:` secret holds, else None. New ones
+    are checked strictly when saved (is_ssh_public_key); older rows are shown
+    when every line is shaped like a public key and none is a private key, so
+    a key saved with a stray line break isn't lost from the rental form."""
+    if not name.startswith(SSH_KEY_PREFIX) or not isinstance(value, str) or "PRIVATE KEY" in value:
+        return None
+    lines = [line.strip() for line in value.strip().splitlines() if line.strip()]
+    if lines and all((m := _PUBLIC_LINE.match(line)) and m.group(1) in _SSH_KEY_TYPES for line in lines):
         return value.strip()
     return None
 
