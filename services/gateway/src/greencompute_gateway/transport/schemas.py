@@ -53,7 +53,7 @@ Deployment = create_model(
             description=(
                 "Cents per GPU per hour, quoted when the deployment is created and locked to the GPU it "
                 "is placed on (never above the quote). Your deployments, GPU rentals and private models "
-                "alike, are charged this × the GPU count, by the minute, while `ready`; requests to a "
+                "alike, are charged this × the GPU count for every started minute they are `ready`; requests to a "
                 "private model are not charged per token. (Shared catalog models aren't deployments of "
                 "yours: they are charged per token.)"
             ),
@@ -104,9 +104,17 @@ class SSHAccess(BaseModel):
     )
 
 
+_PENDING = ("Used but not yet charged, in cents: what your running rentals and private models ran since the "
+            "meter's last tick (once a minute), plus the sub-cent amounts it carries, each rounded up. Charged as "
+            "it adds up to whole cents, and in full (to the end of the started minute) when the rental stops.")
+_AVAILABLE = "The balance less `pending_usage_cents`: what is really left (negative when you owe more than you hold)."
+
+
 class Balance(BaseModel):
     balance_credits: int = Field(description="Balance in cents.")
     balance_usd: float
+    pending_usage_cents: int = Field(description=_PENDING)
+    available_cents: int = Field(description=_AVAILABLE)
 
 
 class RunningCost(BaseModel):
@@ -132,6 +140,8 @@ class Forecast(BaseModel):
     hours_left: float | None = Field(description="balance / burn; null when nothing is running.")
     runs_out_at: str | None = Field(description="When the balance reaches zero at this rate (ISO 8601), or null.")
     running: list[RunningCost]
+    pending_usage_cents: int = Field(description=_PENDING)
+    available_cents: int = Field(description=_AVAILABLE)
 
 
 class SpendingDay(BaseModel):
@@ -317,7 +327,7 @@ class Pricing(BaseModel):
     gpu_rental: GpuRentalPricing
     inference: InferencePricing
     private_model: PrivateModelPricing = Field(
-        description="Your own deployed model: the GPU rental rate × its GPU count, by the minute while it runs.",
+        description="Your own deployed model: the GPU rental rate × its GPU count, per started minute while it runs.",
     )
     docs: str
 
@@ -618,10 +628,17 @@ class WalletDepositAddress(BaseModel):
 
 
 class NewAccountLimits(BaseModel):
-    """A new wallet account's limits for its first 7 days, for every key together."""
+    """A new wallet account's limits for its first 7 days, for every key
+    together. They end sooner once the account has paid in
+    `lifts_after_deposit_usd` in crypto (TAO, alpha, USDC or USDT), or adds an
+    email on the website."""
     max_active_rentals: int
     daily_spend_limit_usd: float
-    until: str = Field(description="When they end. Adding an email on the website ends them sooner.")
+    until: str = Field(description="When they end at the latest.")
+    lifts_after_deposit_usd: float | None = Field(
+        default=None, description="Crypto paid in (credited deposits) that ends them at once.")
+    deposited_usd: float | None = Field(
+        default=None, description="Crypto paid in so far; card payments and staff credits don't count.")
 
 
 class CreditedDeposit(BaseModel):

@@ -16,7 +16,14 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select
 
 from greencompute_persistence.db import session_scope
-from greencompute_persistence.orm import APIKeyORM, DeploymentORM, InvocationRecordORM, LedgerEntryORM, UserORM
+from greencompute_persistence.orm import (
+    APIKeyORM,
+    CryptoInvoiceORM,
+    DeploymentORM,
+    InvocationRecordORM,
+    LedgerEntryORM,
+    UserORM,
+)
 
 SPEND_WINDOW = timedelta(hours=24)
 
@@ -114,11 +121,14 @@ def key_rental_room(
 
 # --- New wallet accounts ---------------------------------------------------------
 # An account a wallet signature created has no email and nobody has vouched
-# for it, which is what abuse looks like too. For its first week (unless the
-# website has since confirmed an email for it) the account as a whole, every
-# key together, may have only a few rentals running and spend only so much
-# a day. Env: GREENCOMPUTE_NEW_WALLET_MAX_RENTALS (2),
-# GREENCOMPUTE_NEW_WALLET_DAILY_SPEND_USD (50), GREENCOMPUTE_NEW_WALLET_DAYS (7).
+# for it, which is what abuse looks like too. For its first week the account
+# as a whole, every key together, may have only a few rentals running and
+# spend only so much a day, unless the website has since confirmed an email
+# for it or it has paid in enough in crypto (owner decision 2026-11-17:
+# money in is the vouching a wallet account can give). Env:
+# GREENCOMPUTE_NEW_WALLET_MAX_RENTALS (2), GREENCOMPUTE_NEW_WALLET_DAILY_SPEND_USD
+# (50), GREENCOMPUTE_NEW_WALLET_DAYS (7), GREENCOMPUTE_NEW_WALLET_LIFT_DEPOSIT_USD
+# (20).
 
 
 def _env_number(name: str, default: float) -> float:
@@ -128,26 +138,109 @@ def _env_number(name: str, default: float) -> float:
         return default
 
 
+#: What lifts the first-week limits, in the words customers read.
+CRYPTO_NAMES = "TAO, alpha, USDC or USDT"
+
+
+def _bonus_rates() -> dict[str, float]:
+    """Payment bonuses by base currency (the gateway's BONUS_RATES: alpha
+    10%), to take back out of what a crypto top-up credited."""
+    try:
+        from greencompute_gateway.application.billing_service import BONUS_RATES
+
+        return dict(BONUS_RATES)
+    except ImportError:  # persistence used without the gateway: its current table
+        return {"alpha": 0.10}
+
+
+def _top_up_currency(deposit_ref: str) -> str:
+    """The base currency of a crypto top-up from its ledger deposit_ref:
+    "alpha:9131128:4" → alpha, "usdc-base:0xabc:7" → usdc,
+    "manual:usdt-eth:0xabc" (staff confirmed an invoice) → usdt."""
+    parts = deposit_ref.split(":")
+    currency = parts[1] if parts[0] == "manual" and len(parts) > 1 else parts[0]
+    return currency.split("-", 1)[0].lower()
+
+
+def crypto_paid_in_cents(session, user_id: str) -> int:
+    """What the account has paid in in crypto, in cents, without the payment
+    bonus. Counted from the ledger, which is what was credited: each crypto
+    top-up is one row with its own unique deposit_ref (one per on-chain
+    transfer, or "manual:<currency>:<tx>" for an invoice staff confirmed
+    against a transaction), so nothing is counted twice. Card payments
+    ("stripe:…") and staff credits (no deposit_ref) don't count. The bonus is
+    the invoice's own `bonus_pct` for an invoice payment, else the
+    currency's rate. One query on the (user_id, created_at) index."""
+    rows = session.execute(
+        select(LedgerEntryORM.amount_cents, LedgerEntryORM.deposit_ref, CryptoInvoiceORM.bonus_pct)
+        .outerjoin(CryptoInvoiceORM, CryptoInvoiceORM.invoice_id == LedgerEntryORM.reference_id)
+        .where(
+            LedgerEntryORM.user_id == user_id,
+            LedgerEntryORM.kind == "topup",
+            LedgerEntryORM.amount_cents > 0,
+            LedgerEntryORM.deposit_ref.is_not(None),
+            LedgerEntryORM.deposit_ref.not_like("stripe%"),
+        )
+    ).all()
+    rates = _bonus_rates() if rows else {}
+    total = 0
+    for amount, deposit_ref, invoice_bonus in rows:
+        bonus = invoice_bonus if invoice_bonus is not None else rates.get(_top_up_currency(deposit_ref), 0.0)
+        total += round(amount / (1 + max(0.0, bonus or 0.0)))
+    return total
+
+
 def new_account_limits(session_factory, user_id: str | None, now: datetime | None = None) -> dict | None:
     """The limits a new wallet account is under now, or None when it isn't
-    one: {"max_active_rentals", "daily_spend_limit_usd", "until"}."""
+    one: {"max_active_rentals", "daily_spend_limit_usd", "until",
+    "lifts_after_deposit_usd", "deposited_usd"}. They end at `until` (a week
+    after sign-up), when the website confirms an email for the account, or
+    as soon as it has paid in `lifts_after_deposit_usd` in crypto
+    (crypto_paid_in_cents: credited on-chain payments without their bonus,
+    never a staff credit or a card payment). With
+    GREENCOMPUTE_NEW_WALLET_LIFT_DEPOSIT_USD at 0 or below, no deposit lifts
+    them (both fields None).
+
+    It runs on every rental start, paid request and control-plane pass: one
+    query on the account; a second, on its ledger, only for a wallet
+    account in its first week without an email."""
     if not user_id:
         return None
     with session_scope(session_factory) as session:
         row = session.execute(
-            select(UserORM.signup_method, UserORM.email_verified_at, UserORM.created_at).where(UserORM.user_id == user_id)
+            select(UserORM.signup_method, UserORM.email_verified_at, UserORM.created_at)
+            .where(UserORM.user_id == user_id)
         ).first()
-    if row is None or row.signup_method != "wallet" or row.email_verified_at is not None or row.created_at is None:
-        return None
-    created = row.created_at if row.created_at.tzinfo else row.created_at.replace(tzinfo=UTC)
-    until = created + timedelta(days=_env_number("GREENCOMPUTE_NEW_WALLET_DAYS", 7))
-    if (now or datetime.now(UTC)) >= until:
+        if row is None or row.signup_method != "wallet" or row.email_verified_at is not None or row.created_at is None:
+            return None
+        created = row.created_at if row.created_at.tzinfo else row.created_at.replace(tzinfo=UTC)
+        until = created + timedelta(days=_env_number("GREENCOMPUTE_NEW_WALLET_DAYS", 7))
+        if (now or datetime.now(UTC)) >= until:
+            return None
+        lift_cents = round(_env_number("GREENCOMPUTE_NEW_WALLET_LIFT_DEPOSIT_USD", 20) * 100)
+        paid_cents = crypto_paid_in_cents(session, user_id) if lift_cents > 0 else None
+    if paid_cents is not None and paid_cents >= lift_cents:
         return None
     return {
         "max_active_rentals": int(_env_number("GREENCOMPUTE_NEW_WALLET_MAX_RENTALS", 2)),
         "daily_spend_limit_usd": _env_number("GREENCOMPUTE_NEW_WALLET_DAILY_SPEND_USD", 50),
         "until": until,
+        "lifts_after_deposit_usd": lift_cents / 100 if paid_cents is not None else None,
+        "deposited_usd": paid_cents / 100 if paid_cents is not None else None,
     }
+
+
+def new_account_lift_text(limits: dict) -> str:
+    """How a new wallet account gets out of its limits early, e.g. "deposit
+    $15.00 more in crypto (TAO, alpha, USDC or USDT) or add an email address
+    on the website (Settings), or wait until 2026-11-24 10:00 UTC" (without
+    the deposit when no deposit lifts them)."""
+    until = limits["until"].strftime("%Y-%m-%d %H:%M UTC")
+    if limits.get("lifts_after_deposit_usd") is None:
+        return f"add an email address on the website (Settings), or wait until {until}"
+    more = max(0.0, limits["lifts_after_deposit_usd"] - (limits.get("deposited_usd") or 0.0))
+    return (f"deposit ${more:.2f} more in crypto ({CRYPTO_NAMES}) or add an email address on the website "
+            f"(Settings), or wait until {until}")
 
 
 def account_spend_cents(session_factory, user_id: str, since: datetime | None = None) -> int:

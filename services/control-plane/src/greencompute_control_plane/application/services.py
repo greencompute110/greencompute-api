@@ -548,6 +548,10 @@ class ControlPlaneService:
         # applies endpoint/ready_instances/port-mapping updates below) and
         # raises on a disallowed live→X transition.
         became_ready = update.state == DeploymentState.READY and deployment.state != DeploymentState.READY
+        # Leaving READY ends a spell the settlement charges (as it was: its
+        # rate, instances and machine, before this update changes them).
+        left_ready = deployment.state == DeploymentState.READY and update.state != DeploymentState.READY
+        was_ready = deployment.model_copy() if left_ready else None
         deployment.state = transition_state(deployment.state, update.state)
         deployment.ready_instances = update.ready_instances if update.state == DeploymentState.READY else 0
         deployment.endpoint = update.endpoint or deployment.endpoint
@@ -621,11 +625,16 @@ class ControlPlaneService:
             DeploymentState.TERMINATED,
         }:
             self.repository.release_gpu_reservation(update.deployment_id)
-        saved = self.repository.update_deployment(deployment)
-        if became_ready:
-            # The hourly meter charges from here: not for time spent starting,
-            # nor (after a resume) for the time it was paused.
-            self.repository.set_billable_since(saved.deployment_id, datetime.now(UTC))
+        # Becoming READY starts the spell the hourly meter charges, in the
+        # same transaction: not for time spent starting, nor (after a resume)
+        # for the time it was paused.
+        saved = self.repository.update_deployment(
+            deployment, open_spell_at=datetime.now(UTC) if became_ready else None,
+        )
+        if was_ready is not None:
+            # After the save: a meter tick from now on sees it isn't READY and
+            # accrues nothing, so the settlement is the spell's last charge.
+            self.settle_ready_spell(was_ready)
         subject = {
             DeploymentState.READY: "deployment.ready",
             DeploymentState.SUSPENDED: "deployment.suspended",
@@ -1383,6 +1392,7 @@ class ControlPlaneService:
             requeued = self._requeue_assignment(assignment, "operator requested requeue", datetime.now(UTC))
             if requeued is not None:
                 return requeued
+        was_ready = deployment.model_copy() if deployment.state == DeploymentState.READY else None
         deployment.state = DeploymentState.PENDING
         deployment.hotkey = None
         deployment.node_id = None
@@ -1395,6 +1405,8 @@ class ControlPlaneService:
         deployment.last_retry_reason = deployment.last_error
         deployment.updated_at = datetime.now(UTC)
         saved = self.repository.update_deployment(deployment)
+        if was_ready is not None:
+            self.settle_ready_spell(was_ready, ended_at=saved.updated_at)
         self.bus.publish(
             "deployment.requested",
             {"deployment_id": saved.deployment_id, "workload_id": saved.workload_id, "requested_instances": saved.requested_instances},
@@ -1539,6 +1551,7 @@ class ControlPlaneService:
         deployment = self.repository.get_deployment(deployment_id)
         if deployment is None:
             raise KeyError(f"deployment not found: {deployment_id}")
+        was_ready = deployment.model_copy() if deployment.state == DeploymentState.READY else None
         active_assignment = next(
             (
                 item
@@ -1578,6 +1591,8 @@ class ControlPlaneService:
         deployment.failure_class = "operator_cleanup"
         deployment.updated_at = datetime.now(UTC)
         saved = self.repository.update_deployment(deployment)
+        if was_ready is not None:
+            self.settle_ready_spell(was_ready, ended_at=saved.updated_at)
         self.repository.add_deployment_event(
             DeploymentStatusUpdate(
                 deployment_id=deployment_id,
@@ -1732,12 +1747,31 @@ class ControlPlaneService:
         if not deployment.hotkey:
             return False
         heartbeat = self.repository.get_heartbeat(deployment.hotkey)
-        if heartbeat is None or heartbeat.observed_at is None:
-            return True
-        if (now - self._ensure_utc(heartbeat.observed_at)).total_seconds() > settings.miner_heartbeat_timeout_seconds:
-            return True
         node = self._find_node(deployment.node_id) if deployment.node_id else None
-        return node is not None and self._is_node_stale(node, now=now)
+        return self._silent_at(
+            deployment.hotkey,
+            heartbeat.observed_at if heartbeat is not None else None,
+            node is not None,
+            self._as_datetime(node.observed_at) if node is not None and node.observed_at is not None else None,
+            now,
+        )
+
+    def _silent_at(
+        self, hotkey: str | None, heartbeat_seen: datetime | None, node_known: bool, node_seen: datetime | None,
+        now: datetime,
+    ) -> bool:
+        """_box_silent's rule from when the machine's heartbeat and its node's
+        inventory were last seen: no heartbeat, or one older than
+        miner_heartbeat_timeout_seconds, or a known node's inventory older
+        than node_inventory_timeout_seconds."""
+        if not hotkey:
+            return False
+        if heartbeat_seen is None:
+            return True
+        if (now - self._ensure_utc(heartbeat_seen)).total_seconds() > settings.miner_heartbeat_timeout_seconds:
+            return True
+        return (node_known and node_seen is not None
+                and (now - self._ensure_utc(node_seen)).total_seconds() > settings.node_inventory_timeout_seconds)
 
     def _end_offline_pod(self, deployment: DeploymentRecord, silent_for: float) -> None:
         reason = f"ended: the machine running it stopped reporting {int(silent_for // 3600)} hours ago"
@@ -2089,6 +2123,7 @@ class ControlPlaneService:
         workload = self.repository.get_workload(deployment.workload_id)
         if workload is None:
             return None
+        was_ready = deployment.model_copy() if deployment.state == DeploymentState.READY else None
         # ORCH-C2: release the scheduler's GPU hold so the freed GPUs become
         # schedulable again. Reservation release is the authoritative free; the
         # adjust_node_capacity increment just keeps the reported value in sync.
@@ -2120,6 +2155,10 @@ class ControlPlaneService:
         deployment.retry_exhausted = False
         deployment.updated_at = observed_at
         saved = self.repository.update_deployment(deployment)
+        if was_ready is not None:
+            # Moved off a machine that went quiet: its spell ends here (the
+            # silent time unbilled); the next machine's READY starts another.
+            self.settle_ready_spell(was_ready, ended_at=observed_at)
         self.bus.publish(
             "deployment.requested",
             {
@@ -2234,6 +2273,13 @@ class ControlPlaneService:
         never from its ready_at. (Rentals without one were already metered
         before the column existed and keep being charged per cycle.)
 
+        Each charge is also counted on the deployment's READY spell (seconds
+        and millicents, accounted up to `now`; a silent machine's tick only
+        moves the clock), so that when it leaves READY settle_ready_spell
+        charges the rest of its started minutes, once. A spell some path left
+        open on a deployment no longer READY is settled at the top of the
+        cycle (settle_unsettled_spells).
+
         Returns dict of deployment_id -> cents actually debited. Drains the
         user's balance to its floor (never below 0, never free up to the
         balance they hold) and only suspends a deployment AFTER the balance is
@@ -2252,6 +2298,13 @@ class ControlPlaneService:
         from greencompute_gateway.infrastructure.billing_repository import BillingRepository
 
         billing_repo = BillingRepository()
+        # Spells that ended by a path that didn't settle them (a crash in
+        # between, a direct state write): settled here, at the latest a minute
+        # on. Never in the way of metering what runs.
+        try:
+            self.settle_unsettled_spells(now)
+        except Exception:
+            logger.exception("settling ended spells failed; metering continues")
         ready_deployments = self.repository.list_deployments_by_state(DeploymentState.READY)
         result: dict[str, int] = {}
 
@@ -2267,7 +2320,10 @@ class ControlPlaneService:
                 continue
             # A pod whose machine has stopped reporting is kept, not moved (see
             # process_unhealthy_miners); don't bill for time it may be unusable.
+            # Its spell is accounted up to now all the same, so the settlement
+            # when it stops doesn't charge the silent time either.
             if self._box_silent(deployment, now):
+                self.repository.skip_metering(deployment.deployment_id, now)
                 continue
             billed_seconds = cycle_seconds
             since = self.repository.get_billable_since(deployment.deployment_id)
@@ -2304,6 +2360,8 @@ class ControlPlaneService:
             whole_cents, _remainder = self.repository.accrue_metering(
                 deployment.deployment_id,
                 add_mcents=add_mcents,
+                billed_seconds=billed_seconds,
+                at=now,
             )
             if whole_cents <= 0:
                 # Sub-cent accumulation this cycle — nothing to debit yet.
@@ -2403,6 +2461,165 @@ class ControlPlaneService:
             logger.info("Metered %d deployments, total %d cents", len(result), sum(result.values()))
 
         return result
+
+    # --- Settlement: every started minute a deployment was READY ---
+
+    #: The most a settlement charges for the time since the meter's last tick.
+    #: The meter ticks about every 60 s, so this only bounds a stale tick (the
+    #: control plane was down, the meter stalled), never a normal stop.
+    SETTLE_TAIL_MAX_SECONDS = 90.0
+
+    def settle_ready_spell(
+        self, deployment: DeploymentRecord, *, ended_at: datetime | None = None, silent: bool | None = None,
+    ) -> int:
+        """Charge what a READY spell still owes as it ends (stopped, failed,
+        deleted, paused for balance, a spend limit or idleness, moved): the
+        rule is every started minute it was READY, at the meter's rate (per
+        GPU × GPUs × running instances). The meter charged it minute by
+        minute as it ran; this adds the seconds since its last tick, the rest
+        of the started minute, and the sub-cent remainder it carried, rounded
+        up to a cent. So a 10 s rental pays one minute and a 61 s one two.
+
+        `deployment` is the record as it was while READY (its rate, instances
+        and machine). Time its machine was silent is never charged: the meter
+        skipped those ticks, and while it is silent as it ends (`silent`,
+        found from its heartbeat when None) the time since the last tick is
+        left out too. A deployment never READY has no spell and pays nothing.
+
+        Settled once per spell whatever calls it (a repeated stop, a machine
+        re-reporting, the reaper and the user together): the spell is closed
+        under its row lock (settle_metering_spell). Never raises; returns the
+        cents debited."""
+        ended_at = ended_at or datetime.now(UTC)
+        try:
+            workload = self.repository.get_workload(deployment.workload_id)
+            private_model = self.is_private_model(deployment, workload)
+            billed = bool(deployment.owner_user_id) and not (
+                workload is not None and workload.kind == WorkloadKind.INFERENCE and not private_model
+            )
+            gpu_count = workload.requirements.gpu_count if workload else 1
+            hourly_cents = deployment.hourly_rate_cents or 10
+            instances = max(deployment.ready_instances or 0, 1)
+            if silent is None:
+                silent = self._box_silent(deployment, ended_at)
+            settled = self.repository.settle_metering_spell(
+                deployment.deployment_id,
+                ended_at=ended_at,
+                mcents_per_hour=hourly_cents * 1000 * gpu_count * instances if billed else 0,
+                charge_tail=billed and not silent,
+                max_tail_seconds=self.SETTLE_TAIL_MAX_SECONDS,
+            )
+        except Exception as exc:
+            logger.error("Failed to settle the ready spell of %s: %s", deployment.deployment_id, exc)
+            return 0
+        if settled is None or not billed or settled["cents"] <= 0:
+            return 0
+        cents = settled["cents"]
+        description = (
+            self._private_model_charge_description(workload, gpu_count, hourly_cents)
+            if private_model
+            else metering.rental_charge_description(gpu_count, hourly_cents)
+        ) + " (final minute)"
+        try:
+            drained = self._settlement_billing().debit_user_to_floor(
+                user_id=deployment.owner_user_id,
+                amount_cents=cents,
+                kind="usage",
+                reference_id=deployment.deployment_id,
+                description=description,
+            )
+        except KeyError:
+            return 0  # the account is gone
+        except Exception as exc:
+            logger.error("Failed to debit the settlement of %s (%d cents): %s", deployment.deployment_id, cents, exc)
+            drained = {"debited_cents": 0, "shortfall_cents": cents}
+        debited = int(drained.get("debited_cents", 0))
+        shortfall = int(drained.get("shortfall_cents", 0))
+        if shortfall > 0:
+            # Still owed: carried on the row like the meter's shortfall, and
+            # charged by the meter if it runs again (a top-up and resume).
+            try:
+                self.repository.return_metering_mcents(deployment.deployment_id, mcents=shortfall * 1000)
+            except Exception as exc:
+                logger.error("Failed to carry back %d settlement cents for %s: %s",
+                             shortfall, deployment.deployment_id, exc)
+        if debited > 0:
+            self.metrics.increment("metering.settlements")
+            logger.info("Settled %s: %d cents for %d started minutes (%.0f s ready)",
+                        deployment.deployment_id, debited, settled["minutes"], settled["billed_seconds"])
+        return debited
+
+    def _settlement_billing(self):
+        """The BillingRepository settlements debit through: one per service,
+        from the environment as the meter's (the same database)."""
+        repo = getattr(self, "_settlement_billing_repo", None)
+        if repo is None:
+            from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+
+            repo = self._settlement_billing_repo = BillingRepository()
+        return repo
+
+    def settle_unsettled_spells(self, now: datetime | None = None) -> int:
+        """Settle spells still open on deployments that are no longer READY:
+        ended by a path that didn't settle them, or a crash between the state
+        change and the settlement. The end is taken as the row's last change
+        (when it left READY, as near as is known). Returns how many."""
+        now = now or datetime.now(UTC)
+        count = 0
+        for deployment_id, changed_at in self.repository.list_unsettled_spells():
+            # One row that can't be read or settled doesn't hold up the rest.
+            try:
+                deployment = self.repository.get_deployment(deployment_id)
+                if deployment is None or deployment.state == DeploymentState.READY:
+                    continue
+                self.settle_ready_spell(deployment, ended_at=min(changed_at or now, now))
+                count += 1
+            except Exception:
+                logger.exception("settling the ended spell of %s failed", deployment_id)
+        return count
+
+    def pending_usage_cents(self, user_id: str, now: datetime | None = None) -> int:
+        """What the account has used but not yet been charged, in whole cents
+        (each deployment rounded up): the seconds its READY rentals and
+        private models ran since the meter's last tick (none while a machine
+        is silent, at most SETTLE_TAIL_MAX_SECONDS), plus the sub-cent
+        remainders and any shortfall carried on its deployments that can
+        still be charged. The balance less this is what is really left.
+
+        It is on every balance read (the website polls it), so it takes a
+        fixed number of queries: one, finding nothing, for an account with
+        nothing running or owed; else one each for those deployments, their
+        workloads, their machines' heartbeats and their nodes' last reports.
+        The meter's rules (hourly_charge_cents, _box_silent) applied to them."""
+        now = now or datetime.now(UTC)
+        rows = self.repository.metering_pending(user_id)
+        if not rows:
+            return 0
+        running = {
+            r["deployment_id"] for r in rows
+            if r["state"] == DeploymentState.READY.value and r["metered_until"] is not None and not r["metered_silent"]
+        }
+        live = [r for r in rows if r["deployment_id"] in running]
+        workloads = self.repository.get_workloads({r["workload_id"] for r in live}) if live else {}
+        heartbeats = self.repository.heartbeats_seen({r["hotkey"] for r in live if r["hotkey"]}) if live else {}
+        nodes = self.repository.nodes_seen({r["node_id"] for r in live if r["node_id"]}) if live else {}
+        total = 0
+        for row in rows:
+            mcents = max(0, row["remainder_mcents"])
+            if row["deployment_id"] in running:
+                workload = workloads.get(row["workload_id"])
+                shared_model = workload is not None and workload.kind == WorkloadKind.INFERENCE and not (
+                    row["owner_user_id"] and metering.is_private_model(
+                        row["owner_user_id"], workload.kind, workload.workload_id, workload.metadata))
+                silent = self._silent_at(row["hotkey"], heartbeats.get(row["hotkey"]), row["node_id"] in nodes,
+                                         nodes.get(row["node_id"]), now)
+                if not shared_model and not silent:
+                    gpu_count = (workload.requirements.gpu_count if workload else 1) or 1
+                    per_hour = (row["hourly_rate_cents"] or 10) * gpu_count * max(row["ready_instances"] or 0, 1)
+                    tail = min(max(0.0, (now - row["metered_until"]).total_seconds()), self.SETTLE_TAIL_MAX_SECONDS)
+                    mcents += round(per_hour * 1000 * tail / 3600)
+            total += -(-mcents // 1000)
+        return total
 
     def hourly_charge_cents(
         self, deployment: DeploymentRecord, workload: WorkloadSpec | None = None, *, now: datetime | None = None,
@@ -2656,6 +2873,7 @@ class ControlPlaneService:
             NEW_ACCOUNT,
             account_spend_cents,
             accounts_with_spend_limits,
+            new_account_lift_text,
             new_account_limits,
             stricter,
         )
@@ -2664,13 +2882,14 @@ class ControlPlaneService:
         own_limits = accounts_with_spend_limits(sf)
         # user -> (limit in cents, its source) when over it, else None
         verdict: dict[str, tuple[int, str] | None] = {}
+        new_by_user: dict[str, dict | None] = {}
         paused: list[str] = []
         for deployment in self.repository.list_deployments_by_state(DeploymentState.READY):
             user_id = deployment.owner_user_id
             if not user_id:
                 continue
             if user_id not in verdict:
-                new = new_account_limits(sf, user_id)
+                new = new_by_user[user_id] = new_account_limits(sf, user_id)
                 limit, source = stricter(
                     own_limits.get(user_id), round(new["daily_spend_limit_usd"] * 100) if new else None)
                 over = limit is not None and account_spend_cents(sf, user_id) >= limit
@@ -2681,7 +2900,7 @@ class ControlPlaneService:
             if source == NEW_ACCOUNT:
                 reason = (
                     f"paused: a new wallet account can spend ${limit / 100:.2f} in 24 hours in its first "
-                    "week, and this one has; add an email to the account (Settings) to lift the limit"
+                    f"week, and this one has; to lift the limit, {new_account_lift_text(new_by_user[user_id])}"
                 )
                 metric = "deployment.suspended.new_account_limit"
             else:
