@@ -507,3 +507,23 @@ def test_staff_debits_are_not_spending(db):
     _charge(db.sf, "u1", 999)
     assert key_limits.account_spend_cents(db.sf, "u1") == 999
     assert account_room(db.sf, "u1", starting_rental=False)[0] is None
+
+
+def test_on_postgres_both_migrations_set_a_short_lock_timeout_first():
+    """users and api_keys are busy: an ALTER queued behind a long transaction
+    would block every request after it. Rendered as Postgres SQL (offline)."""
+    import io
+
+    for number in ("0079", "0080"):
+        path = next(pathlib.Path("alembic/versions").glob(f"*_{number}_*.py"))
+        spec = importlib.util.spec_from_file_location(f"m{number}pg", path)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        for step in (m.upgrade, m.downgrade):
+            buf = io.StringIO()
+            ctx = MigrationContext.configure(dialect_name="postgresql", opts={"as_sql": True, "output_buffer": buf})
+            with Operations.context(ctx):
+                step()
+            sql = buf.getvalue()
+            assert "SET LOCAL lock_timeout = '5s'" in sql, (number, step.__name__)
+            assert sql.index("SET LOCAL lock_timeout") < sql.index("ALTER TABLE"), (number, step.__name__)
