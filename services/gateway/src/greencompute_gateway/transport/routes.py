@@ -1568,12 +1568,8 @@ def get_workload_utilization(
     return service.workload_utilization(workload_id)
 
 
-@router.get("/platform/workloads/{workload_id}/warmup")
-def workload_warmup(
-    workload_id: str,
-    authorization: str | None = Header(default=None),
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-) -> StreamingResponse:
+def _warmup(workload_id: str, authorization: str | None, x_api_key: str | None,
+            headers: dict | None = None) -> StreamingResponse:
     api_key = require_api_key(authorization, x_api_key)
     workload = service.get_workload(workload_id, user_id=api_key.user_id, admin=api_key.admin)
     if workload is None:
@@ -1586,8 +1582,33 @@ def workload_warmup(
     return StreamingResponse(
         _warmup_stream(),
         media_type="text/event-stream",
-        headers={"cache-control": "no-cache"},
+        headers={"cache-control": "no-cache", **(headers or {})},
     )
+
+
+@router.post("/platform/workloads/{workload_id}/warmup")
+def workload_warmup(
+    workload_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> StreamingResponse:
+    """Warm a workload up: a server-sent event stream, `warmup_started` then
+    `warmup_complete`. Needs the `rentals` scope."""
+    return _warmup(workload_id, authorization, x_api_key)
+
+
+@router.get("/platform/workloads/{workload_id}/warmup", include_in_schema=False, deprecated=True)
+def workload_warmup_deprecated(
+    workload_id: str,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> StreamingResponse:
+    """Deprecated: a GET that starts something. Still answers as before, with
+    a `Deprecation` header and a Link to POST, its successor."""
+    return _warmup(workload_id, authorization, x_api_key, headers={
+        "Deprecation": "true",
+        "Link": f'</platform/workloads/{workload_id}/warmup>; rel="successor-version"',
+    })
 
 
 @router.get("/platform/workloads/{workload_id}/shares")
