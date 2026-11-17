@@ -33,9 +33,17 @@ from greencompute_control_plane.domain.state import transition_state
 from greencompute_control_plane.infrastructure.repository import ControlPlaneRepository
 
 logger = logging.getLogger(__name__)
-#: Serializes counting health failures (and the FAILED + replace that can
-#: follow) in this process; the gateway is the only process that counts them.
-_HEALTH_FAILURE_LOCK = threading.RLock()
+#: Serialize counting health failures (and the FAILED + replace that can
+#: follow) per workload in this process; the gateway is the only process that
+#: counts them. Per workload, so one model's failure (whose ops webhook can
+#: take seconds) never holds up another's.
+_HEALTH_FAILURE_LOCKS: dict[str, threading.Lock] = {}
+_HEALTH_FAILURE_LOCKS_GUARD = threading.Lock()
+
+
+def _health_failure_lock(workload_id: str) -> threading.Lock:
+    with _HEALTH_FAILURE_LOCKS_GUARD:
+        return _HEALTH_FAILURE_LOCKS.setdefault(workload_id, threading.Lock())
 
 
 class CannotResumeInPlace(ValueError):
@@ -697,10 +705,13 @@ class ControlPlaneService:
         return ready[0] if ready else None
 
     def record_deployment_health_failure(self, deployment_id: str, error: str) -> DeploymentRecord:
-        # One at a time: two requests failing together must not both take
-        # the deployment to FAILED and each replace it (two replicas of a
+        found = self.repository.get_deployment(deployment_id)
+        if found is None:
+            raise KeyError(f"deployment not found: {deployment_id}")
+        # One at a time per model: two requests failing together must not
+        # both take it to FAILED and each replace it (two replicas of a
         # private model, both billed by the hour).
-        with _HEALTH_FAILURE_LOCK:
+        with _health_failure_lock(found.workload_id):
             deployment = self.repository.get_deployment(deployment_id)
             if deployment is None:
                 raise KeyError(f"deployment not found: {deployment_id}")
