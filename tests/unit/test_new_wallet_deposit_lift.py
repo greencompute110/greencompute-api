@@ -200,6 +200,31 @@ def test_a_payment_in_two_transfers_staff_confirmed_counts_once(db):
     assert new_account_limits(db.sf, uid)["deposited_usd"] == 15.0
 
 
+def test_a_lift_threshold_of_zero_means_no_deposit_lifts_them(db, monkeypatch):
+    monkeypatch.setenv("GREENCOMPUTE_NEW_WALLET_LIFT_DEPOSIT_USD", "0")
+    uid = _wallet_account(db.sf)
+    _deposit(db.sf, uid, 10_000)
+    limits = new_account_limits(db.sf, uid)
+    assert limits is not None and (limits["lifts_after_deposit_usd"], limits["deposited_usd"]) == (None, None)
+    assert new_account_lift_text(limits).startswith("add an email address on the website (Settings), or wait until")
+    monkeypatch.setenv("GREENCOMPUTE_NEW_WALLET_LIFT_DEPOSIT_USD", "-5")
+    assert new_account_limits(db.sf, uid)["lifts_after_deposit_usd"] is None
+
+
+def test_without_a_deposit_lift_the_403_offers_only_the_email(db, monkeypatch):
+    monkeypatch.setenv("GREENCOMPUTE_NEW_WALLET_LIFT_DEPOSIT_USD", "0")
+    uid = _wallet_account(db.sf)
+    _spend(db.sf, uid, 5000)
+    svc, _ = _service(db.sf, uid)
+    monkeypatch.setattr(routes, "service", svc)
+    key = SimpleNamespace(user_id=uid, admin=False, key_id="k1", max_active_rentals=None, daily_spend_limit_usd=None)
+    with pytest.raises(HTTPException) as exc:
+        routes._create_deployment(DeploymentCreateRequest(workload_id="w"), key)
+    detail = exc.value.detail
+    assert detail["message"] == "New wallet accounts can spend $50.00 in any 24 hours for their first 7 days"
+    assert "crypto" not in detail["hint"] and "add an email address" in detail["hint"]
+
+
 def test_the_lift_text():
     until = datetime(2026, 11, 24, 10, 0, tzinfo=UTC)
     assert new_account_lift_text({"lifts_after_deposit_usd": 20.0, "deposited_usd": 5.5, "until": until}) == (

@@ -1272,7 +1272,7 @@ def _new_account_limit(reason: str, numbers: dict) -> HTTPException:
     from greencompute_persistence.key_limits import new_account_lift_text
 
     until = numbers["until"].isoformat() if numbers.get("until") else None
-    lift = new_account_lift_text(numbers) if numbers.get("until") and "lifts_after_deposit_usd" in numbers else None
+    lift = new_account_lift_text(numbers) if numbers.get("until") else None
     if reason == "active":
         message = (
             f"New wallet accounts can have {numbers['max_active_rentals']} rentals running at once for their "
@@ -1285,7 +1285,7 @@ def _new_account_limit(reason: str, numbers: dict) -> HTTPException:
             "first 7 days"
         )
         hint = "wait for earlier spending to fall out of the 24-hour window"
-    if lift:
+    if numbers.get("lifts_after_deposit_usd") is not None:
         message += f", until they have paid in ${numbers['lifts_after_deposit_usd']:.2f} in crypto"
     deposited = numbers.get("deposited_usd")
     return coded(403, "new_account_limit", {

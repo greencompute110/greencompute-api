@@ -197,7 +197,9 @@ def new_account_limits(session_factory, user_id: str | None, now: datetime | Non
     after sign-up), when the website confirms an email for the account, or
     as soon as it has paid in `lifts_after_deposit_usd` in crypto
     (crypto_paid_in_cents: credited on-chain payments without their bonus,
-    never a staff credit or a card payment).
+    never a staff credit or a card payment). With
+    GREENCOMPUTE_NEW_WALLET_LIFT_DEPOSIT_USD at 0 or below, no deposit lifts
+    them (both fields None).
 
     It runs on every rental start, paid request and control-plane pass: one
     query on the account; a second, on its ledger, only for a wallet
@@ -216,24 +218,27 @@ def new_account_limits(session_factory, user_id: str | None, now: datetime | Non
         if (now or datetime.now(UTC)) >= until:
             return None
         lift_cents = round(_env_number("GREENCOMPUTE_NEW_WALLET_LIFT_DEPOSIT_USD", 20) * 100)
-        paid_cents = crypto_paid_in_cents(session, user_id)
-    if paid_cents >= lift_cents:
+        paid_cents = crypto_paid_in_cents(session, user_id) if lift_cents > 0 else None
+    if paid_cents is not None and paid_cents >= lift_cents:
         return None
     return {
         "max_active_rentals": int(_env_number("GREENCOMPUTE_NEW_WALLET_MAX_RENTALS", 2)),
         "daily_spend_limit_usd": _env_number("GREENCOMPUTE_NEW_WALLET_DAILY_SPEND_USD", 50),
         "until": until,
-        "lifts_after_deposit_usd": lift_cents / 100,
-        "deposited_usd": paid_cents / 100,
+        "lifts_after_deposit_usd": lift_cents / 100 if paid_cents is not None else None,
+        "deposited_usd": paid_cents / 100 if paid_cents is not None else None,
     }
 
 
 def new_account_lift_text(limits: dict) -> str:
     """How a new wallet account gets out of its limits early, e.g. "deposit
     $15.00 more in crypto (TAO, alpha, USDC or USDT) or add an email address
-    on the website (Settings), or wait until 2026-11-24 10:00 UTC"."""
+    on the website (Settings), or wait until 2026-11-24 10:00 UTC" (without
+    the deposit when no deposit lifts them)."""
     until = limits["until"].strftime("%Y-%m-%d %H:%M UTC")
-    more = max(0.0, limits["lifts_after_deposit_usd"] - limits["deposited_usd"])
+    if limits.get("lifts_after_deposit_usd") is None:
+        return f"add an email address on the website (Settings), or wait until {until}"
+    more = max(0.0, limits["lifts_after_deposit_usd"] - (limits.get("deposited_usd") or 0.0))
     return (f"deposit ${more:.2f} more in crypto ({CRYPTO_NAMES}) or add an email address on the website "
             f"(Settings), or wait until {until}")
 
