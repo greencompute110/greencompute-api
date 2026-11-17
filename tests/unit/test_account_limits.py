@@ -472,3 +472,22 @@ def test_the_website_s_keys_count_as_unrestricted(api):
     assert routes._unrestricted_key(security.credential_store.get_api_key_by_secret("full"))
     for limited in ("read", "rent"):
         assert not routes._unrestricted_key(security.credential_store.get_api_key_by_secret(limited))
+
+
+def test_model_requests_use_the_stricter_of_the_own_and_the_first_week_cap(db, monkeypatch):
+    monkeypatch.setattr(routes.service, "repository", GatewayRepository(database_url=db.url))
+    key = lambda uid: SimpleNamespace(user_id=uid, admin=False, key_id="k", max_active_rentals=None,
+                                      daily_spend_limit_usd=None)
+    _account(db.sf, "w-default", wallet=True, age=timedelta(days=1))  # no own cap: the $50 default binds
+    _charge(db.sf, "w-default", 5000, kind="inference")
+    with pytest.raises(HTTPException) as exc:
+        routes._enforce_account_spend_limit(key("w-default"))
+    assert exc.value.error_code == "new_account_limit" and exc.value.detail["limit"] == "spend"
+    _account(db.sf, "w-own", wallet=True, age=timedelta(days=1), spend_cents=1000)  # own $10 is stricter
+    _charge(db.sf, "w-own", 1000, kind="inference")
+    with pytest.raises(HTTPException) as exc:
+        routes._enforce_account_spend_limit(key("w-own"))
+    assert exc.value.error_code == "account_spend_limit_reached" and exc.value.detail["daily_spend_limit_usd"] == 10.0
+    _account(db.sf, "w-under", wallet=True, age=timedelta(days=1), spend_cents=90_000)
+    _charge(db.sf, "w-under", 4999, kind="inference")
+    routes._enforce_account_spend_limit(key("w-under"))  # under both

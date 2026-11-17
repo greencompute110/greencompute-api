@@ -814,20 +814,18 @@ def _account_limit_error(reason: str, numbers: dict) -> HTTPException:
 
 
 def _enforce_account_spend_limit(api_key) -> None:
-    """Refuse a paid model request once the account is at the spend limit
-    its owner set (rentals are checked by create_deployment). Admin keys and
-    keys without an account pass."""
+    """Refuse a paid model request once the account is at the spend limit in
+    force: the one its owner set or, for a new wallet account, the stricter
+    first-week one (what GET /platform/account/limits shows as `in_force`).
+    Rentals are checked by create_deployment. Admin keys and keys without an
+    account pass."""
     if getattr(api_key, "admin", False) or not getattr(api_key, "user_id", None):
         return
-    from greencompute_persistence.key_limits import account_own_limits, account_spend_cents
+    from greencompute_persistence.key_limits import NEW_ACCOUNT, account_room
 
-    sf = service.repository.session_factory
-    limit = account_own_limits(sf, api_key.user_id)["daily_spend_limit_cents"]
-    if limit is None:
-        return
-    spent = account_spend_cents(sf, api_key.user_id)
-    if spent >= limit:
-        raise _account_limit_error("spend", {"daily_spend_limit_usd": limit / 100, "spent_cents": spent})
+    why, source, numbers = account_room(service.repository.session_factory, api_key.user_id, starting_rental=False)
+    if why == "spend":
+        raise _new_account_limit(why, numbers) if source == NEW_ACCOUNT else _account_limit_error(why, numbers)
 
 
 @router.get("/platform/users", include_in_schema=False)
