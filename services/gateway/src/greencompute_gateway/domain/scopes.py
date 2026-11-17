@@ -39,7 +39,8 @@ def normalize_scopes(scopes: list[str] | None) -> list[str]:
 
 
 #: required_scope's answer for a request any valid key may make: POST /mcp,
-#: whose tools then each run as their REST request, with its scope.
+#: whose tools then each run as their REST request, with its scope, and
+#: GET /platform/account/limits.
 ANY_SCOPE = "*"
 
 
@@ -50,6 +51,10 @@ def required_scope(method: str, path: str) -> str | None:
     path = path or ""
     if path.rstrip("/") == "/mcp":
         return ANY_SCOPE
+    if path.rstrip("/") == "/platform/account/limits":
+        # Any key may see the account's limits (an agent should know when it
+        # will be stopped); only a full-access key may change them.
+        return ANY_SCOPE if method == "GET" else None
     if path.startswith("/v1/"):
         return "inference"
     if path.startswith("/platform/api-keys"):

@@ -2323,29 +2323,49 @@ class ControlPlaneService:
         return stopped
 
     def stop_rentals_over_account_limits(self) -> list[str]:
-        """Terminate the running deployments of a new wallet account that has
-        spent its first-week daily limit (key_limits.new_account_limits), so
-        "$50 of spend per 24 hours" holds for rentals already running, not only
-        for new ones. Returns the stopped deployment ids."""
-        from greencompute_persistence.key_limits import account_spend_cents, new_account_limits
+        """Terminate the running deployments of an account that has reached
+        its spend limit for the last 24 hours, every key together: the one its
+        owner set (key_limits.account_own_limits) or, for a new wallet account,
+        its first-week limit (key_limits.new_account_limits), whichever is
+        stricter. The same stop as a key's limit (stop_rentals_over_key_limits),
+        so the limit holds for rentals already running, not only new ones.
+        Returns the stopped deployment ids."""
+        from greencompute_persistence.key_limits import (
+            NEW_ACCOUNT,
+            account_spend_cents,
+            accounts_with_spend_limits,
+            new_account_limits,
+            stricter,
+        )
 
-        verdict: dict[str, int | None] = {}  # user -> limit in cents when over it, else None
+        sf = self.repository.session_factory
+        own_limits = accounts_with_spend_limits(sf)
+        # user -> (limit in cents, its source) when over it, else None
+        verdict: dict[str, tuple[int, str] | None] = {}
         stopped: list[str] = []
         for deployment in self.repository.list_deployments_by_state(DeploymentState.READY):
             user_id = deployment.owner_user_id
             if not user_id:
                 continue
             if user_id not in verdict:
-                limits = new_account_limits(self.repository.session_factory, user_id)
-                limit = round(limits["daily_spend_limit_usd"] * 100) if limits else None
-                over = limit is not None and account_spend_cents(self.repository.session_factory, user_id) >= limit
-                verdict[user_id] = limit if over else None
+                new = new_account_limits(sf, user_id)
+                limit, source = stricter(
+                    own_limits.get(user_id), round(new["daily_spend_limit_usd"] * 100) if new else None)
+                over = limit is not None and account_spend_cents(sf, user_id) >= limit
+                verdict[user_id] = (limit, source) if over else None
             if verdict[user_id] is None:
                 continue
-            reason = (
-                f"stopped: a new wallet account can spend ${verdict[user_id] / 100:.2f} in 24 hours in its first "
-                "week, and this one has; add an email to the account (Settings) to lift the limit"
-            )
+            limit, source = verdict[user_id]
+            if source == NEW_ACCOUNT:
+                reason = (
+                    f"stopped: a new wallet account can spend ${limit / 100:.2f} in 24 hours in its first "
+                    "week, and this one has; add an email to the account (Settings) to lift the limit"
+                )
+            else:
+                reason = (
+                    f"stopped: its account reached its spend limit of ${limit / 100:.2f} for the last 24 hours "
+                    "(Settings > Account limits)"
+                )
             try:
                 self.update_deployment_status(
                     DeploymentStatusUpdate(
@@ -2354,7 +2374,8 @@ class ControlPlaneService:
                         error=reason,
                     )
                 )
-                self.metrics.increment("deployment.stopped.account_limit")
+                self.metrics.increment(
+                    "deployment.stopped.account_limit" if source == NEW_ACCOUNT else "deployment.stopped.account_spend_limit")
                 stopped.append(deployment.deployment_id)
                 logger.info("Stopped deployment %s: %s", deployment.deployment_id, reason)
             except Exception as exc:

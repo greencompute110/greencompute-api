@@ -47,6 +47,11 @@ class UserORM(Base):
     # Only the website server sets it: an email typed into PATCH
     # /platform/users/{id} is a contact address, not proof of anything.
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Limits the customer sets for the whole account, every key together
+    # (GET/PUT /platform/account/limits): spend in any 24 hours and rentals
+    # running at once. NULL: no limit.
+    daily_spend_limit_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    max_active_rentals: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class AdminAccountORM(Base):

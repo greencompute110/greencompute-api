@@ -644,3 +644,41 @@ class APIKeyOut(APIKeySummary):
     expires_at: datetime | None = Field(default=None, description="When it stops working; null: never.")
     expired: bool = Field(default=False, description="True once `expires_at` has passed: requests with it get 401 "
                                                      "`api_key_expired`. Delete it and create a new one.")
+
+
+# --- Account-wide limits -----------------------------------------------------------
+
+
+class AccountLimitsUpdate(BaseModel):
+    """PUT /platform/account/limits sets both (one left out: no limit); PATCH
+    changes only the fields sent. null clears a limit."""
+    model_config = {"extra": "forbid"}  # a misspelt field must not clear a limit by being left out
+
+    daily_spend_limit_usd: float | None = Field(default=None, ge=1, le=100000, description=(
+        "What the whole account, every key together, may spend in any 24 hours (rentals, storage and "
+        "inference), at least $1. At it: new rentals and paid model requests are refused and running "
+        "rentals are stopped."))
+    max_active_rentals: int | None = Field(default=None, ge=1, le=1000, description=(
+        "Rentals (and private models) the account may have running at once. Lowering it below what runs "
+        "now stops nothing; it refuses new ones until enough have ended."))
+
+
+class AccountLimitsInForce(BaseModel):
+    """The limits that apply now: for a wallet account in its first week, the
+    stricter of its own and the new-account ones."""
+    daily_spend_limit_usd: float | None
+    daily_spend_limit_source: Literal["account", "new_account"] | None = Field(description=(
+        "`account`: the limit set here; `new_account`: a new wallet account's first-week limit."))
+    max_active_rentals: int | None
+    max_active_rentals_source: Literal["account", "new_account"] | None
+
+
+class AccountLimits(BaseModel):
+    """The account's own limits, every key together, and where it stands."""
+    daily_spend_limit_usd: float | None = Field(description="Set by you; null: no limit.")
+    max_active_rentals: int | None = Field(description="Set by you; null: no limit.")
+    spent_last_24h_usd: float = Field(description="Everything charged in the last 24 hours, by any key or none.")
+    active_rentals: int = Field(description="Deployments not yet ended (starting, running or paused), any key's.")
+    new_account_limits: NewAccountLimits | None = Field(
+        default=None, description="A new wallet account's first-week limits, while they last.")
+    in_force: AccountLimitsInForce

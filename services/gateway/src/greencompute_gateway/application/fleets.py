@@ -467,6 +467,7 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
     stopping at the first refusal), stop extras, record a status. A paused
     fleet still stops extras when its target is lowered, and nothing else."""
     from greencompute_gateway.application.services import (
+        AccountLimitError,
         InsufficientBalanceForRentalError,
         KeyLimitError,
         NewAccountLimitError,
@@ -589,6 +590,13 @@ def _reconcile_locked(service, fleet_id: str, run: _Pass | None = None) -> None:
                 "running at once." if exc.reason == "active" else
                 f"Waiting: the API key that created this fleet has spent its daily limit "
                 f"(${exc.daily_spend_limit_usd:.2f})."))
+            break
+        except AccountLimitError as exc:
+            reasons.insert(0, (
+                f"Waiting: this account may have {exc.numbers.get('max_active_rentals')} rentals running at once "
+                "(its account limit, Settings > Account limits)." if exc.reason == "active" else
+                f"Waiting: this account has spent its daily limit (${exc.numbers.get('daily_spend_limit_usd'):.2f}, "
+                "Settings > Account limits)."))
             break
         except NewAccountLimitError as exc:
             reasons.insert(0, (

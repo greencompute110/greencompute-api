@@ -218,7 +218,8 @@ class EmailTakenError(ValueError):
 
 
 class NewAccountBusyError(Exception):
-    """Another rental is being started for this new wallet account right now."""
+    """Another rental is being started right now for this account, which has a
+    limit on rentals at once (a new wallet account, or one its owner set)."""
 
 
 class NewAccountLimitError(Exception):
@@ -230,6 +231,18 @@ class NewAccountLimitError(Exception):
         self.reason = reason
         self.numbers = numbers
         super().__init__(f"new wallet account at its {reason} limit")
+
+
+class AccountLimitError(Exception):
+    """The account is at one of the limits its owner set for it, every key
+    together (key_limits.account_own_limits): `reason` "active" (rentals at
+    once) or "spend" (spend in the last 24 hours). `numbers` has the limit
+    and what was measured."""
+
+    def __init__(self, reason: str, numbers: dict) -> None:
+        self.reason = reason
+        self.numbers = numbers
+        super().__init__(f"account at its own {reason} limit")
 
 
 class SanctionedAccountError(Exception):
@@ -426,8 +439,9 @@ def _owned_by(owner_user_id: str | None, user_id: str | None) -> bool:
 @contextmanager
 def _account_rental_lock(service, user_id: str | None):
     """Hold a Postgres advisory lock for this account while a deployment is
-    checked against its limits and created. Only new wallet accounts take it
-    (user_id None: no lock); elsewhere than Postgres a no-op.
+    checked against its limits and created. Only accounts with a limit on
+    rentals at once take it (new wallet accounts, and accounts whose owner
+    set one; user_id None: no lock); elsewhere than Postgres a no-op.
 
     Never waits: a second create for the same account while one is under way
     gets NewAccountBusyError at once. Waiting would park a pooled connection
@@ -1038,17 +1052,22 @@ class GatewayService:
                     raise KeyLimitError(why, max_active_rentals=key.max_active_rentals,
                                         daily_spend_limit_usd=key.daily_spend_limit_usd, numbers=numbers)
 
-        # A wallet account's first week: the account's own limits, whichever
-        # key it uses. Checked and created under a per-account lock, so
+        # The account's limits, whichever key it uses: the ones its owner set
+        # (GET/PUT /platform/account/limits) and, for a wallet account's first
+        # week, the new-account ones, the stricter of each. With a limit on
+        # rentals at once, checked and created under a per-account lock, so
         # requests sent at once can't each see room for one more.
-        from greencompute_persistence.key_limits import new_account_limits, new_account_room
+        from greencompute_persistence.key_limits import NEW_ACCOUNT, account_limits, account_room
 
-        limited = not admin and user_id is not None and new_account_limits(self.repository.session_factory, user_id)
-        with _account_rental_lock(self, user_id if limited else None):
-            if limited:
-                why, numbers = new_account_room(self.repository.session_factory, user_id)
-                if why:
+        limits = None if admin or user_id is None else account_limits(self.repository.session_factory, user_id)
+        counted = limits is not None and limits["max_active_rentals"] is not None
+        with _account_rental_lock(self, user_id if counted else None):
+            if limits is not None:
+                why, source, numbers = account_room(self.repository.session_factory, user_id, limits=limits)
+                if why and source == NEW_ACCOUNT:
                     raise NewAccountLimitError(why, numbers)
+                if why:
+                    raise AccountLimitError(why, numbers)
 
             # Fail fast when the fleet is full, too (after the balance check, so a
             # caller who must top up hears that first and is ready to go when a GPU

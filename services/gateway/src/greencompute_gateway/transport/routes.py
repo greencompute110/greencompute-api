@@ -628,6 +628,156 @@ def set_verified_email(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+# --- Account-wide limits (request #19: "stop everything at $X") ----------------------
+
+_RAISE_LIMIT = ("raise or clear it with PUT /platform/account/limits (a full-access key) or under Settings > "
+                "Account limits")
+
+
+def _account_limits_out(user_id: str) -> dict:
+    from greencompute_persistence.key_limits import (
+        account_active_rentals,
+        account_limits,
+        account_own_limits,
+        account_spend_cents,
+    )
+
+    sf = service.repository.session_factory
+    own = account_own_limits(sf, user_id)
+    limits = account_limits(sf, user_id) or {
+        "daily_spend_limit_cents": None, "daily_spend_limit_source": None,
+        "max_active_rentals": None, "max_active_rentals_source": None, "new_account": None,
+    }
+    new = limits["new_account"]
+    cents = own["daily_spend_limit_cents"]
+    in_force_cents = limits["daily_spend_limit_cents"]
+    return schemas.AccountLimits(
+        daily_spend_limit_usd=cents / 100 if cents is not None else None,
+        max_active_rentals=own["max_active_rentals"],
+        spent_last_24h_usd=round(account_spend_cents(sf, user_id) / 100, 2),
+        active_rentals=account_active_rentals(sf, user_id),
+        new_account_limits={**new, "until": new["until"].isoformat()} if new else None,
+        in_force=schemas.AccountLimitsInForce(
+            daily_spend_limit_usd=in_force_cents / 100 if in_force_cents is not None else None,
+            daily_spend_limit_source=limits["daily_spend_limit_source"],
+            max_active_rentals=limits["max_active_rentals"],
+            max_active_rentals_source=limits["max_active_rentals_source"],
+        ),
+    ).model_dump(mode="json")
+
+
+def _set_account_limits(payload: schemas.AccountLimitsUpdate, api_key, *, replace: bool) -> dict:
+    """Only a full-access key may change them, as only one may turn on a
+    wallet's sign-in: a rent-only or read-only key (a leaked agent's, say)
+    must not be able to lift the cap that stops it."""
+    if api_key.scopes and not api_key.admin:
+        raise coded(403, "scope_required", {
+            "message": "changing the account's limits needs a full-access key",
+            "required_scope": "full access", "key_scopes": list(api_key.scopes),
+        })
+    from greencompute_persistence import session_scope
+    from greencompute_persistence.orm import UserORM
+    from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+
+    sent = payload.model_fields_set
+    with session_scope(service.repository.session_factory) as session:
+        user = session.get(UserORM, api_key.user_id, with_for_update=True)
+        if user is None:
+            raise HTTPException(status_code=404, detail="user not found")
+        if not BillingRepository.caller_still_in(session, api_key.user_id, api_key.key_id):
+            raise HTTPException(status_code=401, detail="invalid api key")
+        if replace or "daily_spend_limit_usd" in sent:
+            usd = payload.daily_spend_limit_usd
+            user.daily_spend_limit_cents = round(usd * 100) if usd is not None else None
+        if replace or "max_active_rentals" in sent:
+            user.max_active_rentals = payload.max_active_rentals
+        cents, rentals = user.daily_spend_limit_cents, user.max_active_rentals
+    log.info("account limits: user_id=%s key_id=%s daily_spend_limit_cents=%s max_active_rentals=%s",
+             api_key.user_id, api_key.key_id, cents, rentals)
+    return _account_limits_out(api_key.user_id)
+
+
+@router.get("/platform/account/limits", response_model=None,
+            responses=ok(schemas.AccountLimits, "The account's limits and where it stands"))
+def get_account_limits(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """The limits set for the whole account, every key together: spend in
+    any 24 hours and rentals running at once, with what was spent in the
+    last 24 hours and how many are running. Any key of the account may read
+    them; `in_force` is what applies (for a new wallet account, the stricter
+    of these and its first-week limits)."""
+    api_key = _user_key(authorization, x_api_key)
+    return _account_limits_out(api_key.user_id)
+
+
+@router.put("/platform/account/limits", response_model=None,
+            responses=ok(schemas.AccountLimits, "The account's limits, as now set"))
+def put_account_limits(
+    payload: schemas.AccountLimitsUpdate,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Set both account-wide limits: {"daily_spend_limit_usd": 100,
+    "max_active_rentals": 10}; one left out or null means no limit. At the
+    spend limit, new rentals and paid model requests get 403
+    account_spend_limit_reached and running rentals are stopped; at the
+    rentals limit, new rentals get 403 account_rental_limit_reached (lowering
+    it stops nothing). Needs a full-access key."""
+    return _set_account_limits(payload, _user_key(authorization, x_api_key), replace=True)
+
+
+@router.patch("/platform/account/limits", response_model=None,
+              responses=ok(schemas.AccountLimits, "The account's limits, as now set"))
+def patch_account_limits(
+    payload: schemas.AccountLimitsUpdate,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Change only the limits sent, e.g. {"max_active_rentals": null} to
+    clear one. Needs a full-access key."""
+    return _set_account_limits(payload, _user_key(authorization, x_api_key), replace=False)
+
+
+def _account_limit_error(reason: str, numbers: dict) -> HTTPException:
+    """403 account_rental_limit_reached / account_spend_limit_reached: the
+    account is at a limit its owner set, every key together. Worded like the
+    key's own limits (key_limit)."""
+    if reason == "active":
+        return coded(403, "account_rental_limit_reached", {
+            "message": "this account already has as many rentals running as its account limit allows",
+            "code": "account_rental_limit_reached",
+            "max_active_rentals": numbers.get("max_active_rentals"),
+            "active_rentals": numbers.get("active_rentals"),
+            "hint": "stop one with DELETE /platform/deployments/{id}, or " + _RAISE_LIMIT,
+        })
+    return coded(403, "account_spend_limit_reached", {
+        "message": "this account has reached its spend limit for the last 24 hours",
+        "code": "account_spend_limit_reached",
+        "daily_spend_limit_usd": numbers.get("daily_spend_limit_usd"),
+        "spent_last_24h_usd": round(numbers.get("spent_cents", 0) / 100, 2),
+        "hint": "wait for earlier spending to fall out of the 24-hour window, or " + _RAISE_LIMIT,
+    })
+
+
+def _enforce_account_spend_limit(api_key) -> None:
+    """Refuse a paid model request once the account is at the spend limit
+    its owner set (rentals are checked by create_deployment). Admin keys and
+    keys without an account pass."""
+    if getattr(api_key, "admin", False) or not getattr(api_key, "user_id", None):
+        return
+    from greencompute_persistence.key_limits import account_own_limits, account_spend_cents
+
+    sf = service.repository.session_factory
+    limit = account_own_limits(sf, api_key.user_id)["daily_spend_limit_cents"]
+    if limit is None:
+        return
+    spent = account_spend_cents(sf, api_key.user_id)
+    if spent >= limit:
+        raise _account_limit_error("spend", {"daily_spend_limit_usd": limit / 100, "spent_cents": spent})
+
+
 @router.get("/platform/users", include_in_schema=False)
 def list_users(
     authorization: str | None = Header(default=None),
@@ -1468,6 +1618,7 @@ def create_deployment(
 
 def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
     from greencompute_gateway.application.services import (
+        AccountLimitError,
         InsufficientBalanceForRentalError,
         KeyLimitError,
         NewAccountBusyError,
@@ -1489,6 +1640,8 @@ def _create_deployment(payload: DeploymentCreateRequest, api_key) -> dict:
         raise _wallet_blocked() from exc
     except NewAccountLimitError as exc:
         raise _new_account_limit(exc.reason, exc.numbers) from exc
+    except AccountLimitError as exc:
+        raise _account_limit_error(exc.reason, exc.numbers) from exc
     except NewAccountBusyError as exc:
         raise coded(
             409, "conflict",
@@ -2929,6 +3082,7 @@ def chat_completions(
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("chat_completions", api_key.key_id, limit=60, window_seconds=60)
     _enforce_key_limits(api_key)
+    _enforce_account_spend_limit(api_key)
     _refuse_blocked_account(api_key)
 
     # Pre-flight balance gate: require any positive balance. Per-request cost
@@ -3031,6 +3185,7 @@ def embeddings(
     api_key = require_api_key(authorization, x_api_key)
     enforce_rate_limit("embeddings", api_key.key_id, limit=60, window_seconds=60)
     _enforce_key_limits(api_key)
+    _enforce_account_spend_limit(api_key)
     text = payload.get("input", "")
     vector = [round(((ord(char) % 32) / 31.0), 6) for char in str(text)[:16]]
     return {

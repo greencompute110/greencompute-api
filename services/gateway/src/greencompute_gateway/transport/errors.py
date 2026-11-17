@@ -55,6 +55,10 @@ CODES: dict[str, tuple[int, str]] = {
     "forbidden": (403, "This key or account may not do this."),
     "scope_required": (403, "The key lacks a scope; `detail.required_scope` names it."),
     "key_limit": (403, "The key is at one of its limits (rentals at once, or spend per 24 hours)."),
+    "account_spend_limit_reached": (403, "The account (every key together) reached the spend limit per 24 hours its "
+                                         "owner set; running rentals are stopped too. `detail` has the numbers."),
+    "account_rental_limit_reached": (403, "The account has as many rentals running as the limit its owner set; "
+                                          "stop one or raise the limit."),
     "new_account_limit": (403, "A wallet account's first 7 days: at most 2 rentals at once and $50 of spend per 24 hours."),
     "wallet_blocked": (403, "This wallet can't be used with Green Compute; contact support@green-compute.com."),
     "approval_required": (403, "This change needs a signature from a wallet that already signs in to the account; `detail.sign_with` lists them."),
@@ -166,6 +170,19 @@ def _message(code: str, detail: Any, text: str, retry_after: int | None) -> str:
         return (f"This API key expired{at}. Create a new key at https://www.green-compute.com/settings "
                 "(or with POST /platform/api-keys and a key that still works) and send it as "
                 "`Authorization: Bearer <key>`.")
+    if code in ("account_spend_limit_reached", "account_rental_limit_reached"):
+        how = ("raise or clear the limit under Settings > Account limits at https://www.green-compute.com/settings "
+               "(or PUT /platform/account/limits with a full-access key)")
+        if code == "account_spend_limit_reached" and isinstance(d.get("daily_spend_limit_usd"), (int, float)):
+            spent = d.get("spent_last_24h_usd")
+            spent_txt = f"${spent:.2f}" if isinstance(spent, (int, float)) else "its limit"
+            return (f"This account has spent {spent_txt} in the last 24 hours, and its limit is "
+                    f"${d['daily_spend_limit_usd']:.2f}. Wait for earlier spending to fall out of the 24-hour "
+                    f"window, or {how}.")
+        if code == "account_rental_limit_reached" and isinstance(d.get("max_active_rentals"), int):
+            return (f"This account has {d.get('active_rentals')} rentals running, and its limit is "
+                    f"{d['max_active_rentals']}. Stop one, or {how}.")
+        return f"{_sentence(text)} You can {how}."
     if code == "insufficient_balance":
         short = None
         if isinstance(d.get("required_cents"), int) and isinstance(d.get("current_cents"), int):

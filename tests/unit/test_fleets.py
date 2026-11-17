@@ -412,3 +412,27 @@ def test_the_status_says_how_things_stand_now(world):
     for m in _view(world, f.fleet_id)["members"]:
         _set(world, m["deployment_id"], DeploymentState.READY)
     assert _view(world, f.fleet_id)["status"] == "All 2 running."  # without waiting for the next pass
+
+
+def test_the_accounts_own_limits_are_respected(world):
+    """Limits set for the whole account (GET/PUT /platform/account/limits)
+    hold for fleets as for single rentals: the fleet waits and says why."""
+    with session_scope(world.gw._billing_repo.session_factory) as s:
+        s.get(UserORM, "ann").max_active_rentals = 2
+    f = _create(world, target=3)
+    v = _view(world, f.fleet_id)
+    assert len(v["members"]) == 2
+    assert "this account may have 2 rentals running at once" in v["status"] and "Account limits" in v["status"]
+    with session_scope(world.gw._billing_repo.session_factory) as s:
+        user = s.get(UserORM, "ann")
+        user.max_active_rentals, user.daily_spend_limit_cents = None, 100
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        from greencompute_persistence.orm import LedgerEntryORM
+
+        s.add(LedgerEntryORM(entry_id=str(uuid4()), user_id="ann", amount_cents=-100, balance_after=0,
+                             kind="usage", created_at=datetime.now(UTC)))
+    fleets.reconcile(world.gw, f.fleet_id)
+    v = _view(world, f.fleet_id)
+    assert len(v["members"]) == 2 and "has spent its daily limit ($1.00" in v["status"]
