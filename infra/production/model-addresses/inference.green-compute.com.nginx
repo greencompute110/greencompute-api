@@ -4,7 +4,8 @@
 #
 # Install: /etc/nginx/sites-available/inference.green-compute.com, symlinked
 # into sites-enabled, plus gc-model-proxy.conf in /etc/nginx/snippets/ and
-# gc-server-names.conf in /etc/nginx/conf.d/.
+# server_names_hash_bucket_size 128; in nginx.conf's http block (see
+# ../nginx/README.md: not in conf.d, or certbot renewals fail).
 # Certificates are per name, issued by gc-model-certs.
 
 server {

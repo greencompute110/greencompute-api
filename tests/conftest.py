@@ -13,6 +13,9 @@ os.environ["WEBSITE_NOTIFY_URL"] = "http://127.0.0.1:9/api/internal/notify"
 # oracle is off unless a test turns it on with its RPC call mocked, and the
 # lists are loaded from fixtures (tests/unit/test_sanctions.py).
 os.environ["GREENCOMPUTE_SANCTIONS_ORACLE_ENABLED"] = "false"
+# The TLS certificate watch never connects anywhere in tests
+# (tests/unit/test_tls_watch.py calls it with the connection faked).
+os.environ["GREENCOMPUTE_TLS_WATCH_ENABLED"] = "false"
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = ROOT.parent

@@ -45,7 +45,8 @@ async def lifespan(app: FastAPI):
     """Spawn long-running background tasks at startup; cancel them on
     shutdown: the on-chain crypto deposit watcher, the billing monitor,
     the credit watch (auto-resume after top-up, low-credit emails), fleets,
-    webhook delivery and the daily sanctions-list refresh."""
+    webhook delivery, the daily sanctions-list refresh and the TLS
+    certificate watch."""
     from greencompute_gateway.application.billing_monitor import billing_monitor_loop
     from greencompute_gateway.application.credit_watch import credit_watch_loop
     from greencompute_gateway.application.fleets import fleet_loop
@@ -53,6 +54,7 @@ async def lifespan(app: FastAPI):
     from greencompute_gateway.application.capacity_alerts import capacity_alert_loop
     from greencompute_gateway.application.stopped_alerts import stopped_alert_loop
     from greencompute_gateway.application.sanctions import sanctions_refresh_loop
+    from greencompute_gateway.application.tls_watch import tls_watch_loop
     from greencompute_gateway.infrastructure.deposit_watcher import (
         deposit_watcher_loop,
     )
@@ -71,6 +73,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(capacity_alert_loop(), name="capacity-alerts"),
         asyncio.create_task(stopped_alert_loop(), name="stopped-emails"),
         asyncio.create_task(sanctions_refresh_loop(), name="sanctions-lists"),
+        asyncio.create_task(tls_watch_loop(), name="tls-watch"),
     ]
     try:
         yield
