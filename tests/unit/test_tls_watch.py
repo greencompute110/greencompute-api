@@ -90,7 +90,7 @@ def test_unreachable_directly_retries_through_the_default_gateway():
     assert r.status == tw.OK and calls == [None, "172.18.0.1"]
 
 
-def test_unreachable_both_ways():
+def test_unreachable_both_ways_without_a_gateway():
     def fetch(host, connect):
         raise TimeoutError("timed out")
 
@@ -167,3 +167,133 @@ def test_model_addresses_ready_for_an_hour_are_watched(sf):
 def test_hosts_setting_replaces_the_defaults(sf, monkeypatch):
     monkeypatch.setenv("GREENCOMPUTE_TLS_WATCH_HOSTS", " API.example.com , ,b.example.com")
     assert tw.watched_hosts(sf, NOW) == ["api.example.com", "b.example.com"]
+
+
+# --- review fixes -------------------------------------------------------------
+
+def test_one_bad_host_never_stops_the_others_alerts(sf):
+    model(sf, "ok-model-aaaaaa.inference.green-compute.com")
+    watch = tw.Watch()
+    table = {API: tw.Result(API, tw.INVALID, detail="certificate has expired")}
+
+    def check(host):
+        if host.startswith("ok-model"):
+            raise UnicodeError("label too long")
+        return checker(table)(host)
+
+    sent = []
+    out = tw.run_once(sf, now=NOW, check=check, send=sent.append, watch=watch)
+    assert len(sent) == 1 and "api.green-compute.com: certificate is not valid" in sent[0]
+    bad = next(r for r in out["results"] if r.host.startswith("ok-model"))
+    assert bad.status == tw.UNREACHABLE and "UnicodeError" in bad.detail
+
+
+def test_database_down_still_checks_the_base_hosts():
+    def broken():
+        raise RuntimeError("database is down")
+
+    sent = []
+    out = tw.run_once(broken, now=NOW, check=checker({API: tw.Result(API, tw.INVALID, detail="x")}),
+                      send=sent.append, watch=tw.Watch())
+    assert [r.host for r in out["results"]] == list(tw.DEFAULT_HOSTS) and len(sent) == 1
+
+
+def test_a_failed_send_is_retried_next_pass(sf):
+    watch = tw.Watch()
+    bad = {API: tw.Result(API, tw.INVALID, detail="x")}
+
+    def failing(text):
+        raise RuntimeError("smtp down")
+
+    with pytest.raises(RuntimeError):
+        tw.run_once(sf, now=NOW, check=checker(bad), send=failing, watch=watch)
+    assert len(run(sf, bad, watch, now=NOW + timedelta(minutes=15))[1]) == 1
+
+
+def test_expiring_then_expired_alerts_at_once(sf):
+    watch = tw.Watch()
+    assert len(run(sf, {API: tw.Result(API, tw.EXPIRING, expires_at=NOW + timedelta(hours=5))}, watch)[1]) == 1
+    _, sent = run(sf, {API: tw.Result(API, tw.INVALID, detail="certificate has expired")}, watch,
+                  now=NOW + timedelta(hours=6))
+    assert len(sent) == 1 and "certificate has expired" in sent[0]
+
+
+def test_handshake_drops_are_unreachable_not_invalid():
+    calls = []
+
+    def fetch(host, connect):
+        calls.append(connect)
+        if connect is None:
+            raise OSError(113, "No route to host")
+        raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+
+    r = tw.check_host(API, NOW, fetch=fetch, gateway=lambda: "172.18.0.1")
+    assert r.status == tw.UNREACHABLE and "SSLEOFError" in r.detail and calls == [None, "172.18.0.1"]
+
+    def fetch_then_ok(host, connect):
+        if connect is None:
+            raise ssl.SSLZeroReturnError("closed")
+        return NOW + timedelta(days=50)
+
+    assert tw.check_host(API, NOW, fetch=fetch_then_ok, gateway=lambda: "172.18.0.1").status == tw.OK
+
+
+def test_unreachable_both_ways_tries_the_gateway_after_a_timeout():
+    calls = []
+
+    def fetch(host, connect):
+        calls.append(connect)
+        raise TimeoutError("timed out")
+
+    assert tw.check_host(API, NOW, fetch=fetch, gateway=lambda: "172.18.0.1").status == tw.UNREACHABLE
+    assert calls == [None, "172.18.0.1"]
+
+
+def test_only_our_zone_is_watched(sf):
+    model(sf, "good-123abc.inference.green-compute.com")
+    model(sf, "chat.customer-domain.com")
+    model(sf, "evil.inference.green-compute.com.attacker.net")
+    model(sf, "a.b.inference.green-compute.com")
+    model(sf, ("x" * 64) + ".inference.green-compute.com")
+    assert tw.model_hosts(sf, NOW) == ["good-123abc.inference.green-compute.com"]
+
+
+def test_a_model_address_alerts_invalid_only_twice_in_a_row(sf):
+    host = "fresh-ddd111.inference.green-compute.com"
+    model(sf, host)
+    watch = tw.Watch()
+    bad = {host: tw.Result(host, tw.INVALID, detail="Hostname mismatch")}
+    out, sent = run(sf, bad, watch)
+    assert sent == [] and out["recheck_soon"] is True
+    _, sent = run(sf, bad, watch, now=NOW + timedelta(minutes=15))
+    assert len(sent) == 1 and host in sent[0]
+
+
+def test_many_failures_are_capped_in_one_message(sf):
+    names = [f"m{i:02d}-abc123.inference.green-compute.com" for i in range(30)]
+    for n in names:
+        model(sf, n)
+    watch = tw.Watch()
+    table = {n: tw.Result(n, tw.EXPIRING, expires_at=NOW + timedelta(days=3)) for n in names}
+    _, sent = run(sf, table, watch)
+    assert len(sent) == 1 and sent[0].count("\n! ") == tw.MAX_LINES and "…and 10 more" in sent[0]
+    assert len(sent[0]) < 4000
+
+
+def test_all_ok_does_not_ask_for_a_recheck(sf):
+    out, _ = run(sf, {}, tw.Watch())
+    assert out["recheck_soon"] is False
+
+
+def test_loop_disabled_returns_at_once(monkeypatch):
+    import asyncio
+
+    monkeypatch.setenv("GREENCOMPUTE_TLS_WATCH_ENABLED", "off")
+    asyncio.run(asyncio.wait_for(tw.tls_watch_loop(), timeout=2))
+
+
+def test_interval_setting(monkeypatch):
+    monkeypatch.setenv("GREENCOMPUTE_TLS_WATCH_INTERVAL_SECONDS", "60")
+    assert tw._interval() == 300
+    monkeypatch.setenv("GREENCOMPUTE_TLS_WATCH_INTERVAL_SECONDS", "junk")
+    assert tw._interval() == 21600

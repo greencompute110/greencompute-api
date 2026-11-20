@@ -5,13 +5,20 @@ renewals had failed twice a day for 30 days (a duplicate nginx directive) and
 nothing said so, until every HTTPS call to the API failed. This checks the
 certificates nginx actually serves every few hours and alerts the team
 (infrastructure/alerts: the support inbox, plus Slack/Telegram when
-configured) when one is invalid or has less than GREENCOMPUTE_TLS_WARN_DAYS
-(default 14) left. Let's Encrypt renews at 30 days left, so 14 means renewal
-has been failing for over two weeks.
+configured) when one is invalid, can't be checked, or has less than
+GREENCOMPUTE_TLS_WARN_DAYS (default 14) left. Let's Encrypt renews at 30 days
+left, so 14 means renewal has been failing for over two weeks.
 
 Hosts: api/control/validator.green-compute.com (GREENCOMPUTE_TLS_WATCH_HOSTS,
-comma separated, replaces them), plus every model address with a deployment
-ready for over an hour (gc-model-certs issues those within minutes).
+comma separated, replaces them), plus every model address in our zone
+(<label>.inference.green-compute.com, the only names gc-model-certs issues)
+with a deployment ready for over an hour.
+
+When a host isn't OK it's checked again after RECHECK (15 minutes), not the
+full interval, so "could not check" (UNREACHABLE_STREAK checks in a row) and a
+model address's "not valid" (two in a row: its certificate may still be on its
+way) alert within the hour. A host alerts again only after REPEAT, unless its
+problem changes (expiring → expired alerts at once).
 
 Inside docker on the validator host, the host's public IP has no route back
 to it. nginx is then reached through the container's default gateway instead,
@@ -23,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import socket
 import ssl
 from collections.abc import Callable
@@ -38,11 +46,19 @@ log = logging.getLogger(__name__)
 
 DEFAULT_HOSTS = ("api.green-compute.com", "control.green-compute.com", "validator.green-compute.com")
 MODEL_HOST_MIN_READY = timedelta(hours=1)
-REPEAT = timedelta(hours=24)  # alert a host again at most this often
+REPEAT = timedelta(hours=24)  # the same problem on a host alerts again at most this often
+RECHECK = timedelta(minutes=15)  # next pass when any host isn't OK
 UNREACHABLE_STREAK = 3  # checks in a row before "could not check" is worth an alert
+MODEL_INVALID_STREAK = 2  # a model address's certificate may still be being issued
+MAX_LINES = 20  # alert channels cut long messages (Telegram rejects >4096 chars)
 _TIMEOUT_SECONDS = 8.0
 
 OK, EXPIRING, INVALID, UNREACHABLE = "ok", "expiring", "invalid", "unreachable"
+
+# A connection that drops during the handshake says nothing about the
+# certificate (an nginx reload, workers out of file descriptors): treated like
+# an unreachable host, not an invalid certificate.
+_TRANSIENT_TLS = (ssl.SSLEOFError, ssl.SSLZeroReturnError, ssl.SSLSyscallError)
 
 
 @dataclass
@@ -57,8 +73,8 @@ class Result:
 class Watch:
     """What the previous passes saw: kept in memory, so a gateway restart at
     worst repeats an alert once."""
-    last_alert: dict[str, datetime] = field(default_factory=dict)
-    unreachable: dict[str, int] = field(default_factory=dict)
+    streak: dict[str, tuple[str, int]] = field(default_factory=dict)  # host -> (status, passes in a row)
+    last_alert: dict[str, tuple[str, datetime]] = field(default_factory=dict)  # host -> (status, when)
 
 
 _WATCH = Watch()
@@ -76,6 +92,11 @@ def base_hosts() -> list[str]:
     if raw is None or not raw.strip():
         return list(DEFAULT_HOSTS)
     return [h.strip().lower() for h in raw.split(",") if h.strip()]
+
+
+def _model_host_pattern() -> re.Pattern[str]:
+    zone = (os.environ.get("GREENCOMPUTE_MODEL_INGRESS_DOMAIN") or "inference.green-compute.com").strip().lower()
+    return re.compile(r"[a-z0-9-]{1,63}\." + re.escape(zone))
 
 
 def default_gateway(route_file: str = "/proc/net/route") -> str | None:
@@ -118,23 +139,26 @@ def check_host(host: str, now: datetime | None = None, fetch: Callable[..., date
             expires = fetch(host, connect)
         except ssl.SSLCertVerificationError as exc:  # before SSLError/OSError: both are its parents
             return Result(host, INVALID, detail=exc.verify_message or str(exc))
+        except _TRANSIENT_TLS as exc:  # before SSLError: they are its children
+            unreachable = f"{type(exc).__name__}: {exc}"
         except ssl.SSLError as exc:
             return Result(host, INVALID, detail=str(exc))
         except OSError as exc:
             unreachable = f"{type(exc).__name__}: {exc}"
-            if connect is None:
-                gw = gateway()
-                if gw:
-                    targets.append(gw)
-            continue
-        if expires - now < timedelta(days=warn_days()):
-            return Result(host, EXPIRING, expires_at=expires)
-        return Result(host, OK, expires_at=expires)
+        else:
+            if expires - now < timedelta(days=warn_days()):
+                return Result(host, EXPIRING, expires_at=expires)
+            return Result(host, OK, expires_at=expires)
+        if connect is None:
+            gw = gateway()
+            if gw:
+                targets.append(gw)
     return Result(host, UNREACHABLE, detail=unreachable)
 
 
-def watched_hosts(session_factory, now: datetime) -> list[str]:
-    hosts = base_hosts()
+def model_hosts(session_factory, now: datetime) -> list[str]:
+    """Our model addresses with a deployment ready for over an hour."""
+    pattern = _model_host_pattern()
     with session_scope(session_factory) as session:
         rows = session.execute(
             select(WorkloadORM.ingress_host)
@@ -147,10 +171,12 @@ def watched_hosts(session_factory, now: datetime) -> list[str]:
             )
             .distinct()
         ).scalars().all()
-    for host in sorted(h.lower() for h in rows if h):
-        if host not in hosts:
-            hosts.append(host)
-    return hosts
+    return sorted({h.strip().lower() for h in rows if h and pattern.fullmatch(h.strip().lower())})
+
+
+def watched_hosts(session_factory, now: datetime) -> list[str]:
+    hosts = base_hosts()
+    return hosts + [h for h in model_hosts(session_factory, now) if h not in hosts]
 
 
 def _days_left(expires: datetime, now: datetime) -> int:
@@ -167,46 +193,67 @@ def _line(r: Result, now: datetime, streak: int) -> str:
     return f"{r.host}: could not check the certificate for {streak} checks in a row ({r.detail})"
 
 
+def _needed(r: Result, is_model_host: bool) -> int:
+    if r.status == UNREACHABLE:
+        return UNREACHABLE_STREAK
+    if r.status == INVALID and is_model_host:
+        return MODEL_INVALID_STREAK
+    return 1
+
+
 def run_once(session_factory, now: datetime | None = None, check: Callable[..., Result] | None = None,
              send: Callable[[str], None] | None = None, watch: Watch | None = None) -> dict:
     """Check every watched host; alert on what needs attention. Returns what
-    was seen and sent, for logs and tests."""
+    was seen and sent, and whether to check again soon, for the loop, logs
+    and tests."""
     now = now or datetime.now(UTC)
     check = check or (lambda host: check_host(host, now))
     watch = watch if watch is not None else _WATCH
     if send is None:
         from greencompute_gateway.infrastructure.alerts import send_payment_alert as send
 
+    hosts = base_hosts()
+    try:
+        models = [h for h in model_hosts(session_factory, now) if h not in hosts]
+    except Exception:  # the base hosts don't need the database
+        log.exception("tls watch: could not list model addresses; checking the base hosts only")
+        models = []
+
     results: list[Result] = []
-    lines: list[str] = []
-    for host in watched_hosts(session_factory, now):
-        r = check(host)
+    due: list[tuple[Result, int]] = []
+    for host in hosts + models:
+        try:
+            r = check(host)
+        except Exception as exc:  # one bad host must never stop the others' alerts
+            r = Result(host, UNREACHABLE, detail=f"{type(exc).__name__}: {exc}")
         results.append(r)
         if r.status == OK:
-            watch.unreachable.pop(host, None)
+            watch.streak.pop(host, None)
             watch.last_alert.pop(host, None)  # healthy again: a new problem alerts at once
             continue
-        if r.status == UNREACHABLE:
-            streak = watch.unreachable.get(host, 0) + 1
-            watch.unreachable[host] = streak
-            if streak < UNREACHABLE_STREAK:
-                continue
-        else:
-            watch.unreachable.pop(host, None)
-            streak = 0
-        last = watch.last_alert.get(host)
-        if last is not None and now - last < REPEAT:
+        prev_status, n = watch.streak.get(host, ("", 0))
+        n = n + 1 if prev_status == r.status else 1
+        watch.streak[host] = (r.status, n)
+        if n < _needed(r, host in models):
             continue
-        watch.last_alert[host] = now
-        lines.append(_line(r, now, streak))
+        last = watch.last_alert.get(host)
+        if last is not None and last[0] == r.status and now - last[1] < REPEAT:
+            continue
+        due.append((r, n))
 
+    lines = [_line(r, now, n) for r, n in due]
     if lines:
+        shown = lines[:MAX_LINES]
+        more = len(lines) - len(shown)
         send(
             "TLS certificates need attention:\n"
-            + "\n".join(f"! {line}" for line in lines)
+            + "\n".join(f"! {line}" for line in shown)
+            + (f"\n…and {more} more" if more else "")
             + "\nOn the validator host: certbot renew --dry-run, and read /var/log/letsencrypt/letsencrypt.log"
         )
-    return {"results": results, "alerted": lines}
+        for r, _ in due:  # only once sent: a failed send is retried next pass
+            watch.last_alert[r.host] = (r.status, now)
+    return {"results": results, "alerted": lines, "recheck_soon": any(r.status != OK for r in results)}
 
 
 def _summary(results: list[Result], now: datetime) -> str:
@@ -219,25 +266,35 @@ def _summary(results: list[Result], now: datetime) -> str:
     return " ".join(parts)
 
 
-async def tls_watch_loop() -> None:
-    """Background coroutine started with the gateway."""
-    if os.environ.get("GREENCOMPUTE_TLS_WATCH_ENABLED", "1").strip().lower() in ("0", "false", "no", "off"):
-        log.info("tls watch disabled")
-        return
+def _interval() -> int:
     try:
-        interval = max(300, int(os.environ.get("GREENCOMPUTE_TLS_WATCH_INTERVAL_SECONDS") or 21600))
+        return max(300, int(os.environ.get("GREENCOMPUTE_TLS_WATCH_INTERVAL_SECONDS") or 21600))
     except ValueError:
-        interval = 21600
-    log.info("tls watch starting (interval=%ds, warn at %d days)", interval, warn_days())
+        return 21600
+
+
+async def tls_watch_loop() -> None:
+    """Background coroutine started with the gateway. Logs at WARNING: under
+    uvicorn the root logger drops INFO, and these lines are the evidence the
+    watch is alive (four a day when all is well)."""
+    if os.environ.get("GREENCOMPUTE_TLS_WATCH_ENABLED", "1").strip().lower() in ("0", "false", "no", "off"):
+        log.warning("tls watch disabled")
+        return
+    interval = _interval()
+    log.warning("tls watch starting (interval=%ds, warn at %d days)", interval, warn_days())
     await asyncio.sleep(120)  # let startup settle
     from greencompute_gateway.application.billing_service import get_billing_service
 
     while True:
+        sleep = interval
         try:
             out = await asyncio.to_thread(run_once, get_billing_service().repo.session_factory)
-            log.info("tls watch: %s", _summary(out["results"], datetime.now(UTC)))
+            log.warning("tls watch: %s", _summary(out["results"], datetime.now(UTC)))
             if out["alerted"]:
                 log.warning("tls watch: alerted on %d host(s)", len(out["alerted"]))
+            if out["recheck_soon"]:
+                sleep = min(interval, int(RECHECK.total_seconds()))
         except Exception:
             log.exception("tls watch run failed")
-        await asyncio.sleep(interval)
+            sleep = min(interval, int(RECHECK.total_seconds()))
+        await asyncio.sleep(sleep)
