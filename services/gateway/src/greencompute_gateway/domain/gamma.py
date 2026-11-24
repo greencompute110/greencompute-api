@@ -26,8 +26,13 @@ Settings (gateway env):
   the first is where customers spend and the receiver of signed requests.
   Default: SN110's subnet-owner hotkey, the one `set_service` is published
   for (the owner coldkey signs it; no validator permit needed).
-- GREENCOMPUTE_GAMMA_TREASURY_HOTKEYS: hotkeys whose spends are our own
-  buybacks (default none).
+- GREENCOMPUTE_GAMMA_TREASURY_COLDKEYS: coldkeys whose deposits' spends are
+  our own buybacks, whatever the hotkey. Default: SN110's owner coldkey, so
+  the owner's buyback is never credited to anyone even before any setting
+  is made (on .88 the gateway gets env only through the server's own
+  compose file).
+- GREENCOMPUTE_GAMMA_TREASURY_HOTKEYS: hotkeys whose spends are buybacks too
+  (default none), for a deposit whose coldkey can't be read (closed at once).
 - GREENCOMPUTE_GAMMA_SERVICES_URL: where services.json is served (default
   https://api.green-compute.com/gamma/services.json), the url `set_service`
   publishes.
@@ -40,6 +45,9 @@ import os
 #: SN110's subnet-owner hotkey on mainnet (SubnetOwnerHotkey[110], read
 #: 2026-11-23). The service is published for it.
 SN110_OWNER_HOTKEY = "5CwckYmAV3fET8V9KTKfqds6BnRGACAgofECQqdYfa2Q9rvp"
+#: SN110's owner coldkey (SubnetOwner[110], read 2026-11-24): it signs the
+#: buybacks, so gamma its deposits spend at our service is ours.
+SN110_OWNER_COLDKEY = "5D53sX6AwAzXUB24G85Ch35hYr5rCpXjYFWpFTe4uzBb75sL"
 
 #: Gamma's smallest unit: GammaBalance has 9 decimals.
 RAW_PER_GAMMA = 10**9
@@ -86,6 +94,10 @@ def service_hotkey() -> str:
 
 def treasury_hotkeys() -> set[str]:
     return set(_hotkeys("GREENCOMPUTE_GAMMA_TREASURY_HOTKEYS", []))
+
+
+def treasury_coldkeys() -> set[str]:
+    return set(_hotkeys("GREENCOMPUTE_GAMMA_TREASURY_COLDKEYS", [SN110_OWNER_COLDKEY]))
 
 
 def services_url() -> str:

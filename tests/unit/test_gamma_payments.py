@@ -43,6 +43,7 @@ TREASURY = Keypair.create_from_uri("//GammaTreasury")
 CUSTOMER = Keypair.create_from_uri("//GammaCustomer")
 OTHER = Keypair.create_from_uri("//GammaOther")
 LISTED = Keypair.create_from_uri("//GammaListed")
+THIRD = Keypair.create_from_uri("//GammaThird")
 G = 10**9  # raw units per gamma
 
 
@@ -288,6 +289,20 @@ def test_treasury_spends_are_buybacks_never_credit(env):
         assert spend.kind == "treasury" and spend.amount_raw == 250 * G
     totals = gamma_app.spent_totals(env.sf)
     assert totals["bought_back_gamma"] == "250" and totals["paid_by_customers_gamma"] == "0"
+
+
+def test_spends_from_the_owner_coldkeys_deposits_are_buybacks(env, monkeypatch):
+    # By default, SN110's owner coldkey: no setting needed for the first buyback.
+    assert gamma.treasury_coldkeys() == {gamma.SN110_OWNER_COLDKEY}
+    assert credit(env, OTHER.ss58_address, 40 * G, coldkey=gamma.SN110_OWNER_COLDKEY) == "buyback"
+    assert owner_of(env, OTHER.ss58_address) is None
+    monkeypatch.setenv("GREENCOMPUTE_GAMMA_TREASURY_COLDKEYS", TREASURY.ss58_address)
+    assert credit(env, CUSTOMER.ss58_address, 2 * G, coldkey=TREASURY.ss58_address) == "buyback"
+    # Another coldkey's deposit pays as usual.
+    assert credit(env, THIRD.ss58_address, G, coldkey=OTHER.ss58_address) == "credited"
+    with session_scope(env.sf) as s:
+        assert s.scalar(select(func.count()).select_from(LedgerEntryORM)) == 1
+    assert gamma_app.spent_totals(env.sf)["bought_back_gamma"] == "42"
 
 
 def test_sanctioned_hotkey_or_coldkey_is_never_credited(env):

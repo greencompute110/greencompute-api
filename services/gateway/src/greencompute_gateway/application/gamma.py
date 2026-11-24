@@ -7,7 +7,9 @@ Whose account a hotkey's gamma is credited to:
 - otherwise the hotkey becomes an account of its own, as a wallet sign-in
   would make it (no email; it signs in with the hotkey). This is engy's
   "the hotkey is the account" and what Lium opens on the first sign-in.
-- spends by our treasury hotkeys are buybacks: recorded, never credited.
+- spends from a deposit our treasury coldkey funded (by default SN110's
+  owner coldkey), or by a treasury hotkey, are buybacks: recorded, never
+  credited.
 - a hotkey or deposit coldkey on a sanctions list is never credited.
 
 Credit is $1 per gamma (plus BONUS_RATES["gamma"], 0 today). A total's
@@ -108,7 +110,9 @@ def credit_growth(
     from greencompute_gateway.application import sanctions, wallet_auth
 
     address = normalize_address(CHAIN, hotkey)
-    treasury = address in {_canonical(h) for h in g.treasury_hotkeys()}
+    funder = _canonical(coldkey) if coldkey else None
+    treasury = (address in {_canonical(h) for h in g.treasury_hotkeys()}
+                or (funder is not None and funder in {_canonical(c) for c in g.treasury_coldkeys()}))
     owner: str | None = None
     source: str | None = None
     if treasury:
@@ -118,7 +122,7 @@ def credit_growth(
         try:
             source = sanctions.screen(session_factory, CHAIN, address, new_account=owner is None)
             if not source and coldkey:
-                source = sanctions.screen(session_factory, CHAIN, _canonical(coldkey) or coldkey)
+                source = sanctions.screen(session_factory, CHAIN, funder or coldkey)
         except sanctions.ScreeningUnavailable as exc:
             raise RetryLater("sanctions lists not loaded yet") from exc
         if source:
@@ -371,6 +375,7 @@ def spent_totals(session_factory, *, recent: int = 20) -> dict:
     return {
         "netuid": netuid,
         "service_hotkeys": g.service_hotkeys(),
+        "treasury_coldkeys": sorted(g.treasury_coldkeys()),
         "treasury_hotkeys": sorted(g.treasury_hotkeys()),
         "paid_by_customers_gamma": g.gamma_text(customer),
         "paying_hotkeys": payers,
