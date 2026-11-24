@@ -23,7 +23,9 @@ What counts as revenue (settings.revenue_basis):
 - "usage": what was charged for compute: rentals, private models, shared
   model requests and saved-disk storage.
 Both are always computed; the basis says which one the headline and the
-buyback use. Accounts in settings.excluded_user_ids (our own test accounts)
+buyback use. The public report gives weeks, never single days (a quiet day
+would show one customer's payment), and says what farmers were paid only
+when settings.show_farmer_payments is on. Accounts in settings.excluded_user_ids (our own test accounts)
 are left out of both.
 
 Machines: a node is listed while it has reported within
@@ -67,6 +69,8 @@ DEFAULT_SETTINGS = {
     "revenue_basis": "paid",
     "listed_within_days": 30,
     "excluded_user_ids": [],
+    # Whether the public report says what farmers were paid (totals only).
+    "show_farmer_payments": False,
 }
 BASES = {
     "paid": "What customers paid in: card, crypto and gamma payments, without bonuses, less card chargebacks.",
@@ -123,9 +127,9 @@ def update_settings(session_factory, changes: dict) -> dict:
     for key, value in (changes or {}).items():
         if key not in DEFAULT_SETTINGS:
             raise ReportError(f"unknown setting {key!r}; choose from {sorted(DEFAULT_SETTINGS)}")
-        if key == "published":
+        if key in ("published", "show_farmer_payments"):
             if not isinstance(value, bool):
-                raise ReportError("published must be true or false")
+                raise ReportError(f"{key} must be true or false")
         elif key == "since":
             try:
                 value = date.fromisoformat(str(value)).isoformat()
@@ -722,7 +726,7 @@ def build(session_factory, *, admin: bool = False, now: datetime | None = None) 
     def public(d: dict) -> dict:
         return {k: v for k, v in d.items() if not k.endswith("_cents")}
 
-    return {
+    out = {
         "generated_at": now.isoformat(timespec="seconds"),
         "netuid": g.netuid(),
         "published": bool(settings["published"]),
@@ -731,8 +735,13 @@ def build(session_factory, *, admin: bool = False, now: datetime | None = None) 
                  "listed_within_days": settings["listed_within_days"]},
         "revenue": public(revenue),
         "buybacks": public(buybacks),
-        "farmer_payments": _farmer_payments(session_factory, _since(settings)),
     }
+    if not admin:
+        # Weeks are public; single days would show individual payments.
+        out["revenue"].pop("days", None)
+    if admin or settings["show_farmer_payments"]:
+        out["farmer_payments"] = _farmer_payments(session_factory, _since(settings))
+    return out
 
 
 def public_report(session_factory) -> dict | None:

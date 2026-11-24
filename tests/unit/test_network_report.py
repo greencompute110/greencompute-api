@@ -177,7 +177,8 @@ def test_revenue_is_what_customers_paid_without_bonuses_or_staff_credit(env):
     assert this_week["week_start"] == "2026-11-23" and this_week["card_usd"] == "15.00"
     last_week = revenue["weeks"][1]
     assert (last_week["crypto_usd"], last_week["gamma_usd"], last_week["usd"]) == ("30.00", "7.00", "37.00")
-    assert revenue["days"][0] == {"day": "2026-11-24", "usd": "-5.00"}
+    assert "days" not in revenue  # weeks are public; a single day would show one payment
+    assert report.build(env.sf, admin=True, now=NOW)["revenue"]["days"][0] == {"day": "2026-11-24", "usd": "-5.00"}
     # Counting from October includes the earlier payment.
     report.update_settings(env.sf, {"since": "2026-10-01"})
     assert report.build(env.sf, now=NOW)["revenue"]["total_usd"] == "179.00"
@@ -332,6 +333,9 @@ def test_farmer_statement_and_payments(env):
     status, st = call("GET", f"/platform/admin/farmers/{farmer['farmer_id']}/statement", key="gk_admin",
                       query=b"month=2026-11")
     assert status == 200 and (st["paid_usd"], st["balance_usd"]) == ("15.00", "8.00")
+    assert "farmer_payments" not in report.build(env.sf, now=NOW)  # not public unless staff turn it on
+    assert report.build(env.sf, admin=True, now=NOW)["farmer_payments"]["total_usd"] == "15.00"
+    report.update_settings(env.sf, {"show_farmer_payments": True})
     assert report.build(env.sf, now=NOW)["farmer_payments"] == {
         "total_usd": "15.00", "months": [{"month": "2026-11", "usd": "15.00"}]}
     assert report.statement(env.sf, farmer["farmer_id"], "2026-10")["revenue_usd"] == "4.00"
