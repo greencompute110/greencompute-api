@@ -630,7 +630,7 @@ class WalletDepositAddress(BaseModel):
 class NewAccountLimits(BaseModel):
     """A new wallet account's limits for its first 7 days, for every key
     together. They end sooner once the account has paid in
-    `lifts_after_deposit_usd` in crypto (TAO, alpha, USDC or USDT), or adds an
+    `lifts_after_deposit_usd` in crypto (TAO, alpha, gamma, USDC or USDT), or adds an
     email on the website."""
     max_active_rentals: int
     daily_spend_limit_usd: float

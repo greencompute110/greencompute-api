@@ -319,6 +319,14 @@ def _create_account(session_factory, chain: str, address: str) -> str | None:
     return user_id
 
 
+def create_wallet_account(session_factory, chain: str, address: str) -> str | None:
+    """A new wallet account (no email; it signs in with the wallet), as a
+    first sign-in makes one: for a hotkey whose first gamma payment arrives
+    before it ever signed in (application/gamma.py). The caller screened the
+    wallet. None when another request made its account meanwhile."""
+    return _create_account(session_factory, chain, address)
+
+
 def _blocked(session_factory, chain: str, address: str, source: str, user_id: str | None) -> WalletAuthError:
     """Refuse a sanctioned wallet: flag it, tell staff once, tell the caller
     only the neutral sentence."""

@@ -31,6 +31,8 @@ BONUS_RATES: dict[str, float] = {
     "usdc": 0.00,
     "tao": 0.00,
     "alpha": 0.10,
+    # Gamma spent at our service hotkey: $1 per gamma, like Lium (engy adds 5%).
+    "gamma": 0.00,
 }
 
 

@@ -8,7 +8,7 @@ import re
 import pytest
 
 from greencompute_gateway.main import app
-from greencompute_gateway.transport.openapi import OPTIONAL_KEY
+from greencompute_gateway.transport.openapi import OPTIONAL_KEY, _signed_may
 
 # A key check, or handing the caller's key on to a handler that checks it
 # (/v1/completions runs as /v1/chat/completions).
@@ -47,7 +47,10 @@ def test_routes_that_take_a_key_require_one_and_public_ones_do_not(spec):
         source = inspect.getsource(endpoint)
         security = ops[(method, path)]["security"]
         if AUTH_CALLS.search(source) and (method, path) not in OPTIONAL_KEY:
-            assert security == [{"bearerAuth": []}, {"apiKeyHeader": []}], (method, path)
+            keys = [{"bearerAuth": []}, {"apiKeyHeader": []}]
+            # A hotkey-signed request (btauth/1) is a third way where its scopes allow it.
+            expected = keys + [{"btauth": []}] if _signed_may(method, path) else keys
+            assert security == expected, (method, path)
         else:
             assert security == [], (method, path)
     for public in (("get", "/platform/pricing"), ("get", "/platform/nodes/supported"), ("get", "/healthz"),

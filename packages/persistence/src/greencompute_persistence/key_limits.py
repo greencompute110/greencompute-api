@@ -139,7 +139,7 @@ def _env_number(name: str, default: float) -> float:
 
 
 #: What lifts the first-week limits, in the words customers read.
-CRYPTO_NAMES = "TAO, alpha, USDC or USDT"
+CRYPTO_NAMES = "TAO, alpha, gamma, USDC or USDT"
 
 
 def _bonus_rates() -> dict[str, float]:
@@ -232,7 +232,7 @@ def new_account_limits(session_factory, user_id: str | None, now: datetime | Non
 
 def new_account_lift_text(limits: dict) -> str:
     """How a new wallet account gets out of its limits early, e.g. "deposit
-    $15.00 more in crypto (TAO, alpha, USDC or USDT) or add an email address
+    $15.00 more in crypto (TAO, alpha, gamma, USDC or USDT) or add an email address
     on the website (Settings), or wait until 2026-11-24 10:00 UTC" (without
     the deposit when no deposit lifts them)."""
     until = limits["until"].strftime("%Y-%m-%d %H:%M UTC")

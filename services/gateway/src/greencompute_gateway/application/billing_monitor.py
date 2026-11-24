@@ -61,7 +61,8 @@ SENT_RETENTION = timedelta(days=7)
 # Each deposit watcher moves its cursor every tick (about a minute); one that
 # hasn't for this long has stopped crediting payments on that chain.
 WATCHER_STALL = timedelta(minutes=30)
-WATCHER_CHAINS = {"eth": "Ethereum (USDC/USDT)", "base": "Base (USDC/USDT)", "bittensor": "Bittensor (TAO/alpha)"}
+WATCHER_CHAINS = {"eth": "Ethereum (USDC/USDT)", "base": "Base (USDC/USDT)", "bittensor": "Bittensor (TAO/alpha)",
+                  "gamma": "Bittensor gamma (spent at our service hotkey)"}
 
 # Charges allowed to take a balance below zero: saved-pod storage and admin debits.
 MAY_GO_NEGATIVE = ("storage", "adjustment", "refund", "chargeback")
@@ -196,7 +197,10 @@ def stalled_watchers(session, now: datetime) -> list[Finding]:
     if os.environ.get("GREENCOMPUTE_DEPOSIT_WATCHER_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
         return []
     out = []
+    gamma_off = os.environ.get("GREENCOMPUTE_GAMMA_WATCHER_ENABLED", "true").strip().lower() in ("0", "false", "no", "off")
     for chain, label in WATCHER_CHAINS.items():
+        if chain == "gamma" and gamma_off:
+            continue
         row = session.get(KeyValueStateORM, f"watcher:{chain}:last_block")
         moved = _aware(row.updated_at) if row else None
         if moved is None or moved > now - WATCHER_STALL:

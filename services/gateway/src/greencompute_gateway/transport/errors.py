@@ -71,6 +71,12 @@ CODES: dict[str, tuple[int, str]] = {
     "approval_required": (403, "This change needs a signature from a wallet that already signs in to the account; `detail.sign_with` lists them."),
     "wallet_sign_in_off": (403, "This wallet is linked to an account to pay in, not to sign in; sign in another way and turn wallet sign-in on under Billing > Verified wallets."),
     "signature_invalid": (401, "The wallet signature doesn't match the sign-in message; request a new challenge and sign it unchanged."),
+    "signed_request_invalid": (401, "A btauth/1 signed request failed a check; `detail.reason` says which "
+                                    "(malformed, wrong_receiver, stale, bad_signature, replayed, "
+                                    "unsupported_crypto). Sign every attempt again with a fresh nonce."),
+    "gamma_payment_required": (402, "The hotkey that signed the request has no account here yet: spend SN110 "
+                                    "gamma at our service hotkey (`detail.pay` has the commands), or sign in "
+                                    "with the hotkey."),
     "challenge_invalid": (400, "The sign-in message is unknown, already used or expired; request a new challenge."),
     "terminal_ticket_invalid": (401, "The terminal ticket is unknown, already used, expired (60 s) or for another "
                                      "rental or key; request a new one."),

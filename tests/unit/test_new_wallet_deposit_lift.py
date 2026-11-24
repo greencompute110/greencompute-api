@@ -137,7 +137,7 @@ def test_the_control_plane_pause_sees_the_deposit_and_says_how_to_lift_it(db):
     assert db.cp.get_deployment(running[paid]).state == DeploymentState.READY
     reason = db.cp.get_deployment(running[short]).last_error
     assert reason.startswith("paused: a new wallet account can spend $50.00 in 24 hours in its first week")
-    assert "deposit $15.00 more in crypto (TAO, alpha, USDC or USDT) or add an email address" in reason
+    assert "deposit $15.00 more in crypto (TAO, alpha, gamma, USDC or USDT) or add an email address" in reason
     assert "or wait until 20" in reason
 
 
@@ -155,7 +155,7 @@ def test_the_403_says_how_much_more_to_deposit_or_when_it_ends(db, monkeypatch):
     assert (detail["lifts_after_deposit_usd"], detail["deposited_usd"]) == (20.0, 12.5)
     assert detail["message"] == ("New wallet accounts can spend $50.00 in any 24 hours for their first 7 days, "
                                  "until they have paid in $20.00 in crypto")
-    assert "deposit $7.50 more in crypto (TAO, alpha, USDC or USDT)" in detail["hint"]
+    assert "deposit $7.50 more in crypto (TAO, alpha, gamma, USDC or USDT)" in detail["hint"]
     assert "add an email address on the website (Settings)" in detail["hint"]
     assert detail["until"][:10] in detail["hint"]
 
@@ -228,7 +228,7 @@ def test_without_a_deposit_lift_the_403_offers_only_the_email(db, monkeypatch):
 def test_the_lift_text():
     until = datetime(2026, 11, 24, 10, 0, tzinfo=UTC)
     assert new_account_lift_text({"lifts_after_deposit_usd": 20.0, "deposited_usd": 5.5, "until": until}) == (
-        "deposit $14.50 more in crypto (TAO, alpha, USDC or USDT) or add an email address on the website "
+        "deposit $14.50 more in crypto (TAO, alpha, gamma, USDC or USDT) or add an email address on the website "
         "(Settings), or wait until 2026-11-24 10:00 UTC")
 
 

@@ -1063,6 +1063,62 @@ class VerifiedWalletORM(Base):
     sign_in: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 
+class GammaSpentTotalORM(Base):
+    """What a hotkey has spent at one of our gamma service hotkeys, as the
+    chain's GammaSpent(netuid, service, hotkey) read at the last finalized
+    block the gamma watcher looked at. Nothing is sent to us when a customer
+    pays in gamma: accepting it is crediting the growth of this total.
+
+    `subnet_counter` is the subnet's RegisteredSubnetCounter when the total
+    was read: dissolving the subnet clears the chain's totals, so a total
+    under an older counter counts from zero again."""
+
+    __tablename__ = "gamma_spent_totals"
+
+    netuid: Mapped[int] = mapped_column(Integer, primary_key=True)
+    service_hotkey: Mapped[str] = mapped_column(String(64), primary_key=True)
+    hotkey: Mapped[str] = mapped_column(String(64), primary_key=True)
+    subnet_counter: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Gamma in its smallest unit (1e9 per gamma, $1 each).
+    total_raw: Mapped[int] = mapped_column(BigInteger, default=0)
+    # customer (credited to user_id) | treasury (our own buyback, never
+    # credited) | blocked (a sanctioned wallet: never credited)
+    kind: Mapped[str] = mapped_column(String(16))
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Every cent credited for this total so far, bonus included.
+    credited_cents: Mapped[int] = mapped_column(BigInteger, default=0)
+    last_block: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class GammaSpendORM(Base):
+    """Each growth of a GammaSpent total the watcher saw: a customer's gamma
+    payment (credited; also a crypto_deposits row with currency "gamma"), a
+    buyback our treasury hotkey spent (never credited), or a spend from a
+    sanctioned wallet (blocked). The public record of revenue paid or bought
+    back in gamma."""
+
+    __tablename__ = "gamma_spends"
+
+    # "gamma:<netuid>:<counter>:<service>:<hotkey>:<total_raw after>": a total
+    # only grows, so this names one growth; the ledger's deposit_ref for a
+    # customer's.
+    spend_id: Mapped[str] = mapped_column(String(300), primary_key=True)
+    netuid: Mapped[int] = mapped_column(Integer)
+    subnet_counter: Mapped[int] = mapped_column(BigInteger, default=0)
+    service_hotkey: Mapped[str] = mapped_column(String(64))
+    hotkey: Mapped[str] = mapped_column(String(64), index=True)
+    kind: Mapped[str] = mapped_column(String(16), index=True)
+    amount_raw: Mapped[int] = mapped_column(BigInteger)
+    total_raw: Mapped[int] = mapped_column(BigInteger)
+    # The finalized block the growth was read at: the spend is in it or in
+    # one of the blocks since the watcher's previous read.
+    block_number: Mapped[int] = mapped_column(BigInteger, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    credited_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class WalletAuthChallengeORM(Base):
     """A one-time sign-in message issued to a wallet (POST
     /platform/auth/wallet/challenge). The exact text is kept, so verify checks

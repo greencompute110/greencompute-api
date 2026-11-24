@@ -8,8 +8,15 @@ from fastapi.responses import PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 
 from greencompute_persistence import database_ready, load_runtime_settings, render_prometheus_text
-from greencompute_gateway.transport.security import current_client_ip, current_rate_limit, current_request_route
+from greencompute_gateway.transport.security import (
+    current_client_ip,
+    current_rate_limit,
+    current_request_route,
+    current_signed_request,
+)
 from greencompute_gateway.transport.security import metrics as gateway_metrics
+from greencompute_gateway.transport import signed_requests
+from greencompute_gateway.transport.gamma_routes import router as gamma_router
 from greencompute_gateway.transport.mcp import router as mcp_router
 from greencompute_gateway.transport.routes import router
 from greencompute_gateway.transport.errors import CrashToJSON, install_error_handlers
@@ -44,7 +51,8 @@ def _client_ip_from_request(request) -> str | None:
 async def lifespan(app: FastAPI):
     """Spawn long-running background tasks at startup; cancel them on
     shutdown: the on-chain crypto deposit watcher, the billing monitor,
-    the credit watch (auto-resume after top-up, low-credit emails), fleets,
+    the gamma watcher (payments spent at our service hotkey), the credit
+    watch (auto-resume after top-up, low-credit emails), fleets,
     webhook delivery, the daily sanctions-list refresh and the TLS
     certificate watch."""
     from greencompute_gateway.application.billing_monitor import billing_monitor_loop
@@ -58,6 +66,7 @@ async def lifespan(app: FastAPI):
     from greencompute_gateway.infrastructure.deposit_watcher import (
         deposit_watcher_loop,
     )
+    from greencompute_gateway.infrastructure.gamma_watcher import gamma_watcher_loop
 
     # More threads for the sync routes (AnyIO's default is 40); /v1
     # completions have their own (transport/v1_capacity).
@@ -66,6 +75,7 @@ async def lifespan(app: FastAPI):
     raise_default_pool()
     tasks = [
         asyncio.create_task(deposit_watcher_loop(), name="deposit-watcher"),
+        asyncio.create_task(gamma_watcher_loop(), name="gamma-watcher"),
         asyncio.create_task(billing_monitor_loop(), name="billing-monitor"),
         asyncio.create_task(credit_watch_loop(), name="credit-watch"),
         asyncio.create_task(fleet_loop(), name="fleets"),
@@ -181,6 +191,19 @@ class _RequestContext:
         from starlette.datastructures import MutableHeaders
         from starlette.requests import Request
 
+        signed = None
+        found = signed_requests.headers_of(scope)
+        if found is not None:
+            # A hotkey-signed request (btauth/1): its signature covers the
+            # exact body, so read it first, then hand the app the same bytes.
+            limit = signed_requests._max_body()
+            body = await signed_requests.read_body(receive, limit)
+            if body is None:
+                await signed_requests.too_large(send, limit)
+                return
+            signed = signed_requests.check(scope, found, body)
+            receive = signed_requests.replay(body, receive)
+        signed_token = current_signed_request.set(signed)
         token = current_client_ip.set(_client_ip_from_request(Request(scope)))
         route_token = current_request_route.set((scope.get("method"), scope.get("path")))
         rate_state = {"path": scope.get("path"), "counted": False, "headers": None}
@@ -199,6 +222,7 @@ class _RequestContext:
             current_rate_limit.reset(rate_token)
             current_request_route.reset(route_token)
             current_client_ip.reset(token)
+            current_signed_request.reset(signed_token)
 
 
 app.add_middleware(_RequestContext)
@@ -206,6 +230,7 @@ app.add_middleware(_RequestContext)
 
 app.include_router(router)
 app.include_router(mcp_router)  # POST /mcp: the API as an MCP server
+app.include_router(gamma_router)  # /gamma/*: paying with gamma (Subnet services standard)
 install_error_handlers(app)
 
 

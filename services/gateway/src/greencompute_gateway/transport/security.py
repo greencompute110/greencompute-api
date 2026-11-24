@@ -5,6 +5,7 @@ import hmac
 import math
 import os
 import time
+from dataclasses import dataclass
 from datetime import UTC
 
 from fastapi import HTTPException, status
@@ -123,6 +124,43 @@ current_client_ip: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 current_request_route: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
     "gateway_current_request_route", default=None
 )
+
+
+@dataclass(frozen=True)
+class SignedRequest:
+    """A request signed with a Bittensor hotkey (btauth/1): the verified
+    hotkey, or why it didn't verify (an infrastructure.btauth.BtAuthError)."""
+
+    hotkey: str | None = None
+    error: Exception | None = None
+
+
+# Set by the request-context middleware for a request carrying X-Bittensor-*
+# headers (transport/signed_requests.py); None for every other request.
+current_signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.ContextVar(
+    "gateway_current_signed_request", default=None
+)
+
+_SIGNED_HELP = "https://www.green-compute.com/docs/gamma"
+
+
+def _signed_request_key(signed: SignedRequest, client_ip: str | None):
+    """The key a signed request acts as: its hotkey account's (gamma.py)."""
+    from greencompute_gateway.transport.errors import coded
+
+    if signed.error is not None or not signed.hotkey:
+        metrics.increment("auth.failure.signed_request")
+        _check_auth_failure_throttle(client_ip)
+        reason = getattr(signed.error, "reason", "malformed")
+        message = getattr(signed.error, "message", "the signed request is not valid")
+        raise coded(status.HTTP_401_UNAUTHORIZED, "signed_request_invalid", {
+            "message": f"signed request refused: {message}",
+            "reason": reason,
+            "docs": _SIGNED_HELP,
+        })
+    from greencompute_gateway.application.gamma import signed_request_key
+
+    return signed_request_key(credential_store.session_factory, signed.hotkey)
 
 
 def _check_scopes(api_key) -> None:
@@ -280,6 +318,18 @@ def require_api_key(
     admin_required: bool = False,
     client_ip: str | None = None,
 ):
+    signed = current_signed_request.get()
+    if signed is not None:
+        # A hotkey-signed request (btauth/1): it acts as the hotkey's account,
+        # whatever Authorization header came with it, and never as an admin.
+        api_key = _signed_request_key(signed, client_ip)
+        _apply_key_rate_limit(api_key)
+        if admin_required:
+            metrics.increment("auth.failure.admin_required")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin api key required")
+        _check_scopes(api_key)
+        metrics.increment("auth.success.signed_request")
+        return api_key
     secret = extract_api_key_secret(authorization, x_api_key)
     if not secret:
         metrics.increment("auth.failure.missing_api_key")

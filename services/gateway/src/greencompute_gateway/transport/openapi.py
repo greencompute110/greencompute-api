@@ -5,7 +5,9 @@ declared no auth scheme, so every route looked public, and documented only
 On top of what FastAPI generates:
 
 - Two security schemes, `bearerAuth` (Authorization: Bearer <key>) and
-  `apiKeyHeader` (X-API-Key), required on every route that takes a key; the
+  `apiKeyHeader` (X-API-Key), required on every route that takes a key, and
+  `btauth` (a request signed with a Bittensor hotkey that paid in gamma) as
+  a third way on the routes a signed request may call; the
   public ones (prices, GPU list, health, wallet sign-in, sales forms) say
   `security: []`. The per-route `authorization` / `X-API-Key` header
   parameters are dropped: the schemes say it.
@@ -45,6 +47,42 @@ SECURITY_SCHEMES = {
     },
 }
 KEY_REQUIRED = [{"bearerAuth": []}, {"apiKeyHeader": []}]
+#: Routes a hotkey-signed request may also call: those whose scope is one a
+#: signed request has (domain/gamma.SIGNED_REQUEST_SCOPES).
+KEY_OR_SIGNED = KEY_REQUIRED + [{"btauth": []}]
+
+
+def _btauth_scheme() -> dict:
+    from greencompute_gateway.domain import gamma
+
+    receiver = gamma.service_hotkey()
+    return {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Bittensor-Signature",
+        "description": (
+            "Bittensor signed requests, `btauth/1` (https://www.bittensor.com/docs/guides/signed-requests). "
+            f"The sender hotkey is the account: spend SN110 gamma at the receiver hotkey `{receiver}` "
+            f"(`btcli gamma spend --netuid {gamma.netuid()} --service-hotkey {receiver} --amount-gamma 5 -H API_KEY`) "
+            "and the hotkey's account is credited $1 per gamma within about a minute; no sign-up or API key. "
+            "Send all of `X-Bittensor-Version: 1`, `X-Bittensor-Hotkey` (sender ss58), `X-Bittensor-Receiver` "
+            f"(`{receiver}`), `X-Bittensor-Nonce` (unix time in nanoseconds; accepted from 10 s old to 2 s ahead, "
+            "each once) and `X-Bittensor-Signature` (0x-hex sr25519 signature over the payload: the "
+            "newline-joined lines `btauth/1`, `sr25519`, METHOD, request target as sent, hex sha256 of the raw "
+            "body, nonce, sender, receiver). Signed requests may rent, run inference and read the account "
+            "(scopes " + ", ".join(gamma.SIGNED_REQUEST_SCOPES) + "). When these headers are present any "
+            "Authorization header is ignored, so OpenAI-style SDKs may send a placeholder key."
+        ),
+        "x-btauth": {
+            "version": "btauth/1",
+            "netuid": gamma.netuid(),
+            "receivers": gamma.service_hotkeys(),
+            "crypto": ["sr25519"],
+            "scopes": list(gamma.SIGNED_REQUEST_SCOPES),
+            "balance": f"{gamma.API_BASE}/gamma/balance",
+            "services": gamma.services_url(),
+        },
+    }
 
 #: Routes that take an API key but don't need one: wallet sign-in reads it
 #: only to tell the website's server apart.
@@ -129,7 +167,7 @@ def _components(spec: dict) -> dict:
     # POST /platform/api-keys documents the customer's body; the staff-only
     # fields of the model it parses (user_id, admin) stay out of the spec.
     schemas["APIKeyCreatePublic"] = APIKeyCreatePublic.model_json_schema(ref_template="#/components/schemas/{model}")
-    spec["components"]["securitySchemes"] = SECURITY_SCHEMES
+    spec["components"]["securitySchemes"] = {**SECURITY_SCHEMES, "btauth": _btauth_scheme()}
     return schemas
 
 
@@ -158,6 +196,14 @@ def _takes_key(route) -> bool:
     return False
 
 
+def _signed_may(method: str, path: str) -> bool:
+    from greencompute_gateway.domain.gamma import SIGNED_REQUEST_SCOPES
+    from greencompute_gateway.domain.scopes import ANY_SCOPE, required_scope
+
+    needed = required_scope(method, path)
+    return needed == ANY_SCOPE or needed in SIGNED_REQUEST_SCOPES
+
+
 def customize(app: FastAPI, spec: dict) -> dict:
     _components(spec)
     secured_ops: set[tuple[str, str]] = set()
@@ -172,7 +218,7 @@ def customize(app: FastAPI, spec: dict) -> dict:
             if not isinstance(op, dict) or method not in ("get", "post", "put", "patch", "delete"):
                 continue
             secured = (method, path) in secured_ops
-            op["security"] = KEY_REQUIRED if secured else []
+            op["security"] = (KEY_OR_SIGNED if _signed_may(method, path) else KEY_REQUIRED) if secured else []
             params = [p for p in op.get("parameters", [])
                       if not (p.get("in") == "header" and p.get("name", "").lower() in _AUTH_PARAMS)]
             if params:
