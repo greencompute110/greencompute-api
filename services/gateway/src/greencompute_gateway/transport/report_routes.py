@@ -5,8 +5,9 @@ Public:
   revenue, buybacks). 404 until staff publish it. CORS *.
 
 Staff (admin key), kept out of the public spec:
-- GET  /platform/admin/report: the report with farmers' names, every
-  machine, the farmers and the settings, published or not.
+- GET  /platform/admin/report: the report with farmers' names and the week
+  in progress, a preview of what the public gets, every machine, the
+  farmers, staff debits and the settings, published or not.
 - PUT  /platform/admin/report/settings
 - POST /platform/admin/farmers, PATCH /platform/admin/farmers/{id}
 - PUT  /platform/admin/machines/{node_id}: whose machine it is / hide it
@@ -72,9 +73,11 @@ def admin_report(
     sf = _sf()
     return {
         "settings": report.get_settings(sf),
-        "report": report.build(sf, admin=True),
+        "report": report.build(sf, admin=True),   # up to now, with names
+        "preview": report.build(sf),              # exactly what /platform/report gives once published
         "machines": report.machines(sf),
         "farmers": report.list_farmers(sf),
+        "adjustments": report.adjustments(sf),
         "bases": report.BASES,
     }
 

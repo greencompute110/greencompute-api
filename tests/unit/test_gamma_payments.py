@@ -706,6 +706,32 @@ def test_a_client_that_hangs_up_mid_body_gets_no_answer(env):
     assert sent == []
 
 
+def test_gamma_is_not_an_invoice_currency(env, monkeypatch):
+    from greencompute_gateway.application import billing_service
+    from greencompute_persistence import key_limits
+
+    assert "gamma" not in billing_service.BONUS_RATES  # what /platform/billing/bonus-rates lists
+    assert key_limits._bonus_rates()["gamma"] == 0.0 and gamma.bonus_pct() == 0.0
+    # An all-separator setting falls back to the default rather than break the spec.
+    monkeypatch.setenv("GREENCOMPUTE_GAMMA_SERVICE_HOTKEYS", " , ")
+    assert gamma.service_hotkeys() == [gamma.SN110_OWNER_HOTKEY]
+
+
+def test_watcher_backs_off_while_the_chain_cannot_be_read(env, monkeypatch):
+    def refuse():
+        raise ConnectionError("no endpoint")
+
+    monkeypatch.setattr(gamma_watcher, "_connect", refuse)
+    monkeypatch.setitem(gamma_watcher._failures, "n", 0)
+    for _ in range(3):
+        assert gamma_watcher.scan_gamma(env.sf, env.billing) == 0
+    assert gamma_watcher._failures["n"] == 3
+    chain = FakeChain()
+    monkeypatch.setattr(gamma_watcher, "_connect", lambda: chain)
+    gamma_watcher.scan_gamma(env.sf, env.billing)
+    assert gamma_watcher._failures["n"] == 0
+
+
 # --- the public documents -----------------------------------------------------------
 
 

@@ -208,10 +208,11 @@ def stalled_watchers(session, now: datetime) -> list[Finding]:
         if moved is None or moved > now - WATCHER_STALL:
             continue
         hours = (now - moved).total_seconds() / 3600
+        which, logs = ("gamma watcher", "gamma watcher") if chain == "gamma" else ("deposit watcher", f"watcher {chain}")
         out.append(Finding(
             "stalled_watcher", f"watcher:{chain}:{row.value}", PROBLEM,
-            f"payments on {label} aren't being detected: the deposit watcher has been stuck at block "
-            f"{row.value} for {hours:.1f} h (gateway logs: 'watcher {chain}')",
+            f"payments on {label} aren't being detected: the {which} has been stuck at block "
+            f"{row.value} for {hours:.1f} h (gateway logs: '{logs}')",
         ))
     return out
 

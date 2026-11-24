@@ -2423,6 +2423,7 @@ class ControlPlaneService:
                         if private_model
                         else metering.rental_charge_description(gpu_count, hourly_cents)
                     ),
+                    node_id=deployment.node_id,
                 )
             except KeyError:
                 # User not found — skip (matches prior behavior).
@@ -2541,6 +2542,7 @@ class ControlPlaneService:
                 kind="usage",
                 reference_id=deployment.deployment_id,
                 description=description,
+                node_id=deployment.node_id,
             )
         except KeyError:
             return 0  # the account is gone

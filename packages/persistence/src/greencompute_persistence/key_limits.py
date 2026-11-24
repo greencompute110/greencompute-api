@@ -146,9 +146,9 @@ def _bonus_rates() -> dict[str, float]:
     """Payment bonuses by base currency (the gateway's BONUS_RATES: alpha
     10%), to take back out of what a crypto top-up credited."""
     try:
-        from greencompute_gateway.application.billing_service import BONUS_RATES
+        from greencompute_gateway.application.billing_service import BONUS_RATES, GAMMA_BONUS_RATE
 
-        return dict(BONUS_RATES)
+        return {**BONUS_RATES, "gamma": GAMMA_BONUS_RATE}
     except ImportError:  # persistence used without the gateway: its current table
         return {"alpha": 0.10}
 

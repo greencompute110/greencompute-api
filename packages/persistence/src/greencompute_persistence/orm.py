@@ -927,6 +927,11 @@ class LedgerEntryORM(Base):
     balance_after: Mapped[int] = mapped_column(BigInteger)
     kind: Mapped[str] = mapped_column(String(32), index=True)
     reference_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # The machine a rental charge was for (node_inventory.node_id), written by
+    # the meter: a rental can move to another machine, and a farmer's
+    # statement must follow the machine that ran each charge. NULL on other
+    # rows and on charges from before 2026-11-24.
+    node_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Globally-unique on-chain deposit reference for crypto top-ups, e.g.
     # "usdt-eth:0xabc…:7" (currency:tx_hash:log_index) or "tao:5123456:3"
     # (chain:block:event_index). UNIQUE so a single on-chain transfer can

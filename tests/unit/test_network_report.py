@@ -122,6 +122,41 @@ def test_nothing_is_public_until_published(env):
     assert call("GET", "/platform/report")[0] == 404
 
 
+def test_public_report_cache_is_single_flight_and_never_outlives_a_change(env, monkeypatch):
+    import threading
+
+    report.update_settings(env.sf, {"published": True})
+    builds, real_build = [], report.build
+    gate = threading.Event()
+
+    def slow_build(session_factory, **kwargs):
+        builds.append(1)
+        gate.wait(5)
+        return real_build(session_factory, **kwargs)
+
+    monkeypatch.setattr(report, "build", slow_build)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(report.public_report(env.sf))) for _ in range(6)]
+    for t in threads:
+        t.start()
+    gate.set()
+    for t in threads:
+        t.join(10)
+    assert len(builds) == 1 and len(results) == 6 and all(r is not None for r in results)
+    # A build in flight when the report is unpublished is thrown away.
+    report._forget_cache()
+    gate.clear()
+    out = []
+    t = threading.Thread(target=lambda: out.append(report.public_report(env.sf)))
+    t.start()
+    while len(builds) < 2:
+        pass
+    report.update_settings(env.sf, {"published": False})
+    gate.set()
+    t.join(10)
+    assert out == [None] and report.public_report(env.sf) is None
+
+
 def test_staff_routes_need_an_admin_key(env):
     for method, path, body in (
         ("GET", "/platform/admin/report", None),
@@ -169,19 +204,45 @@ def test_revenue_is_what_customers_paid_without_bonuses_or_staff_credit(env):
     ledger(env, "ours", 4000, ref="stripe:cs_2", user="staff-test", when=NOW)         # our own test account
     ledger(env, "early", 7700, ref="stripe:cs_0", when=datetime(2026, 10, 30, tzinfo=UTC))  # before the start
     report.update_settings(env.sf, {"excluded_user_ids": ["staff-test"]})
-    revenue = report.build(env.sf, now=NOW)["revenue"]
+    revenue = report.build(env.sf, admin=True, now=NOW)["revenue"]  # staff: up to now
     by = {m["method"]: m["usd"] for m in revenue["by_method"]}
     assert by == {"card": "15.00", "crypto": "80.00", "gamma": "7.00"}
-    assert revenue["total_usd"] == "102.00" and revenue["basis"] == "paid"
+    assert revenue["total_usd"] == "102.00" and revenue["basis"] == "paid" and revenue["through"] == "2026-11-24"
     this_week = revenue["weeks"][0]
     assert this_week["week_start"] == "2026-11-23" and this_week["card_usd"] == "15.00"
     last_week = revenue["weeks"][1]
     assert (last_week["crypto_usd"], last_week["gamma_usd"], last_week["usd"]) == ("30.00", "7.00", "37.00")
-    assert "days" not in revenue  # weeks are public; a single day would show one payment
-    assert report.build(env.sf, admin=True, now=NOW)["revenue"]["days"][0] == {"day": "2026-11-24", "usd": "-5.00"}
+    assert revenue["days"][0] == {"day": "2026-11-24", "usd": "-5.00"}
     # Counting from October includes the earlier payment.
     report.update_settings(env.sf, {"since": "2026-10-01"})
-    assert report.build(env.sf, now=NOW)["revenue"]["total_usd"] == "179.00"
+    assert report.build(env.sf, admin=True, now=NOW)["revenue"]["total_usd"] == "179.00"
+
+
+def test_the_public_report_stops_at_the_last_completed_week(env):
+    """NOW is a Tuesday: the public sees money and GPU-hours through Sunday
+    the 22nd, totals included, so polling can't show a payment as it lands
+    or how many GPUs are rented this minute."""
+    ledger(env, "last-week", 3000, ref="usdc-base:0x1:1", when=datetime(2026, 11, 20, 9, tzinfo=UTC))
+    ledger(env, "sunday-night", 700, ref="stripe:cs_s", when=datetime(2026, 11, 22, 23, 59, tzinfo=UTC))
+    ledger(env, "monday", 4321, ref="usdc-base:0x2:1", when=datetime(2026, 11, 23, 0, 30, tzinfo=UTC))
+    ledger(env, "today", 900, ref="stripe:cs_t", when=NOW)
+    ledger(env, "use-old", -400, kind="usage", reference="dep-a", description="GPU usage 1× GPU @ $0.40/hr",
+           when=datetime(2026, 11, 21, tzinfo=UTC))
+    ledger(env, "use-now", -800, kind="usage", reference="dep-a", description="GPU usage 2× GPU @ $0.40/hr")
+    public = report.build(env.sf, now=NOW)
+    revenue = public["revenue"]
+    assert revenue["through"] == "2026-11-22" and revenue["total_usd"] == "37.00"
+    assert {m["method"]: m["usd"] for m in revenue["by_method"]} == {"card": "7.00", "crypto": "30.00", "gamma": "0.00"}
+    assert [w["week_start"] for w in revenue["weeks"]][0] == "2026-11-16" and "days" not in revenue
+    assert revenue["compute_delivered"] == {"usd": "4.00", "gpu_hours": "10.0"}
+    assert public["buybacks"]["to_buy_back_usd"] == "37.00"
+    # Staff see up to now.
+    staff = report.build(env.sf, admin=True, now=NOW)["revenue"]
+    assert staff["total_usd"] == "89.21" and staff["compute_delivered"]["gpu_hours"] == "30.0"
+    # Before the first completed week there is nothing to show yet.
+    report.update_settings(env.sf, {"since": "2026-11-23"})
+    early = report.build(env.sf, now=NOW)["revenue"]
+    assert (early["through"], early["total_usd"], early["weeks"]) == (None, "0.00", [])
 
 
 def test_compute_delivered_and_the_usage_basis(env):
@@ -193,11 +254,11 @@ def test_compute_delivered_and_the_usage_basis(env):
     ledger(env, "inf", -3, kind="inference", description="Inference m: 1 in + 1 out tokens")
     ledger(env, "sto", -100, kind="storage", reference="dep-a", description="Saved-pod storage $1.00/day")
     ledger(env, "adj", -5000, kind="adjustment", description="Manual admin debit")  # not compute
-    revenue = report.build(env.sf, now=NOW)["revenue"]
+    revenue = report.build(env.sf, admin=True, now=NOW)["revenue"]
     assert revenue["compute_delivered"] == {"usd": "8.63", "gpu_hours": "16.0"}  # 10 + 4 + 2 GPU-hours
     assert revenue["total_usd"] == "0.00"  # nothing was paid in
     report.update_settings(env.sf, {"revenue_basis": "usage"})
-    revenue = report.build(env.sf, now=NOW)["revenue"]
+    revenue = report.build(env.sf, admin=True, now=NOW)["revenue"]
     assert revenue["total_usd"] == "8.63" and revenue["basis"] == "usage"
     _, _, by_node = report.compute_delivered(env.sf, NOW - timedelta(days=30))
     assert by_node["node-a1"]["cents"] == 480 and round(by_node["node-a1"]["gpu_hours"], 1) == 12.0
@@ -244,6 +305,12 @@ def test_farmers_labels_terms_and_changes(env):
             report.create_farmer(env.sf, **bad)
     changed = report.update_farmer(env.sf, first["farmer_id"], {"public_label": "Provider One", "archived": True})
     assert changed["public_label"] == "Provider One" and changed["archived"] is True
+    # Changing one term keeps the others.
+    report.update_farmer(env.sf, first["farmer_id"], {"terms": {"usd_per_gpu_hour": 0.25, "monthly_fee_usd": 500}})
+    kept = report.update_farmer(env.sf, first["farmer_id"], {"terms": {"revenue_share_pct": 60}})
+    assert kept["terms"] == {"usd_per_gpu_hour": 0.25, "revenue_share_pct": 60.0, "monthly_fee_usd": 500.0}
+    with pytest.raises(report.ReportError):
+        report.create_farmer(env.sf, name={"a": 1})
     with pytest.raises(report.ReportError):
         report.update_farmer(env.sf, first["farmer_id"], {"public_label": "Farmer B"})
     assert report.update_farmer(env.sf, "nope", {"name": "x"}) is None
@@ -286,9 +353,13 @@ def test_buyback_owes_card_and_crypto_revenue_less_what_was_bought_back(env):
     assert "--service-hotkey 5CwckYmAV3fET8V9KTKfqds6BnRGACAgofECQqdYfa2Q9rvp" in out["commands"][1]
     assert out["on_chain"]["spent_gamma"] == "555"  # every spend here, whenever
     assert [entry["gamma"] for entry in out["log"]] == ["30"]
-    public = report.build(env.sf, now=NOW)["buybacks"]
-    assert (public["to_buy_back_usd"], public["outstanding_usd"]) == ("100.00", "70.00")
-    assert not [k for k in public if k.endswith("_cents")]
+    staff = report.build(env.sf, admin=True, now=NOW)["buybacks"]
+    assert (staff["to_buy_back_usd"], staff["outstanding_usd"]) == ("100.00", "70.00")
+    public = report.build(env.sf, now=NOW)
+    assert not [k for k in (*public["buybacks"], *public["revenue"]) if k.endswith("_cents")]
+    # This week's payments aren't public yet; the buyback already made is (it is on chain).
+    assert (public["buybacks"]["to_buy_back_usd"], public["buybacks"]["bought_back_usd"]) == ("0.00", "30.00")
+    assert "All gamma ever spent" in public["buybacks"]["on_chain"]["scope"]
     # Bought back in full: nothing outstanding, no commands.
     _treasury_spend(env, "b2", 80)
     out = report.buyback(env.sf, now=NOW)
@@ -303,6 +374,34 @@ def test_buyback_without_a_price_gives_no_amount(env, monkeypatch):
     ledger(env, "card", 6000, ref="stripe:cs_1")
     out = report.buyback(env.sf, now=NOW)
     assert out["outstanding_usd"] == "60.00" and out["tao_usd"] is None and out["commands"] == []
+
+
+def test_on_the_usage_basis_gamma_only_covers_its_own_accounts_usage(env):
+    """A hotkey prepays $100 in gamma and uses nothing; a card customer uses
+    $50. The $50 is still to buy back: prepaid gamma doesn't cancel what
+    others' usage owes."""
+    with session_scope(env.sf) as s:
+        s.add(UserORM(user_id="gamma-payer", username="gp", email=None, display_name="gp", profile_metadata={},
+                      balance_credits=0, created_at=NOW))
+    ledger(env, "g", 10_000, ref="gamma:110:0:svc:hk:100", user="gamma-payer")
+    ledger(env, "use", -5000, kind="usage", reference="dep-a", description="GPU usage 1× GPU @ $0.40/hr")
+    report.update_settings(env.sf, {"revenue_basis": "usage"})
+    out = report.buyback(env.sf, now=NOW)
+    assert (out["revenue_usd"], out["to_buy_back_usd"], out["paid_in_gamma_usd"]) == ("50.00", "50.00", "0.00")
+    # Once the gamma payer uses $30 of it, that $30 is revenue already bought back.
+    ledger(env, "use-g", -3000, kind="usage", reference="dep-b", description="GPU usage 1× GPU @ $0.70/hr",
+           user="gamma-payer")
+    out = report.buyback(env.sf, now=NOW)
+    assert (out["revenue_usd"], out["to_buy_back_usd"], out["paid_in_gamma_usd"]) == ("80.00", "50.00", "30.00")
+
+
+def test_staff_debits_are_listed_not_netted(env):
+    ledger(env, "paid", 1100, ref="usdt-eth:0x1:1")
+    ledger(env, "back", -1100, kind="refund", description="Manual admin debit")
+    assert report.build(env.sf, admin=True, now=NOW)["revenue"]["total_usd"] == "11.00"
+    status, body = call("GET", "/platform/admin/report", key="gk_admin")
+    assert status == 200
+    assert [(a["kind"], a["usd"], a["user_id"]) for a in body["adjustments"]] == [("refund", "11.00", "cust")]
 
 
 # --- statements ---------------------------------------------------------------------
@@ -334,6 +433,12 @@ def test_farmer_statement_and_payments(env):
                       query=b"month=2026-11")
     assert status == 200 and (st["paid_usd"], st["balance_usd"]) == ("15.00", "8.00")
     assert "farmer_payments" not in report.build(env.sf, now=NOW)  # not public unless staff turn it on
+    # Our own test accounts are left out of statements, as of the report.
+    ledger(env, "ours", -900, kind="usage", reference="dep-a", description="GPU usage 1× GPU @ $0.40/hr",
+           user="staff-test")
+    assert report.statement(env.sf, farmer["farmer_id"], "2026-11")["revenue_usd"] == "13.00"
+    report.update_settings(env.sf, {"excluded_user_ids": ["staff-test"]})
+    assert report.statement(env.sf, farmer["farmer_id"], "2026-11")["revenue_usd"] == "4.00"
     assert report.build(env.sf, admin=True, now=NOW)["farmer_payments"]["total_usd"] == "15.00"
     report.update_settings(env.sf, {"show_farmer_payments": True})
     assert report.build(env.sf, now=NOW)["farmer_payments"] == {
@@ -345,8 +450,48 @@ def test_farmer_statement_and_payments(env):
     assert call("GET", f"/platform/admin/farmers/{farmer['farmer_id']}/statement", key="gk_admin",
                 query=b"month=2026-13")[0] == 400
     for bad in ({"month": "2026-11", "amount_usd": 0}, {"month": "Nov", "amount_usd": 5},
-                {"month": "2026-11", "amount_usd": "5"}):
+                {"month": "2026-11", "amount_usd": "5"}, {"month": "2026-11\n", "amount_usd": 5},
+                {"month": "0000-01", "amount_usd": 5}, {"month": 202611, "amount_usd": 5}):
         assert call("POST", f"/platform/admin/farmers/{farmer['farmer_id']}/payments", bad, key="gk_admin")[0] == 400
+    for month in (b"0000-01", b"9999-12", b"2026-1"):
+        assert call("GET", f"/platform/admin/farmers/{farmer['farmer_id']}/statement", key="gk_admin",
+                    query=b"month=" + month)[0] == 400
+
+
+def test_a_charge_belongs_to_the_machine_that_ran_it(env):
+    """A rental moved to another farmer's machine: each charge stays with the
+    machine written on it, whatever the rental's node is today."""
+    a = report.create_farmer(env.sf, name="Acme", terms={"revenue_share_pct": 50})
+    b = report.create_farmer(env.sf, name="Nordic", terms={"revenue_share_pct": 50})
+    report.assign_machine(env.sf, "node-a1", farmer_id=a["farmer_id"])
+    report.assign_machine(env.sf, "node-b1", farmer_id=b["farmer_id"])
+    with session_scope(env.sf) as s:
+        for entry_id, node in (("on-a", "node-a1"), ("on-b", "node-b1")):
+            s.add(LedgerEntryORM(entry_id=entry_id, user_id="cust", amount_cents=-400, balance_after=0, kind="usage",
+                                 reference_id="dep-a", node_id=node, description="GPU usage 1× GPU @ $0.40/hr",
+                                 created_at=NOW))
+        s.get(DeploymentORM, "dep-a").node_id = None  # requeued, not placed again
+    assert report.statement(env.sf, a["farmer_id"], "2026-11")["revenue_usd"] == "4.00"
+    assert report.statement(env.sf, b["farmer_id"], "2026-11")["revenue_usd"] == "4.00"
+
+
+def test_the_meter_writes_the_machine_on_the_charge(env):
+    from greencompute_gateway.infrastructure.billing_repository import BillingRepository
+
+    repo = BillingRepository.__new__(BillingRepository)
+    repo.session_factory = env.sf
+    with session_scope(env.sf) as s:
+        s.get(UserORM, "cust").balance_credits = 500
+    out = repo.debit_user_to_floor(user_id="cust", amount_cents=40, kind="usage", reference_id="dep-a",
+                                   description="GPU usage 1× GPU @ $0.40/hr", node_id="node-b1")
+    assert out == {"debited_cents": 40, "shortfall_cents": 0}
+    with session_scope(env.sf) as s:
+        row = s.scalar(select(LedgerEntryORM).where(LedgerEntryORM.kind == "usage"))
+        assert (row.node_id, row.reference_id, row.amount_cents) == ("node-b1", "dep-a", -40)
+    # Without one (inference, older callers) nothing changes.
+    repo.debit_user_to_floor(user_id="cust", amount_cents=3, kind="inference", description="Inference m")
+    with session_scope(env.sf) as s:
+        assert s.scalar(select(LedgerEntryORM).where(LedgerEntryORM.kind == "inference")).node_id is None
 
 
 def test_admin_report_has_everything_staff_need(env):
@@ -357,6 +502,9 @@ def test_admin_report_has_everything_staff_need(env):
     assert {m["node_id"] for m in body["machines"]} == {"node-a1", "node-a2", "node-b1", "node-old"}
     assert body["farmers"][0]["farmer_id"] == farmer["farmer_id"]
     assert body["report"]["gpus"]["by_farmer"][0]["farmer"] == "Unassigned"
+    # The preview is what the public would get: no names, no days, completed weeks only.
+    assert "days" not in body["preview"]["revenue"] and "days" in body["report"]["revenue"]
+    assert "name" not in body["preview"]["gpus"]["by_farmer"][0]
     # The public spec lists the report and none of the staff routes.
     app.openapi_schema = None
     paths = app.openapi()["paths"]

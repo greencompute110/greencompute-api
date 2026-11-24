@@ -31,9 +31,12 @@ BONUS_RATES: dict[str, float] = {
     "usdc": 0.00,
     "tao": 0.00,
     "alpha": 0.10,
-    # Gamma spent at our service hotkey: $1 per gamma, like Lium (engy adds 5%).
-    "gamma": 0.00,
 }
+# Gamma spent at our service hotkey is credited $1 per gamma, like Lium (engy
+# adds 5%). Kept apart from BONUS_RATES, whose keys are what
+# GET /platform/billing/bonus-rates lists as currencies to pay an invoice in:
+# gamma is never invoiced.
+GAMMA_BONUS_RATE = 0.00
 
 
 def _deposit_address_for(currency: str) -> str:

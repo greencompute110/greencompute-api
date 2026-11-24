@@ -155,9 +155,11 @@ class BillingRepository:
         kind: str = "usage",
         reference_id: str | None = None,
         description: str = "",
+        node_id: str | None = None,
     ) -> dict:
         """Debit up to `amount_cents`, draining the balance toward zero but
-        never below it, in ONE SELECT..FOR UPDATE transaction.
+        never below it, in ONE SELECT..FOR UPDATE transaction. `node_id`: the
+        machine a rental charge is for, kept on the ledger row.
 
         Unlike ``debit_user`` this NEVER raises InsufficientBalanceError and
         NEVER drives the balance negative — it takes ``min(amount_cents,
@@ -187,6 +189,7 @@ class BillingRepository:
                     balance_after=row.balance_credits,
                     kind=kind,
                     reference_id=reference_id,
+                    node_id=node_id,
                     description=description,
                     created_at=datetime.now(UTC),
                 )

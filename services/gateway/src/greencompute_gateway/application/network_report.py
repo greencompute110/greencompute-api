@@ -23,9 +23,20 @@ What counts as revenue (settings.revenue_basis):
 - "usage": what was charged for compute: rentals, private models, shared
   model requests and saved-disk storage.
 Both are always computed; the basis says which one the headline and the
-buyback use. The public report gives weeks, never single days (a quiet day
-would show one customer's payment), and says what farmers were paid only
-when settings.show_farmer_payments is on. Accounts in settings.excluded_user_ids (our own test accounts)
+buyback use.
+
+What the public report holds back, so that nobody polling it can read one
+customer's payment or how many GPUs are rented right now:
+- money and GPU-hours stop at the end of the last completed UTC week (totals
+  too); the week in progress and single days are for staff only;
+- farmers appear under their labels, never by name, and never with their
+  revenue; what farmers were paid shows only when
+  settings.show_farmer_payments is on.
+Buybacks already made and gamma spent on chain are public on the chain
+itself, so those are current.
+
+Staff debits (refund, adjustment) are not netted against revenue: they
+correct many different things. Staff see them listed beside the report. Accounts in settings.excluded_user_ids (our own test accounts)
 are left out of both.
 
 Machines: a node is listed while it has reported within
@@ -80,9 +91,10 @@ METHODS = (("card", "Card"), ("crypto", "Crypto"), ("gamma", "Gamma"))
 UNASSIGNED = "Unassigned"
 MAX_WEEKS = 26
 _RATE = re.compile(r"\$([\d.]+)/hr")
-_MONTH = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_MONTH = re.compile(r"20[2-9]\d-(0[1-9]|1[0-2])")
 _cache_lock = threading.Lock()
-_cache: dict = {"at": 0.0, "value": None}
+_build_lock = threading.Lock()
+_cache: dict = {"at": 0.0, "value": None, "generation": 0}
 CACHE_SECONDS = 60
 
 
@@ -103,8 +115,11 @@ def _usd(cents: int | float) -> str:
 
 
 def _forget_cache() -> None:
+    """Drop the cached public report; a build already under way is then
+    discarded rather than cached (its generation is old)."""
     with _cache_lock:
         _cache["at"], _cache["value"] = 0.0, None
+        _cache["generation"] += 1
 
 
 # --- settings -----------------------------------------------------------------------
@@ -220,7 +235,9 @@ def list_farmers(session_factory) -> list[dict]:
 
 
 def _clean(text, field: str, limit: int, *, required: bool = True) -> str:
-    value = " ".join(str(text or "").split())
+    if text is not None and not isinstance(text, str):
+        raise ReportError(f"{field} must be text")
+    value = " ".join((text or "").split())
     if required and not value:
         raise ReportError(f"{field} is required")
     if len(value) > limit:
@@ -256,7 +273,9 @@ def update_farmer(session_factory, farmer_id: str, changes: dict) -> dict | None
             elif key == "public_label":
                 row.public_label = _clean(value, "public_label", 64)
             elif key == "terms":
-                row.terms = _check_terms(value)
+                if not isinstance(value, dict):
+                    raise ReportError("terms must be an object")
+                row.terms = _check_terms({**_terms(row.terms), **value})  # a term left out keeps its value
             elif key == "notes":
                 row.notes = str(value or "")[:4000] or None
             elif key == "archived":
@@ -380,14 +399,16 @@ def _method(deposit_ref: str) -> str:
 
 
 def paid_in(session_factory, since: datetime, until: datetime | None = None, excluded: list[str] | None = None):
-    """{day: {method: cents}}: what customers paid in, by UTC day."""
+    """What customers paid in: ({day: {method: cents}}, {user_id: gamma cents}).
+    Days are UTC; the second says who paid how much in gamma."""
     from greencompute_persistence.key_limits import _bonus_rates, _top_up_currency
 
     out: dict[date, dict[str, int]] = {}
+    gamma_by_user: dict[str, int] = {}
     with session_scope(session_factory) as session:
         query = (
             select(LedgerEntryORM.amount_cents, LedgerEntryORM.deposit_ref, LedgerEntryORM.kind,
-                   LedgerEntryORM.created_at, CryptoInvoiceORM.bonus_pct)
+                   LedgerEntryORM.created_at, CryptoInvoiceORM.bonus_pct, LedgerEntryORM.user_id)
             .outerjoin(CryptoInvoiceORM, CryptoInvoiceORM.invoice_id == LedgerEntryORM.reference_id)
             .where(
                 LedgerEntryORM.created_at >= since,
@@ -401,7 +422,7 @@ def paid_in(session_factory, since: datetime, until: datetime | None = None, exc
             query = query.where(LedgerEntryORM.user_id.not_in(excluded))
         rows = session.execute(query).all()
     rates = _bonus_rates() if rows else {}
-    for amount, deposit_ref, kind, created_at, invoice_bonus in rows:
+    for amount, deposit_ref, kind, created_at, invoice_bonus, user_id in rows:
         day = _aware(created_at).astimezone(UTC).date()
         bucket = out.setdefault(day, {})
         if kind == "chargeback":
@@ -411,31 +432,36 @@ def paid_in(session_factory, since: datetime, until: datetime | None = None, exc
         bonus = 0.0
         if method != "card":
             bonus = invoice_bonus if invoice_bonus is not None else rates.get(_top_up_currency(deposit_ref), 0.0)
-        bucket[method] = bucket.get(method, 0) + round(amount / (1 + max(0.0, bonus or 0.0)))
-    return out
+        cents = round(amount / (1 + max(0.0, bonus or 0.0)))
+        bucket[method] = bucket.get(method, 0) + cents
+        if method == "gamma":
+            gamma_by_user[user_id] = gamma_by_user.get(user_id, 0) + cents
+    return out, gamma_by_user
 
 
 def compute_delivered(session_factory, since: datetime, until: datetime | None = None,
                       excluded: list[str] | None = None):
     """What was charged for compute, by UTC day: ({day: cents}, {day: GPU-hours},
     {node_id: {"cents", "gpu_hours"}}). GPU-hours come from each rental
-    charge's own rate ("… @ $0.40/hr")."""
+    charge's own rate ("… @ $0.40/hr"). A charge belongs to the machine that
+    ran it: the node written on the charge, or for charges from before that
+    was recorded, the node its rental is on now."""
     cents_by_day: dict[date, int] = {}
     hours_by_day: dict[date, float] = {}
     by_node: dict[str | None, dict] = {}
     with session_scope(session_factory) as session:
         day = _day_expr(session, LedgerEntryORM.created_at)
+        node = func.coalesce(LedgerEntryORM.node_id, DeploymentORM.node_id)
         base = [LedgerEntryORM.amount_cents < 0, LedgerEntryORM.created_at >= since]
         if until is not None:
             base.append(LedgerEntryORM.created_at < until)
         if excluded:
             base.append(LedgerEntryORM.user_id.not_in(excluded))
         usage = session.execute(
-            select(day, DeploymentORM.node_id, LedgerEntryORM.description,
-                   func.sum(-LedgerEntryORM.amount_cents))
+            select(day, node, LedgerEntryORM.description, func.sum(-LedgerEntryORM.amount_cents))
             .outerjoin(DeploymentORM, DeploymentORM.deployment_id == LedgerEntryORM.reference_id)
             .where(LedgerEntryORM.kind == "usage", *base)
-            .group_by(day, DeploymentORM.node_id, LedgerEntryORM.description)
+            .group_by(day, node, LedgerEntryORM.description)
         ).all()
         other = session.execute(
             select(day, func.sum(-LedgerEntryORM.amount_cents))
@@ -448,13 +474,29 @@ def compute_delivered(session_factory, since: datetime, until: datetime | None =
         hours = cents / 100 / float(rate.group(1)) if rate and float(rate.group(1)) > 0 else 0.0
         cents_by_day[d] = cents_by_day.get(d, 0) + cents
         hours_by_day[d] = hours_by_day.get(d, 0.0) + hours
-        node = by_node.setdefault(node_id, {"cents": 0, "gpu_hours": 0.0})
-        node["cents"] += cents
-        node["gpu_hours"] += hours
+        entry = by_node.setdefault(node_id, {"cents": 0, "gpu_hours": 0.0})
+        entry["cents"] += cents
+        entry["gpu_hours"] += hours
     for raw_day, cents in other:
         d = _as_day(raw_day)
         cents_by_day[d] = cents_by_day.get(d, 0) + int(cents or 0)
     return cents_by_day, hours_by_day, by_node
+
+
+def _used_by(session_factory, user_ids: list[str], since: datetime, until: datetime | None) -> dict[str, int]:
+    """Cents of compute each of these accounts was charged in the window."""
+    if not user_ids:
+        return {}
+    with session_scope(session_factory) as session:
+        query = (
+            select(LedgerEntryORM.user_id, func.sum(-LedgerEntryORM.amount_cents))
+            .where(LedgerEntryORM.user_id.in_(user_ids), LedgerEntryORM.amount_cents < 0,
+                   LedgerEntryORM.kind.in_(("usage", "inference", "storage")), LedgerEntryORM.created_at >= since)
+            .group_by(LedgerEntryORM.user_id)
+        )
+        if until is not None:
+            query = query.where(LedgerEntryORM.created_at < until)
+        return {user_id: int(cents or 0) for user_id, cents in session.execute(query).all()}
 
 
 def _week_start(day: date) -> date:
@@ -469,13 +511,21 @@ def _weeks(first: date, last: date) -> list[date]:
     return out
 
 
-def _revenue(session_factory, settings: dict, now: datetime) -> dict:
+def _revenue(session_factory, settings: dict, now: datetime, *, completed_weeks_only: bool = False) -> dict:
+    """Revenue since settings.since. `completed_weeks_only` (the public
+    report): everything stops at the end of the last completed UTC week."""
     since = _since(settings)
     excluded = settings["excluded_user_ids"]
-    paid = paid_in(session_factory, since, excluded=excluded)
-    used_cents, used_hours, _ = compute_delivered(session_factory, since, excluded=excluded)
-    basis = settings["revenue_basis"]
     today = now.astimezone(UTC).date()
+    until = None
+    last_day = today
+    if completed_weeks_only:
+        monday = _week_start(today)
+        until = datetime.combine(monday, datetime.min.time(), tzinfo=UTC)
+        last_day = monday - timedelta(days=1)
+    paid, gamma_by_user = paid_in(session_factory, since, until, excluded)
+    used_cents, used_hours, _ = compute_delivered(session_factory, since, until, excluded)
+    basis = settings["revenue_basis"]
 
     def paid_day(d: date) -> int:
         return sum(paid.get(d, {}).values())
@@ -484,24 +534,38 @@ def _revenue(session_factory, settings: dict, now: datetime) -> dict:
     all_days = sorted(set(paid) | set(used_cents))
     by_method = {m: sum(v.get(m, 0) for v in paid.values()) for m, _ in METHODS}
     weeks = []
-    for week in _weeks(since.date(), today):
-        days = [week + timedelta(days=i) for i in range(7)]
-        weeks.append({
-            "week_start": week.isoformat(), "week_end": days[-1].isoformat(),
-            "usd": _usd(sum(headline(d) for d in days)),
-            **{f"{m}_usd": _usd(sum(paid.get(d, {}).get(m, 0) for d in days)) for m, _ in METHODS},
-            "compute_usd": _usd(sum(used_cents.get(d, 0) for d in days)),
-            "gpu_hours": f"{sum(used_hours.get(d, 0.0) for d in days):.1f}",
-        })
+    if last_day >= since.date():
+        for week in _weeks(since.date(), last_day):
+            days = [week + timedelta(days=i) for i in range(7)]
+            weeks.append({
+                "week_start": week.isoformat(), "week_end": days[-1].isoformat(),
+                "usd": _usd(sum(headline(d) for d in days)),
+                **{f"{m}_usd": _usd(sum(paid.get(d, {}).get(m, 0) for d in days)) for m, _ in METHODS},
+                "compute_usd": _usd(sum(used_cents.get(d, 0) for d in days)),
+                "gpu_hours": f"{sum(used_hours.get(d, 0.0) for d in days):.1f}",
+            })
     last_days = [today - timedelta(days=i) for i in range(30) if today - timedelta(days=i) >= since.date()]
+    total = sum(headline(d) for d in all_days)
+    if basis == "paid":
+        # A gamma payment was bought back when its customer minted it.
+        already = by_method["gamma"]
+    else:
+        # On the usage basis, the usage that gamma paid for: each account's
+        # gamma covers its own charges first, and nobody else's.
+        used = _used_by(session_factory, sorted(gamma_by_user), since, until)
+        already = sum(min(cents, used.get(user_id, 0)) for user_id, cents in gamma_by_user.items())
     return {
         "basis": basis,
         "basis_text": BASES[basis],
-        "total_cents": sum(headline(d) for d in all_days),
-        "total_usd": _usd(sum(headline(d) for d in all_days)),
+        # The last day counted; None when no day is yet (the public report
+        # before its first completed week).
+        "through": last_day.isoformat() if last_day >= since.date() else None,
+        "total_cents": total,
+        "total_usd": _usd(total),
         "paid_in_usd": _usd(sum(by_method.values())),
         "by_method": [{"method": m, "label": label, "usd": _usd(by_method[m])} for m, label in METHODS],
         "by_method_cents": by_method,
+        "bought_back_by_customers_cents": min(already, max(0, total)),
         "weeks": weeks,
         "days": [{"day": d.isoformat(), "usd": _usd(headline(d))} for d in last_days],
         "compute_delivered": {
@@ -532,22 +596,25 @@ def _buybacks(session_factory, settings: dict, revenue: dict) -> dict:
             GammaSpendORM.netuid == netuid)) or 0)
     from greencompute_gateway.application.gamma import last_block
 
-    gamma_cents = revenue["by_method_cents"].get("gamma", 0)
-    # Gamma payments were bought back when the customer minted them; the
-    # rest of the revenue is ours to buy back.
-    owed = max(0, revenue["total_cents"] - gamma_cents)
+    by_customers = revenue["bought_back_by_customers_cents"]
+    # Revenue paid in gamma was bought back by the customer; the rest is
+    # ours to buy back.
+    owed = max(0, revenue["total_cents"] - by_customers)
     return {
         "to_buy_back_cents": owed,
         "to_buy_back_usd": _usd(owed),
         "bought_back_usd": _usd(bought_cents),
         "outstanding_cents": max(0, owed - bought_cents),
         "outstanding_usd": _usd(max(0, owed - bought_cents)),
-        "paid_in_gamma_usd": _usd(gamma_cents),
+        "paid_in_gamma_usd": _usd(by_customers),
         "log": log_rows[:50],
         "on_chain": {
             "netuid": netuid,
             "service_hotkey": g.service_hotkey(),
+            "service_hotkeys": g.service_hotkeys(),
             "spent_gamma": g.gamma_text(spent_raw),
+            "scope": "All gamma ever spent at our service hotkeys: customers' payments, our buybacks and any "
+                     "spends we refused to credit. It counts from the first spend, not from the report's start.",
             "as_of_block": last_block(session_factory),
             "how_to_check": "SubtensorModule.GammaSpent(netuid, service hotkey, *) at any finalized block: "
                             "the sum is every gamma payment and buyback made here.",
@@ -556,7 +623,7 @@ def _buybacks(session_factory, settings: dict, revenue: dict) -> dict:
 
 
 def buyback(session_factory, *, now: datetime | None = None) -> dict:
-    """What is owed and what one buyback for it takes: for staff."""
+    """What is owed, up to now, and what one buyback for it takes: for staff."""
     now = now or _now()
     settings = get_settings(session_factory)
     revenue = _revenue(session_factory, settings, now)
@@ -583,21 +650,36 @@ def buyback(session_factory, *, now: datetime | None = None) -> dict:
             f"btcli gamma spend --netuid {netuid} --service-hotkey {service} --amount-gamma <the gamma the mint gave> "
             "-H gc-buyback",
         ] if tao else [],
-        "weeks": [{"week_start": w["week_start"], "week_end": w["week_end"],
-                   "to_buy_back_usd": _usd(max(0.0, (float(w["usd"]) - float(w["gamma_usd"])) * 100))}
-                  for w in revenue["weeks"]],
+        "weeks": [{"week_start": w["week_start"], "week_end": w["week_end"], "revenue_usd": w["usd"],
+                   "gamma_usd": w["gamma_usd"]} for w in revenue["weeks"]],
         "note": "Signed by the subnet owner coldkey: mint gamma with the TAO into the buyback hotkey, then spend "
                 "it at our service hotkey. The gateway records the spend as a buyback within a minute; it is "
                 "never credited to an account. Keep the deposit open until it shows here.",
     }
 
 
+def adjustments(session_factory, settings: dict | None = None) -> list[dict]:
+    """Staff debits since the report's start (refunds, adjustments): they are
+    not netted against revenue, so staff see them and can judge."""
+    settings = settings or get_settings(session_factory)
+    with session_scope(session_factory) as session:
+        rows = session.execute(
+            select(LedgerEntryORM.created_at, LedgerEntryORM.kind, LedgerEntryORM.amount_cents,
+                   LedgerEntryORM.description, LedgerEntryORM.user_id)
+            .where(LedgerEntryORM.kind.in_(("refund", "adjustment")), LedgerEntryORM.amount_cents < 0,
+                   LedgerEntryORM.created_at >= _since(settings))
+            .order_by(LedgerEntryORM.created_at.desc()).limit(100)
+        ).all()
+    return [{"day": _aware(when).astimezone(UTC).date().isoformat(), "kind": kind, "usd": _usd(-cents),
+             "description": description or "", "user_id": user_id} for when, kind, cents, description, user_id in rows]
+
+
 # --- farmer statements --------------------------------------------------------------
 
 
 def _month_bounds(month: str) -> tuple[datetime, datetime]:
-    if not _MONTH.match(month or ""):
-        raise ReportError("month must be YYYY-MM")
+    if not isinstance(month, str) or not _MONTH.fullmatch(month):
+        raise ReportError("month must be YYYY-MM, from 2020-01 on")
     year, mon = int(month[:4]), int(month[5:])
     start = datetime(year, mon, 1, tzinfo=UTC)
     end = datetime(year + (mon == 12), mon % 12 + 1, 1, tzinfo=UTC)
@@ -616,7 +698,8 @@ def statement(session_factory, farmer_id: str, month: str) -> dict | None:
     """A farmer's month: GPU-hours rented on their machines, what customers
     were charged for them, what the contract's terms make that, and what has
     been paid. Machines are the farmer's now (a machine moved between
-    farmers takes its history with it)."""
+    farmers takes its history with it); a machine left out of the public
+    report still earns."""
     start, end = _month_bounds(month)
     with session_scope(session_factory) as session:
         farmer = session.get(FarmerORM, farmer_id)
@@ -628,8 +711,11 @@ def statement(session_factory, farmer_id: str, month: str) -> dict | None:
             .order_by(FarmerPaymentORM.paid_at)).all()]
         paid_cents = int(session.scalar(select(func.coalesce(func.sum(FarmerPaymentORM.amount_cents), 0)).where(
             FarmerPaymentORM.farmer_id == farmer_id, FarmerPaymentORM.month == month)) or 0)
-    mine = [m for m in machines(session_factory) if m["farmer_id"] == farmer_id]
-    _, _, by_node = compute_delivered(session_factory, start, end)
+    settings = get_settings(session_factory)
+    mine = [m for m in machines(session_factory, settings=settings) if m["farmer_id"] == farmer_id]
+    # Our own test accounts are left out here as in the report: they pay
+    # nothing, so there is no revenue to share on what they ran.
+    _, _, by_node = compute_delivered(session_factory, start, end, settings["excluded_user_ids"])
     by_model: dict[str, dict] = {}
     rows = []
     for m in mine:
@@ -666,7 +752,7 @@ def statement(session_factory, farmer_id: str, month: str) -> dict | None:
 
 def record_payment(session_factory, farmer_id: str, *, month, amount_usd, reference=None, note=None,
                    paid_at=None, created_by=None) -> dict | None:
-    _month_bounds(str(month or ""))
+    _month_bounds(month)
     if isinstance(amount_usd, bool) or not isinstance(amount_usd, (int, float)) or not 0 < float(amount_usd) <= 1e8:
         raise ReportError("amount_usd must be a number above 0")
     when = _now()
@@ -679,7 +765,7 @@ def record_payment(session_factory, farmer_id: str, *, month, amount_usd, refere
         if session.get(FarmerORM, farmer_id) is None:
             return None
         row = FarmerPaymentORM(
-            payment_id=str(uuid4()), farmer_id=farmer_id, month=str(month), amount_cents=round(float(amount_usd) * 100),
+            payment_id=str(uuid4()), farmer_id=farmer_id, month=month, amount_cents=round(float(amount_usd) * 100),
             paid_at=when, reference=_clean(reference, "reference", 256, required=False) or None,
             note=str(note or "")[:2000] or None, created_by=created_by, created_at=_now(),
         )
@@ -715,12 +801,13 @@ def _farmer_payments(session_factory, since: datetime) -> dict:
 
 
 def build(session_factory, *, admin: bool = False, now: datetime | None = None) -> dict:
-    """The report. `admin`: with farmers' names and ids, for staff."""
+    """The report. `admin`: for staff, with farmers' names and ids, the week
+    in progress and single days; otherwise what the public gets."""
     now = now or _now()
     settings = get_settings(session_factory)
     farmers = {f["farmer_id"]: f for f in list_farmers(session_factory)}
     all_machines = machines(session_factory, settings=settings, now=now)
-    revenue = _revenue(session_factory, settings, now)
+    revenue = _revenue(session_factory, settings, now, completed_weeks_only=not admin)
     buybacks = _buybacks(session_factory, settings, revenue)
 
     def public(d: dict) -> dict:
@@ -737,7 +824,6 @@ def build(session_factory, *, admin: bool = False, now: datetime | None = None) 
         "buybacks": public(buybacks),
     }
     if not admin:
-        # Weeks are public; single days would show individual payments.
         out["revenue"].pop("days", None)
     if admin or settings["show_farmer_payments"]:
         out["farmer_payments"] = _farmer_payments(session_factory, _since(settings))
@@ -745,13 +831,31 @@ def build(session_factory, *, admin: bool = False, now: datetime | None = None) 
 
 
 def public_report(session_factory) -> dict | None:
-    """The published report, at most a minute old; None until published."""
-    with _cache_lock:
-        if _cache["value"] is not None and time.monotonic() - _cache["at"] < CACHE_SECONDS:
-            return _cache["value"]
+    """The published report, at most a minute old; None until published.
+    Whether it is published is asked on every request, so unpublishing takes
+    it down at once; one request builds while the others wait for it."""
     if not get_settings(session_factory)["published"]:
         return None
-    value = build(session_factory)
+
+    def cached():
+        if _cache["value"] is not None and time.monotonic() - _cache["at"] < CACHE_SECONDS:
+            return _cache["value"]
+        return None
+
     with _cache_lock:
-        _cache["at"], _cache["value"] = time.monotonic(), value
-    return value
+        value = cached()
+    if value is not None:
+        return value
+    with _build_lock:
+        with _cache_lock:
+            value = cached()
+            generation = _cache["generation"]
+        if value is not None:
+            return value
+        value = build(session_factory)
+        with _cache_lock:
+            if _cache["generation"] == generation:  # nothing changed while it was built
+                _cache["at"], _cache["value"] = time.monotonic(), value
+                return value
+    # A setting, a farmer or a machine changed meanwhile: answer from now.
+    return public_report(session_factory)

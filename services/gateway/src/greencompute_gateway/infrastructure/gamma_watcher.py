@@ -46,9 +46,14 @@ STATUS_EVERY_TICKS = 25
 # blocks since the last read, when there are at most this many (12 minutes
 # of blocks); after a longer gap the growth is credited from totals alone.
 MAX_EVENT_BLOCKS = 60
+WS_TIMEOUT_SECONDS = 30
+# While the chain can't be read, wait longer between tries (up to this) and
+# log every 10th failure, rather than reconnect and warn every 12 s.
+MAX_BACKOFF_SECONDS = 120
 
 _conn = {"substrate": None, "url": None}
 _ticks = {"n": 0}
+_failures = {"n": 0}
 
 
 def _kv_set(session_factory, key: str, value: str) -> None:
@@ -80,7 +85,10 @@ def _connect():
     failures = []
     for url in subtensor_urls():
         try:
-            _conn["substrate"], _conn["url"] = SubstrateInterface(url=url, ss58_format=42), url
+            # A read timeout, so an endpoint that goes silent fails the tick
+            # (and is replaced) instead of holding the watcher's thread.
+            _conn["substrate"], _conn["url"] = SubstrateInterface(
+                url=url, ss58_format=42, ws_options={"timeout": WS_TIMEOUT_SECONDS}), url
             return _conn["substrate"]
         except Exception as exc:  # noqa: BLE001
             failures.append(f"{url.split('//')[-1].split('/')[0]}: {type(exc).__name__}: {exc}")
@@ -213,10 +221,15 @@ def scan_gamma(session_factory, billing=None, substrate=None) -> int:
         substrate = substrate or _connect()
         chain = read_chain(substrate, netuid, services)
     except Exception as exc:  # noqa: BLE001
-        log.warning("gamma watcher: reading the chain failed (%s: %s); retrying next tick", type(exc).__name__, exc)
         if own:
+            _failures["n"] += 1
             _close()
+        if not own or _failures["n"] % 10 == 1:
+            log.warning("gamma watcher: reading the chain failed %d time(s) in a row (%s: %s); retrying",
+                        _failures["n"] if own else 1, type(exc).__name__, exc)
         return 0
+    if own:
+        _failures["n"] = 0
 
     block, counter = chain["block"], chain["counter"]
     previous = gamma_app.last_block(session_factory)
@@ -326,4 +339,4 @@ async def gamma_watcher_loop() -> None:
                 log.info("gamma watcher: credited %d spend(s)", n)
         except Exception:
             log.exception("gamma watcher tick failed")
-        await asyncio.sleep(interval)
+        await asyncio.sleep(min(MAX_BACKOFF_SECONDS, interval * (1 + _failures["n"])))

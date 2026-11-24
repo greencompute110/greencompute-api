@@ -74,7 +74,7 @@ def _hotkeys(name: str, default: list[str]) -> list[str]:
         part = part.strip()
         if part and part not in out:
             out.append(part)
-    return out
+    return out or list(default)  # "," or spaces only: as if unset
 
 
 def netuid() -> int:
@@ -105,10 +105,10 @@ def services_url() -> str:
 
 
 def bonus_pct() -> float:
-    """Extra credit per gamma (engy gives 5%); BONUS_RATES["gamma"], 0 now."""
-    from greencompute_gateway.application.billing_service import BONUS_RATES
+    """Extra credit per gamma (engy gives 5%): GAMMA_BONUS_RATE, 0 now."""
+    from greencompute_gateway.application import billing_service
 
-    return max(0.0, float(BONUS_RATES.get("gamma", 0.0)))
+    return max(0.0, float(billing_service.GAMMA_BONUS_RATE))
 
 
 def base_cents(total_raw: int) -> int:

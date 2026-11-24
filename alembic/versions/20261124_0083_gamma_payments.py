@@ -14,6 +14,10 @@ the finalized head and credits the growth.
 
 New tables only: nothing existing is locked or rewritten.
 
+Never downgrade this on a database that has accepted gamma: the downgrade
+refuses while gamma_spent_totals has rows, because without them every
+recorded spend would be credited again.
+
 Revision ID: 20261124_0083
 Revises: 20261118_0082
 Create Date: 2026-11-24
@@ -65,5 +69,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # gamma_spent_totals is what stops a spend being credited twice: without
+    # it the watcher would credit every hotkey's whole on-chain total again
+    # at its next spend. So this refuses once anything has been recorded.
+    bind = op.get_bind()
+    if bind.execute(sa.text("select count(*) from gamma_spent_totals")).scalar():
+        raise RuntimeError(
+            "gamma_spent_totals has rows: dropping it would let recorded gamma spends be credited again. "
+            "Don't downgrade past 20261124_0083 on a database that has accepted gamma."
+        )
     op.drop_table("gamma_spends")
     op.drop_table("gamma_spent_totals")
