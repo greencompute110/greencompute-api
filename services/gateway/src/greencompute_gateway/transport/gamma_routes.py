@@ -49,14 +49,33 @@ def services_document_alias() -> JSONResponse:
 
 
 @router.get("/gamma/balance", tags=["gamma"], summary="A hotkey's gamma balance")
-def gamma_balance(hotkey: str = Query(..., min_length=40, max_length=64,
-                                      description="The hotkey (ss58) that spent the gamma")) -> JSONResponse:
-    """What the hotkey's gamma spends at our service were credited, how much
-    of that is used, and what is left, in USD as decimal strings; zeros for a
-    hotkey with no account. Spends are credited within about a minute of
-    finalizing (`as_of_block` is the last block read)."""
+def gamma_balance(hotkey: str | None = Query(None, min_length=40, max_length=64,
+                                             description="The hotkey (ss58) that spent the gamma; "
+                                                         "optional on a request the hotkey signs")) -> JSONResponse:
+    """What the hotkey's gamma spends at our service were credited
+    (`credited_usd`, public: the chain shows the spends), and what of it is
+    used and left, in USD as decimal strings. `used_usd` and `remaining_usd`
+    are given when the request is signed by the hotkey itself (btauth/1) or
+    the account is nothing but that hotkey's gamma; otherwise they are null,
+    so nobody can read another account's balance from its wallet address.
+    Spends are credited within about a minute of finalizing (`as_of_block`
+    is the last block read)."""
+    from greencompute_gateway.transport import security
+
+    signed = security.current_signed_request.get()
+    signed_by = None
+    if signed is not None:
+        if signed.error is not None or not signed.hotkey:
+            raise coded(401, "signed_request_invalid", {
+                "message": f"signed request refused: {getattr(signed.error, 'message', 'not valid')}",
+                "reason": getattr(signed.error, "reason", "malformed"),
+            })
+        signed_by = signed.hotkey
+    target = (hotkey or signed_by or "").strip()
+    if not target:
+        raise coded(400, "invalid_request", "hotkey is required: ?hotkey=<ss58>, or sign the request with it")
     try:
-        return _json(gamma_app.balance(_session_factory(), hotkey.strip()))
+        return _json(gamma_app.balance(_session_factory(), target, signed_by=signed_by))
     except ValueError:
         raise coded(400, "invalid_request", "hotkey must be an ss58 address, e.g. 5F…") from None
 

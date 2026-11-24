@@ -315,36 +315,65 @@ def last_block(session_factory) -> int | None:
             return None
 
 
-def balance(session_factory, hotkey: str) -> dict:
-    """The standard's balance: what the hotkey's gamma was credited, what of
-    it is used, and what is left, in USD as decimal strings; zeros for a
-    hotkey with no account.
+def _only_this_hotkeys_gamma(session, user: UserORM, wallet: VerifiedWalletORM, credited: int) -> bool:
+    """True for an account that is nothing but this hotkey's gamma: opened
+    for the wallet, no email, no other wallet, and every cent ever added to
+    it is gamma this hotkey spent. Its balance says nothing the chain's
+    public record of those spends doesn't already start to say."""
+    if credited <= 0 or not wallet.sign_in or user.signup_method != "wallet" or (user.email or "").strip():
+        return False
+    wallets = session.scalar(select(func.count()).select_from(VerifiedWalletORM).where(
+        VerifiedWalletORM.user_id == user.user_id)) or 0
+    if wallets != 1:
+        return False
+    added = int(session.scalar(select(func.coalesce(func.sum(LedgerEntryORM.amount_cents), 0)).where(
+        LedgerEntryORM.user_id == user.user_id, LedgerEntryORM.amount_cents > 0)) or 0)
+    return added == credited
 
-    For a hotkey that signs in to its account (the hotkey is the account),
-    `remaining_usd` is the account's balance, however it was funded. For one
-    an account linked only to pay in, the account's balance isn't the
-    hotkey's to show: `remaining_usd` is then at most what the hotkey paid."""
+
+def balance(session_factory, hotkey: str, *, signed_by: str | None = None) -> dict:
+    """The standard's balance for a hotkey, in USD as decimal strings.
+
+    `credited_usd`, what the hotkey's gamma spends here were credited, is
+    public: the chain shows the spends to anyone. What is used and what is
+    left are the account's business, so `used_usd` and `remaining_usd` are
+    given only
+    - to a request signed by the hotkey itself (btauth/1; `signed_by`), when
+      the hotkey signs in to its account, or
+    - for an account that is nothing but this hotkey's gamma (the hotkey is
+      the account, as at Lium and engy);
+    and are null otherwise: never the balance of an account that was funded
+    another way, or that only linked the hotkey to pay in. Zeros for a
+    hotkey that never spent here and has nothing to show."""
     address = _canonical(hotkey)
     if address is None:
         raise ValueError("not a hotkey")
+    own = signed_by is not None and _canonical(signed_by) == address
+    used: int | None = None
+    remaining: int | None = None
     with session_scope(session_factory) as session:
-        credited = int(session.scalar(select(func.coalesce(func.sum(GammaSpentTotalORM.credited_cents), 0)).where(
-            GammaSpentTotalORM.hotkey == address, GammaSpentTotalORM.kind == "customer",
+        credited = int(session.scalar(select(func.coalesce(func.sum(GammaSpendORM.credited_cents), 0)).where(
+            GammaSpendORM.hotkey == address, GammaSpendORM.kind == "customer",
         )) or 0)
         wallet = session.scalar(select(VerifiedWalletORM).where(
             VerifiedWalletORM.chain == CHAIN, VerifiedWalletORM.address == address))
         user = session.get(UserORM, wallet.user_id) if wallet is not None else None
-        remaining = max(0, int(user.balance_credits or 0)) if user is not None else 0
-        if wallet is not None and not wallet.sign_in:
-            remaining = min(remaining, credited)
-    used = max(0, credited - remaining)
-    return {
+        if user is not None and ((own and wallet.sign_in) or _only_this_hotkeys_gamma(session, user, wallet, credited)):
+            remaining = max(0, int(user.balance_credits or 0))
+            used = max(0, credited - remaining)
+        elif credited == 0 and (not own or wallet is None):
+            used, remaining = 0, 0  # nothing paid here: nothing to show, account or not
+    out = {
         "hotkey": hotkey,
         "credited_usd": g.usd_text(credited),
-        "used_usd": g.usd_text(used),
-        "remaining_usd": g.usd_text(remaining),
+        "used_usd": g.usd_text(used) if used is not None else None,
+        "remaining_usd": g.usd_text(remaining) if remaining is not None else None,
         "as_of_block": last_block(session_factory),
     }
+    if remaining is None:
+        out["note"] = ("used_usd and remaining_usd are shown to the hotkey itself: sign this request with it "
+                       "(btauth/1), on an account the hotkey signs in to.")
+    return out
 
 
 def spent_totals(session_factory, *, recent: int = 20) -> dict:

@@ -567,7 +567,48 @@ def test_balance_endpoint(env):
     assert call("GET", "/gamma/balance", query=b"hotkey=" + b"x" * 48)[0] == 400
 
 
-def test_balance_of_a_payment_only_hotkey_never_shows_the_whole_account(env):
+def signed_balance(key, hotkey=None):
+    query = f"hotkey={hotkey}" if hotkey else ""
+    return signed("GET", "/gamma/balance", key=key, query=query)
+
+
+def test_balance_never_shows_an_account_that_did_not_pay_in_gamma(env):
+    # A wallet account (signed in with a coldkey, paid in TAO): no gamma here.
+    user = wallet_auth.create_wallet_account(env.sf, "bittensor", OTHER.ss58_address)
+    with session_scope(env.sf) as s:
+        s.get(UserORM, user).balance_credits = 123_456
+    status, body = call("GET", "/gamma/balance", query=f"hotkey={OTHER.ss58_address}".encode())
+    assert status == 200
+    assert (body["credited_usd"], body["used_usd"], body["remaining_usd"]) == ("0.00", "0.00", "0.00")
+    # Its own signature shows its balance.
+    status, body = signed_balance(OTHER)
+    assert status == 200 and body["remaining_usd"] == "1234.56" and body["hotkey"] == OTHER.ss58_address
+    # Someone else's signature doesn't.
+    status, body = signed_balance(CUSTOMER, OTHER.ss58_address)
+    assert status == 200 and body["remaining_usd"] == "0.00"
+
+
+def test_balance_of_an_account_with_other_funding_needs_the_hotkeys_signature(env):
+    credit(env, CUSTOMER.ss58_address, 5 * G)
+    user = owner_of(env, CUSTOMER.ss58_address)
+    with session_scope(env.sf) as s:  # a card payment too
+        row = s.get(UserORM, user)
+        row.balance_credits += 10_000
+        s.add(LedgerEntryORM(entry_id="card-1", user_id=user, amount_cents=10_000, balance_after=10_500,
+                             kind="topup", deposit_ref="stripe:cs_1", description="Stripe payment"))
+    status, body = call("GET", "/gamma/balance", query=f"hotkey={CUSTOMER.ss58_address}".encode())
+    assert status == 200
+    assert (body["credited_usd"], body["used_usd"], body["remaining_usd"]) == ("5.00", None, None)
+    assert "sign this request" in body["note"]
+    status, body = signed_balance(CUSTOMER)
+    assert (body["credited_usd"], body["remaining_usd"]) == ("5.00", "105.00")
+    # A bad signature is told so, not served the public view.
+    headers = btauth.sign(CUSTOMER, method="GET", target="/gamma/balance", body=b"", receiver=OTHER.ss58_address)
+    status, body = call("GET", "/gamma/balance", headers=headers)
+    assert status == 401 and body["error"]["code"] == "signed_request_invalid"
+
+
+def test_balance_of_a_payment_only_hotkey_never_shows_the_account(env):
     credit(env, OTHER.ss58_address, G)
     user = owner_of(env, OTHER.ss58_address)
     with session_scope(env.sf) as s:
@@ -575,9 +616,13 @@ def test_balance_of_a_payment_only_hotkey_never_shows_the_whole_account(env):
                                 address=CUSTOMER.ss58_address, sign_in=False))
     credit(env, CUSTOMER.ss58_address, 2 * G)
     with session_scope(env.sf) as s:
-        s.get(UserORM, user).balance_credits = 100_000  # card top-ups too
-    body = gamma_app.balance(env.sf, CUSTOMER.ss58_address)
-    assert (body["credited_usd"], body["remaining_usd"]) == ("2.00", "2.00")
+        s.get(UserORM, user).balance_credits = 150  # under what the hotkey paid
+    for body in (gamma_app.balance(env.sf, CUSTOMER.ss58_address),
+                 gamma_app.balance(env.sf, CUSTOMER.ss58_address, signed_by=CUSTOMER.ss58_address)):
+        assert (body["credited_usd"], body["used_usd"], body["remaining_usd"]) == ("2.00", None, None)
+    # The account's first hotkey no longer stands for the whole account either (two wallets now).
+    body = gamma_app.balance(env.sf, OTHER.ss58_address)
+    assert (body["credited_usd"], body["remaining_usd"]) == ("1.00", None)
 
 
 def test_platform_gamma_and_openapi(env):
