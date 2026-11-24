@@ -1375,7 +1375,7 @@ class BillingRepository:
         key = session.get(APIKeyORM, key_id)
         if key is None or key.user_id != user_id:
             return False
-        tag = (key.issued_by_wallet or "").removesuffix("#web")
+        tag = (key.issued_by_wallet or "").removesuffix("#web").removesuffix("#btauth")
         if not tag:
             return True
         chain, _, address = tag.partition(":")

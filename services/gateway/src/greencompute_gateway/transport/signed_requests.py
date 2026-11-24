@@ -20,7 +20,13 @@ from greencompute_gateway.transport.security import SignedRequest
 
 #: The largest body a signed request may carry (a 1M-token chat request is
 #: ~5 MB); larger uploads use an API key.
-MAX_SIGNED_BODY_BYTES = 64 * 1024 * 1024
+MAX_SIGNED_BODY_BYTES = 32 * 1024 * 1024
+#: Bodies over this are hashed and verified off the event loop.
+VERIFY_IN_THREAD_OVER_BYTES = 256 * 1024
+
+#: read_body's answers besides the body itself.
+TOO_LARGE = object()
+DISCONNECTED = object()
 
 
 def _max_body() -> int:
@@ -54,21 +60,21 @@ def target_of(scope) -> str:
     return f"{path}?{query.decode('latin-1')}" if query else path
 
 
-async def read_body(receive, limit: int) -> bytes | None:
-    """The whole body, or None when it is larger than `limit` or the client
-    went away."""
+async def read_body(receive, limit: int):
+    """The whole body; TOO_LARGE when it is larger than `limit`; or
+    DISCONNECTED when the client went away before sending all of it."""
     chunks, size = [], 0
     while True:
         message = await receive()
         if message["type"] != "http.request":
-            return None
+            return DISCONNECTED
         chunk = message.get("body") or b""
         size += len(chunk)
         if size > limit:
-            return None
+            return TOO_LARGE
         chunks.append(chunk)
         if not message.get("more_body"):
-            return b"".join(chunks)
+            return chunks[0] if len(chunks) == 1 else b"".join(chunks)
 
 
 def replay(body: bytes, receive):
@@ -92,9 +98,21 @@ async def too_large(send, limit: int) -> None:
         "error": {"code": "invalid_request", "retryable": False,
                   "message": "The signed request's body is too large; use an API key for larger uploads."},
     }).encode()
+    # Sent before the CORS middleware, so it says itself that any page may read it.
     await send({"type": "http.response.start", "status": 413,
-                "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+                "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
+                            (b"access-control-allow-origin", b"*")]})
     await send({"type": "http.response.body", "body": body})
+
+
+async def check_async(scope, found: dict[str, list[str]], body: bytes) -> SignedRequest:
+    """check(), off the event loop for a large body (hashing 32 MB takes
+    tens of milliseconds)."""
+    if len(body) > VERIFY_IN_THREAD_OVER_BYTES:
+        import asyncio
+
+        return await asyncio.to_thread(check, scope, found, body)
+    return check(scope, found, body)
 
 
 def check(scope, found: dict[str, list[str]], body: bytes) -> SignedRequest:

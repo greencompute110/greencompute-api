@@ -41,7 +41,12 @@ from greencompute_persistence.orm import (
     VerifiedWalletORM,
 )
 from greencompute_gateway.domain import gamma as g
-from greencompute_gateway.infrastructure.wallet_signatures import InvalidAddress, normalize_address, wallet_tag
+from greencompute_gateway.infrastructure.wallet_signatures import (
+    SIGNED_TAG_SUFFIX,
+    InvalidAddress,
+    normalize_address,
+    wallet_tag,
+)
 
 log = logging.getLogger(__name__)
 
@@ -102,16 +107,21 @@ def credit_growth(
     block: int,
     coldkey: str | None = None,
     billing=None,
+    tx_hash: str | None = None,
 ) -> str:
     """Handle the chain's GammaSpent(netuid, service, hotkey) = `total_raw`
-    read at finalized `block`. Returns credited | buyback | blocked |
+    read at finalized `block` (`tx_hash`: the spend's extrinsic, when the
+    watcher found its event). Returns credited | buyback | blocked |
     logged (grew by under a cent's worth, carried over) | seen (not grown).
     Raises RetryLater when it can't be decided yet."""
     from greencompute_gateway.application import sanctions, wallet_auth
 
     address = normalize_address(CHAIN, hotkey)
     funder = _canonical(coldkey) if coldkey else None
-    treasury = (address in {_canonical(h) for h in g.treasury_hotkeys()}
+    # Ours: a treasury hotkey, a service hotkey spending at itself, or any
+    # hotkey whose deposit a treasury coldkey funded.
+    own_hotkeys = {_canonical(h) for h in (*g.treasury_hotkeys(), *g.service_hotkeys())}
+    treasury = (address in own_hotkeys
                 or (funder is not None and funder in {_canonical(c) for c in g.treasury_coldkeys()}))
     owner: str | None = None
     source: str | None = None
@@ -138,7 +148,7 @@ def credit_growth(
 
     outcome, cents, balance_after, amount = _apply(
         session_factory, netuid=netuid, counter=counter, service=service, address=address, total_raw=total_raw,
-        block=block, kind=kind, owner=owner, source=source,
+        block=block, kind=kind, owner=owner, source=source, tx_hash=tx_hash,
     )
     if outcome == "seen":
         return outcome
@@ -155,7 +165,7 @@ def credit_growth(
         ))
     elif outcome == "credited" and billing is not None:
         dep = {"deposit_ref": spend_id(netuid, counter, service, address, total_raw), "currency": CURRENCY,
-               "amount_raw": amount, "decimals": 9, "tx_hash": None}
+               "amount_raw": amount, "decimals": 9, "tx_hash": tx_hash}
         billing._email_deposit(owner, dep, cents, balance_after, bonus_pct=g.bonus_pct())
     return outcome
 
@@ -167,7 +177,8 @@ def _canonical(hotkey: str) -> str | None:
         return None
 
 
-def _apply(session_factory, *, netuid, counter, service, address, total_raw, block, kind, owner, source):
+def _apply(session_factory, *, netuid, counter, service, address, total_raw, block, kind, owner, source,
+           tx_hash=None):
     """The transaction: re-read the total under its row lock, credit or log
     the growth since, move the total. (outcome, cents, balance_after, gamma)."""
     now = _now()
@@ -176,6 +187,20 @@ def _apply(session_factory, *, netuid, counter, service, address, total_raw, blo
         if row is not None and row.subnet_counter > counter:
             return "seen", 0, None, 0  # read before the subnet was registered again
         same = row is not None and row.subnet_counter == counter
+        if row is not None and row.subnet_counter < counter and total_raw >= row.total_raw > 0:
+            # The subnet's counter grew but this total did not start over. A
+            # dissolved subnet's totals are cleared, so this is the counter
+            # being set for a subnet that wasn't dissolved (a runtime
+            # backfill): carry on from the old total, never credit it again.
+            _alert_once(f"counter:{netuid}:{counter}", (
+                f"Gamma watcher: subnet {netuid}'s RegisteredSubnetCounter went from {row.subnet_counter} to "
+                f"{counter} but spent totals at our service did not reset. Treated as the same subnet: only "
+                "growth past the old totals is credited. Check the subnet was not dissolved and re-registered."
+            ))
+            same = True
+            if total_raw == row.total_raw:
+                row.subnet_counter = counter
+                return "seen", 0, None, 0
         prev_total = row.total_raw if same else 0
         prev_cents = row.credited_cents if same else 0
         if total_raw <= prev_total:
@@ -188,7 +213,7 @@ def _apply(session_factory, *, netuid, counter, service, address, total_raw, blo
         cents, balance_after = 0, None
         outcome = {"treasury": "buyback", "blocked": "blocked"}.get(kind, "credited")
         deposit = dict(
-            deposit_ref=ref, currency=CURRENCY, tx_hash=None, sender=address, deposit_address=service,
+            deposit_ref=ref, currency=CURRENCY, tx_hash=tx_hash, sender=address, deposit_address=service,
             amount_raw=amount, decimals=9, block_number=block, usd_price=1.0, observed_at=now,
         )
         if kind == "customer":
@@ -212,7 +237,7 @@ def _apply(session_factory, *, netuid, counter, service, address, total_raw, blo
                 ))
                 add_event(session, payment_event(
                     owner, cents=cents, balance_after=balance_after, method="crypto", currency=CURRENCY,
-                    sender=address, matched_by="gamma",
+                    tx_hash=tx_hash, sender=address, matched_by="gamma",
                 ))
             else:
                 outcome = "logged"
@@ -223,7 +248,7 @@ def _apply(session_factory, *, netuid, counter, service, address, total_raw, blo
 
         session.add(GammaSpendORM(
             spend_id=ref, netuid=netuid, subnet_counter=counter, service_hotkey=service, hotkey=address,
-            kind=kind, amount_raw=amount, total_raw=total_raw, block_number=block,
+            kind=kind, amount_raw=amount, total_raw=total_raw, block_number=block, tx_hash=tx_hash,
             user_id=owner if kind == "customer" else None, credited_cents=cents if kind == "customer" else None,
             observed_at=now,
         ))
@@ -245,17 +270,25 @@ def _apply(session_factory, *, netuid, counter, service, address, total_raw, blo
 
 def signed_request_key(session_factory, hotkey: str):
     """The API key a btauth/1 request signed by `hotkey` acts as: one per
-    account and hotkey, scopes SIGNED_REQUEST_SCOPES, made on first use. Its
-    secret is never shown; it goes the way of the hotkey's other keys (a new
-    sign-in, turning the hotkey's sign-in off, unlinking it) and comes back
-    on the next signed request while the hotkey may still sign in."""
+    account and hotkey, made on first use, found by a tag only the server
+    sets ("<chain>:<address>#btauth"), so no key a user made or named can
+    stand in for it. Whatever its row says, it is used with exactly
+    SIGNED_REQUEST_SCOPES, never as an admin and never expired. Its secret
+    is never shown. Unlinking the hotkey or turning its sign-in off deletes
+    it, and every request checks the hotkey still signs in."""
     from greencompute_gateway.transport.errors import coded
 
     address = _canonical(hotkey)
     if address is None:
         raise coded(401, "signed_request_invalid", {"message": "X-Bittensor-Hotkey isn't a valid hotkey",
                                                      "reason": "malformed"})
-    tag = wallet_tag(CHAIN, address)
+    tag = wallet_tag(CHAIN, address) + SIGNED_TAG_SUFFIX
+
+    def as_used(key: APIKeyORM):
+        return stored_api_key(key).model_copy(update={
+            "scopes": list(g.SIGNED_REQUEST_SCOPES), "admin": False, "expires_at": None,
+        })
+
     with session_scope(session_factory) as session:
         wallet = session.scalar(select(VerifiedWalletORM).where(
             VerifiedWalletORM.chain == CHAIN, VerifiedWalletORM.address == address))
@@ -275,22 +308,19 @@ def signed_request_key(session_factory, hotkey: str):
                 "turn on \"Sign in with this wallet\" for it under Billing > Verified wallets."
             ))
         user_id = wallet.user_id
-        key = session.scalar(select(APIKeyORM).where(
+        find = select(APIKeyORM).where(
             APIKeyORM.user_id == user_id, APIKeyORM.issued_by_wallet == tag,
-            APIKeyORM.name == g.SIGNED_REQUEST_KEY_NAME,
-        ).limit(1))
+        ).order_by(APIKeyORM.created_at, APIKeyORM.key_id).limit(1)
+        key = session.scalar(find)
         if key is not None:
-            return stored_api_key(key)
+            return as_used(key)
         # The account's lock, as every key a wallet's sign-in makes takes it,
         # so two first requests can't make two keys or race a revocation.
         user = session.get(UserORM, user_id, with_for_update=True)
         if user is None or (user.username or "").startswith("deleted-"):
             raise coded(403, "forbidden", "The account this hotkey signs in to no longer exists. "
                                           "Contact support@green-compute.com.")
-        key = session.scalar(select(APIKeyORM).where(
-            APIKeyORM.user_id == user_id, APIKeyORM.issued_by_wallet == tag,
-            APIKeyORM.name == g.SIGNED_REQUEST_KEY_NAME,
-        ).limit(1))
+        key = session.scalar(find)
         if key is None:
             key = APIKeyORM(
                 key_id=str(uuid4()), user_id=user_id, name=g.SIGNED_REQUEST_KEY_NAME, admin=False,
@@ -300,7 +330,7 @@ def signed_request_key(session_factory, hotkey: str):
             session.add(key)
             session.flush()
             log.info("gamma: signed-request key %s for account %s (hotkey %s)", key.key_id, user_id, _short(address))
-        return stored_api_key(key)
+        return as_used(key)
 
 
 # --- what anyone may read -----------------------------------------------------------
@@ -377,24 +407,26 @@ def balance(session_factory, hotkey: str, *, signed_by: str | None = None) -> di
 
 
 def spent_totals(session_factory, *, recent: int = 20) -> dict:
-    """What has been spent at our service, as the watcher last read it:
+    """What has been spent at our service, as the watcher recorded it:
     customers' payments, our buybacks, and spends that were blocked; plus
-    the latest buybacks. Anyone can check the sum on chain
+    the latest buybacks. Summed from the log of spends (what each was when
+    it happened), so a hotkey that is later classed differently doesn't
+    rewrite history. Anyone can check the sum on chain
     (GammaSpent(netuid, service, *))."""
     netuid = g.netuid()
     with session_scope(session_factory) as session:
         rows = session.execute(
-            select(GammaSpentTotalORM.kind, func.coalesce(func.sum(GammaSpentTotalORM.total_raw), 0),
-                   func.count())
-            .where(GammaSpentTotalORM.netuid == netuid)
-            .group_by(GammaSpentTotalORM.kind)
+            select(GammaSpendORM.kind, func.coalesce(func.sum(GammaSpendORM.amount_raw), 0),
+                   func.count(func.distinct(GammaSpendORM.hotkey)))
+            .where(GammaSpendORM.netuid == netuid)
+            .group_by(GammaSpendORM.kind)
         ).all()
         buybacks = session.scalars(
             select(GammaSpendORM).where(GammaSpendORM.netuid == netuid, GammaSpendORM.kind == "treasury")
-            .order_by(GammaSpendORM.block_number.desc()).limit(recent)
+            .order_by(GammaSpendORM.block_number.desc(), GammaSpendORM.observed_at.desc()).limit(recent)
         ).all()
         recent_buybacks = [{
-            "gamma": g.gamma_text(b.amount_raw), "read_at_block": b.block_number, "hotkey": b.hotkey,
+            "gamma": g.gamma_text(b.amount_raw), "block": b.block_number, "tx_hash": b.tx_hash, "hotkey": b.hotkey,
             "observed_at": b.observed_at.isoformat() if b.observed_at else None,
         } for b in buybacks]
     by_kind = {kind: (int(total), int(n)) for kind, total, n in rows}

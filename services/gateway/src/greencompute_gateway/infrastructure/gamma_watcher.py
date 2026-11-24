@@ -42,6 +42,10 @@ log = logging.getLogger(__name__)
 # How often the chain's own status (gamma on for the subnet, our service
 # listing) is read again, in ticks.
 STATUS_EVERY_TICKS = 25
+# A spend's own block and transaction are looked up in the events of the
+# blocks since the last read, when there are at most this many (12 minutes
+# of blocks); after a longer gap the growth is credited from totals alone.
+MAX_EVENT_BLOCKS = 60
 
 _conn = {"substrate": None, "url": None}
 _ticks = {"n": 0}
@@ -103,14 +107,51 @@ def read_chain(substrate, netuid: int, services: list[str]) -> dict:
 
 
 def deposit_coldkey(substrate, head, netuid: int, hotkey: str) -> str | None:
-    """The coldkey that owns the hotkey's deposit, to screen it too. None
-    when the deposit is closed, or the read fails (the hotkey is still
-    screened)."""
-    try:
-        deposit = _value(substrate.query("SubtensorModule", "GammaDeposits", [netuid, hotkey], block_hash=head))
-    except Exception:  # noqa: BLE001
-        return None
+    """The coldkey that owns the hotkey's deposit: it says whether the spend
+    is our own buyback, and it is screened too. None when the deposit has
+    been closed. A failed read raises: whose gamma it is can't be decided
+    without it, so the caller retries next tick rather than credit a
+    buyback to an account."""
+    deposit = _value(substrate.query("SubtensorModule", "GammaDeposits", [netuid, hotkey], block_hash=head))
     return str(deposit.get("coldkey")) if isinstance(deposit, dict) and deposit.get("coldkey") else None
+
+
+def spend_events(substrate, netuid: int, services: set[str], first: int, last: int) -> dict | None:
+    """The GammaSpent events at our services in blocks first..last, oldest
+    first, per (service, hotkey): [(block, extrinsic hash, amount)]. They
+    give each spend its own block and transaction; totals stay the source
+    of what is owed. None when the range is too long or a block can't be
+    read: the growth is then credited as one spend, with no transaction."""
+    from greencompute_gateway.infrastructure.deposit_watcher import _extrinsic_hashes
+
+    if first > last or last - first + 1 > MAX_EVENT_BLOCKS:
+        return None
+    found: dict[tuple[str, str], list[tuple[int, str | None, int]]] = {}
+    try:
+        for number in range(first, last + 1):
+            block_hash = substrate.get_block_hash(number)
+            if not block_hash:
+                return None
+            hashes = None
+            for ev in substrate.get_events(block_hash) or []:
+                value = _value(ev) or {}
+                event = value.get("event") or {}
+                if event.get("module_id") != "SubtensorModule" or event.get("event_id") != "GammaSpent":
+                    continue
+                attrs = event.get("attributes") or {}
+                if not isinstance(attrs, dict) or int(attrs.get("netuid", -1)) != netuid:
+                    continue
+                service, hotkey = _canonical(str(attrs.get("service"))), _canonical(str(attrs.get("hotkey")))
+                if service not in services or hotkey is None:
+                    continue
+                if hashes is None:
+                    hashes = _extrinsic_hashes(substrate, block_hash)
+                found.setdefault((service, hotkey), []).append(
+                    (number, hashes.get(value.get("extrinsic_idx")), int(attrs.get("amount") or 0)))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("gamma watcher: reading spend events %d..%d failed (%s); crediting from totals", first, last, exc)
+        return None
+    return found
 
 
 def read_status(substrate, head, netuid: int, service: str) -> dict:
@@ -122,7 +163,35 @@ def read_status(substrate, head, netuid: int, service: str) -> dict:
     url = listing.get("url") if isinstance(listing, dict) else None
     if isinstance(url, (bytes, bytearray)):
         url = url.decode("utf-8", "replace")
-    return {"gamma_enabled": enabled, "service_hotkey": service, "service_url": url or None}
+    out = {"gamma_enabled": enabled, "service_hotkey": service, "service_url": url or None}
+    try:
+        out["owner_coldkey"] = str(_value(substrate.query("SubtensorModule", "SubnetOwner", [netuid], block_hash=head)))
+        out["owner_hotkey"] = str(_value(substrate.query("SubtensorModule", "SubnetOwnerHotkey", [netuid],
+                                                         block_hash=head)))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _check_owner(status: dict, netuid: int) -> None:
+    """Alert once if the subnet's owner keys no longer match what we treat
+    as the treasury coldkey and the service hotkey: after an owner or
+    hotkey swap, buybacks would be credited as payments, or customers would
+    be spending at a hotkey nobody reads."""
+    coldkey, hotkey = status.get("owner_coldkey"), status.get("owner_hotkey")
+    if coldkey and _canonical(coldkey) not in {_canonical(c) for c in gamma.treasury_coldkeys()}:
+        gamma_app._alert_once(f"owner-coldkey:{coldkey}", (
+            f"Gamma: subnet {netuid}'s owner coldkey is now {coldkey}, which is not a treasury coldkey here "
+            f"({', '.join(sorted(gamma.treasury_coldkeys())) or 'none'}). Its buybacks would be credited as "
+            "customer payments: set GREENCOMPUTE_GAMMA_TREASURY_COLDKEYS on the gateway."
+        ))
+    if hotkey and not status.get("service_url") and _canonical(hotkey) not in {
+            _canonical(h) for h in gamma.service_hotkeys()}:
+        gamma_app._alert_once(f"owner-hotkey:{hotkey}", (
+            f"Gamma: subnet {netuid}'s owner hotkey is now {hotkey}, and our service hotkey "
+            f"{gamma.service_hotkey()} has no listing on chain. If the service moved to the new hotkey, add it "
+            "to GREENCOMPUTE_GAMMA_SERVICE_HOTKEYS (keep the old one listed too)."
+        ))
 
 
 def _canonical(hotkey: str) -> str | None:
@@ -163,27 +232,40 @@ def scan_gamma(session_factory, billing=None, substrate=None) -> int:
             select(GammaSpentTotalORM).where(GammaSpentTotalORM.netuid == netuid)).all()}
 
     credited, stuck = 0, False
+    events: dict | None | bool = False  # False: not read yet (only read when a total grew)
     for service, totals in chain["totals"].items():
         for hotkey, total in totals.items():
             seen = known.get((service, hotkey))
             if seen is not None and seen[0] == counter and total <= seen[1]:
                 continue
+            if events is False:
+                events = (spend_events(substrate, netuid, set(services), previous + 1, block)
+                          if previous is not None else None)
+            before = seen[1] if seen is not None and seen[0] == counter else 0
+            mine = (events or {}).get((service, hotkey)) or []
+            if mine and sum(amount for _, _, amount in mine) == total - before:
+                # Each spend with its own block and transaction.
+                steps, running = [], before
+                for number, tx_hash, amount in mine:
+                    running += amount
+                    steps.append((running, number, tx_hash))
+            else:
+                steps = [(total, block, None)]
             try:
-                outcome = gamma_app.credit_growth(
-                    session_factory, netuid=netuid, counter=counter, service=service, hotkey=hotkey,
-                    total_raw=total, block=block, coldkey=deposit_coldkey(substrate, chain["head"], netuid, hotkey),
-                    billing=billing,
-                )
+                coldkey = deposit_coldkey(substrate, chain["head"], netuid, hotkey)
+                for step_total, step_block, tx_hash in steps:
+                    outcome = gamma_app.credit_growth(
+                        session_factory, netuid=netuid, counter=counter, service=service, hotkey=hotkey,
+                        total_raw=step_total, block=step_block, coldkey=coldkey, billing=billing, tx_hash=tx_hash,
+                    )
+                    if outcome == "credited":
+                        credited += 1
             except gamma_app.RetryLater as exc:
                 log.warning("gamma watcher: %s waits (%s)", hotkey, exc)
                 stuck = True
-                continue
             except Exception:
                 log.exception("gamma watcher: crediting %s at block %d failed; retrying next tick", hotkey, block)
                 stuck = True
-                continue
-            if outcome == "credited":
-                credited += 1
         for (svc, hotkey), (seen_counter, seen_total) in known.items():
             if svc != service or seen_counter != counter or seen_total <= 0:
                 continue
@@ -201,6 +283,7 @@ def scan_gamma(session_factory, billing=None, substrate=None) -> int:
         if _ticks["n"] % STATUS_EVERY_TICKS == 1:
             try:
                 status = read_status(substrate, chain["head"], netuid, services[0])
+                _check_owner(status, netuid)
                 status.update({"netuid": netuid, "checked_block": block,
                                "checked_at": datetime.now(UTC).isoformat(timespec="seconds")})
                 _kv_set(session_factory, gamma_app.CHAIN_STATUS_KEY, json.dumps(status))

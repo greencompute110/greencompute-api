@@ -49,11 +49,17 @@ def wallet_tag(chain: str, address: str) -> str:
 WEB_TAG_SUFFIX = "#web"
 
 
-def wallet_tags(chain: str, address: str) -> tuple[str, str]:
-    """Both tags of a wallet's keys: what unlinking it, turning its sign-in
+#: Appended to wallet_tag for the one key that stands for a hotkey's signed
+#: requests (btauth/1, application/gamma.py). Only the server ever sets it:
+#: a signed request can't make keys, so nothing inherits it.
+SIGNED_TAG_SUFFIX = "#btauth"
+
+
+def wallet_tags(chain: str, address: str) -> tuple[str, ...]:
+    """Every tag of a wallet's keys: what unlinking it, turning its sign-in
     off or a revoke_keys signature ends."""
     tag = wallet_tag(chain, address)
-    return tag, tag + WEB_TAG_SUFFIX
+    return tag, tag + WEB_TAG_SUFFIX, tag + SIGNED_TAG_SUFFIX
 
 
 def detect_chain(address: str) -> str:

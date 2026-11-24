@@ -193,13 +193,15 @@ def unbilled_rentals(session, now: datetime) -> list[Finding]:
 def stalled_watchers(session, now: datetime) -> list[Finding]:
     """Deposit watchers whose cursor hasn't moved lately: payments on that
     chain aren't being seen. (The Base watcher sat stuck for five days after
-    the 2026-10-14 outage with nothing but log lines to show for it.)"""
-    if os.environ.get("GREENCOMPUTE_DEPOSIT_WATCHER_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
-        return []
+    the 2026-10-14 outage with nothing but log lines to show for it.) The
+    gamma watcher is a task of its own with its own switch."""
+    def off(name: str) -> bool:
+        return os.environ.get(name, "true").strip().lower() in ("0", "false", "no", "off")
+
+    deposits_off, gamma_off = off("GREENCOMPUTE_DEPOSIT_WATCHER_ENABLED"), off("GREENCOMPUTE_GAMMA_WATCHER_ENABLED")
     out = []
-    gamma_off = os.environ.get("GREENCOMPUTE_GAMMA_WATCHER_ENABLED", "true").strip().lower() in ("0", "false", "no", "off")
     for chain, label in WATCHER_CHAINS.items():
-        if chain == "gamma" and gamma_off:
+        if gamma_off if chain == "gamma" else deposits_off:
             continue
         row = session.get(KeyValueStateORM, f"watcher:{chain}:last_block")
         moved = _aware(row.updated_at) if row else None

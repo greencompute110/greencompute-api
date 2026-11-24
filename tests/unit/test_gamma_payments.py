@@ -352,7 +352,7 @@ def test_signed_request_acts_as_the_hotkeys_account(env):
         assert len(keys) == 1
         assert keys[0].name == gamma.SIGNED_REQUEST_KEY_NAME
         assert sorted(keys[0].scopes) == ["inference", "read", "rentals"]
-        assert keys[0].issued_by_wallet == f"bittensor:{CUSTOMER.ss58_address}"
+        assert keys[0].issued_by_wallet == f"bittensor:{CUSTOMER.ss58_address}#btauth"
 
 
 def test_signed_post_body_reaches_the_route_unchanged(env):
@@ -426,6 +426,7 @@ def test_a_huge_signed_body_is_refused(env, monkeypatch):
                           receiver=SERVICE.ss58_address)
     status, body = call("POST", "/v1/chat/completions", raw=raw, headers=headers)
     assert status == 413 and body["error"]["code"] == "invalid_request"
+    assert call.last_headers.get("access-control-allow-origin") == "*"
 
 
 def test_revoked_key_comes_back_while_the_hotkey_signs_in(env):
@@ -455,13 +456,19 @@ class FakeChain:
     def get_block_number(self, head):
         return int(head[6:])
 
+    fail_deposits = False
+
     def query(self, module, name, params, block_hash=None):
+        if name == "GammaDeposits" and self.fail_deposits:
+            raise ConnectionError("rpc went away")
         v = {
             "RegisteredSubnetCounter": lambda: self.counter,
             "GammaDeposits": lambda: ({"coldkey": self.coldkeys[params[1]], "balance": 0, "daily_spend_cap": None}
                                       if params[1] in self.coldkeys else None),
             "SubnetGammaEnabled": lambda: self.enabled,
             "Services": lambda: {"url": self.url} if self.url else None,
+            "SubnetOwner": lambda: gamma.SN110_OWNER_COLDKEY,
+            "SubnetOwnerHotkey": lambda: SERVICE.ss58_address,
         }[name]()
         return types.SimpleNamespace(value=v)
 
@@ -469,6 +476,25 @@ class FakeChain:
         assert name == "GammaSpent"
         return [(types.SimpleNamespace(value=hk), types.SimpleNamespace(value=total))
                 for hk, total in self.totals.get(params[1], {}).items()]
+
+    # Blocks and their events: {block: [(hotkey, amount)]}, one extrinsic each.
+    spends: dict = {}
+
+    def get_block_hash(self, number):
+        return f"0xblock{number}"
+
+    def get_events(self, block_hash):
+        number = int(block_hash[7:])
+        return [types.SimpleNamespace(value={
+            "phase": "ApplyExtrinsic", "extrinsic_idx": i,
+            "event": {"module_id": "SubtensorModule", "event_id": "GammaSpent",
+                      "attributes": {"netuid": 110, "hotkey": hk, "service": SERVICE.ss58_address, "amount": amount}},
+        }) for i, (hk, amount) in enumerate(self.spends.get(number, []))]
+
+    def get_block(self, block_hash=None):
+        number = int(block_hash[7:])
+        return {"extrinsics": [types.SimpleNamespace(extrinsic_hash=bytes([number % 256, i]) * 16)
+                               for i in range(len(self.spends.get(number, [])))]}
 
 
 def test_watcher_credits_growth_at_the_finalized_head(env):
@@ -537,6 +563,147 @@ def test_stalled_gamma_watcher_is_reported(env, monkeypatch):
     monkeypatch.setenv("GREENCOMPUTE_GAMMA_WATCHER_ENABLED", "false")
     with session_scope(env.sf) as s:
         assert not [f for f in billing_monitor.stalled_watchers(s, datetime.now(UTC)) if "gamma" in f.key]
+
+
+def test_each_spend_gets_its_own_block_and_transaction(env):
+    chain = FakeChain(block=5000)
+    chain.totals[SERVICE.ss58_address] = {}
+    gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain)  # the first read: nothing yet
+    # Two spends by one hotkey before the next read, in blocks 5001 and 5003.
+    chain.spends = {5001: [(OTHER.ss58_address, 9 * G), (CUSTOMER.ss58_address, 2 * G)],
+                    5003: [(CUSTOMER.ss58_address, 3 * G)]}
+    chain.block = 5003
+    chain.totals[SERVICE.ss58_address] = {CUSTOMER.ss58_address: 5 * G, OTHER.ss58_address: 9 * G}
+    assert gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain) == 3
+    with session_scope(env.sf) as s:
+        mine = s.scalars(select(GammaSpendORM).where(GammaSpendORM.hotkey == CUSTOMER.ss58_address)
+                         .order_by(GammaSpendORM.block_number)).all()
+        assert [(m.block_number, m.amount_raw, m.total_raw) for m in mine] == [(5001, 2 * G, 2 * G), (5003, 3 * G, 5 * G)]
+        assert all(m.tx_hash and m.tx_hash.startswith("0x") for m in mine) and mine[0].tx_hash != mine[1].tx_hash
+        # The deposit log carries the transaction too: what the "already
+        # credited" check for a staff-confirmed invoice looks up.
+        deposits = {d.tx_hash for d in s.scalars(select(CryptoDepositORM))}
+        assert {m.tx_hash for m in mine} <= deposits
+    assert balance_cents(env, owner_of(env, CUSTOMER.ss58_address)) == 500
+
+
+def test_events_that_do_not_add_up_fall_back_to_the_total(env):
+    chain = FakeChain(block=6000)
+    chain.totals[SERVICE.ss58_address] = {}
+    gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain)
+    chain.spends = {6001: [(CUSTOMER.ss58_address, 1 * G)]}  # the chain says 4 were spent
+    chain.block = 6001
+    chain.totals[SERVICE.ss58_address] = {CUSTOMER.ss58_address: 4 * G}
+    assert gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain) == 1
+    with session_scope(env.sf) as s:
+        spend = s.scalar(select(GammaSpendORM))
+        assert (spend.amount_raw, spend.tx_hash, spend.block_number) == (4 * G, None, 6001)
+    assert balance_cents(env, owner_of(env, CUSTOMER.ss58_address)) == 400
+
+
+def test_a_failed_deposit_read_waits_rather_than_credit_a_buyback(env):
+    chain = FakeChain(block=7000)
+    chain.totals[SERVICE.ss58_address] = {OTHER.ss58_address: 1000 * G}
+    chain.coldkeys[OTHER.ss58_address] = gamma.SN110_OWNER_COLDKEY
+    chain.fail_deposits = True
+    assert gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain) == 0
+    assert owner_of(env, OTHER.ss58_address) is None and gamma_app.last_block(env.sf) is None
+    chain.fail_deposits, chain.block = False, 7001
+    assert gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain) == 0
+    assert gamma_app.spent_totals(env.sf)["bought_back_gamma"] == "1000"
+    assert owner_of(env, OTHER.ss58_address) is None
+
+
+def test_the_service_hotkey_spending_at_itself_is_ours(env):
+    assert credit(env, SERVICE.ss58_address, 7 * G) == "buyback"
+    assert owner_of(env, SERVICE.ss58_address) is None
+
+
+def test_a_counter_that_grows_without_a_reset_never_credits_again(env):
+    assert credit(env, CUSTOMER.ss58_address, 50 * G, counter=0) == "credited"
+    user = owner_of(env, CUSTOMER.ss58_address)
+    # The counter is set for a subnet that was never dissolved: same totals.
+    assert credit(env, CUSTOMER.ss58_address, 50 * G, counter=1, block=300) == "seen"
+    assert credit(env, CUSTOMER.ss58_address, 52 * G, counter=1, block=301) == "credited"
+    assert balance_cents(env, user) == 5200
+    assert any("did not reset" in a for a in env.alerts)
+
+
+def test_totals_keep_what_each_spend_was(env, monkeypatch):
+    credit(env, CUSTOMER.ss58_address, 50 * G)
+    monkeypatch.setenv("GREENCOMPUTE_GAMMA_TREASURY_HOTKEYS", CUSTOMER.ss58_address)
+    assert credit(env, CUSTOMER.ss58_address, 51 * G, block=101) == "buyback"
+    totals = gamma_app.spent_totals(env.sf)
+    assert (totals["paid_by_customers_gamma"], totals["bought_back_gamma"]) == ("50", "1")
+    assert gamma_app.balance(env.sf, CUSTOMER.ss58_address)["credited_usd"] == "50.00"
+
+
+def test_no_key_a_user_made_can_stand_in_for_the_signed_request_key(env):
+    from datetime import UTC, datetime, timedelta
+
+    credit(env, CUSTOMER.ss58_address, 5 * G)
+    user = owner_of(env, CUSTOMER.ss58_address)
+    with session_scope(env.sf) as s:  # same name, the wallet's sign-in tag, full access, expired
+        s.add(APIKeyORM(key_id="planted", user_id=user, name=gamma.SIGNED_REQUEST_KEY_NAME, admin=False, scopes=[],
+                        secret="gk_planted", issued_by_wallet=f"bittensor:{CUSTOMER.ss58_address}",
+                        expires_at=datetime.now(UTC) - timedelta(days=1)))
+    status, body = signed("POST", "/platform/api-keys", {"name": "x"})
+    assert status == 403 and body["detail"]["required_scope"] == "keys"
+    assert signed("GET", "/platform/secrets")[0] == 200
+    with session_scope(env.sf) as s:
+        used = s.scalar(select(APIKeyORM).where(APIKeyORM.issued_by_wallet.like("%#btauth")))
+        assert used.key_id != "planted"
+        # Even if its row were widened, a signed request keeps its three scopes.
+        used.scopes = []
+    status, body = signed("POST", "/platform/api-keys", {"name": "x"})
+    assert status == 403 and body["detail"]["required_scope"] == "keys"
+    # Turning the hotkey's sign-in off (or unlinking it) deletes the key.
+    wallet_auth.revoke_wallet_keys(env.sf, user, "bittensor", CUSTOMER.ss58_address)
+    with session_scope(env.sf) as s:
+        assert s.scalar(select(func.count()).select_from(APIKeyORM).where(
+            APIKeyORM.issued_by_wallet.like("%#btauth"))) == 0
+
+
+def test_an_api_key_still_works_next_to_a_stray_bittensor_header(env):
+    credit(env, CUSTOMER.ss58_address, 5 * G)
+    user = owner_of(env, CUSTOMER.ss58_address)
+    with session_scope(env.sf) as s:
+        s.add(APIKeyORM(key_id="k-plain", user_id=user, name="mine", admin=False, scopes=[], secret="gk_plain"))
+    status, _ = call("GET", "/platform/secrets", headers={
+        "Authorization": "Bearer gk_plain", "X-Bittensor-Hotkey": OTHER.ss58_address, "X-Bittensor-Version": "1"})
+    assert status == 200
+
+
+def test_a_wrapped_signature_is_refused():
+    payload = btauth.build_payload(scheme="sr25519", method="POST", target="/v1/x?a=1", body=b"{}", nonce=NONCE,
+                                   sender=CUSTOMER.ss58_address, receiver=SERVICE.ss58_address)
+    wrapped = "0x" + CUSTOMER.sign(b"<Bytes>" + payload + b"</Bytes>").hex()
+    with pytest.raises(btauth.BtAuthError) as exc:
+        btauth.verify(_signed_headers(**{"x-bittensor-signature": wrapped}), b"{}", method="POST",
+                      target="/v1/x?a=1", receivers=[SERVICE.ss58_address], now_ns=NONCE, nonces=btauth.NonceStore())
+    assert exc.value.reason == "bad_signature"
+
+
+def test_a_client_that_hangs_up_mid_body_gets_no_answer(env):
+    headers = btauth.sign(CUSTOMER, method="POST", target="/platform/secrets", body=b"{}",
+                          receiver=SERVICE.ss58_address)
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST", "scheme": "http",
+        "path": "/platform/secrets", "raw_path": b"/platform/secrets", "query_string": b"",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        "client": ("203.0.113.9", 1), "server": ("api.test", 80),
+    }
+    messages = [{"type": "http.request", "body": b"{", "more_body": True}, {"type": "http.disconnect"}]
+    sent = []
+
+    async def receive():
+        return messages.pop(0)
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    assert sent == []
 
 
 # --- the public documents -----------------------------------------------------------

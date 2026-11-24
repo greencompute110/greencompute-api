@@ -433,7 +433,7 @@ def revoke_wallet_keys(session_factory, user_id: str, chain: str, address: str, 
     """Delete the keys this wallet's sign-ins issued on this account, over the
     API and for website sessions, and keys made with them (`web_only`: only
     the website sessions')."""
-    tags = wallet_tags(chain, address)[1:] if web_only else wallet_tags(chain, address)
+    tags = (wallet_tag(chain, address) + WEB_TAG_SUFFIX,) if web_only else wallet_tags(chain, address)
     with session_scope(session_factory) as session:
         # The account's lock, as every shut-out and every key made with a
         # wallet's key take it: a key being made from one of these can't slip

@@ -1114,6 +1114,9 @@ class GammaSpendORM(Base):
     # The finalized block the growth was read at: the spend is in it or in
     # one of the blocks since the watcher's previous read.
     block_number: Mapped[int] = mapped_column(BigInteger, index=True)
+    # The spend_gamma extrinsic, when the watcher found the spend's event
+    # (it reads totals; events only for the few blocks since its last read).
+    tx_hash: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     credited_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)

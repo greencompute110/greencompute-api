@@ -198,10 +198,12 @@ class _RequestContext:
             # exact body, so read it first, then hand the app the same bytes.
             limit = signed_requests._max_body()
             body = await signed_requests.read_body(receive, limit)
-            if body is None:
+            if body is signed_requests.DISCONNECTED:
+                return  # the client went away mid-body: nobody to answer
+            if body is signed_requests.TOO_LARGE:
                 await signed_requests.too_large(send, limit)
                 return
-            signed = signed_requests.check(scope, found, body)
+            signed = await signed_requests.check_async(scope, found, body)
             receive = signed_requests.replay(body, receive)
         signed_token = current_signed_request.set(signed)
         token = current_client_ip.set(_client_ip_from_request(Request(scope)))

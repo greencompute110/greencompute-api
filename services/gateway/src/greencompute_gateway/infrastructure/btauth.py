@@ -22,6 +22,9 @@ scheme from its own records, never from X-Bittensor-Crypto; ours is sr25519
 for every hotkey (what `btcli wallet new-hotkey` makes), so the hashed and
 ed25519 schemes are refused rather than guessed.
 
+The signature is checked with the sr25519 bindings on the exact payload
+bytes (the substrate signing context), never a wrapped form.
+
 The replay store is in this process's memory: the gateway runs as one
 process (as for the per-key rate limit), and an entry is only needed for the
 12 s a nonce can be fresh.
@@ -49,8 +52,10 @@ H_NONCE = "x-bittensor-nonce"
 H_SIGNATURE = "x-bittensor-signature"
 H_CRYPTO = "x-bittensor-crypto"
 HEADERS = (H_VERSION, H_HOTKEY, H_RECEIVER, H_NONCE, H_SIGNATURE, H_CRYPTO)
-#: Any of these makes a request a signed one (the others must then be there).
-TRIGGERS = (H_VERSION, H_HOTKEY, H_NONCE, H_SIGNATURE)
+#: What makes a request a signed one (the other headers must then be
+#: there). Only the signature: a client that happens to send some other
+#: X-Bittensor-* header with its API key keeps working as before.
+TRIGGERS = (H_SIGNATURE,)
 
 _NONCE = re.compile(r"^[0-9]{1,20}$")
 _SIG = re.compile(r"^(0x)?[0-9a-fA-F]{128}$")
@@ -224,10 +229,13 @@ def verify(
     payload = build_payload(scheme=SCHEME, method=method, target=target, body=body, nonce=nonce_text,
                             sender=sender, receiver=receiver)
     try:
-        from substrateinterface import Keypair, KeypairType
+        import sr25519
 
-        ok = Keypair(public_key=public_key, crypto_type=KeypairType.SR25519, ss58_format=42).verify(
-            payload, bytes.fromhex(signature[2:] if signature.startswith("0x") else signature))
+        # The bindings directly, on the exact payload: substrate-interface's
+        # Keypair.verify would also accept a signature over the payload
+        # wrapped in <Bytes>…</Bytes>, which btauth/1 never allows.
+        ok = bool(sr25519.verify(
+            bytes.fromhex(signature[2:] if signature.startswith("0x") else signature), payload, public_key))
     except Exception:
         ok = False
     if not ok:
