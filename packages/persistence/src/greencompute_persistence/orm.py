@@ -1122,6 +1122,54 @@ class GammaSpendORM(Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class FarmerORM(Base):
+    """A GPU provider ("farmer"): whose machines these are, and the terms we
+    pay them on. The public report shows only `public_label` ("Farmer A");
+    the name and terms are for staff."""
+
+    __tablename__ = "farmers"
+
+    farmer_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True)
+    public_label: Mapped[str] = mapped_column(String(64), unique=True)
+    # {"usd_per_gpu_hour": 0.25, "revenue_share_pct": 70, "monthly_fee_usd": 0}:
+    # what a monthly statement owes; any may be absent.
+    terms: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class NodeFarmerORM(Base):
+    """Which farmer a machine (node_inventory.node_id) belongs to, and
+    whether it is left out of the report (an internal test machine). Every
+    node reports the one miner hotkey, so this is set by staff."""
+
+    __tablename__ = "node_farmers"
+
+    node_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    farmer_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    hidden: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class FarmerPaymentORM(Base):
+    """A payment made to a farmer for a month's statement (in USD, from
+    alpha sold for TAO and USD), entered by staff after it is sent."""
+
+    __tablename__ = "farmer_payments"
+
+    payment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    farmer_id: Mapped[str] = mapped_column(String(64), index=True)
+    month: Mapped[str] = mapped_column(String(7), index=True)  # "2026-11"
+    amount_cents: Mapped[int] = mapped_column(BigInteger)
+    paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    reference: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class WalletAuthChallengeORM(Base):
     """A one-time sign-in message issued to a wallet (POST
     /platform/auth/wallet/challenge). The exact text is kept, so verify checks

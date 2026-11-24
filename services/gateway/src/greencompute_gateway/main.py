@@ -18,6 +18,7 @@ from greencompute_gateway.transport.security import metrics as gateway_metrics
 from greencompute_gateway.transport import signed_requests
 from greencompute_gateway.transport.gamma_routes import router as gamma_router
 from greencompute_gateway.transport.mcp import router as mcp_router
+from greencompute_gateway.transport.report_routes import router as report_router
 from greencompute_gateway.transport.routes import router
 from greencompute_gateway.transport.errors import CrashToJSON, install_error_handlers
 
@@ -233,6 +234,7 @@ app.add_middleware(_RequestContext)
 app.include_router(router)
 app.include_router(mcp_router)  # POST /mcp: the API as an MCP server
 app.include_router(gamma_router)  # /gamma/*: paying with gamma (Subnet services standard)
+app.include_router(report_router)  # /platform/report: GPUs, revenue and buybacks, once published
 install_error_handlers(app)
 
 
