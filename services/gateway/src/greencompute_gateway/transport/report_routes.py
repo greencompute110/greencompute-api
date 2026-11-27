@@ -11,7 +11,7 @@ Staff (admin key), kept out of the public spec:
   published or not.
 - POST /platform/admin/contracts, PATCH /platform/admin/contracts/{id}
 - POST /platform/admin/contracts/{id}/payments,
-  DELETE /platform/admin/contract-payments/{id}
+  PATCH and DELETE /platform/admin/contract-payments/{id}
 - PUT  /platform/admin/report/settings
 - POST /platform/admin/farmers, PATCH /platform/admin/farmers/{id}
 - PUT  /platform/admin/machines/{node_id}: whose machine it is / hide it
@@ -191,7 +191,8 @@ def admin_create_contract(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> dict:
     """{"name", "starts_on", "farmer_id"?, "gpu_model"?, "gpu_count"?,
-    "monthly_usd"?, "ends_on"?, "notes"?}: a bare-metal contract."""
+    "monthly_usd"?, "term_months"? or "ends_on"?, "notes"?}: a contract the
+    sales team made directly, e.g. for one month, two months or a quarter."""
     _admin(authorization, x_api_key)
     return _call(report.create_contract, _sf(), payload)
 
@@ -222,6 +223,19 @@ def admin_record_contract_payment(
         amount_usd=payload.get("amount_usd"), reference=payload.get("reference"), note=payload.get("note"),
         created_by=getattr(api_key, "key_id", None),
     ), "contract")
+
+
+@router.patch("/platform/admin/contract-payments/{payment_id}", include_in_schema=False)
+def admin_update_contract_payment(
+    payment_id: str,
+    payload: dict,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
+    """Any of {"received_on", "amount_usd", "reference", "note"}: correct a
+    recorded payment."""
+    _admin(authorization, x_api_key)
+    return _found(_call(report.update_contract_payment, _sf(), payment_id, payload), "payment")
 
 
 @router.delete("/platform/admin/contract-payments/{payment_id}", include_in_schema=False)

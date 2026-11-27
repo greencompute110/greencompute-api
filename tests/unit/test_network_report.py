@@ -182,6 +182,7 @@ def test_contract_routes_need_an_admin_key(env):
         ("POST", "/platform/admin/contracts", {"name": "X", "starts_on": "2026-11-01"}),
         ("PATCH", "/platform/admin/contracts/c1", {"name": "Y"}),
         ("POST", "/platform/admin/contracts/c1/payments", {"received_on": "2026-11-02", "amount_usd": 5}),
+        ("PATCH", "/platform/admin/contract-payments/p1", {"amount_usd": 6}),
         ("DELETE", "/platform/admin/contract-payments/p1", None),
     ):
         assert call(method, path, body)[0] == 401, path
@@ -815,3 +816,132 @@ def test_contracts_are_checked(env):
     report.update_contract(env.sf, cid, {"archived": True})
     assert report.build(env.sf, admin=True, now=NOW)["revenue"]["total_usd"] == "100.00"
     assert report.build(env.sf, admin=True, now=NOW)["gpus"]["contract_gpus"] == 0
+
+
+# --- the two flows staff see: normal flow by currency, and contracts ------------------
+
+
+def test_staff_see_the_normal_flow_by_currency_and_contracts_apart(env):
+    """Normal flow: what came in through the website, each currency on its
+    own, gamma among them but burned. Contracts: the sales team's direct
+    deals. The public report keeps to the four streams."""
+    with session_scope(env.sf) as s:
+        s.add(CryptoInvoiceORM(invoice_id="inv1", user_id="cust", currency="usdc-base", amount_usd=20.0,
+                               amount_crypto=20.0, bonus_pct=0.05, total_credits=2100, deposit_address="0xabc",
+                               status="confirmed", created_at=NOW, expires_at=NOW))
+    day = NOW - timedelta(days=2)
+    ledger(env, "card", 2000, ref="stripe:cs_1", when=day)
+    ledger(env, "usdc", 2100, ref="usdc-base:0xabc:1", reference="inv1", when=day)      # $20 + 5% bonus
+    ledger(env, "usdt", 1500, ref="usdt-eth:0xdef:2", when=day)
+    ledger(env, "tao", 4000, ref="tao:9131128:42", when=day)
+    ledger(env, "manual", 5000, ref="manual:tao:0xdead", when=day)                      # staff confirmed a TAO tx
+    ledger(env, "alpha", 1100, ref="alpha:9:4", when=day)                               # $10 + 10% alpha bonus
+    ledger(env, "gamma", 700, ref="gamma:110:0:svc:hk:7", when=day)
+    ledger(env, "odd", 300, ref="doge:1:1", when=day)                                   # a crypto we don't name
+    ledger(env, "cb", -500, kind="chargeback", when=day)
+    contract = report.create_contract(env.sf, {"name": "Lab", "starts_on": "2026-11-01", "term_months": 2})
+    report.record_contract_payment(env.sf, contract["contract_id"], received_on="2026-11-10", amount_usd=9000)
+    revenue = report.build(env.sf, admin=True, now=NOW)["revenue"]
+    assert [(c["currency"], c["label"], c["usd"]) for c in revenue["by_currency"]] == [
+        ("card", "Card", "15.00"), ("usdc", "USDC", "20.00"), ("usdt", "USDT", "15.00"), ("tao", "TAO", "90.00"),
+        ("alpha", "Alpha", "10.00"), ("gamma", "Gamma", "7.00"), ("other", "Other", "3.00")]
+    assert (revenue["total_usd"], revenue["normal_usd"], revenue["contracts_usd"]) == ("9160.00", "160.00", "9000.00")
+    # The four streams still add up: crypto is USDC + USDT + TAO + alpha + other.
+    assert {m["method"]: m["usd"] for m in revenue["by_method"]} == {
+        "gamma": "7.00", "contract": "9000.00", "card": "15.00", "crypto": "138.00"}
+    quarter = revenue["periods"][0]
+    assert {k: quarter[k] for k in ("usd", "normal_usd", "contract_usd", "card_usd", "usdc_usd", "usdt_usd", "tao_usd",
+                                    "alpha_usd", "other_usd", "gamma_usd", "crypto_usd")} == {
+        "usd": "9160.00", "normal_usd": "160.00", "contract_usd": "9000.00", "card_usd": "15.00", "usdc_usd": "20.00",
+        "usdt_usd": "15.00", "tao_usd": "90.00", "alpha_usd": "10.00", "other_usd": "3.00", "gamma_usd": "7.00",
+        "crypto_usd": "138.00"}
+    assert quarter["to_buy_back_usd"] == "9153.00"        # everything but the gamma
+    # On the usage basis the normal flow is the compute charged; contracts are the same.
+    ledger(env, "use", -400, kind="usage", reference="dep-a", description="GPU usage 1× GPU @ $0.40/hr", when=day)
+    report.update_settings(env.sf, {"revenue_basis": "usage"})
+    usage = report.build(env.sf, admin=True, now=NOW)["revenue"]
+    assert (usage["total_usd"], usage["normal_usd"], usage["contracts_usd"]) == ("9004.00", "4.00", "9000.00")
+    report.update_settings(env.sf, {"revenue_basis": "paid"})
+    # The public report: the four streams, never the flows or the split by currency.
+    public = report.build(env.sf, now=JANUARY)["revenue"]
+    assert public["total_usd"] == "9160.00" and len(public["periods"]) == 1
+    for key in ("by_currency", "normal_usd", "contracts_usd"):
+        assert key not in public, key
+    assert not [k for k in public["periods"][0] if k in ("normal_usd", "usdc_usd", "usdt_usd", "tao_usd", "alpha_usd",
+                                                         "other_usd")]
+    assert {"gamma_usd", "contract_usd", "card_usd", "crypto_usd"} <= set(public["periods"][0])
+
+
+def test_contract_terms_one_month_two_months_a_quarter(env):
+    """What the sales team sells: a term in whole months from a start date."""
+    status, one = call("POST", "/platform/admin/contracts", {
+        "name": "One month", "starts_on": "2026-11-01", "term_months": 1, "monthly_usd": 3000,
+        "gpu_model": "rtx5090", "gpu_count": 8}, key="gk_admin")
+    assert status == 200
+    assert (one["ends_on"], one["term_months"], one["value_usd"], one["outstanding_usd"]) == (
+        "2026-11-30", 1, "3000.00", "3000.00")
+    two = report.create_contract(env.sf, {"name": "Two months", "starts_on": "2026-11-15", "term_months": 2,
+                                          "monthly_usd": 1000})
+    assert (two["ends_on"], two["term_months"], two["value_usd"]) == ("2027-01-14", 2, "2000.00")
+    quarter = report.create_contract(env.sf, {"name": "A quarter", "starts_on": "2026-12-01", "term_months": 3})
+    assert (quarter["ends_on"], quarter["term_months"], quarter["value_usd"], quarter["outstanding_usd"]) == (
+        "2027-02-28", 3, None, None)                      # no monthly value: no contract value
+    year = report.create_contract(env.sf, {"name": "A year", "starts_on": "2026-01-31", "term_months": 12,
+                                           "monthly_usd": 100})
+    assert (year["ends_on"], year["term_months"], year["value_usd"]) == ("2027-01-30", 12, "1200.00")
+    # A month that is shorter than the start day: 31 January + 1 month ends in February.
+    short = report.create_contract(env.sf, {"name": "From the 31st", "starts_on": "2027-01-31", "term_months": 1})
+    assert (short["ends_on"], short["term_months"]) == ("2027-02-27", 1)
+    # Dates given by hand: a whole number of months is recognised, anything else has no term.
+    by_hand = report.create_contract(env.sf, {"name": "By hand", "starts_on": "2026-11-01", "ends_on": "2027-01-31",
+                                              "monthly_usd": 500})
+    assert (by_hand["term_months"], by_hand["value_usd"]) == (3, "1500.00")
+    odd = report.create_contract(env.sf, {"name": "Odd", "starts_on": "2026-11-01", "ends_on": "2026-11-20",
+                                          "monthly_usd": 500})
+    assert (odd["term_months"], odd["value_usd"], odd["outstanding_usd"]) == (None, None, None)
+    open_ended = report.create_contract(env.sf, {"name": "Open", "starts_on": "2026-11-01", "monthly_usd": 500})
+    assert (open_ended["ends_on"], open_ended["term_months"], open_ended["value_usd"]) == (None, None, None)
+    # What is received comes off what is outstanding, never below zero.
+    cid = one["contract_id"]
+    report.record_contract_payment(env.sf, cid, received_on="2026-11-02", amount_usd=1200)
+    assert report.list_contracts(env.sf)[-1]["name"] and next(
+        c for c in report.list_contracts(env.sf) if c["contract_id"] == cid)["outstanding_usd"] == "1800.00"
+    report.record_contract_payment(env.sf, cid, received_on="2026-11-20", amount_usd=2500)
+    assert next(c for c in report.list_contracts(env.sf) if c["contract_id"] == cid)["outstanding_usd"] == "0.00"
+    # Editing: a longer term moves the end date; a new start date with a term moves both.
+    status, longer = call("PATCH", f"/platform/admin/contracts/{cid}", {"term_months": 3}, key="gk_admin")
+    assert status == 200 and (longer["ends_on"], longer["value_usd"], longer["outstanding_usd"]) == (
+        "2027-01-31", "9000.00", "5300.00")
+    status, moved = call("PATCH", f"/platform/admin/contracts/{cid}", {"starts_on": "2026-12-10", "term_months": 1},
+                         key="gk_admin")
+    assert status == 200 and (moved["starts_on"], moved["ends_on"], moved["term_months"]) == (
+        "2026-12-10", "2027-01-09", 1)
+    status, opened = call("PATCH", f"/platform/admin/contracts/{cid}", {"ends_on": None}, key="gk_admin")
+    assert status == 200 and (opened["ends_on"], opened["term_months"], opened["value_usd"]) == (None, None, None)
+    for bad in ({"term_months": 0}, {"term_months": 121}, {"term_months": 1.5}, {"term_months": "3"},
+                {"term_months": True}, {"term_months": 2, "ends_on": "2027-01-31"}):
+        assert call("PATCH", f"/platform/admin/contracts/{cid}", bad, key="gk_admin")[0] == 400, bad
+        assert call("POST", "/platform/admin/contracts", {"name": "Bad", "starts_on": "2026-11-01", **bad},
+                    key="gk_admin")[0] == 400, bad
+
+
+def test_a_recorded_contract_payment_can_be_corrected(env):
+    contract = report.create_contract(env.sf, {"name": "Lab", "starts_on": "2026-11-01", "term_months": 1})
+    cid = contract["contract_id"]
+    payment = report.record_contract_payment(env.sf, cid, received_on="2026-11-05", amount_usd=100, reference="A")
+    pid = payment["payment_id"]
+    status, fixed = call("PATCH", f"/platform/admin/contract-payments/{pid}",
+                         {"amount_usd": 150.5, "received_on": "2026-11-06", "reference": "INV-7", "note": "typo"},
+                         key="gk_admin")
+    assert status == 200 and fixed == {"payment_id": pid, "contract_id": cid, "received_on": "2026-11-06",
+                                       "amount_usd": "150.50", "reference": "INV-7", "note": "typo"}
+    assert report.build(env.sf, admin=True, now=NOW)["revenue"]["contracts_usd"] == "150.50"
+    # One field at a time keeps the others.
+    status, kept = call("PATCH", f"/platform/admin/contract-payments/{pid}", {"note": ""}, key="gk_admin")
+    assert status == 200 and (kept["amount_usd"], kept["reference"], kept["note"]) == ("150.50", "INV-7", "")
+    future = (datetime.now(UTC) + timedelta(days=3)).date().isoformat()
+    for bad in ({"amount_usd": 0}, {"amount_usd": "5"}, {"received_on": "5 Nov"}, {"received_on": future},
+                {"colour": "green"}, {"received_on": None}):
+        assert call("PATCH", f"/platform/admin/contract-payments/{pid}", bad, key="gk_admin")[0] == 400, bad
+    assert call("PATCH", "/platform/admin/contract-payments/nope", {"note": "x"}, key="gk_admin")[0] == 404
+    assert report.build(env.sf, admin=True, now=NOW)["revenue"]["contracts_usd"] == "150.50"

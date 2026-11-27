@@ -7,7 +7,11 @@ shown the way the subnet's owner wants it shown.
    machines rented under a contract (bare metal, by the month), which staff
    record from the signed contract (declared).
 2. Revenue, per period (settings.period: quarter by default), in four
-   streams: gamma, contracts, card and crypto.
+   streams: gamma, contracts, card and crypto. Staff see it as two flows:
+   the normal flow (what came in through the website, each currency on its
+   own: card, USDC, USDT, TAO, alpha, and gamma apart from them) and
+   contracts (direct deals the sales team makes, for a month, two months, a
+   quarter and so on).
 3. Buybacks: revenue is bought back as SN110 alpha that is burned. A payment
    in gamma already is one (the customer burned alpha to mint it). The rest
    (contracts, card, crypto) is bought back by the owner after each period
@@ -71,6 +75,7 @@ same rule as the admin GPU usage page.
 """
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import os
@@ -131,6 +136,13 @@ BASES = {
              "plus contract payments received.",
 }
 METHODS = (("gamma", "Gamma"), ("contract", "Contracts"), ("card", "Card"), ("crypto", "Crypto"))
+# What came in through the website ("normal flow"), by what it was paid in:
+# staff see each on its own. Gamma is the odd one out: paid on chain and
+# burned by the customer, it brings no cash and needs no buyback.
+CURRENCIES = (("card", "Card"), ("usdc", "USDC"), ("usdt", "USDT"), ("tao", "TAO"), ("alpha", "Alpha"),
+              ("gamma", "Gamma"), ("other", "Other"))
+# The currencies the "crypto" stream is made of.
+CRYPTO = ("usdc", "usdt", "tao", "alpha", "other")
 UNASSIGNED = "Unassigned"
 # Hours in an average month: a contract's monthly value as an hourly rate.
 HOURS_PER_MONTH = 730
@@ -531,6 +543,32 @@ def _as_date(value, field: str, *, required: bool = True) -> date | None:
     return day
 
 
+def _add_months(day: date, months: int) -> date:
+    """The same day `months` later, or that month's last day when it has no
+    such day (31 January + 1 month = 28 or 29 February)."""
+    month = day.month - 1 + months
+    year, month = day.year + month // 12, month % 12 + 1
+    return date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def _term_end(start: date, months: int) -> date:
+    """The last day of a term of whole months: 1 November + 1 month ends on
+    30 November."""
+    return _add_months(start, months) - timedelta(days=1)
+
+
+def _term_months(start: date, end: date | None) -> int | None:
+    """How many whole months a contract runs; None when it is open-ended or
+    its dates aren't a whole number of months."""
+    if end is None or end < start:
+        return None
+    guess = (end.year - start.year) * 12 + (end.month - start.month)
+    for months in (guess, guess + 1):
+        if months >= 1 and _term_end(start, months) == end:
+            return months
+    return None
+
+
 def _contract_active(row: ContractORM, today: date) -> bool:
     return (row.archived_at is None and row.starts_on <= today
             and (row.ends_on is None or row.ends_on >= today))
@@ -543,15 +581,23 @@ def _contract_payment_out(row: ContractPaymentORM) -> dict:
 
 
 def _contract_out(row: ContractORM, payments: list[ContractPaymentORM], today: date) -> dict:
+    received = sum(p.amount_cents for p in payments)
+    months = _term_months(row.starts_on, row.ends_on)
+    # What the whole term is worth, when both the monthly value and a term
+    # of whole months are known.
+    value = row.monthly_cents * months if row.monthly_cents is not None and months else None
     return {
         "contract_id": row.contract_id, "name": row.name, "farmer_id": row.farmer_id,
         "gpu_model": row.gpu_model or "", "gpu_label": _gpu(row.gpu_model)[1] if row.gpu_model else "",
         "gpu_count": int(row.gpu_count or 0),
         "monthly_usd": _usd(row.monthly_cents) if row.monthly_cents is not None else None,
         "starts_on": row.starts_on.isoformat(), "ends_on": row.ends_on.isoformat() if row.ends_on else None,
+        "term_months": months,
+        "value_usd": _usd(value) if value is not None else None,
+        "outstanding_usd": _usd(max(0, value - received)) if value is not None else None,
         "notes": row.notes or "", "archived": row.archived_at is not None,
         "active": _contract_active(row, today),
-        "received_usd": _usd(sum(p.amount_cents for p in payments)),
+        "received_usd": _usd(received),
         "payments": [_contract_payment_out(p) for p in payments],
     }
 
@@ -603,6 +649,14 @@ def _contract_fields(session, values: dict, *, current: ContractORM | None = Non
             out["starts_on"] = _as_date(value, "starts_on")
         elif key == "ends_on":
             out["ends_on"] = _as_date(value, "ends_on", required=False)
+        elif key == "term_months":
+            # The term in whole months ("one month, two months, a quarter"):
+            # the end date follows from the start (_apply_term).
+            if "ends_on" in values:
+                raise ReportError("send term_months or ends_on, not both")
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 120:
+                raise ReportError("term_months must be a whole number of months, 1 to 120")
+            out["term_months"] = value
         elif key == "notes":
             out["notes"] = str(value or "")[:4000] or None
         elif key == "archived":
@@ -612,6 +666,16 @@ def _contract_fields(session, values: dict, *, current: ContractORM | None = Non
         else:
             raise ReportError(f"unknown field {key!r}")
     return out
+
+
+def _apply_term(row: ContractORM, fields: dict) -> None:
+    """Set the fields on the contract; a term in months sets its end date
+    from its (new) start date."""
+    months = fields.pop("term_months", None)
+    for key, value in fields.items():
+        setattr(row, key, value)
+    if months is not None:
+        row.ends_on = _term_end(row.starts_on, months)
 
 
 def _check_contract(row: ContractORM) -> None:
@@ -630,8 +694,10 @@ def create_contract(session_factory, values: dict) -> dict:
         fields = _contract_fields(session, values)
         if session.scalar(select(ContractORM.contract_id).where(ContractORM.name == fields["name"])):
             raise ReportError("another contract already has that name")
+        months = fields.pop("term_months", None)
         row = ContractORM(**{"contract_id": str(uuid4()), "gpu_model": "", "gpu_count": 0, "created_at": _now(),
                              **fields})
+        _apply_term(row, {} if months is None else {"term_months": months})
         _check_contract(row)
         session.add(row)
         session.flush()
@@ -645,8 +711,7 @@ def update_contract(session_factory, contract_id: str, changes: dict) -> dict | 
         row = session.get(ContractORM, contract_id)
         if row is None:
             return None
-        for key, value in _contract_fields(session, dict(changes or {}), current=row).items():
-            setattr(row, key, value)
+        _apply_term(row, _contract_fields(session, dict(changes or {}), current=row))
         _check_contract(row)
         if session.scalar(select(ContractORM.contract_id).where(
                 ContractORM.contract_id != contract_id, ContractORM.name == row.name)):
@@ -657,21 +722,54 @@ def update_contract(session_factory, contract_id: str, changes: dict) -> dict | 
     return out
 
 
+def _received_on(value) -> date:
+    day = _as_date(value, "received_on")
+    if day > _now().date() + timedelta(days=1):
+        raise ReportError("received_on can't be in the future: record a payment once it has arrived")
+    return day
+
+
+def _payment_cents(amount_usd) -> int:
+    if isinstance(amount_usd, bool) or not isinstance(amount_usd, (int, float)) or not 0 < float(amount_usd) <= 1e8:
+        raise ReportError("amount_usd must be a number above 0")
+    return round(float(amount_usd) * 100)
+
+
+def update_contract_payment(session_factory, payment_id: str, changes: dict) -> dict | None:
+    """Correct a recorded payment: its day, amount, reference or note."""
+    with session_scope(session_factory) as session:
+        row = session.get(ContractPaymentORM, payment_id)
+        if row is None:
+            return None
+        for key, value in dict(changes or {}).items():
+            if key == "received_on":
+                row.received_on = _received_on(value)
+            elif key == "amount_usd":
+                row.amount_cents = _payment_cents(value)
+            elif key == "reference":
+                row.reference = _clean(value, "reference", 256, required=False) or None
+            elif key == "note":
+                row.note = str(value or "")[:2000] or None
+            else:
+                raise ReportError(f"unknown field {key!r}")
+        session.flush()
+        out = _contract_payment_out(row)
+    _forget_cache()
+    return out
+
+
 def record_contract_payment(session_factory, contract_id: str, *, received_on, amount_usd, reference=None,
                             note=None, created_by=None) -> dict | None:
     """Money received on a contract: revenue on `received_on` (a UTC day,
     today at the latest)."""
-    day = _as_date(received_on, "received_on")
-    if day > _now().date() + timedelta(days=1):
-        raise ReportError("received_on can't be in the future: record a payment once it has arrived")
-    if isinstance(amount_usd, bool) or not isinstance(amount_usd, (int, float)) or not 0 < float(amount_usd) <= 1e8:
-        raise ReportError("amount_usd must be a number above 0")
+    day = _received_on(received_on)
+    cents = _payment_cents(amount_usd)
     with session_scope(session_factory) as session:
         if session.get(ContractORM, contract_id) is None:
             return None
         row = ContractPaymentORM(
             payment_id=str(uuid4()), contract_id=contract_id, received_on=day,
-            amount_cents=round(float(amount_usd) * 100),
+            amount_cents=cents,
             reference=_clean(reference, "reference", 256, required=False) or None,
             note=str(note or "")[:2000] or None, created_by=created_by, created_at=_now(),
         )
@@ -732,14 +830,28 @@ def _as_day(value) -> date:
     return value if isinstance(value, date) and not isinstance(value, datetime) else date.fromisoformat(str(value)[:10])
 
 
-def _method(deposit_ref: str) -> str:
-    head = deposit_ref.split(":", 1)[0].lower()
-    return "card" if head == "stripe" else "gamma" if head == "gamma" else "crypto"
+def _currency(deposit_ref: str) -> str:
+    """What a payment was made in, from its ledger deposit_ref: card, usdc,
+    usdt, tao, alpha or gamma; "other" for a crypto we don't name."""
+    from greencompute_persistence.key_limits import _top_up_currency
+
+    if deposit_ref.split(":", 1)[0].lower() == "stripe":
+        return "card"
+    currency = _top_up_currency(deposit_ref)
+    return currency if currency in ("usdc", "usdt", "tao", "alpha", "gamma") else "other"
+
+
+def _stream(bucket: dict, method: str) -> int:
+    """A day's cents for one of the four streams, from its cents by currency."""
+    if method == "crypto":
+        return sum(bucket.get(c, 0) for c in CRYPTO)
+    return bucket.get(method, 0)
 
 
 def paid_in(session_factory, since: datetime, until: datetime | None = None, excluded: list[str] | None = None):
-    """What customers paid in: ({day: {method: cents}}, {user_id: gamma cents}).
-    Days are UTC; the second says who paid how much in gamma."""
+    """What customers paid in: ({day: {currency: cents}}, {user_id: gamma
+    cents}). Currencies are CURRENCIES' (card, usdc, usdt, tao, alpha,
+    gamma, other). Days are UTC; the second says who paid how much in gamma."""
     from greencompute_persistence.key_limits import _bonus_rates, _top_up_currency
 
     out: dict[date, dict[str, int]] = {}
@@ -767,13 +879,13 @@ def paid_in(session_factory, since: datetime, until: datetime | None = None, exc
         if kind == "chargeback":
             bucket["card"] = bucket.get("card", 0) + int(amount)  # negative: money the card network took back
             continue
-        method = _method(deposit_ref)
+        currency = _currency(deposit_ref)
         bonus = 0.0
-        if method != "card":
+        if currency != "card":
             bonus = invoice_bonus if invoice_bonus is not None else rates.get(_top_up_currency(deposit_ref), 0.0)
         cents = round(amount / (1 + max(0.0, bonus or 0.0)))
-        bucket[method] = bucket.get(method, 0) + cents
-        if method == "gamma":
+        bucket[currency] = bucket.get(currency, 0) + cents
+        if currency == "gamma":
             gamma_by_user[user_id] = gamma_by_user.get(user_id, 0) + cents
     return out, gamma_by_user
 
@@ -894,7 +1006,8 @@ def _revenue(session_factory, settings: dict, now: datetime, *, completed_only: 
 
     headline = paid_day if basis == "paid" else usage_day
     all_days = sorted(set(paid) | set(used_cents))
-    by_method = {m: sum(v.get(m, 0) for v in paid.values()) for m, _ in METHODS}
+    by_method = {m: sum(_stream(v, m) for v in paid.values()) for m, _ in METHODS}
+    by_currency = {c: sum(v.get(c, 0) for v in paid.values()) for c, _ in CURRENCIES}
 
     def gamma_covered(by_user: dict[str, int], to: datetime | None) -> int:
         """What of the revenue customers already bought back by paying in
@@ -923,13 +1036,18 @@ def _revenue(session_factory, settings: dict, now: datetime, *, completed_only: 
             days = [d for d in all_days if start <= d <= end]
             usd_cents = sum(headline(d) for d in days)
             gamma_cents = sum(paid.get(d, {}).get("gamma", 0) for d in days)
+            contract_cents = sum(paid.get(d, {}).get("contract", 0) for d in days)
             rows.append({
                 "start": start.isoformat(), "end": end.isoformat(),
                 # Set when the count starts part-way through the period.
                 "counted_from": since.date().isoformat() if since.date() > start else None,
                 "complete": end < current,
                 "usd": _usd(usd_cents),
-                **{f"{m}_usd": _usd(sum(paid.get(d, {}).get(m, 0) for d in days)) for m, _ in METHODS},
+                **{f"{m}_usd": _usd(sum(_stream(paid.get(d, {}), m) for d in days)) for m, _ in METHODS},
+                # For staff: the normal flow (everything but contracts) and
+                # each currency of it; card and gamma are above.
+                "normal_usd": _usd(usd_cents - contract_cents),
+                **{f"{c}_usd": _usd(sum(paid.get(d, {}).get(c, 0) for d in days)) for c in CRYPTO},
                 # What the owner buys back for the period: on the paid basis
                 # everything but the gamma; not worked out per period on the
                 # usage basis (gamma covers usage across periods).
@@ -952,6 +1070,10 @@ def _revenue(session_factory, settings: dict, now: datetime, *, completed_only: 
         "paid_in_usd": _usd(sum(by_method.values())),
         "by_method": [{"method": m, "label": label, "usd": _usd(by_method[m])} for m, label in METHODS],
         "by_method_cents": by_method,
+        # For staff: the two flows, and the normal flow by currency.
+        "normal_usd": _usd(total - by_method["contract"]),
+        "contracts_usd": _usd(by_method["contract"]),
+        "by_currency": [{"currency": c, "label": label, "usd": _usd(by_currency[c])} for c, label in CURRENCIES],
         "bought_back_by_customers_cents": min(already, max(0, total)),
         "due_cents": due,
         "due_by_customers_cents": min(already_due, max(0, due)),
@@ -1248,7 +1370,13 @@ def build(session_factory, *, admin: bool = False, now: datetime | None = None) 
         "buybacks": public(buybacks),
     }
     if not admin:
-        out["revenue"].pop("days", None)
+        # The public report gives the four streams; days, the two flows and
+        # the split by currency are staff's.
+        for key in ("days", "normal_usd", "contracts_usd", "by_currency"):
+            out["revenue"].pop(key, None)
+        for row in out["revenue"]["periods"]:
+            for key in ("normal_usd", *(f"{c}_usd" for c in CRYPTO)):
+                row.pop(key, None)
         # The public report holds nothing of the period in progress.
         for key in ("accruing_usd", "settle_now_usd"):
             out["buybacks"].pop(key, None)
