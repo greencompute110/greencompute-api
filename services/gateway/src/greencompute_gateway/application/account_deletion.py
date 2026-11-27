@@ -27,7 +27,9 @@ Remaining credit is forfeited: the balance goes to zero with an
 "account_closed" ledger entry recording the amount. A negative balance is left
 as it is, so a debt stays on the books. Open crypto invoices are rejected, so a
 payment sent afterwards shows up as an unmatched deposit to refund rather than
-crediting an account nobody can use.
+crediting an account nobody can use. Gamma the account spent that is still
+waiting for the weekly gamma limit is given up with the balance: it is
+counted in what the preview says is lost, and stops waiting.
 """
 from __future__ import annotations
 
@@ -42,6 +44,7 @@ from greencompute_persistence.orm import (
     APIKeyORM,
     CryptoInvoiceORM,
     DeploymentORM,
+    GammaSpendORM,
     InferenceBalanceHoldORM,
     LedgerEntryORM,
     ProviderServerORM,
@@ -101,6 +104,7 @@ def deletion_preview(session_factory, user_id: str) -> dict | None:
             return None
         blocking = _blockers(session, user_id)
         balance = int(user.balance_credits or 0)
+        waiting = _gamma_waiting(session, user_id)
 
         def count(column) -> int:
             return session.scalar(select(func.count()).where(column == user_id)) or 0
@@ -109,13 +113,23 @@ def deletion_preview(session_factory, user_id: str) -> dict | None:
             "user_id": user_id,
             "balance_cents": balance,
             "balance_usd": round(balance / 100, 2),
-            # What is lost: positive credit only (a debt is not written off).
-            "credit_lost_usd": round(max(0, balance) / 100, 2),
+            # What is lost: positive credit only (a debt is not written off),
+            # and gamma that was spent but not credited yet.
+            "credit_lost_usd": round((max(0, balance) + waiting) / 100, 2),
+            "gamma_waiting_usd": round(waiting / 100, 2),
             "active_deployments": blocking,
             "can_delete": not blocking,
             "api_keys": count(APIKeyORM.user_id),
             "verified_wallets": count(VerifiedWalletORM.user_id),
         }
+
+
+def _gamma_waiting(session, user_id: str) -> int:
+    """Cents of gamma the account spent that wait for the weekly limit."""
+    return int(session.scalar(
+        select(func.coalesce(func.sum(GammaSpendORM.waiting_cents), 0)).where(
+            GammaSpendORM.user_id == user_id, GammaSpendORM.kind == "customer",
+            GammaSpendORM.waiting_cents > 0)) or 0)
 
 
 def _scrub_metadata(meta: dict | None) -> dict:
@@ -135,6 +149,15 @@ def delete_account(session_factory, user_id: str, *, now: datetime | None = None
     already-deleted account is a no-op, so the website can safely retry."""
     now = now or datetime.now(UTC)
     with session_scope(session_factory) as session:
+        # The account's waiting gamma first, then the account: the order the
+        # gamma watcher locks them in when it credits what waited, so the
+        # two can't deadlock.
+        waiting_spends = session.scalars(
+            select(GammaSpendORM).where(
+                GammaSpendORM.user_id == user_id, GammaSpendORM.kind == "customer", GammaSpendORM.waiting_cents > 0)
+            .order_by(GammaSpendORM.observed_at, GammaSpendORM.block_number, GammaSpendORM.spend_id)
+            .with_for_update()
+        ).all()
         user = session.get(UserORM, user_id, with_for_update=True)
         if user is None:
             raise KeyError(f"user not found: {user_id}")
@@ -156,6 +179,12 @@ def delete_account(session_factory, user_id: str, *, now: datetime | None = None
                 description="Account deleted by its owner; remaining credit forfeited",
                 created_at=now,
             ))
+        # Gamma that was waiting for the weekly limit stops waiting: there
+        # is no account left to credit. Each spend keeps what it was worth
+        # and what was credited, so the amount given up stays on record.
+        gamma_given_up = sum(int(spend.waiting_cents or 0) for spend in waiting_spends)
+        for spend in waiting_spends:
+            spend.waiting_cents = 0
 
         def remove(model, *where) -> int:
             return session.execute(delete(model).where(*where)).rowcount or 0
@@ -223,6 +252,7 @@ def delete_account(session_factory, user_id: str, *, now: datetime | None = None
             "user_id": user_id,
             "credit_forfeited_cents": forfeited,
             "credit_forfeited_usd": round(forfeited / 100, 2),
+            "gamma_waiting_forfeited_cents": gamma_given_up,
             **summary,
             "invoices_cancelled": len(open_invoices),
             "workloads_scrubbed": len(workloads),

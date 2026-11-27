@@ -15,11 +15,16 @@ Lium (SN51), engy (SN53) and SayGM (SN28) already take it:
    (wallet sign-in) for an API key.
 
 So every dollar paid in gamma is a dollar of SN110 alpha already bought and
-burned. The planned buyback gives card and crypto revenue the same
-treatment (cadence still the owner's call): the owner mints gamma with that
-much TAO into a treasury hotkey and spends it at the same service, so
-GammaSpent at our service is all revenue, which anyone can read on chain.
-Treasury spends are recorded as buybacks and never credited to anyone.
+burned. The buyback gives contract, card and crypto revenue the same
+treatment after each period ends (a quarter by default; the network
+report's settings): the owner mints gamma with that much TAO into a
+treasury hotkey and spends it at the same service, so GammaSpent at our
+service is all revenue, which anyone can read on chain. Treasury spends are
+recorded as buybacks and never credited to anyone.
+
+Gamma pays us nothing in hand, so how much credit it buys is limited: a
+weekly limit, $1,000 until staff set another (application/gamma.py). Gamma
+spent above it waits and is credited in a later week; it is never refused.
 
 Settings (gateway env):
 - GREENCOMPUTE_GAMMA_SERVICE_HOTKEYS: our service hotkeys, comma-separated;
@@ -145,6 +150,8 @@ def how_to_pay(hotkey: str | None = None) -> dict:
             "btcli wallet new-hotkey -H API_KEY  (a fresh hotkey: it is your account here)",
             f"btcli gamma mint --netuid {n} --hotkey {key} --amount-tao 1",
             f"btcli gamma spend --netuid {n} --service-hotkey {svc} --amount-gamma 5 -H {key}",
+            f"Before a large spend, read `limit` at {API_BASE}/platform/gamma: we credit gamma up to a weekly "
+            "limit. Gamma spent above it is not lost; it waits and is credited in a later week, oldest first.",
             "Within about a minute of the spend finalizing, the hotkey's account is credited $1 per gamma. "
             f"Check it at {API_BASE}/gamma/balance?hotkey=<hotkey>.",
             "Then sign each request with the hotkey (btauth/1, receiver = the service hotkey), or sign in "
@@ -163,7 +170,8 @@ def services_document() -> dict:
         "description": (
             "GPU rentals (RTX 4090 and 5090, billed by the minute) and OpenAI-compatible inference on "
             "Bittensor subnet 110. Pay with gamma: spend SN110 gamma at our service hotkey and that hotkey's "
-            "account is credited $1 per gamma; then call the API with btauth/1-signed requests."
+            "account is credited $1 per gamma; then call the API with btauth/1-signed requests. Gamma is "
+            "credited up to a weekly limit (see `limits`); what is over it is credited in a later week."
         ),
         "publishers": publishers,
         "services": [
@@ -174,6 +182,9 @@ def services_document() -> dict:
             {"type": "gamma", "signature": "btauth/1", "balance": f"{API_BASE}/gamma/balance"},
         ],
         "pricing": f"{API_BASE}/platform/pricing",
+        # Gamma is credited up to a weekly limit; what is over it waits its
+        # turn. `limit` at this address says where the week stands.
+        "limits": f"{API_BASE}/platform/gamma",
         "terms": "https://www.green-compute.com/terms",
         "docs": DOCS_URL,
     }

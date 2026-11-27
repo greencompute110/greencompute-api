@@ -4,7 +4,8 @@ A customer's spend_gamma sends us nothing: the chain adds it to
 GammaSpent(netuid, service, hotkey). Each tick (default every 12 s, one
 block) reads every total at our service hotkeys at the FINALIZED head, as
 the standard says, and hands each one that grew to application/gamma.py,
-which credits the growth exactly once.
+which credits the growth exactly once, up to the weekly gamma limit; what is
+over it waits and is credited by a later tick (release_waiting).
 
 Dissolving the subnet clears the chain's totals and bumps nothing until the
 netuid is registered again, which raises RegisteredSubnetCounter; a total is
@@ -51,9 +52,13 @@ WS_TIMEOUT_SECONDS = 30
 # log every 10th failure, rather than reconnect and warn every 12 s.
 MAX_BACKOFF_SECONDS = 120
 
+# Failed tries in a row at crediting waiting gamma before staff are told.
+RELEASE_FAILURES_BEFORE_ALERT = 5
+
 _conn = {"substrate": None, "url": None}
 _ticks = {"n": 0}
 _failures = {"n": 0}
+_release_failures = {"n": 0}
 
 
 def _kv_set(session_factory, key: str, value: str) -> None:
@@ -211,6 +216,22 @@ def _canonical(hotkey: str) -> str | None:
 
 def scan_gamma(session_factory, billing=None, substrate=None) -> int:
     """One tick. Returns how many spends were credited."""
+    # First the gamma that was waiting for the weekly limit (a new week, or
+    # a limit staff raised), so a new spend never gets ahead of it. It needs
+    # no chain read, so it also runs while the chain can't be reached.
+    try:
+        gamma_app.release_waiting(session_factory, billing)
+        _release_failures["n"] = 0
+        gamma_app._ALERTED.discard("release-failing")
+    except Exception as exc:
+        _release_failures["n"] += 1
+        log.exception("gamma watcher: crediting waiting gamma failed; retrying next tick")
+        if _release_failures["n"] >= RELEASE_FAILURES_BEFORE_ALERT:
+            gamma_app._alert_once("release-failing", (
+                f"Gamma watcher: crediting gamma that waits for the weekly limit has failed "
+                f"{_release_failures['n']} times in a row ({type(exc).__name__}: {exc}). New gamma payments are "
+                "still read, but they queue behind what is waiting. Check the gateway log."
+            ))
     netuid = gamma.netuid()
     services = [s for s in (_canonical(h) for h in gamma.service_hotkeys()) if s]
     if not services:

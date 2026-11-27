@@ -7,11 +7,14 @@ Covered: the wire format against the standard's golden vectors and every
 refusal; signed requests through the real ASGI app (body replayed, scopes,
 placeholder bearer ignored, no account yet, payment-only link); crediting
 exactly once, fractions of a cent, treasury buybacks, sanctions, a new
-subnet counter; the watcher against a fake chain; the public documents."""
+subnet counter; the watcher against a fake chain; the public documents; the
+weekly limit (what is over it waits and is credited later, oldest first,
+never lost and never ahead of gamma already waiting)."""
 import asyncio
 import hashlib
 import json
 import types
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
@@ -63,8 +66,10 @@ def env(tmp_path, monkeypatch):
                         lambda text, **kw: alerts.append(text))
     btauth.nonce_store.clear()
     gamma_app._ALERTED.clear()
+    gamma_app._status_cache.update(at=0.0, value=None)
     wallet_auth._ALERTED.clear()
     gamma_watcher._ticks["n"] = 0
+    gamma_watcher._release_failures["n"] = 0
     # The lists have loaded (one listed hotkey), as they have in production.
     sanctions.store_list(repo.session_factory, sanctions.OFAC, {("bittensor", LISTED.ss58_address): "Listed Party"})
     return types.SimpleNamespace(sf=repo.session_factory, billing=billing, alerts=alerts)
@@ -839,4 +844,366 @@ def test_platform_gamma_and_openapi(env):
     assert {"btauth": []} in spec["paths"]["/v1/chat/completions"]["post"]["security"]
     assert {"btauth": []} not in spec["paths"]["/platform/api-keys"]["post"]["security"]
     assert spec["paths"]["/gamma/balance"]["get"]["security"] == []
+    app.openapi_schema = None
+
+
+# --- the weekly limit ---------------------------------------------------------------
+
+
+def spend_rows(env, hotkey):
+    with session_scope(env.sf) as s:
+        return [(r.credited_cents, r.waiting_cents) for r in s.scalars(
+            select(GammaSpendORM).where(GammaSpendORM.hotkey == hotkey).order_by(GammaSpendORM.total_raw)).all()]
+
+
+def gamma_ledger(env, user_id):
+    with session_scope(env.sf) as s:
+        return [(e.deposit_ref.split(":")[-1], e.amount_cents) for e in s.scalars(
+            select(LedgerEntryORM).where(LedgerEntryORM.user_id == user_id, LedgerEntryORM.kind == "topup")
+            .order_by(LedgerEntryORM.created_at, LedgerEntryORM.amount_cents.desc())).all()]
+
+
+def next_week(weeks=1):
+    return gamma_app.week_start(datetime.now(UTC)) + timedelta(days=7 * weeks, hours=1)
+
+
+def test_the_limit_is_1000_usd_a_week_until_staff_set_another(env):
+    assert gamma_app.get_settings(env.sf) == {"weekly_limit_usd": 1000.0}
+    status = gamma_app.limit_status(env.sf)
+    assert (status["weekly_usd"], status["credited_this_week_usd"], status["remaining_this_week_usd"],
+            status["waiting_usd"], status["credits_now"]) == ("1000.00", "0.00", "1000.00", "0.00", True)
+    monday = gamma_app.week_start(datetime.now(UTC)).date()
+    assert status["week_start"] == monday.isoformat() and monday.weekday() == 0
+    assert status["week_end"] == (monday + timedelta(days=6)).isoformat()
+
+
+def test_gamma_over_the_weekly_limit_waits_and_is_never_lost(env):
+    # 1,500 gamma against a $1,000 week: $1,000 now, $500 waits.
+    assert credit(env, CUSTOMER.ss58_address, 1500 * G) == "credited"
+    user = owner_of(env, CUSTOMER.ss58_address)
+    assert balance_cents(env, user) == 100_000
+    assert spend_rows(env, CUSTOMER.ss58_address) == [(100_000, 50_000)]
+    assert any("weekly limit is reached" in a for a in env.alerts)
+    status = gamma_app.limit_status(env.sf, fresh=True)
+    monday = gamma_app.week_start(datetime.now(UTC)).date()
+    assert (status["credited_this_week_usd"], status["remaining_this_week_usd"], status["waiting_usd"],
+            status["credits_now"]) == ("1000.00", "0.00", "500.00", False)
+    # $500 is ahead: it takes next week's room first, and $500 of that week is left for new gamma.
+    assert status["next_credit_from"] == (monday + timedelta(days=7)).isoformat()
+    # Someone else spends 10 gamma the same week: all of it waits; their account is open, with nothing yet.
+    assert credit(env, OTHER.ss58_address, 10 * G) == "waiting"
+    other = owner_of(env, OTHER.ss58_address)
+    assert balance_cents(env, other) == 0 and spend_rows(env, OTHER.ss58_address) == [(0, 1_000)]
+    body = gamma_app.balance(env.sf, OTHER.ss58_address)
+    assert (body["credited_usd"], body["waiting_usd"]) == ("0.00", "10.00")
+    # Nothing moves while the week is full.
+    assert gamma_app.release_waiting(env.sf, env.billing) == 0
+    # The next week: both are credited, the older spend first.
+    assert gamma_app.release_waiting(env.sf, env.billing, now=next_week()) == 2
+    assert balance_cents(env, user) == 150_000 and balance_cents(env, other) == 1_000
+    assert spend_rows(env, CUSTOMER.ss58_address) == [(150_000, 0)]
+    assert spend_rows(env, OTHER.ss58_address) == [(1_000, 0)]
+    # One ledger row per part, each with its own reference; one deposit-log row per spend, with its whole credit.
+    parts = gamma_ledger(env, user)
+    assert [cents for _, cents in parts] == [100_000, 50_000] and parts[1][0].endswith("#100000")
+    assert [cents for _, cents in gamma_ledger(env, other)] == [1_000]
+    with session_scope(env.sf) as s:
+        deposits = {d.sender: d.credited_cents for d in s.scalars(select(CryptoDepositORM)).all()}
+        total = s.scalar(select(GammaSpentTotalORM.credited_cents).where(
+            GammaSpentTotalORM.hotkey == CUSTOMER.ss58_address))
+    assert deposits == {CUSTOMER.ss58_address: 150_000, OTHER.ss58_address: 1_000} and total == 150_000
+    # Released twice: nothing more.
+    assert gamma_app.release_waiting(env.sf, env.billing, now=next_week()) == 0
+    assert balance_cents(env, user) == 150_000
+    # The account that is nothing but its hotkey's gamma still shows its balance.
+    body = gamma_app.balance(env.sf, OTHER.ss58_address)
+    assert (body["credited_usd"], body["remaining_usd"], body["waiting_usd"]) == ("10.00", "10.00", "0.00")
+
+
+def test_a_long_queue_is_paid_week_by_week(env):
+    credit(env, CUSTOMER.ss58_address, 3500 * G)     # $1,000 now, $2,500 waits
+    user = owner_of(env, CUSTOMER.ss58_address)
+    status = gamma_app.limit_status(env.sf, fresh=True)
+    monday = gamma_app.week_start(datetime.now(UTC)).date()
+    # Weeks 1 and 2 are full, week 3 has $500 left: new gamma is credited from then.
+    assert status["next_credit_from"] == (monday + timedelta(days=21)).isoformat()
+    for week, balance, waiting in ((1, 200_000, 150_000), (2, 300_000, 50_000), (3, 350_000, 0)):
+        assert gamma_app.release_waiting(env.sf, env.billing, now=next_week(week)) == 1
+        assert balance_cents(env, user) == balance
+        assert spend_rows(env, CUSTOMER.ss58_address) == [(balance, waiting)]
+    assert len({ref for ref, _ in gamma_ledger(env, user)}) == 4      # four parts, four references
+
+
+def test_new_gamma_never_gets_ahead_of_gamma_that_is_waiting(env):
+    credit(env, CUSTOMER.ss58_address, 1500 * G)     # $500 waits
+    gamma_app.set_weekly_limit(env.sf, 1200)         # $200 of room opens, and $500 is waiting for it
+    assert credit(env, OTHER.ss58_address, 100 * G) == "waiting"
+    assert gamma_app.release_waiting(env.sf, env.billing) == 1
+    assert spend_rows(env, CUSTOMER.ss58_address) == [(120_000, 30_000)]
+    assert spend_rows(env, OTHER.ss58_address) == [(0, 10_000)]
+    # With room for everyone waiting and more, a new spend is credited at once.
+    gamma_app.set_weekly_limit(env.sf, 2000)
+    assert credit(env, THIRD.ss58_address, 50 * G) == "credited"
+    assert spend_rows(env, THIRD.ss58_address) == [(5_000, 0)]
+    assert gamma_app.release_waiting(env.sf, env.billing) == 2
+    assert gamma_app.limit_status(env.sf, fresh=True)["waiting_usd"] == "0.00"
+
+
+def test_no_limit_and_a_limit_of_zero(env):
+    assert gamma_app.set_weekly_limit(env.sf, None) == {"weekly_limit_usd": None}
+    assert credit(env, CUSTOMER.ss58_address, 5000 * G) == "credited"
+    assert spend_rows(env, CUSTOMER.ss58_address) == [(500_000, 0)]
+    status = gamma_app.limit_status(env.sf, fresh=True)
+    assert (status["weekly_usd"], status["remaining_this_week_usd"], status["credits_now"]) == (None, None, True)
+    # Zero pauses crediting: every spend waits, and nothing says when.
+    gamma_app.set_weekly_limit(env.sf, 0)
+    assert credit(env, OTHER.ss58_address, 20 * G) == "waiting"
+    status = gamma_app.limit_status(env.sf, fresh=True)
+    assert (status["credits_now"], status["next_credit_from"], status["waiting_usd"]) == (False, None, "20.00")
+    assert gamma_app.release_waiting(env.sf, env.billing, now=next_week()) == 0
+    # Removing the limit credits everything that waited.
+    gamma_app.set_weekly_limit(env.sf, None)
+    assert gamma_app.release_waiting(env.sf, env.billing) == 1
+    assert balance_cents(env, owner_of(env, OTHER.ss58_address)) == 2_000
+
+
+def test_our_buybacks_do_not_use_the_limit(env):
+    assert credit(env, TREASURY.ss58_address, 5000 * G) == "buyback"
+    assert credit(env, CUSTOMER.ss58_address, 1000 * G) == "credited"
+    assert spend_rows(env, CUSTOMER.ss58_address) == [(100_000, 0)]
+    assert gamma_app.limit_status(env.sf, fresh=True)["remaining_this_week_usd"] == "0.00"
+
+
+def test_only_this_weeks_gamma_credit_counts(env):
+    credit(env, CUSTOMER.ss58_address, 900 * G)
+    user = owner_of(env, CUSTOMER.ss58_address)
+    with session_scope(env.sf) as s:
+        # Last week's gamma, and a card payment this week: neither is this week's gamma credit.
+        s.add(LedgerEntryORM(entry_id="old", user_id=user, amount_cents=80_000, balance_after=0, kind="topup",
+                             deposit_ref="gamma:110:0:x:y:1", description="x",
+                             created_at=gamma_app.week_start(datetime.now(UTC)) - timedelta(hours=1)))
+        s.add(LedgerEntryORM(entry_id="card", user_id=user, amount_cents=70_000, balance_after=0, kind="topup",
+                             deposit_ref="stripe:cs_9", description="x"))
+    assert gamma_app.limit_status(env.sf, fresh=True)["remaining_this_week_usd"] == "100.00"
+    assert credit(env, CUSTOMER.ss58_address, 1050 * G) == "credited"      # 150 more: 100 fits, 50 waits
+    assert spend_rows(env, CUSTOMER.ss58_address) == [(90_000, 0), (10_000, 5_000)]
+
+
+def test_waiting_gamma_of_a_deleted_account_is_dropped_and_staff_are_told(env):
+    credit(env, CUSTOMER.ss58_address, 1500 * G)
+    credit(env, OTHER.ss58_address, 10 * G)
+    user = owner_of(env, CUSTOMER.ss58_address)
+    with session_scope(env.sf) as s:      # deleted some other way than delete_account, which ends the wait itself
+        s.get(UserORM, user).profile_metadata = {"deleted_at": "2026-11-27T00:00:00+00:00"}
+    # It doesn't hold up the one behind it.
+    assert gamma_app.release_waiting(env.sf, env.billing, now=next_week()) == 1
+    assert spend_rows(env, CUSTOMER.ss58_address) == [(100_000, 0)]
+    assert balance_cents(env, user) == 100_000
+    assert spend_rows(env, OTHER.ss58_address) == [(1_000, 0)]
+    assert any("has been deleted" in a and "$500.00" in a for a in env.alerts)
+
+
+def test_an_account_merely_named_deleted_keeps_its_waiting_gamma(env):
+    credit(env, CUSTOMER.ss58_address, 1500 * G)
+    user = owner_of(env, CUSTOMER.ss58_address)
+    with session_scope(env.sf) as s:
+        s.get(UserORM, user).username = "deleted-scenes"      # a name anyone may choose
+    assert gamma_app.release_waiting(env.sf, env.billing, now=next_week()) == 1
+    assert balance_cents(env, user) == 150_000 and not env.alerts[1:]
+    # And it can still sign its requests.
+    assert signed("GET", "/platform/secrets")[0] == 200
+
+
+def test_gamma_that_waited_is_screened_again_before_it_is_credited(env):
+    """Listed after the spend, while its gamma waited: never credited."""
+    credit(env, CUSTOMER.ss58_address, 1500 * G)                                # $500 waits
+    credit(env, OTHER.ss58_address, 10 * G, coldkey=THIRD.ss58_address)         # all of it waits
+    credit(env, TREASURY.ss58_address, G)
+    key = Keypair.create_from_uri("//GammaFourth")
+    credit(env, key.ss58_address, 20 * G)                                       # behind them, clean
+    sanctions.store_list(env.sf, sanctions.OFAC, {
+        ("bittensor", LISTED.ss58_address): "Listed Party",
+        ("bittensor", CUSTOMER.ss58_address): "Now Listed",       # the hotkey itself
+        ("bittensor", THIRD.ss58_address): "Now Listed Too",      # the other's deposit coldkey
+    })
+    assert gamma_app.release_waiting(env.sf, env.billing, now=next_week()) == 1
+    customer, other, fourth = (owner_of(env, k.ss58_address) for k in (CUSTOMER, OTHER, key))
+    assert (balance_cents(env, customer), balance_cents(env, other), balance_cents(env, fourth)) == (100_000, 0, 2_000)
+    assert spend_rows(env, CUSTOMER.ss58_address) == [(100_000, 0)]
+    assert spend_rows(env, OTHER.ss58_address) == [(0, 0)]
+    blocked = [a for a in env.alerts if "NOT credited" in a]
+    assert len(blocked) == 2 and any("$500.00" in a for a in blocked) and any(THIRD.ss58_address in a for a in blocked)
+    with session_scope(env.sf) as s:
+        deposits = {d.sender: (d.status, d.credited_cents) for d in s.scalars(select(CryptoDepositORM)).all()}
+    # The spend nothing was credited of is logged as blocked; the part-credited one keeps its credited row.
+    assert deposits[OTHER.ss58_address][0] == "blocked" and deposits[CUSTOMER.ss58_address] == ("credited", 100_000)
+    # Nothing is left waiting to reserve the weeks ahead.
+    assert gamma_app.limit_status(env.sf, fresh=True)["waiting_usd"] == "0.00"
+    assert gamma_app.release_waiting(env.sf, env.billing, now=next_week(2)) == 0
+
+
+def test_an_account_with_a_listed_wallet_gets_no_waiting_gamma(env):
+    credit(env, CUSTOMER.ss58_address, 1500 * G)
+    user = owner_of(env, CUSTOMER.ss58_address)
+    with session_scope(env.sf) as s:      # the account also verified a wallet that is on the list
+        s.add(VerifiedWalletORM(wallet_id="w-listed", user_id=user, chain="bittensor", address=LISTED.ss58_address,
+                                sign_in=False))
+    assert gamma_app.release_waiting(env.sf, env.billing, now=next_week()) == 0
+    assert balance_cents(env, user) == 100_000 and spend_rows(env, CUSTOMER.ss58_address) == [(100_000, 0)]
+
+
+def test_releasing_never_loads_the_account_before_its_lock(env, monkeypatch):
+    """The account's row must first be read under its lock, in _credit: a
+    row loaded earlier in the session is not refreshed by the locked read,
+    and a charge or top-up committed meanwhile would be overwritten."""
+    credit(env, CUSTOMER.ss58_address, 2500 * G)
+    credit(env, CUSTOMER.ss58_address, 2600 * G)          # two waiting spends of one account
+    user = owner_of(env, CUSTOMER.ss58_address)
+    gamma_app.set_weekly_limit(env.sf, None)
+    from sqlalchemy.orm import Session
+
+    loads, real_get = [], Session.get
+
+    def spy(self, entity, ident, **kwargs):
+        if entity is UserORM:
+            loads.append(bool(kwargs.get("with_for_update")))
+        return real_get(self, entity, ident, **kwargs)
+
+    monkeypatch.setattr(Session, "get", spy)
+    assert gamma_app.release_waiting(env.sf, env.billing) == 2
+    monkeypatch.undo()
+    assert loads and all(loads), loads                    # every load of the account takes its lock
+    assert balance_cents(env, user) == 260_000
+    with session_scope(env.sf) as s:
+        ledger_sum = s.scalar(select(func.sum(LedgerEntryORM.amount_cents)).where(LedgerEntryORM.user_id == user))
+    assert ledger_sum == 260_000
+
+
+def test_crediting_takes_its_turn_on_the_settings_row(env):
+    with session_scope(env.sf) as s:
+        assert s.get(KeyValueStateORM, gamma_app.SETTINGS_KEY) is None
+    credit(env, CUSTOMER.ss58_address, 5 * G)
+    with session_scope(env.sf) as s:
+        assert s.get(KeyValueStateORM, gamma_app.SETTINGS_KEY).value == "{}"
+    # The row made for the lock sets nothing: the default limit still applies, and staff can change it.
+    assert gamma_app.get_settings(env.sf) == {"weekly_limit_usd": 1000.0}
+    assert gamma_app.set_weekly_limit(env.sf, 50) == {"weekly_limit_usd": 50.0}
+    assert credit(env, CUSTOMER.ss58_address, 100 * G) == "credited"
+    assert spend_rows(env, CUSTOMER.ss58_address) == [(500, 0), (4_500, 5_000)]
+    # A buyback takes no turn and makes no row of its own.
+    assert credit(env, TREASURY.ss58_address, G) == "buyback"
+
+
+def test_an_account_sees_its_own_gamma_credited_and_waiting(env):
+    credit(env, CUSTOMER.ss58_address, 400 * G)
+    credit(env, CUSTOMER.ss58_address, 1500 * G)          # 1,100 more: $600 fits, $500 waits
+    credit(env, OTHER.ss58_address, 10 * G)               # someone else's, waiting too
+    status, body = signed("GET", "/platform/billing/gamma")
+    assert status == 200
+    assert (body["credited_usd"], body["waiting_usd"]) == ("1000.00", "500.00") and "not lost" in body["waiting_note"]
+    assert [(s["gamma"], s["credited_usd"], s["waiting_usd"]) for s in body["spends"]] == [
+        ("1100", "600.00", "500.00"), ("400", "400.00", "0.00")]
+    assert all(s["hotkey"] == CUSTOMER.ss58_address for s in body["spends"])
+    assert body["limit"]["weekly_usd"] == "1000.00" and body["limit"]["credits_now"] is False
+    assert call("GET", "/platform/billing/gamma")[0] == 401
+    # With nothing waiting there is no note.
+    gamma_app.set_weekly_limit(env.sf, None)
+    gamma_app.release_waiting(env.sf, env.billing)
+    assert signed("GET", "/platform/billing/gamma")[1]["waiting_note"] is None
+    app.openapi_schema = None
+    assert "/platform/billing/gamma" in app.openapi()["paths"]
+    app.openapi_schema = None
+
+
+def test_staff_are_told_when_waiting_gamma_keeps_failing_to_credit(env, monkeypatch):
+    chain = FakeChain()
+    monkeypatch.setattr(gamma_app, "release_waiting", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    gamma_watcher._release_failures["n"] = 0
+    for _ in range(4):
+        gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain)
+    assert not [a for a in env.alerts if "failed" in a]
+    for _ in range(3):
+        gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain)
+    assert len([a for a in env.alerts if "has failed 5 times in a row" in a]) == 1
+    monkeypatch.undo()
+    gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain)
+    assert gamma_watcher._release_failures["n"] == 0
+
+
+def test_deleting_an_account_says_what_waiting_gamma_is_lost_and_stops_it_waiting(env):
+    from greencompute_gateway.application import account_deletion
+
+    credit(env, CUSTOMER.ss58_address, 1500 * G)
+    user = owner_of(env, CUSTOMER.ss58_address)
+    with session_scope(env.sf) as s:
+        s.get(UserORM, user).balance_credits = 250       # most of the $1,000 is used
+    preview = account_deletion.deletion_preview(env.sf, user)
+    assert (preview["balance_usd"], preview["gamma_waiting_usd"], preview["credit_lost_usd"]) == (2.5, 500.0, 502.5)
+    out = account_deletion.delete_account(env.sf, user)
+    assert (out["credit_forfeited_cents"], out["gamma_waiting_forfeited_cents"]) == (250, 50_000)
+    # The spend keeps what it was worth and what was credited; nothing waits, nothing is credited later.
+    assert spend_rows(env, CUSTOMER.ss58_address) == [(100_000, 0)]
+    assert gamma_app.release_waiting(env.sf, env.billing, now=next_week()) == 0
+    assert gamma_app.limit_status(env.sf, fresh=True)["waiting_usd"] == "0.00"
+    assert not any("has been deleted" in a for a in env.alerts)
+
+
+def test_the_watcher_credits_what_waited_before_anything_new(env):
+    chain = FakeChain()
+    chain.totals[SERVICE.ss58_address] = {CUSTOMER.ss58_address: 1500 * G}
+    assert gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain) == 1
+    user = owner_of(env, CUSTOMER.ss58_address)
+    assert balance_cents(env, user) == 100_000
+    # Staff raise the limit: the next tick credits the rest, with nothing new on chain.
+    gamma_app.set_weekly_limit(env.sf, 5000)
+    chain.block = 1001
+    assert gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain) == 0
+    assert balance_cents(env, user) == 150_000
+    # A spend that waits doesn't hold the watcher's cursor: it was handled.
+    assert gamma_app.last_block(env.sf) == 1001
+    # A failing release never stops the tick.
+    chain.block, chain.totals[SERVICE.ss58_address][CUSTOMER.ss58_address] = 1002, 1501 * G
+    real = gamma_app.release_waiting
+    gamma_app.release_waiting = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db hiccup"))
+    try:
+        assert gamma_watcher.scan_gamma(env.sf, env.billing, substrate=chain) == 1
+    finally:
+        gamma_app.release_waiting = real
+    assert balance_cents(env, user) == 150_100
+
+
+def test_limit_in_the_public_and_staff_views(env):
+    with session_scope(env.sf) as s:
+        s.add(APIKeyORM(key_id="admin", user_id=None, name="admin", admin=True, scopes=[], secret="gk_admin"))
+    credit(env, CUSTOMER.ss58_address, 1500 * G)
+    status, body = call("GET", "/platform/gamma")
+    assert status == 200
+    assert (body["limit"]["weekly_usd"], body["limit"]["waiting_usd"], body["limit"]["credits_now"]) == (
+        "1000.00", "500.00", False)
+    assert "not lost" in body["limit"]["note"]
+    assert any("weekly" in step for step in body["steps"])
+    status, body = call("GET", "/gamma/balance", query=f"hotkey={CUSTOMER.ss58_address}".encode())
+    assert (body["credited_usd"], body["waiting_usd"]) == ("1000.00", "500.00")
+    assert call("GET", "/gamma/services.json")[1]["limits"].endswith("/platform/gamma")
+    # Staff only.
+    admin = {"authorization": "Bearer gk_admin"}
+    assert call("GET", "/platform/admin/gamma")[0] in (401, 403)
+    assert call("PUT", "/platform/admin/gamma/settings", {"weekly_limit_usd": 1})[0] in (401, 403)
+    status, body = call("GET", "/platform/admin/gamma", headers=admin)
+    assert status == 200 and body["settings"] == {"weekly_limit_usd": 1000.0}
+    assert [(w["hotkey"], w["credited_usd"], w["waiting_usd"], w["gamma"]) for w in body["waiting"]] == [
+        (CUSTOMER.ss58_address, "1000.00", "500.00", "1500")]
+    for bad in ({"weekly_limit_usd": -1}, {"weekly_limit_usd": "1000"}, {"weekly_limit_usd": True}, {},
+                {"weekly_limit_usd": 5, "x": 1}):
+        assert call("PUT", "/platform/admin/gamma/settings", bad, headers=admin)[0] == 400, bad
+    status, body = call("PUT", "/platform/admin/gamma/settings", {"weekly_limit_usd": 2500.5}, headers=admin)
+    assert status == 200 and body["settings"] == {"weekly_limit_usd": 2500.5}
+    assert body["limit"]["weekly_usd"] == "2500.50"
+    # The public view follows at once (its 10 s cache is dropped on a change).
+    assert call("GET", "/platform/gamma")[1]["limit"]["weekly_usd"] == "2500.50"
+    status, body = call("PUT", "/platform/admin/gamma/settings", {"weekly_limit_usd": None}, headers=admin)
+    assert status == 200 and body["limit"]["weekly_usd"] is None
+    # Neither route is in the public spec.
+    app.openapi_schema = None
+    assert not any(path.startswith("/platform/admin/gamma") for path in app.openapi()["paths"])
     app.openapi_schema = None

@@ -6,8 +6,10 @@ payments without bonuses, never staff credit; card chargebacks; excluded
 accounts; the counting-from date); GPU-hours and revenue per machine; which
 machines are listed, online, hidden and whose; farmers and their labels;
 the buyback sum (gamma payments already bought back, treasury spends
-count); statements and payments; and that every staff route needs an admin
-key."""
+count), due only once its period (a quarter by default) has ended;
+contracts as a revenue stream and as capacity; the public GPU bands and
+shares (rounded down, never exact unless staff choose); statements and
+payments; and that every staff route needs an admin key."""
 import asyncio
 import json
 import types
@@ -33,7 +35,8 @@ from greencompute_persistence.orm import (
     WorkloadORM,
 )
 
-NOW = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)
+NOW = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)   # a Tuesday, in the fourth quarter
+JANUARY = datetime(2027, 1, 5, 12, 0, tzinfo=UTC)  # the quarter NOW is in has ended
 G = 10**9
 
 
@@ -174,14 +177,34 @@ def test_staff_routes_need_an_admin_key(env):
     assert report.get_settings(env.sf)["published"] is False
 
 
+def test_contract_routes_need_an_admin_key(env):
+    for method, path, body in (
+        ("POST", "/platform/admin/contracts", {"name": "X", "starts_on": "2026-11-01"}),
+        ("PATCH", "/platform/admin/contracts/c1", {"name": "Y"}),
+        ("POST", "/platform/admin/contracts/c1/payments", {"received_on": "2026-11-02", "amount_usd": 5}),
+        ("DELETE", "/platform/admin/contract-payments/p1", None),
+    ):
+        assert call(method, path, body)[0] == 401, path
+        assert call(method, path, body, key="gk_user")[0] == 403, path
+    assert report.list_contracts(env.sf) == []
+
+
 def test_settings_are_checked(env):
+    # What the owner asked for is the default: quarters, bands, no GPU-hours.
+    defaults = report.get_settings(env.sf)
+    assert (defaults["period"], defaults["gpu_detail"], defaults["show_providers"], defaults["show_gpu_hours"]) == (
+        "quarter", "bands", True, False)
     for bad in ({"since": "yesterday"}, {"revenue_basis": "profit"}, {"listed_within_days": 0},
-                {"published": "yes"}, {"excluded_user_ids": "cust"}, {"colour": "green"}):
+                {"published": "yes"}, {"excluded_user_ids": "cust"}, {"colour": "green"}, {"period": "year"},
+                {"period": None}, {"gpu_detail": "rough"}, {"show_providers": "no"}, {"show_gpu_hours": 1}):
         with pytest.raises(report.ReportError):
             report.update_settings(env.sf, bad)
     out = report.update_settings(env.sf, {"since": "2026-10-01", "revenue_basis": "usage", "listed_within_days": 7,
-                                          "excluded_user_ids": ["b", "a", "a"]})
+                                          "excluded_user_ids": ["b", "a", "a"], "period": "month",
+                                          "gpu_detail": "exact", "show_providers": False, "show_gpu_hours": True})
     assert out["excluded_user_ids"] == ["a", "b"] and report.get_settings(env.sf) == out
+    assert (out["period"], out["gpu_detail"], out["show_providers"], out["show_gpu_hours"]) == (
+        "month", "exact", False, True)
     status, body = call("PUT", "/platform/admin/report/settings", {"since": "soon"}, key="gk_admin")
     assert status == 400 and "YYYY-MM-DD" in body["detail"]
 
@@ -203,25 +226,36 @@ def test_revenue_is_what_customers_paid_without_bonuses_or_staff_credit(env):
     ledger(env, "cb", -500, kind="chargeback", when=NOW)                              # a card payment reversed
     ledger(env, "ours", 4000, ref="stripe:cs_2", user="staff-test", when=NOW)         # our own test account
     ledger(env, "early", 7700, ref="stripe:cs_0", when=datetime(2026, 10, 30, tzinfo=UTC))  # before the start
-    report.update_settings(env.sf, {"excluded_user_ids": ["staff-test"]})
+    report.update_settings(env.sf, {"excluded_user_ids": ["staff-test"], "period": "week"})
     revenue = report.build(env.sf, admin=True, now=NOW)["revenue"]  # staff: up to now
     by = {m["method"]: m["usd"] for m in revenue["by_method"]}
-    assert by == {"card": "15.00", "crypto": "80.00", "gamma": "7.00"}
+    assert by == {"gamma": "7.00", "contract": "0.00", "card": "15.00", "crypto": "80.00"}
+    assert [m["method"] for m in revenue["by_method"]] == ["gamma", "contract", "card", "crypto"]
     assert revenue["total_usd"] == "102.00" and revenue["basis"] == "paid" and revenue["through"] == "2026-11-24"
-    this_week = revenue["weeks"][0]
-    assert this_week["week_start"] == "2026-11-23" and this_week["card_usd"] == "15.00"
-    last_week = revenue["weeks"][1]
-    assert (last_week["crypto_usd"], last_week["gamma_usd"], last_week["usd"]) == ("30.00", "7.00", "37.00")
+    this_week = revenue["periods"][0]
+    assert (this_week["start"], this_week["end"], this_week["complete"], this_week["card_usd"]) == (
+        "2026-11-23", "2026-11-29", False, "15.00")
+    last_week = revenue["periods"][1]
+    assert (last_week["crypto_usd"], last_week["gamma_usd"], last_week["usd"], last_week["complete"]) == (
+        "30.00", "7.00", "37.00", True)
+    assert last_week["to_buy_back_usd"] == "30.00" and last_week["counted_from"] is None
     assert revenue["days"][0] == {"day": "2026-11-24", "usd": "-5.00"}
+    # By quarter, the default: one row, the quarter in progress, counted from the start date.
+    report.update_settings(env.sf, {"period": "quarter"})
+    revenue = report.build(env.sf, admin=True, now=NOW)["revenue"]
+    assert [(q["start"], q["end"], q["counted_from"], q["complete"], q["usd"]) for q in revenue["periods"]] == [
+        ("2026-10-01", "2026-12-31", "2026-11-01", False, "102.00")]
     # Counting from October includes the earlier payment.
     report.update_settings(env.sf, {"since": "2026-10-01"})
     assert report.build(env.sf, admin=True, now=NOW)["revenue"]["total_usd"] == "179.00"
 
 
-def test_the_public_report_stops_at_the_last_completed_week(env):
-    """NOW is a Tuesday: the public sees money and GPU-hours through Sunday
-    the 22nd, totals included, so polling can't show a payment as it lands
-    or how many GPUs are rented this minute."""
+def test_the_public_report_stops_at_the_last_completed_period(env):
+    """By week, NOW being a Tuesday: the public sees money and GPU-hours
+    through Sunday the 22nd, totals included, so polling can't show a payment
+    as it lands or how many GPUs are rented this minute. By quarter (the
+    default) it sees nothing until the quarter has ended."""
+    report.update_settings(env.sf, {"period": "week", "show_gpu_hours": True})
     ledger(env, "last-week", 3000, ref="usdc-base:0x1:1", when=datetime(2026, 11, 20, 9, tzinfo=UTC))
     ledger(env, "sunday-night", 700, ref="stripe:cs_s", when=datetime(2026, 11, 22, 23, 59, tzinfo=UTC))
     ledger(env, "monday", 4321, ref="usdc-base:0x2:1", when=datetime(2026, 11, 23, 0, 30, tzinfo=UTC))
@@ -232,17 +266,41 @@ def test_the_public_report_stops_at_the_last_completed_week(env):
     public = report.build(env.sf, now=NOW)
     revenue = public["revenue"]
     assert revenue["through"] == "2026-11-22" and revenue["total_usd"] == "37.00"
-    assert {m["method"]: m["usd"] for m in revenue["by_method"]} == {"card": "7.00", "crypto": "30.00", "gamma": "0.00"}
-    assert [w["week_start"] for w in revenue["weeks"]][0] == "2026-11-16" and "days" not in revenue
+    assert {m["method"]: m["usd"] for m in revenue["by_method"]} == {
+        "gamma": "0.00", "contract": "0.00", "card": "7.00", "crypto": "30.00"}
+    assert revenue["periods"][0]["start"] == "2026-11-16" and "days" not in revenue
+    assert all(w["complete"] for w in revenue["periods"])
+    assert revenue["next_figures_on"] == "2026-11-30"      # when the week in progress will show
     assert revenue["compute_delivered"] == {"usd": "4.00", "gpu_hours": "10.0"}
-    assert public["buybacks"]["to_buy_back_usd"] == "37.00"
-    # Staff see up to now.
-    staff = report.build(env.sf, admin=True, now=NOW)["revenue"]
-    assert staff["total_usd"] == "89.21" and staff["compute_delivered"]["gpu_hours"] == "30.0"
+    assert revenue["periods"][0]["gpu_hours"] == "10.0"
+    assert public["buybacks"]["to_buy_back_usd"] == "37.00" and public["buybacks"]["next_due"] == "2026-11-30"
+    assert "accruing_usd" not in public["buybacks"] and "settle_now_usd" not in public["buybacks"]
+    # GPU-hours and compute charged are off the public report unless staff turn them on.
+    report.update_settings(env.sf, {"show_gpu_hours": False})
+    quiet = report.build(env.sf, now=NOW)["revenue"]
+    assert "compute_delivered" not in quiet
+    assert not [k for row in quiet["periods"] for k in row if k in ("gpu_hours", "compute_usd")]
+    # Staff see up to now, GPU-hours included, whatever the public setting.
+    staff = report.build(env.sf, admin=True, now=NOW)
+    assert staff["revenue"]["total_usd"] == "89.21" and staff["revenue"]["compute_delivered"]["gpu_hours"] == "30.0"
+    assert staff["revenue"]["next_figures_on"] is None
+    assert (staff["buybacks"]["to_buy_back_usd"], staff["buybacks"]["accruing_usd"]) == ("37.00", "52.21")
     # Before the first completed week there is nothing to show yet.
     report.update_settings(env.sf, {"since": "2026-11-23"})
     early = report.build(env.sf, now=NOW)["revenue"]
-    assert (early["through"], early["total_usd"], early["weeks"]) == (None, "0.00", [])
+    assert (early["through"], early["total_usd"], early["periods"]) == (None, "0.00", [])
+    # By quarter: nothing of the quarter in progress is public; it all shows once it has ended.
+    report.update_settings(env.sf, {"since": "2026-11-01", "period": "quarter"})
+    public = report.build(env.sf, now=NOW)
+    assert (public["period"], public["revenue"]["through"], public["revenue"]["total_usd"]) == ("quarter", None, "0.00")
+    assert public["revenue"]["periods"] == [] and public["revenue"]["next_figures_on"] == "2027-01-01"
+    assert (public["buybacks"]["to_buy_back_usd"], public["buybacks"]["next_due"]) == ("0.00", "2027-01-01")
+    later = report.build(env.sf, now=JANUARY)
+    assert (later["revenue"]["through"], later["revenue"]["total_usd"]) == ("2026-12-31", "89.21")
+    assert [(q["start"], q["end"], q["counted_from"], q["complete"], q["usd"], q["to_buy_back_usd"])
+            for q in later["revenue"]["periods"]] == [
+        ("2026-10-01", "2026-12-31", "2026-11-01", True, "89.21", "89.21")]
+    assert (later["buybacks"]["to_buy_back_usd"], later["buybacks"]["next_due"]) == ("89.21", "2027-04-01")
 
 
 def test_compute_delivered_and_the_usage_basis(env):
@@ -274,16 +332,23 @@ def test_gpus_by_type_and_by_farmer(env):
     assert (a["public_label"], b["public_label"]) == ("Farmer A", "Farmer B")
     report.assign_machine(env.sf, "node-a1", farmer_id=a["farmer_id"])
     report.assign_machine(env.sf, "node-a2", farmer_id=a["farmer_id"])
+    report.update_settings(env.sf, {"gpu_detail": "exact"})
     gpus = report.build(env.sf, now=NOW)["gpus"]
+    assert gpus["detail"] == "exact"
     assert (gpus["gpus"], gpus["online_gpus"], gpus["machines"], gpus["machines_online"]) == (24, 16, 3, 2)
+    assert (gpus["contract_gpus"], gpus["total_gpus"]) == (0, 24)
     assert [(m["label"], m["gpus"], m["online_gpus"]) for m in gpus["by_model"]] == [
         ("RTX 4090", 16, 8), ("RTX 5090", 8, 8)]
     assert [(f["farmer"], f["gpus"], f["online_gpus"]) for f in gpus["by_farmer"]] == [
         ("Farmer A", 16, 8), ("Unassigned", 8, 8)]
+    # Shares are of capacity at list price: 16 x $0.40 against 8 x $0.70.
+    assert [f["share_pct"] for f in gpus["by_farmer"]] == [53.3, 46.7]
+    assert "usd_per_hour" not in gpus["by_farmer"][0]
     # The public report never carries a farmer's name or id; staff's does.
     assert "Acme" not in json.dumps(report.build(env.sf, now=NOW))
     admin = report.build(env.sf, admin=True, now=NOW)["gpus"]["by_farmer"][0]
     assert admin["name"] == "Acme Hosting" and admin["farmer_id"] == a["farmer_id"]
+    assert admin["usd_per_hour"] == "6.40"
     # A hidden machine and one silent past the listing window are left out.
     report.assign_machine(env.sf, "node-b1", hidden=True)
     report.update_settings(env.sf, {"listed_within_days": 3})
@@ -345,25 +410,53 @@ def test_buyback_owes_card_and_crypto_revenue_less_what_was_bought_back(env):
                             observed_at=NOW))
     _treasury_spend(env, "b1", 30, NOW - timedelta(days=1))
     _treasury_spend(env, "b0", 500, datetime(2026, 10, 1, tzinfo=UTC))  # before the counting-from date
+    # While the quarter runs nothing is due: the $100 builds up, and falls due on 1 January.
     out = report.buyback(env.sf, now=NOW)
+    assert (out["period"], out["revenue_usd"], out["to_buy_back_usd"], out["accruing_usd"], out["next_due"]) == (
+        "quarter", "125.00", "0.00", "100.00", "2027-01-01")
+    assert (out["bought_back_usd"], out["outstanding_usd"], out["commands"], out["tao_to_mint"]) == (
+        "30.00", "0.00", [], None)
+    # To settle everything up to today anyway: $100 less the $30 already bought back.
+    assert (out["settle_now_usd"], out["settle_now_tao"]) == ("70.00", "0.1750")
+    assert out["periods"] == [{"start": "2026-10-01", "end": "2026-12-31", "counted_from": "2026-11-01",
+                               "complete": False, "revenue_usd": "125.00", "gamma_usd": "25.00",
+                               "to_buy_back_usd": "100.00"}]
+    public = report.build(env.sf, now=NOW)
+    assert not [k for k in (*public["buybacks"], *public["revenue"]) if k.endswith("_cents")]
+    assert "next_due_day" not in public["revenue"]
+    # This quarter's payments aren't public yet; the buyback already made is (it is on chain).
+    assert (public["buybacks"]["to_buy_back_usd"], public["buybacks"]["bought_back_usd"]) == ("0.00", "30.00")
+    assert "All gamma ever spent" in public["buybacks"]["on_chain"]["scope"]
+    # The quarter has ended: it is due, less what was bought back early.
+    out = report.buyback(env.sf, now=JANUARY)
     assert (out["revenue_usd"], out["to_buy_back_usd"], out["bought_back_usd"], out["outstanding_usd"]) == (
         "125.00", "100.00", "30.00", "70.00")
+    assert (out["accruing_usd"], out["next_due"], out["settle_now_usd"]) == ("0.00", "2027-04-01", "70.00")
     assert out["paid_in_gamma_usd"] == "25.00" and out["tao_usd"] == 400.0 and out["tao_to_mint"] == "0.1750"
     assert out["commands"][0] == "btcli gamma mint --netuid 110 --hotkey gc-buyback --amount-tao 0.1750"
     assert "--service-hotkey 5CwckYmAV3fET8V9KTKfqds6BnRGACAgofECQqdYfa2Q9rvp" in out["commands"][1]
     assert out["on_chain"]["spent_gamma"] == "555"  # every spend here, whenever
     assert [entry["gamma"] for entry in out["log"]] == ["30"]
-    staff = report.build(env.sf, admin=True, now=NOW)["buybacks"]
-    assert (staff["to_buy_back_usd"], staff["outstanding_usd"]) == ("100.00", "70.00")
-    public = report.build(env.sf, now=NOW)
-    assert not [k for k in (*public["buybacks"], *public["revenue"]) if k.endswith("_cents")]
-    # This week's payments aren't public yet; the buyback already made is (it is on chain).
-    assert (public["buybacks"]["to_buy_back_usd"], public["buybacks"]["bought_back_usd"]) == ("0.00", "30.00")
-    assert "All gamma ever spent" in public["buybacks"]["on_chain"]["scope"]
+    assert [(q["start"], q["complete"]) for q in out["periods"]] == [("2027-01-01", False), ("2026-10-01", True)]
+    staff = report.build(env.sf, admin=True, now=JANUARY)["buybacks"]
+    assert (staff["to_buy_back_usd"], staff["outstanding_usd"], staff["accruing_usd"]) == ("100.00", "70.00", "0.00")
+    public = report.build(env.sf, now=JANUARY)["buybacks"]
+    assert (public["to_buy_back_usd"], public["outstanding_usd"], public["paid_in_gamma_usd"]) == (
+        "100.00", "70.00", "25.00")
+    # New revenue in the new quarter builds up beside what is due.
+    ledger(env, "jan", 900, ref="stripe:cs_j", when=JANUARY - timedelta(days=1))
+    out = report.buyback(env.sf, now=JANUARY)
+    assert (out["to_buy_back_usd"], out["outstanding_usd"], out["accruing_usd"], out["settle_now_usd"]) == (
+        "100.00", "70.00", "9.00", "79.00")
     # Bought back in full: nothing outstanding, no commands.
-    _treasury_spend(env, "b2", 80)
-    out = report.buyback(env.sf, now=NOW)
+    _treasury_spend(env, "b2", 80, JANUARY)
+    out = report.buyback(env.sf, now=JANUARY)
     assert out["outstanding_usd"] == "0.00" and out["commands"] == [] and out["tao_to_mint"] is None
+    assert out["settle_now_usd"] == "0.00" and out["settle_now_tao"] is None
+    # By week the same money falls due after its week.
+    report.update_settings(env.sf, {"period": "week"})
+    out = report.buyback(env.sf, now=NOW + timedelta(days=7))
+    assert (out["to_buy_back_usd"], out["next_due"]) == ("100.00", "2026-12-07")
 
 
 def test_buyback_without_a_price_gives_no_amount(env, monkeypatch):
@@ -372,8 +465,9 @@ def test_buyback_without_a_price_gives_no_amount(env, monkeypatch):
 
     monkeypatch.setattr("greencompute_gateway.infrastructure.price_feed.get_price", no_price)
     ledger(env, "card", 6000, ref="stripe:cs_1")
-    out = report.buyback(env.sf, now=NOW)
+    out = report.buyback(env.sf, now=JANUARY)
     assert out["outstanding_usd"] == "60.00" and out["tao_usd"] is None and out["commands"] == []
+    assert out["settle_now_tao"] is None
 
 
 def test_on_the_usage_basis_gamma_only_covers_its_own_accounts_usage(env):
@@ -386,13 +480,26 @@ def test_on_the_usage_basis_gamma_only_covers_its_own_accounts_usage(env):
     ledger(env, "g", 10_000, ref="gamma:110:0:svc:hk:100", user="gamma-payer")
     ledger(env, "use", -5000, kind="usage", reference="dep-a", description="GPU usage 1× GPU @ $0.40/hr")
     report.update_settings(env.sf, {"revenue_basis": "usage"})
-    out = report.buyback(env.sf, now=NOW)
+    out = report.buyback(env.sf, now=JANUARY)
     assert (out["revenue_usd"], out["to_buy_back_usd"], out["paid_in_gamma_usd"]) == ("50.00", "50.00", "0.00")
+    # Per period it isn't worked out on this basis: gamma covers usage across periods.
+    assert out["periods"][-1]["to_buy_back_usd"] is None
     # Once the gamma payer uses $30 of it, that $30 is revenue already bought back.
     ledger(env, "use-g", -3000, kind="usage", reference="dep-b", description="GPU usage 1× GPU @ $0.70/hr",
            user="gamma-payer")
-    out = report.buyback(env.sf, now=NOW)
+    out = report.buyback(env.sf, now=JANUARY)
     assert (out["revenue_usd"], out["to_buy_back_usd"], out["paid_in_gamma_usd"]) == ("80.00", "50.00", "30.00")
+    # In the quarter itself all of it is still building up; the gamma-funded part never falls due.
+    out = report.buyback(env.sf, now=NOW)
+    assert (out["to_buy_back_usd"], out["accruing_usd"], out["paid_in_gamma_usd"]) == ("0.00", "50.00", "30.00")
+    # Usage in the next quarter that gamma paid for doesn't reduce what the last quarter owes.
+    ledger(env, "use-g2", -2000, kind="usage", reference="dep-b", description="GPU usage 1× GPU @ $0.70/hr",
+           user="gamma-payer", when=JANUARY - timedelta(days=2))
+    ledger(env, "use-c2", -700, kind="usage", reference="dep-a", description="GPU usage 1× GPU @ $0.40/hr",
+           when=JANUARY - timedelta(days=2))
+    out = report.buyback(env.sf, now=JANUARY)
+    assert (out["revenue_usd"], out["to_buy_back_usd"], out["accruing_usd"], out["paid_in_gamma_usd"]) == (
+        "107.00", "50.00", "7.00", "50.00")
 
 
 def test_staff_debits_are_listed_not_netted(env):
@@ -440,9 +547,15 @@ def test_farmer_statement_and_payments(env):
     report.update_settings(env.sf, {"excluded_user_ids": ["staff-test"]})
     assert report.statement(env.sf, farmer["farmer_id"], "2026-11")["revenue_usd"] == "4.00"
     assert report.build(env.sf, admin=True, now=NOW)["farmer_payments"]["total_usd"] == "15.00"
+    # In public only once the period the statement month is in has ended, as for revenue.
     report.update_settings(env.sf, {"show_farmer_payments": True})
-    assert report.build(env.sf, now=NOW)["farmer_payments"] == {
+    assert report.build(env.sf, now=NOW)["farmer_payments"] == {"total_usd": "0.00", "months": []}
+    assert report.build(env.sf, now=JANUARY)["farmer_payments"] == {
         "total_usd": "15.00", "months": [{"month": "2026-11", "usd": "15.00"}]}
+    report.update_settings(env.sf, {"period": "month"})
+    assert report.build(env.sf, now=NOW)["farmer_payments"]["months"] == []
+    assert report.build(env.sf, now=NOW + timedelta(days=10))["farmer_payments"]["total_usd"] == "15.00"
+    report.update_settings(env.sf, {"period": "quarter"})
     assert report.statement(env.sf, farmer["farmer_id"], "2026-10")["revenue_usd"] == "4.00"
     assert call("DELETE", f"/platform/admin/farmer-payments/{payment['payment_id']}", key="gk_admin")[0] == 200
     assert call("DELETE", f"/platform/admin/farmer-payments/{payment['payment_id']}", key="gk_admin")[0] == 404
@@ -502,12 +615,203 @@ def test_admin_report_has_everything_staff_need(env):
     assert {m["node_id"] for m in body["machines"]} == {"node-a1", "node-a2", "node-b1", "node-old"}
     assert body["farmers"][0]["farmer_id"] == farmer["farmer_id"]
     assert body["report"]["gpus"]["by_farmer"][0]["farmer"] == "Unassigned"
-    # The preview is what the public would get: no names, no days, completed weeks only.
+    assert body["report"]["gpus"]["detail"] == "exact" and body["contracts"] == []
+    # The preview is what the public would get: bands, no names, no days, completed periods only.
     assert "days" not in body["preview"]["revenue"] and "days" in body["report"]["revenue"]
-    assert "name" not in body["preview"]["gpus"]["by_farmer"][0]
+    assert body["preview"]["gpus"]["detail"] == "bands" and "by_farmer" not in body["preview"]["gpus"]
+    assert "accruing_usd" in body["report"]["buybacks"] and "accruing_usd" not in body["preview"]["buybacks"]
     # The public spec lists the report and none of the staff routes.
     app.openapi_schema = None
     paths = app.openapi()["paths"]
     app.openapi_schema = None
     assert "/platform/report" in paths and paths["/platform/report"]["get"]["security"] == []
     assert not [p for p in paths if p.startswith("/platform/admin/")]
+
+
+# --- how much the public report says about GPUs --------------------------------------
+
+
+def test_public_gpu_counts_are_bands_rounded_down_never_exact(env):
+    a = report.create_farmer(env.sf, name="Acme Hosting")
+    report.assign_machine(env.sf, "node-a1", farmer_id=a["farmer_id"])
+    report.assign_machine(env.sf, "node-a2", farmer_id=a["farmer_id"])
+    public = report.build(env.sf, now=NOW)
+    gpus = public["gpus"]
+    # 24 listed, 16 online, none under contract.
+    assert (gpus["detail"], gpus["total"], gpus["on_demand"], gpus["online"], gpus["under_contract"]) == (
+        "bands", "20+", "20+", "10+", None)
+    assert gpus["by_model"] == [{"gpu_model": "rtx4090", "label": "RTX 4090", "gpus": "10+"},
+                                {"gpu_model": "rtx5090", "label": "RTX 5090", "gpus": "5+"}]
+    # Providers by label, with their types and a share rounded down to 5%: 53.3% and 46.7%.
+    assert gpus["providers"] == [
+        {"provider": "Farmer A", "types": ["RTX 4090"], "share_pct": 50, "share": "50%+"},
+        {"provider": "Unassigned", "types": ["RTX 5090"], "share_pct": 45, "share": "45%+"}]
+    assert gpus["provider_count"] == 1 and gpus["listed_within_days"] == 30
+    # No exact count, machine count or name anywhere in what the public gets.
+    text = json.dumps(public)
+    for key in ("online_gpus", "machines", "total_gpus", "contract_gpus", "by_farmer", "usd_per_hour", "Acme",
+                "_share"):
+        assert key not in text, key
+    assert not any(isinstance(v, int) and not isinstance(v, bool) for k, v in gpus.items()
+                   if k not in ("listed_within_days", "provider_count"))
+    # Staff always see the exact counts.
+    assert report.build(env.sf, admin=True, now=NOW)["gpus"]["gpus"] == 24
+    # Providers can be left out altogether, in either detail.
+    report.update_settings(env.sf, {"show_providers": False})
+    hidden = report.build(env.sf, now=NOW)["gpus"]
+    assert hidden["providers"] == [] and hidden["provider_count"] is None
+    report.update_settings(env.sf, {"gpu_detail": "exact"})
+    exact = report.build(env.sf, now=NOW)["gpus"]
+    assert exact["by_farmer"] == [] and exact["gpus"] == 24
+    staff = report.build(env.sf, admin=True, now=NOW)["gpus"]["by_farmer"]
+    assert len(staff) == 2 and "_share" not in staff[0]
+    report.update_settings(env.sf, {"show_providers": True})
+    assert "_share" not in report.build(env.sf, now=NOW)["gpus"]["by_farmer"][0]
+
+
+def test_bands_never_round_up(env):
+    assert [report._band(n) for n in (0, 1, 4, 5, 9, 10, 19, 24, 99, 100, 149, 150, 999, 1000, 2300)] == [
+        "0", "1+", "1+", "5+", "5+", "10+", "10+", "20+", "90+", "100+", "100+", "150+", "950+", "1,000+", "2,000+"]
+    for n in range(1, 3000):
+        floor = int(report._band(n).rstrip("+").replace(",", ""))
+        assert 0 < floor <= n
+    assert report._share_band(100.0, alone=False) == (100, "100%")
+    assert report._share_band(42.0, alone=True) == (100, "100%")
+    assert report._share_band(1.0, alone=False) == (0, "under 5%")
+    assert report._share_band(98.9, alone=False) == (95, "95%+")
+    assert report._share_band(0.0, alone=False) == (0, "0%")
+    assert report._share_band(34.999, alone=False) == (30, "30%+")
+    # Shares shown never exceed the real ones, so they never add up past 100%.
+    for parts in ((1, 1, 1), (2, 1), (5, 3, 1, 1), (97, 2, 1), (1,) * 7):
+        shown = [report._share_band(100 * p / sum(parts), alone=False)[0] for p in parts]
+        assert sum(shown) <= 100 and all(w <= 100 * p / sum(parts) for w, p in zip(shown, parts)), (parts, shown)
+
+
+def test_a_lone_provider_shows_all_of_the_capacity(env):
+    gpus = report.build(env.sf, now=NOW)["gpus"]
+    assert gpus["providers"] == [{"provider": "Unassigned", "types": ["RTX 4090", "RTX 5090"], "share_pct": 100,
+                                  "share": "100%"}]
+    assert gpus["provider_count"] == 0
+
+
+# --- contracts ----------------------------------------------------------------------
+
+
+def test_contracts_are_a_revenue_stream_and_capacity(env):
+    farmer = report.create_farmer(env.sf, name="Acme")
+    report.assign_machine(env.sf, "node-a1", farmer_id=farmer["farmer_id"])
+    status, contract = call("POST", "/platform/admin/contracts", {
+        "name": "  Lab   One ", "farmer_id": farmer["farmer_id"], "gpu_model": "RTX 5090", "gpu_count": 40,
+        "monthly_usd": 14600, "starts_on": "2026-11-01", "notes": "bare metal",
+    }, key="gk_admin")
+    assert status == 200
+    assert (contract["name"], contract["gpu_model"], contract["gpu_label"], contract["gpu_count"]) == (
+        "Lab One", "rtx5090", "RTX 5090", 40)
+    assert (contract["monthly_usd"], contract["active"], contract["archived"], contract["received_usd"]) == (
+        "14600.00", True, False, "0.00")
+    cid = contract["contract_id"]
+    # A GPU type we don't list a price for is valued at its contract's own rate: 7300 / 10 / 730 h = $1.00.
+    report.create_contract(env.sf, {"name": "H100 lab", "gpu_model": "h100", "gpu_count": 10, "monthly_usd": 7300,
+                                    "starts_on": "2026-11-10"})
+    # One that has ended, one not started, one archived: none of them is capacity.
+    report.create_contract(env.sf, {"name": "Ended", "gpu_model": "rtx4090", "gpu_count": 99,
+                                    "starts_on": "2026-01-01", "ends_on": "2026-11-23"})
+    report.create_contract(env.sf, {"name": "Later", "gpu_model": "rtx4090", "gpu_count": 99,
+                                    "starts_on": "2026-12-01"})
+    gone = report.create_contract(env.sf, {"name": "Gone", "gpu_model": "rtx4090", "gpu_count": 99,
+                                           "starts_on": "2026-11-01"})
+    assert report.update_contract(env.sf, gone["contract_id"], {"archived": True})["active"] is False
+    gpus = report.build(env.sf, admin=True, now=NOW)["gpus"]
+    assert (gpus["gpus"], gpus["contract_gpus"], gpus["total_gpus"]) == (24, 50, 74)
+    assert [(m["label"], m["gpus"], m["contract_gpus"], m["total_gpus"]) for m in gpus["by_model"]] == [
+        ("H100", 0, 10, 10), ("RTX 4090", 16, 0, 16), ("RTX 5090", 8, 40, 48)]
+    acme = gpus["by_farmer"][0]
+    # Acme: 8 x 0.40 + 40 x 0.70 = $31.20 an hour of $50.00 (plus 8 x 0.40 + 8 x 0.70 + 10 x 1.00 unassigned).
+    assert (acme["farmer"], acme["gpus"], acme["contract_gpus"], acme["usd_per_hour"], acme["share_pct"]) == (
+        "Farmer A", 8, 40, "31.20", 62.4)
+    public = report.build(env.sf, now=NOW)["gpus"]
+    assert (public["total"], public["on_demand"], public["under_contract"]) == ("70+", "20+", "50+")
+    assert [(m["label"], m["gpus"]) for m in public["by_model"]] == [
+        ("H100", "10+"), ("RTX 4090", "10+"), ("RTX 5090", "40+")]
+    assert public["providers"][0] == {"provider": "Farmer A", "types": ["RTX 4090", "RTX 5090"], "share_pct": 60,
+                                      "share": "60%+"}
+
+    # Payments received are revenue on the day they arrived, on either basis, and are bought back.
+    status, payment = call("POST", f"/platform/admin/contracts/{cid}/payments",
+                           {"received_on": "2026-11-05", "amount_usd": 14600, "reference": "wire 881"},
+                           key="gk_admin")
+    assert status == 200 and (payment["amount_usd"], payment["received_on"]) == ("14600.00", "2026-11-05")
+    report.record_contract_payment(env.sf, cid, received_on="2026-10-20", amount_usd=5000)   # before the start date
+    ledger(env, "card", 2000, ref="stripe:cs_1", when=NOW - timedelta(days=1))
+    ledger(env, "gamma", 700, ref="gamma:110:0:svc:hk:7", when=NOW - timedelta(days=3))
+    revenue = report.build(env.sf, admin=True, now=NOW)["revenue"]
+    assert {m["method"]: m["usd"] for m in revenue["by_method"]} == {
+        "gamma": "7.00", "contract": "14600.00", "card": "20.00", "crypto": "0.00"}
+    quarter = revenue["periods"][0]
+    assert (quarter["usd"], quarter["contract_usd"], quarter["to_buy_back_usd"]) == ("14627.00", "14600.00", "14620.00")
+    out = report.buyback(env.sf, now=JANUARY)
+    assert (out["revenue_usd"], out["to_buy_back_usd"], out["paid_in_gamma_usd"]) == ("14627.00", "14620.00", "7.00")
+    report.update_settings(env.sf, {"revenue_basis": "usage"})
+    assert report.build(env.sf, admin=True, now=NOW)["revenue"]["total_usd"] == "14600.00"
+    report.update_settings(env.sf, {"revenue_basis": "paid"})
+    # The public report gives the stream's total for completed periods, never the contracts themselves.
+    assert report.build(env.sf, now=NOW)["revenue"]["total_usd"] == "0.00"
+    later = json.dumps(report.build(env.sf, now=JANUARY))
+    assert '"contract_usd": "14600.00"' in later and "Lab One" not in later and "wire 881" not in later
+    # Staff's list: the contract with its payments, newest first, and what it has brought in.
+    status, body = call("GET", "/platform/admin/report", key="gk_admin")
+    mine = next(c for c in body["contracts"] if c["contract_id"] == cid)
+    assert mine["received_usd"] == "19600.00"
+    assert [p["received_on"] for p in mine["payments"]] == ["2026-11-05", "2026-10-20"]
+    assert [c["name"] for c in body["contracts"]][-1] == "Gone"      # archived ones last
+    # Taking a payment back out takes its revenue out.
+    assert call("DELETE", f"/platform/admin/contract-payments/{payment['payment_id']}", key="gk_admin")[0] == 200
+    assert call("DELETE", f"/platform/admin/contract-payments/{payment['payment_id']}", key="gk_admin")[0] == 404
+    assert report.build(env.sf, admin=True, now=NOW)["revenue"]["total_usd"] == "27.00"
+
+
+def test_contracts_are_checked(env):
+    good = {"name": "Lab", "starts_on": "2026-11-01"}
+    for bad in ({"starts_on": "2026-11-01"}, {"name": "Lab"}, {**good, "starts_on": "soon"},
+                {**good, "gpu_count": 4}, {**good, "gpu_model": "rtx5090", "gpu_count": -1},
+                {**good, "gpu_count": 2.5, "gpu_model": "x"}, {**good, "monthly_usd": "12000"},
+                {**good, "monthly_usd": -5}, {**good, "ends_on": "2026-10-31"}, {**good, "farmer_id": "nope"},
+                {**good, "colour": "green"}, {**good, "starts_on": "1999-01-01"}):
+        assert call("POST", "/platform/admin/contracts", bad, key="gk_admin")[0] == 400, bad
+    status, contract = call("POST", "/platform/admin/contracts", good, key="gk_admin")
+    assert status == 200 and (contract["gpu_model"], contract["gpu_count"], contract["monthly_usd"]) == ("", 0, None)
+    cid = contract["contract_id"]
+    assert call("POST", "/platform/admin/contracts", good, key="gk_admin")[0] == 400       # the name is taken
+    other = report.create_contract(env.sf, {"name": "Other", "starts_on": "2026-11-01"})
+    assert call("PATCH", f"/platform/admin/contracts/{other['contract_id']}", {"name": "Lab"}, key="gk_admin")[0] == 400
+    assert call("PATCH", f"/platform/admin/contracts/{cid}", {"gpu_count": 8}, key="gk_admin")[0] == 400  # which GPU?
+    status, changed = call("PATCH", f"/platform/admin/contracts/{cid}",
+                           {"gpu_model": "RTX 4090", "gpu_count": 8, "monthly_usd": 2000.5, "ends_on": "2027-10-31"},
+                           key="gk_admin")
+    assert status == 200 and (changed["gpu_label"], changed["monthly_usd"], changed["ends_on"]) == (
+        "RTX 4090", "2000.50", "2027-10-31")
+    status, cleared = call("PATCH", f"/platform/admin/contracts/{cid}", {"monthly_usd": None, "ends_on": None,
+                                                                         "farmer_id": None}, key="gk_admin")
+    assert status == 200 and (cleared["monthly_usd"], cleared["ends_on"], cleared["gpu_count"]) == (None, None, 8)
+    assert call("PATCH", f"/platform/admin/contracts/{cid}", {"ends_on": "2026-01-01"}, key="gk_admin")[0] == 400
+    assert call("PATCH", "/platform/admin/contracts/nope", {"name": "x"}, key="gk_admin")[0] == 404
+    tomorrow_and_more = (datetime.now(UTC) + timedelta(days=3)).date().isoformat()
+    for bad in ({"received_on": "2026-11-05", "amount_usd": 0}, {"received_on": "2026-11-05", "amount_usd": "5"},
+                {"amount_usd": 5}, {"received_on": "5 Nov", "amount_usd": 5},
+                {"received_on": tomorrow_and_more, "amount_usd": 5}, {"received_on": "2026-11-05", "amount_usd": True}):
+        assert call("POST", f"/platform/admin/contracts/{cid}/payments", bad, key="gk_admin")[0] == 400, bad
+    assert call("POST", "/platform/admin/contracts/nope/payments", {"received_on": "2026-11-05", "amount_usd": 5},
+                key="gk_admin")[0] == 404
+    # A payment dated tomorrow (allowed, for time zones) counts from its day on, in totals and rows alike.
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date().isoformat()
+    report.record_contract_payment(env.sf, cid, received_on=tomorrow, amount_usd=7)
+    today_report = report.build(env.sf, admin=True)["revenue"]
+    assert today_report["total_usd"] == "0.00" and sum(float(q["usd"]) for q in today_report["periods"]) == 0
+    assert report.build(env.sf, admin=True, now=datetime.now(UTC) + timedelta(days=1))["revenue"]["total_usd"] == "7.00"
+    report.delete_contract_payment(env.sf, next(
+        p["payment_id"] for c in report.list_contracts(env.sf) for p in c["payments"] if p["received_on"] == tomorrow))
+    # An archived contract keeps the revenue it brought in.
+    report.record_contract_payment(env.sf, cid, received_on="2026-11-05", amount_usd=100)
+    report.update_contract(env.sf, cid, {"archived": True})
+    assert report.build(env.sf, admin=True, now=NOW)["revenue"]["total_usd"] == "100.00"
+    assert report.build(env.sf, admin=True, now=NOW)["gpus"]["contract_gpus"] == 0

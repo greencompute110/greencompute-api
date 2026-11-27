@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, JSON, Boolean, DateTime, Float, Index, Integer, String, Text, false, text
+from sqlalchemy import BigInteger, JSON, Boolean, Date, DateTime, Float, Index, Integer, String, Text, false, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -1123,7 +1123,14 @@ class GammaSpendORM(Base):
     # (it reads totals; events only for the few blocks since its last read).
     tx_hash: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # A customer's spend: the cents credited for it so far, and the cents
+    # still waiting for room under the weekly gamma limit (credited in a
+    # later week, oldest spend first; application/gamma.py).
     credited_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    waiting_cents: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"))
+    # The coldkey that owned the hotkey's deposit when it spent, so that
+    # gamma which waits can be screened again before it is credited.
+    coldkey: Mapped[str | None] = mapped_column(String(64), nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
@@ -1156,6 +1163,45 @@ class NodeFarmerORM(Base):
     farmer_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     hidden: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ContractORM(Base):
+    """A contract for machines rented outside the on-demand marketplace
+    (bare metal, by the month), entered by staff: who it is with, whose
+    machines they are, how many GPUs of what type it covers and what it is
+    worth a month. Its GPUs count as capacity under contract while it is
+    active; its revenue is the payments recorded against it."""
+
+    __tablename__ = "contracts"
+
+    contract_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True)
+    farmer_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Normalised like a node's model ("rtx5090", "h100"); "" when not said.
+    gpu_model: Mapped[str] = mapped_column(String(64), default="")
+    gpu_count: Mapped[int] = mapped_column(Integer, default=0)
+    monthly_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    starts_on: Mapped[date] = mapped_column(Date)
+    ends_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ContractPaymentORM(Base):
+    """Money received on a contract, entered by staff. It is revenue on the
+    day it was received (`received_on`, a UTC day)."""
+
+    __tablename__ = "contract_payments"
+
+    payment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    contract_id: Mapped[str] = mapped_column(String(64), index=True)
+    received_on: Mapped[date] = mapped_column(Date, index=True)
+    amount_cents: Mapped[int] = mapped_column(BigInteger)
+    reference: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class FarmerPaymentORM(Base):
