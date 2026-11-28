@@ -830,8 +830,8 @@ def contract_capacity(session_factory, today: date) -> list[dict]:
 def public_contracts(session_factory, settings: dict, *, through: date | None, today: date) -> list[dict]:
     """The contracts as anyone may see them: a label ("Contract A", by the
     order they were entered, so it never changes), the term, whether it is
-    running, the GPU type (with a count as exact as settings.gpu_detail
-    allows) and what was received from the report's start through
+    running, the GPU type (with its count only when settings.gpu_detail is
+    "exact") and what was received from the report's start through
     `through`. Never the customer's name, the notes or what the contract is
     worth. A contract shows once it has started on or before `through`, and
     while it is running or has brought in money in that time."""
@@ -859,7 +859,10 @@ def public_contracts(session_factory, settings: dict, *, through: date | None, t
                 "ends_on": row.ends_on.isoformat() if row.ends_on else None,
                 "status": "active" if running else "ended",
                 "gpu_label": _gpu(row.gpu_model)[1] if row.gpu_model else "",
-                "gpus": (_band(count) if bands else count) if count else None,
+                # A count only when staff chose exact GPU counts: with bands
+                # (the default) a contract shows its GPU type and no number,
+                # so nobody is handed GPUs and money side by side to divide.
+                "gpus": count if count and not bands else None,
                 "received_usd": _usd(got),
             })
     return out

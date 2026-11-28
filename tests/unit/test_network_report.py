@@ -785,14 +785,14 @@ def test_contracts_are_a_revenue_stream_and_capacity(env):
     public = report.build(env.sf, now=NOW)
     assert (public["revenue"]["total_usd"], public["revenue"]["contracts_usd"], public["revenue"]["normal_usd"]) == (
         "14607.00", "14600.00", "7.00")
-    # The contracts are listed by label, with their term, GPUs as a band and what was received: no name,
+    # The contracts are listed by label, with their term, GPU type (no count) and what was received: no name,
     # no notes, no reference, no value. The ended, not-yet-started and archived ones that brought in
     # nothing are left out or marked.
     assert public["contracts"] == [
         {"label": "Contract A", "term_months": None, "starts_on": "2026-11-01", "ends_on": None, "status": "active",
-         "gpu_label": "RTX 5090", "gpus": "40+", "received_usd": "14600.00"},
+         "gpu_label": "RTX 5090", "gpus": None, "received_usd": "14600.00"},
         {"label": "Contract B", "term_months": None, "starts_on": "2026-11-10", "ends_on": None, "status": "active",
-         "gpu_label": "H100", "gpus": "10+", "received_usd": "0.00"},
+         "gpu_label": "H100", "gpus": None, "received_usd": "0.00"},
     ]
     # Once it has ended, a contract that brought in money stays listed, as ended, under the same label.
     report.update_contract(env.sf, cid, {"ends_on": "2026-11-20"})
