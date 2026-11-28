@@ -59,11 +59,15 @@ def _found(value, what: str):
 def network_report() -> JSONResponse:
     """Subnet 110's public figures: the GPUs the network has, by type and by
     provider (under anonymous labels; counts are rounded down to a band
-    unless `gpus.detail` is "exact"), revenue for each completed period
-    (`period`: quarter by default) by stream (gamma, contracts, card,
-    crypto), and how much of it has been bought back as SN110 alpha and
-    burned, with the on-chain total to check it against. Refreshed every
-    minute."""
+    unless `gpus.detail` is "exact"), and revenue per period (`period`:
+    quarter by default) in two flows: the normal flow through the website,
+    by currency (`by_currency`: card, USDC, USDT, TAO, alpha, and gamma,
+    which customers burn on chain), and contracts agreed directly
+    (`contracts`: label, term, GPU type and what was received; never a
+    name). Money figures run through `revenue.through` (the end of the
+    last completed week unless `revenue.public_through` says otherwise).
+    Then how much has been bought back as SN110 alpha and burned, with the
+    on-chain total to check it against. Refreshed every minute."""
     value = report.public_report(_sf())
     if value is None:
         raise coded(404, "not_found", "the network report isn't published yet")

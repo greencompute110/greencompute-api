@@ -254,8 +254,10 @@ def test_revenue_is_what_customers_paid_without_bonuses_or_staff_credit(env):
 def test_the_public_report_stops_at_the_last_completed_period(env):
     """By week, NOW being a Tuesday: the public sees money and GPU-hours
     through Sunday the 22nd, totals included, so polling can't show a payment
-    as it lands or how many GPUs are rented this minute. By quarter (the
-    default) it sees nothing until the quarter has ended."""
+    as it lands or how many GPUs are rented this minute. That is so whatever
+    the period is (public_through "week", the default); "day" runs through
+    yesterday, and "period" shows completed periods only."""
+    assert report.get_settings(env.sf)["public_through"] == "week"
     report.update_settings(env.sf, {"period": "week", "show_gpu_hours": True})
     ledger(env, "last-week", 3000, ref="usdc-base:0x1:1", when=datetime(2026, 11, 20, 9, tzinfo=UTC))
     ledger(env, "sunday-night", 700, ref="stripe:cs_s", when=datetime(2026, 11, 22, 23, 59, tzinfo=UTC))
@@ -275,7 +277,8 @@ def test_the_public_report_stops_at_the_last_completed_period(env):
     assert revenue["compute_delivered"] == {"usd": "4.00", "gpu_hours": "10.0"}
     assert revenue["periods"][0]["gpu_hours"] == "10.0"
     assert public["buybacks"]["to_buy_back_usd"] == "37.00" and public["buybacks"]["next_due"] == "2026-11-30"
-    assert "accruing_usd" not in public["buybacks"] and "settle_now_usd" not in public["buybacks"]
+    assert public["buybacks"]["accruing_usd"] == "0.00" and "settle_now_usd" not in public["buybacks"]
+    assert revenue["public_through"] == "week"
     # GPU-hours and compute charged are off the public report unless staff turn them on.
     report.update_settings(env.sf, {"show_gpu_hours": False})
     quiet = report.build(env.sf, now=NOW)["revenue"]
@@ -284,18 +287,35 @@ def test_the_public_report_stops_at_the_last_completed_period(env):
     # Staff see up to now, GPU-hours included, whatever the public setting.
     staff = report.build(env.sf, admin=True, now=NOW)
     assert staff["revenue"]["total_usd"] == "89.21" and staff["revenue"]["compute_delivered"]["gpu_hours"] == "30.0"
-    assert staff["revenue"]["next_figures_on"] is None
+    assert staff["revenue"]["next_figures_on"] is None and "public_through" not in staff["revenue"]
     assert (staff["buybacks"]["to_buy_back_usd"], staff["buybacks"]["accruing_usd"]) == ("37.00", "52.21")
     # Before the first completed week there is nothing to show yet.
     report.update_settings(env.sf, {"since": "2026-11-23"})
     early = report.build(env.sf, now=NOW)["revenue"]
     assert (early["through"], early["total_usd"], early["periods"]) == (None, "0.00", [])
-    # By quarter: nothing of the quarter in progress is public; it all shows once it has ended.
+    # By quarter, the public still sees through the last completed week: the quarter in progress, so far.
     report.update_settings(env.sf, {"since": "2026-11-01", "period": "quarter"})
     public = report.build(env.sf, now=NOW)
-    assert (public["period"], public["revenue"]["through"], public["revenue"]["total_usd"]) == ("quarter", None, "0.00")
+    assert (public["period"], public["revenue"]["through"], public["revenue"]["total_usd"]) == (
+        "quarter", "2026-11-22", "37.00")
+    assert [(q["start"], q["end"], q["complete"], q["usd"]) for q in public["revenue"]["periods"]] == [
+        ("2026-10-01", "2026-12-31", False, "37.00")]
+    assert public["revenue"]["next_figures_on"] == "2026-11-30"
+    # None of it is due yet: it builds up until the quarter ends.
+    assert (public["buybacks"]["to_buy_back_usd"], public["buybacks"]["accruing_usd"],
+            public["buybacks"]["next_due"]) == ("0.00", "37.00", "2027-01-01")
+    # "day": through yesterday (Monday the 23rd), never today.
+    report.update_settings(env.sf, {"public_through": "day"})
+    daily = report.build(env.sf, now=NOW)["revenue"]
+    assert (daily["through"], daily["total_usd"], daily["next_figures_on"], daily["public_through"]) == (
+        "2026-11-23", "80.21", "2026-11-25", "day")
+    # "period": nothing of the quarter in progress is public; it all shows once it has ended.
+    report.update_settings(env.sf, {"public_through": "period"})
+    public = report.build(env.sf, now=NOW)
+    assert (public["revenue"]["through"], public["revenue"]["total_usd"]) == (None, "0.00")
     assert public["revenue"]["periods"] == [] and public["revenue"]["next_figures_on"] == "2027-01-01"
-    assert (public["buybacks"]["to_buy_back_usd"], public["buybacks"]["next_due"]) == ("0.00", "2027-01-01")
+    assert (public["buybacks"]["to_buy_back_usd"], public["buybacks"]["accruing_usd"],
+            public["buybacks"]["next_due"]) == ("0.00", "0.00", "2027-01-01")
     later = report.build(env.sf, now=JANUARY)
     assert (later["revenue"]["through"], later["revenue"]["total_usd"]) == ("2026-12-31", "89.21")
     assert [(q["start"], q["end"], q["counted_from"], q["complete"], q["usd"], q["to_buy_back_usd"])
@@ -548,15 +568,18 @@ def test_farmer_statement_and_payments(env):
     report.update_settings(env.sf, {"excluded_user_ids": ["staff-test"]})
     assert report.statement(env.sf, farmer["farmer_id"], "2026-11")["revenue_usd"] == "4.00"
     assert report.build(env.sf, admin=True, now=NOW)["farmer_payments"]["total_usd"] == "15.00"
-    # In public only once the period the statement month is in has ended, as for revenue.
+    # In public only once the public figures have passed the end of the statement month, as for revenue.
     report.update_settings(env.sf, {"show_farmer_payments": True})
     assert report.build(env.sf, now=NOW)["farmer_payments"] == {"total_usd": "0.00", "months": []}
     assert report.build(env.sf, now=JANUARY)["farmer_payments"] == {
         "total_usd": "15.00", "months": [{"month": "2026-11", "usd": "15.00"}]}
-    report.update_settings(env.sf, {"period": "month"})
-    assert report.build(env.sf, now=NOW)["farmer_payments"]["months"] == []
-    assert report.build(env.sf, now=NOW + timedelta(days=10))["farmer_payments"]["total_usd"] == "15.00"
-    report.update_settings(env.sf, {"period": "quarter"})
+    # A statement month shows once the public figures have reached its last day: through the last
+    # completed week, that is the Monday after the month's last Sunday... (30 Nov is a Monday: 7 Dec).
+    assert report.build(env.sf, now=NOW + timedelta(days=10))["farmer_payments"]["months"] == []
+    assert report.build(env.sf, now=NOW + timedelta(days=14))["farmer_payments"]["total_usd"] == "15.00"
+    report.update_settings(env.sf, {"public_through": "period"})
+    assert report.build(env.sf, now=NOW + timedelta(days=14))["farmer_payments"]["months"] == []
+    report.update_settings(env.sf, {"public_through": "week"})
     assert report.statement(env.sf, farmer["farmer_id"], "2026-10")["revenue_usd"] == "4.00"
     assert call("DELETE", f"/platform/admin/farmer-payments/{payment['payment_id']}", key="gk_admin")[0] == 200
     assert call("DELETE", f"/platform/admin/farmer-payments/{payment['payment_id']}", key="gk_admin")[0] == 404
@@ -620,7 +643,9 @@ def test_admin_report_has_everything_staff_need(env):
     # The preview is what the public would get: bands, no names, no days, completed periods only.
     assert "days" not in body["preview"]["revenue"] and "days" in body["report"]["revenue"]
     assert body["preview"]["gpus"]["detail"] == "bands" and "by_farmer" not in body["preview"]["gpus"]
-    assert "accruing_usd" in body["report"]["buybacks"] and "accruing_usd" not in body["preview"]["buybacks"]
+    assert "settle_now_usd" in body["report"]["buybacks"] and "settle_now_usd" not in body["preview"]["buybacks"]
+    assert body["preview"]["contracts"] == [] and "contracts" not in body["report"]
+    assert (body["settings"]["public_through"], body["settings"]["show_contracts"]) == ("week", True)
     # The public spec lists the report and none of the staff routes.
     app.openapi_schema = None
     paths = app.openapi()["paths"]
@@ -755,10 +780,37 @@ def test_contracts_are_a_revenue_stream_and_capacity(env):
     report.update_settings(env.sf, {"revenue_basis": "usage"})
     assert report.build(env.sf, admin=True, now=NOW)["revenue"]["total_usd"] == "14600.00"
     report.update_settings(env.sf, {"revenue_basis": "paid"})
-    # The public report gives the stream's total for completed periods, never the contracts themselves.
-    assert report.build(env.sf, now=NOW)["revenue"]["total_usd"] == "0.00"
+    # The public report, through the last completed week: the payment of the 5th and the gamma of the
+    # 21st, not yesterday's card payment.
+    public = report.build(env.sf, now=NOW)
+    assert (public["revenue"]["total_usd"], public["revenue"]["contracts_usd"], public["revenue"]["normal_usd"]) == (
+        "14607.00", "14600.00", "7.00")
+    # The contracts are listed by label, with their term, GPUs as a band and what was received: no name,
+    # no notes, no reference, no value. The ended, not-yet-started and archived ones that brought in
+    # nothing are left out or marked.
+    assert public["contracts"] == [
+        {"label": "Contract A", "term_months": None, "starts_on": "2026-11-01", "ends_on": None, "status": "active",
+         "gpu_label": "RTX 5090", "gpus": "40+", "received_usd": "14600.00"},
+        {"label": "Contract B", "term_months": None, "starts_on": "2026-11-10", "ends_on": None, "status": "active",
+         "gpu_label": "H100", "gpus": "10+", "received_usd": "0.00"},
+    ]
+    # Once it has ended, a contract that brought in money stays listed, as ended, under the same label.
+    report.update_contract(env.sf, cid, {"ends_on": "2026-11-20"})
+    listed = report.build(env.sf, now=NOW)["contracts"]
+    assert [(c["label"], c["status"], c["received_usd"]) for c in listed] == [
+        ("Contract A", "ended", "14600.00"), ("Contract B", "active", "0.00")]
+    report.update_contract(env.sf, cid, {"ends_on": None})
     later = json.dumps(report.build(env.sf, now=JANUARY))
-    assert '"contract_usd": "14600.00"' in later and "Lab One" not in later and "wire 881" not in later
+    assert '"contract_usd": "14600.00"' in later
+    for private in ("Lab One", "wire 881", "bare metal", "monthly", "value_usd", "contract_id", "farmer_id"):
+        assert private not in later, private
+    # With exact GPU detail the counts are exact; with the list switched off there is no list at all.
+    report.update_settings(env.sf, {"gpu_detail": "exact"})
+    assert [c["gpus"] for c in report.build(env.sf, now=NOW)["contracts"]] == [40, 10]
+    report.update_settings(env.sf, {"gpu_detail": "bands", "show_contracts": False})
+    hidden = report.build(env.sf, now=NOW)
+    assert "contracts" not in hidden and hidden["revenue"]["contracts_usd"] == "14600.00"
+    report.update_settings(env.sf, {"show_contracts": True})
     # Staff's list: the contract with its payments, newest first, and what it has brought in.
     status, body = call("GET", "/platform/admin/report", key="gk_admin")
     mine = next(c for c in body["contracts"] if c["contract_id"] == cid)
@@ -862,14 +914,18 @@ def test_staff_see_the_normal_flow_by_currency_and_contracts_apart(env):
     usage = report.build(env.sf, admin=True, now=NOW)["revenue"]
     assert (usage["total_usd"], usage["normal_usd"], usage["contracts_usd"]) == ("9004.00", "4.00", "9000.00")
     report.update_settings(env.sf, {"revenue_basis": "paid"})
-    # The public report: the four streams, never the flows or the split by currency.
-    public = report.build(env.sf, now=JANUARY)["revenue"]
-    assert public["total_usd"] == "9160.00" and len(public["periods"]) == 1
-    for key in ("by_currency", "normal_usd", "contracts_usd"):
-        assert key not in public, key
-    assert not [k for k in public["periods"][0] if k in ("normal_usd", "usdc_usd", "usdt_usd", "tao_usd", "alpha_usd",
-                                                         "other_usd")]
-    assert {"gamma_usd", "contract_usd", "card_usd", "crypto_usd"} <= set(public["periods"][0])
+    # The public report shows the same two flows and the same split, through the last completed week
+    # (the payments were on Sunday the 22nd), and never single days.
+    public = report.build(env.sf, now=NOW)["revenue"]
+    assert (public["through"], public["total_usd"], public["normal_usd"], public["contracts_usd"]) == (
+        "2026-11-22", "9160.00", "160.00", "9000.00")
+    assert public["by_currency"] == revenue["by_currency"] and "days" not in public
+    row = public["periods"][0]
+    assert (row["complete"], row["normal_usd"], row["usdt_usd"], row["tao_usd"], row["gamma_usd"]) == (
+        False, "160.00", "15.00", "90.00", "7.00")
+    # A week earlier none of it had happened yet as far as the public could see.
+    earlier = report.build(env.sf, now=NOW - timedelta(days=3))["revenue"]
+    assert (earlier["through"], earlier["normal_usd"], earlier["contracts_usd"]) == ("2026-11-15", "0.00", "9000.00")
 
 
 def test_contract_terms_one_month_two_months_a_quarter(env):

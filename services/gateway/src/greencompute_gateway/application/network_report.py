@@ -51,10 +51,16 @@ each was received, on either basis. Gamma counts when it is credited: gamma
 that is waiting for the weekly gamma limit (application/gamma.py) is revenue
 in the week it is credited.
 
-What the public report holds back, so that nobody polling it can read one
-customer's payment or how many GPUs are rented right now:
-- money stops at the end of the last completed period (totals too); the
-  period in progress and single days are for staff only;
+Anyone may see the revenue once the report is published: the two flows,
+the normal flow by currency, and the contracts (settings.show_contracts)
+under labels ("Contract A") with their term, GPU type and what was
+received, never a customer's name or what the contract is worth.
+
+What the public report holds back, so that nobody polling it can read a
+payment the moment it lands or how many GPUs are rented right now:
+- money stops at the end of the last completed week (totals too), or of
+  yesterday, or of the last completed period: settings.public_through.
+  Today's figures and single days are for staff only;
 - farmers appear under their labels, never by name, and never with their
   revenue; what farmers were paid shows only when
   settings.show_farmer_payments is on, and then only for statement months
@@ -119,6 +125,13 @@ DEFAULT_SETTINGS = {
     "show_providers": True,
     # Whether the public report shows GPU-hours and compute charged.
     "show_gpu_hours": False,
+    # How fresh the public money figures are: through the last completed
+    # "week" (default), through yesterday ("day"), or completed periods only
+    # ("period"). Buybacks fall due per `period` whichever this is.
+    "public_through": "week",
+    # Whether the public report lists the contracts (a label, the term, the
+    # GPU type, what was received): never a customer's name or the value.
+    "show_contracts": True,
     "listed_within_days": 30,
     "excluded_user_ids": [],
     # Whether the public report says what farmers were paid (totals only).
@@ -129,6 +142,7 @@ PERIODS = ("week", "month", "quarter")
 # months, three years of quarters.
 MAX_PERIODS = {"week": 26, "month": 24, "quarter": 12}
 GPU_DETAILS = ("bands", "exact")
+PUBLIC_THROUGH = ("week", "day", "period")
 BASES = {
     "paid": "What customers paid: gamma, contract, card and crypto payments, without bonuses, less card "
             "chargebacks.",
@@ -198,7 +212,7 @@ def update_settings(session_factory, changes: dict) -> dict:
     for key, value in (changes or {}).items():
         if key not in DEFAULT_SETTINGS:
             raise ReportError(f"unknown setting {key!r}; choose from {sorted(DEFAULT_SETTINGS)}")
-        if key in ("published", "show_farmer_payments", "show_providers", "show_gpu_hours"):
+        if key in ("published", "show_farmer_payments", "show_providers", "show_gpu_hours", "show_contracts"):
             if not isinstance(value, bool):
                 raise ReportError(f"{key} must be true or false")
         elif key == "period":
@@ -207,6 +221,9 @@ def update_settings(session_factory, changes: dict) -> dict:
         elif key == "gpu_detail":
             if value not in GPU_DETAILS:
                 raise ReportError(f"gpu_detail must be one of {list(GPU_DETAILS)}")
+        elif key == "public_through":
+            if value not in PUBLIC_THROUGH:
+                raise ReportError(f"public_through must be one of {list(PUBLIC_THROUGH)}")
         elif key == "since":
             try:
                 value = date.fromisoformat(str(value)).isoformat()
@@ -274,17 +291,21 @@ def _check_terms(terms) -> dict:
     return out
 
 
+def _letters(n: int) -> str:
+    """0 -> "A", 25 -> "Z", 26 -> "AA": letters to label things with."""
+    letters = ""
+    while True:
+        letters = chr(ord("A") + n % 26) + letters
+        n = n // 26 - 1
+        if n < 0:
+            return letters
+
+
 def _next_label(session) -> str:
     taken = set(session.scalars(select(FarmerORM.public_label)).all())
     n = 0
     while True:
-        letters, k = "", n
-        while True:
-            letters = chr(ord("A") + k % 26) + letters
-            k = k // 26 - 1
-            if k < 0:
-                break
-        label = f"Farmer {letters}"
+        label = f"Farmer {_letters(n)}"
         if label not in taken:
             return label
         n += 1
@@ -806,6 +827,44 @@ def contract_capacity(session_factory, today: date) -> list[dict]:
     return out
 
 
+def public_contracts(session_factory, settings: dict, *, through: date | None, today: date) -> list[dict]:
+    """The contracts as anyone may see them: a label ("Contract A", by the
+    order they were entered, so it never changes), the term, whether it is
+    running, the GPU type (with a count as exact as settings.gpu_detail
+    allows) and what was received from the report's start through
+    `through`. Never the customer's name, the notes or what the contract is
+    worth. A contract shows once it has started on or before `through`, and
+    while it is running or has brought in money in that time."""
+    if through is None:
+        return []
+    since = _since(settings).date()
+    bands = settings["gpu_detail"] == "bands"
+    with session_scope(session_factory) as session:
+        rows = session.scalars(select(ContractORM).order_by(ContractORM.created_at, ContractORM.contract_id)).all()
+        received = {cid: int(cents or 0) for cid, cents in session.execute(
+            select(ContractPaymentORM.contract_id, func.sum(ContractPaymentORM.amount_cents))
+            .where(ContractPaymentORM.received_on >= since, ContractPaymentORM.received_on <= through)
+            .group_by(ContractPaymentORM.contract_id)).all()}
+        out = []
+        for index, row in enumerate(rows):
+            got = received.get(row.contract_id, 0)
+            running = _contract_active(row, today)
+            if row.starts_on > through or not (running or got):
+                continue
+            count = int(row.gpu_count or 0) if row.gpu_model else 0
+            out.append({
+                "label": f"Contract {_letters(index)}",
+                "term_months": _term_months(row.starts_on, row.ends_on),
+                "starts_on": row.starts_on.isoformat(),
+                "ends_on": row.ends_on.isoformat() if row.ends_on else None,
+                "status": "active" if running else "ended",
+                "gpu_label": _gpu(row.gpu_model)[1] if row.gpu_model else "",
+                "gpus": (_band(count) if bands else count) if count else None,
+                "received_usd": _usd(got),
+            })
+    return out
+
+
 def contract_paid(session_factory, since: date, until: date | None = None) -> dict[date, int]:
     """Cents received on contracts, by day, from `since` to before `until`."""
     with session_scope(session_factory) as session:
@@ -976,24 +1035,33 @@ def _periods(first: date, last: date, period: str) -> list[date]:
     return out
 
 
-def _revenue(session_factory, settings: dict, now: datetime, *, completed_only: bool = False) -> dict:
-    """Revenue since settings.since. `completed_only` (the public report):
-    everything stops at the end of the last completed period. Either way
-    the result says what of it is due for buyback: the revenue of completed
-    periods (`due_cents`), less what customers paid of it in gamma."""
+def _revenue(session_factory, settings: dict, now: datetime, *, public: bool = False) -> dict:
+    """Revenue since settings.since. `public` (the public report): everything
+    stops where settings.public_through says, the end of the last completed
+    week by default. Either way the result says what of it is due for
+    buyback: the revenue of completed periods (`due_cents`), less what
+    customers paid of it in gamma."""
     since = _since(settings)
     excluded = settings["excluded_user_ids"]
     period, basis = settings["period"], settings["revenue_basis"]
     today = now.astimezone(UTC).date()
     current = _period_start(today, period)                 # the period in progress
     cut = datetime.combine(current, datetime.min.time(), tzinfo=UTC)
-    until = cut if completed_only else None
-    last_day = current - timedelta(days=1) if completed_only else today
+    if public:
+        # `stop`: the first day NOT counted. `moves_on`: when it next moves.
+        stop, moves_on = {
+            "day": (today, today + timedelta(days=1)),
+            "week": (_period_start(today, "week"), _period_start(today, "week") + timedelta(days=7)),
+            "period": (current, _period_next(current, period)),
+        }[settings["public_through"]]
+        until = datetime.combine(stop, datetime.min.time(), tzinfo=UTC)
+    else:
+        # Staff: up to now. A payment staff dated ahead (tomorrow is
+        # allowed, for time zones) counts from its day on.
+        stop, moves_on, until = today + timedelta(days=1), None, None
+    last_day = stop - timedelta(days=1)
     paid, gamma_by_user = paid_in(session_factory, since, until, excluded)
-    # A payment staff dated ahead (tomorrow is allowed, for time zones)
-    # counts from its day on.
-    not_after = current if completed_only else today + timedelta(days=1)
-    for day, cents in contract_paid(session_factory, since.date(), not_after).items():
+    for day, cents in contract_paid(session_factory, since.date(), stop).items():
         paid.setdefault(day, {})["contract"] = cents
     used_cents, used_hours, _ = compute_delivered(session_factory, since, until, excluded)
 
@@ -1022,8 +1090,8 @@ def _revenue(session_factory, settings: dict, now: datetime, *, completed_only: 
     already = gamma_covered(gamma_by_user, until)
     due_days = [d for d in all_days if d < current]
     due = sum(headline(d) for d in due_days)
-    if completed_only:
-        already_due = already
+    if until is not None and stop <= current:
+        already_due = already  # everything counted lies in completed periods
     elif basis == "paid":
         already_due = sum(paid.get(d, {}).get("gamma", 0) for d in due_days)
     else:
@@ -1061,10 +1129,11 @@ def _revenue(session_factory, settings: dict, now: datetime, *, completed_only: 
         "basis_text": BASES[basis],
         "period": period,
         # The last day counted; None when no day is yet (the public report
-        # before its first completed period).
+        # before its first completed week, day or period).
         "through": last_day.isoformat() if last_day >= since.date() else None,
-        # The public report: the day the period in progress will first show.
-        "next_figures_on": _period_next(current, period).isoformat() if completed_only else None,
+        # The public report: how fresh it is, and the day it next moves on.
+        "public_through": settings["public_through"] if public else None,
+        "next_figures_on": moves_on.isoformat() if moves_on else None,
         "total_cents": total,
         "total_usd": _usd(total),
         "paid_in_usd": _usd(sum(by_method.values())),
@@ -1343,7 +1412,7 @@ def build(session_factory, *, admin: bool = False, now: datetime | None = None) 
     settings = get_settings(session_factory)
     farmers = {f["farmer_id"]: f for f in list_farmers(session_factory)}
     all_machines = machines(session_factory, settings=settings, now=now)
-    revenue = _revenue(session_factory, settings, now, completed_only=not admin)
+    revenue = _revenue(session_factory, settings, now, public=not admin)
     buybacks = _buybacks(session_factory, settings, revenue)
     summary = _gpu_summary([m for m in all_machines if m["listed"]],
                            contract_capacity(session_factory, now.astimezone(UTC).date()), farmers, admin=admin)
@@ -1369,17 +1438,17 @@ def build(session_factory, *, admin: bool = False, now: datetime | None = None) 
         "revenue": public(revenue),
         "buybacks": public(buybacks),
     }
-    if not admin:
-        # The public report gives the four streams; days, the two flows and
-        # the split by currency are staff's.
-        for key in ("days", "normal_usd", "contracts_usd", "by_currency"):
-            out["revenue"].pop(key, None)
-        for row in out["revenue"]["periods"]:
-            for key in ("normal_usd", *(f"{c}_usd" for c in CRYPTO)):
-                row.pop(key, None)
-        # The public report holds nothing of the period in progress.
-        for key in ("accruing_usd", "settle_now_usd"):
-            out["buybacks"].pop(key, None)
+    if admin:
+        out["revenue"].pop("public_through", None)
+    else:
+        # Single days are staff's; so is what a buyback today would take.
+        out["revenue"].pop("days", None)
+        out["buybacks"].pop("settle_now_usd", None)
+        if settings["show_contracts"]:
+            through = revenue["through"]
+            out["contracts"] = public_contracts(
+                session_factory, settings, through=date.fromisoformat(through) if through else None,
+                today=now.astimezone(UTC).date())
         if not settings["show_gpu_hours"]:
             out["revenue"].pop("compute_delivered", None)
             for row in out["revenue"]["periods"]:
@@ -1388,9 +1457,11 @@ def build(session_factory, *, admin: bool = False, now: datetime | None = None) 
     if admin:
         out["farmer_payments"] = _farmer_payments(session_factory, _since(settings))
     elif settings["show_farmer_payments"]:
-        out["farmer_payments"] = _farmer_payments(
-            session_factory, _since(settings),
-            before=_period_start(now.astimezone(UTC).date(), settings["period"]))
+        # Only statement months that ended before the first day not yet
+        # public, as for revenue.
+        through = revenue["through"]
+        not_yet = (date.fromisoformat(through) + timedelta(days=1)) if through else _since(settings).date()
+        out["farmer_payments"] = _farmer_payments(session_factory, _since(settings), before=not_yet)
     return out
 
 
